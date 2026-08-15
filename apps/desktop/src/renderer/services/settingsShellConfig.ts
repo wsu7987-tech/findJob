@@ -19,6 +19,11 @@ interface SettingsSaveForm {
   quick_capture_screenshot_hotkey: string;
   close_to_tray: boolean;
   quick_capture_always_on_top: boolean;
+  reasoning_executor: "llm" | "codex-cli";
+  codex_cli_path: string;
+  codex_model: string;
+  codex_reasoning_effort: string;
+  codex_timeout_seconds: number;
 }
 
 interface SettingsSaveOptions {
@@ -48,7 +53,18 @@ export const buildSettingsSavePayload = (
     quick_capture_hotkey: normalizeNullableString(form.quick_capture_hotkey),
     quick_capture_screenshot_hotkey: normalizeNullableString(form.quick_capture_screenshot_hotkey),
     close_to_tray: form.close_to_tray,
-    quick_capture_always_on_top: form.quick_capture_always_on_top
+    quick_capture_always_on_top: form.quick_capture_always_on_top,
+    reasoning_executor: form.reasoning_executor,
+    codex_cli_path: form.codex_cli_path || "codex",
+    codex_model: normalizeNullableString(form.codex_model),
+    codex_reasoning_effort: (normalizeNullableString(form.codex_reasoning_effort) ?? null) as
+      | "minimal"
+      | "low"
+      | "medium"
+      | "high"
+      | "xhigh"
+      | null,
+    codex_timeout_seconds: form.codex_timeout_seconds
   };
 
   if (options.llmApiKeyTouched) {

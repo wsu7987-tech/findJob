@@ -129,6 +129,10 @@ export const normalizeRunSnapshot = (payload: ApiRunSnapshot): UiRunSnapshot => 
     finishedAt: payload.finished_at ? formatDateTime(payload.finished_at) : null,
     reportWeekKey: payload.report_week_key ?? null,
     linkedReportVersionId: payload.linked_report_version_id ?? null,
+    executorType: payload.executor_type ?? "llm",
+    executorVersion: payload.executor_version ?? null,
+    modelName: payload.model_name ?? null,
+    reasoningEffort: payload.reasoning_effort ?? null,
     resultSnapshots: payload.result_snapshots ?? []
   };
 };

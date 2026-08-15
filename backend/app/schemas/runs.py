@@ -20,6 +20,10 @@ class RunResponse(BaseModel):
     finished_at: str | None = None
     report_week_key: str | None = None
     linked_report_version_id: str | None = None
+    executor_type: str = "llm"
+    executor_version: str | None = None
+    model_name: str | None = None
+    reasoning_effort: str | None = None
 
 
 class RunResultSnapshotResponse(BaseModel):

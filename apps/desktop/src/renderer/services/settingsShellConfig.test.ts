@@ -21,7 +21,12 @@ describe("settingsShellConfig", () => {
     quick_capture_hotkey: "CommandOrControl+Alt+Q",
     quick_capture_screenshot_hotkey: "CommandOrControl+Alt+S",
     close_to_tray: false,
-    quick_capture_always_on_top: false
+    quick_capture_always_on_top: false,
+    reasoning_executor: "codex-cli" as const,
+    codex_cli_path: "codex",
+    codex_model: "gpt-5.6",
+    codex_reasoning_effort: "high",
+    codex_timeout_seconds: 300
   };
 
   it("includes desktop shell fields in the main save payload", () => {
@@ -34,7 +39,10 @@ describe("settingsShellConfig", () => {
       quick_capture_hotkey: "CommandOrControl+Alt+Q",
       quick_capture_screenshot_hotkey: "CommandOrControl+Alt+S",
       close_to_tray: false,
-      quick_capture_always_on_top: false
+      quick_capture_always_on_top: false,
+      reasoning_executor: "codex-cli",
+      codex_model: "gpt-5.6",
+      codex_reasoning_effort: "high"
     });
   });
 

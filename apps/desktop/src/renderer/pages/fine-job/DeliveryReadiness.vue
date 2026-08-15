@@ -32,7 +32,10 @@ const platformStore = useFineJobPlatformSessionsStore();
 const resumesStore = useFineJobResumesStore();
 const router = useRouter();
 
-const llmReady = computed(() => configStore.llmStatus.status === "ready");
+const generationReady = computed(
+  () => configStore.selectedGenerationStatus.status === "ready"
+);
+const usingCodex = computed(() => configStore.data?.reasoning_executor === "codex-cli");
 
 onMounted(() => {
   void strategyStore.load();
@@ -44,12 +47,12 @@ onMounted(() => {
 const requiredItems = computed(() => [
   {
     key: "llm",
-    title: "LLM 配置",
-    description: llmReady.value
-      ? "模型连通性正常，可用于岗位匹配、打招呼和回复草稿。"
-      : "需要先配置并测试 LLM。Embedding 可选，不阻塞开始投递。",
-    state: llmReady.value ? "ready" : "missing",
-    action: llmReady.value ? "已就绪" : "去配置",
+    title: usingCodex.value ? "Codex CLI 配置" : "LLM 配置",
+    description: generationReady.value
+      ? `${usingCodex.value ? "Codex CLI" : "模型"}能力正常，可用于岗位匹配、打招呼和回复草稿。`
+      : `需要先配置并检测${usingCodex.value ? " Codex CLI" : " LLM"}。Embedding 可选，不阻塞开始投递。`,
+    state: generationReady.value ? "ready" : "missing",
+    action: generationReady.value ? "已就绪" : "去配置",
     routeName: null,
     icon: Connection
   },
@@ -138,7 +141,7 @@ const statusCopy = computed(() => {
   return {
     label: "未就绪",
     title: `还缺 ${missingItems.value.length} 项，暂不能开始投递`,
-    description: "先补齐关键前置条件。系统不会在 LLM、岗位意向、平台登录或投递策略缺失时启动自动化。"
+    description: "先补齐关键前置条件。系统不会在智能执行器、岗位意向、平台登录或投递策略缺失时启动自动化。"
   };
 });
 

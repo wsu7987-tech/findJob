@@ -39,6 +39,24 @@ def test_summary_precheck_requires_complete_config(client: TestClient) -> None:
     }
 
 
+def test_codex_executor_replaces_llm_requirements_but_keeps_embedding_independent(
+    client: TestClient,
+) -> None:
+    patch_response = client.patch(
+        "/api/config",
+        json={"reasoning_executor": "codex-cli"},
+    )
+    assert patch_response.status_code == 200
+
+    response = client.get("/api/summary/precheck")
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error_category": "CONFIG_INVALID",
+        "error_message": "Missing required config: embedding_provider, embedding_model",
+    }
+
+
 def test_summary_precheck_reports_missing_real_provider_fields(
     configured_client: TestClient,
 ) -> None:

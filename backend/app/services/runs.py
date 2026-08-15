@@ -85,7 +85,13 @@ def create_summary_run(
     rows = _load_summary_rows(db, pool_ids)
     run_id = new_id()
     started_at = utc_now()
-    _create_run_record(db, run_id=run_id, started_at=started_at, total_items=len(rows))
+    _create_run_record(
+        db,
+        run_id=run_id,
+        started_at=started_at,
+        total_items=len(rows),
+        config=config,
+    )
     initial_state = {
         "run_id": run_id,
         "started_at": started_at,
@@ -182,7 +188,11 @@ def get_run(db: Database, run_id: str) -> dict[str, object]:
               started_at,
               finished_at,
               report_week_key,
-              linked_report_version_id
+              linked_report_version_id,
+              executor_type,
+              executor_version,
+              model_name,
+              reasoning_effort
             FROM run_records
             WHERE id = ?
             """,
@@ -232,7 +242,11 @@ def list_runs(
               started_at,
               finished_at,
               report_week_key,
-              linked_report_version_id
+              linked_report_version_id,
+              executor_type,
+              executor_version,
+              model_name,
+              reasoning_effort
             FROM run_records
             {where_sql}
             ORDER BY started_at DESC, id DESC
@@ -314,6 +328,10 @@ def _serialize_run_row(row) -> dict[str, object]:
         "finished_at": row["finished_at"],
         "report_week_key": row["report_week_key"],
         "linked_report_version_id": row["linked_report_version_id"],
+        "executor_type": row["executor_type"],
+        "executor_version": row["executor_version"],
+        "model_name": row["model_name"],
+        "reasoning_effort": row["reasoning_effort"],
     }
 
 
@@ -386,6 +404,11 @@ def serialize_config_snapshot(config: AppConfig) -> dict[str, object]:
         "quick_capture_screenshot_hotkey": config.quick_capture_screenshot_hotkey,
         "close_to_tray": config.close_to_tray,
         "quick_capture_always_on_top": config.quick_capture_always_on_top,
+        "reasoning_executor": config.reasoning_executor,
+        "codex_cli_path": config.codex_cli_path,
+        "codex_model": config.codex_model,
+        "codex_reasoning_effort": config.codex_reasoning_effort,
+        "codex_timeout_seconds": config.codex_timeout_seconds,
     }
 
 
@@ -421,6 +444,11 @@ def restore_config_snapshot(snapshot: dict[str, object]) -> AppConfig:
         quick_capture_always_on_top=bool(
             snapshot.get("quick_capture_always_on_top", False)
         ),
+        reasoning_executor=str(snapshot.get("reasoning_executor") or "llm"),
+        codex_cli_path=str(snapshot.get("codex_cli_path") or "codex"),
+        codex_model=_optional_str(snapshot.get("codex_model")),
+        codex_reasoning_effort=_optional_str(snapshot.get("codex_reasoning_effort")),
+        codex_timeout_seconds=int(snapshot.get("codex_timeout_seconds") or 300),
     )
 
 
@@ -562,17 +590,56 @@ def _create_run_record(
     run_id: str,
     started_at: str,
     total_items: int,
+    config: AppConfig | None = None,
 ) -> None:
+    executor_type = config.reasoning_executor if config is not None else "llm"
+    model_name = None
+    reasoning_effort = None
+    if config is not None:
+        if executor_type == "codex-cli":
+            model_name = config.codex_model
+            reasoning_effort = config.codex_reasoning_effort
+        else:
+            model_name = config.llm_model
     with db.connect() as connection:
         connection.execute(
             """
             INSERT INTO run_records (
               id, task_type, status, stage, started_at, total_items,
-              succeeded_items, failed_items, skipped_items
+              succeeded_items, failed_items, skipped_items,
+              executor_type, model_name, reasoning_effort
             )
-            VALUES (?, 'summary', 'pending', 'queued', ?, ?, 0, 0, 0)
+            VALUES (?, 'summary', 'pending', 'queued', ?, ?, 0, 0, 0, ?, ?, ?)
             """,
-            (run_id, started_at, total_items),
+            (
+                run_id,
+                started_at,
+                total_items,
+                executor_type,
+                model_name,
+                reasoning_effort,
+            ),
+        )
+
+
+def _update_run_executor_details(
+    db: Database,
+    *,
+    run_id: str,
+    executor_version: str | None,
+    model_name: str | None,
+    reasoning_effort: str | None,
+) -> None:
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE run_records
+            SET executor_version = COALESCE(?, executor_version),
+                model_name = COALESCE(?, model_name),
+                reasoning_effort = COALESCE(?, reasoning_effort)
+            WHERE id = ?
+            """,
+            (executor_version, model_name, reasoning_effort, run_id),
         )
 
 

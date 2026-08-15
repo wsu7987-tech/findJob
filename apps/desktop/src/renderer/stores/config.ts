@@ -2,7 +2,11 @@
 import { computed, ref } from "vue";
 
 import { ApiError, NetworkError, api } from "../services/api";
-import type { AppConfigPayload, ProviderConnectivityCheckResponse } from "../types";
+import type {
+  AppConfigPayload,
+  CodexConnectivityCheckResponse,
+  ProviderConnectivityCheckResponse
+} from "../types";
 
 const SECRET_STORAGE_PREFIX = "fine-job.config.secret.";
 const SECRET_FIELDS = ["llm_api_key", "embedding_api_key"] as const;
@@ -49,6 +53,9 @@ export interface CapabilityStatusState {
   model: string | null;
   baseUrl: string | null;
   errorCategory: string | null;
+  cliVersion: string | null;
+  authenticated: boolean | null;
+  reasoningEffort: string | null;
 }
 
 const createCapabilityState = (
@@ -61,6 +68,9 @@ const createCapabilityState = (
   model: null,
   baseUrl: null,
   errorCategory: null,
+  cliVersion: null,
+  authenticated: null,
+  reasoningEffort: null,
   ...partial
 });
 
@@ -98,6 +108,7 @@ export const useConfigStore = defineStore("config", () => {
   const connectionUnavailable = ref(false);
   const llmStatus = ref<CapabilityStatusState>(createCapabilityState());
   const embeddingStatus = ref<CapabilityStatusState>(createCapabilityState());
+  const codexStatus = ref<CapabilityStatusState>(createCapabilityState());
   const probingCapabilities = ref(false);
 
   const backendStatus = computed<CapabilityStatusState>(() => {
@@ -131,10 +142,14 @@ export const useConfigStore = defineStore("config", () => {
     });
   });
 
+  const selectedGenerationStatus = computed(() =>
+    data.value?.reasoning_executor === "codex-cli" ? codexStatus.value : llmStatus.value
+  );
+
   const generationReady = computed(
     () =>
       backendStatus.value.status === "ready" &&
-      llmStatus.value.status === "ready"
+      selectedGenerationStatus.value.status === "ready"
   );
 
   const generationBlockReason = computed(() => {
@@ -142,12 +157,26 @@ export const useConfigStore = defineStore("config", () => {
       return backendStatus.value.detail;
     }
 
-    if (llmStatus.value.status !== "ready") {
-      return llmStatus.value.detail || "LLM 尚未就绪";
+    if (selectedGenerationStatus.value.status !== "ready") {
+      return selectedGenerationStatus.value.detail || "智能执行器尚未就绪";
     }
 
     return "";
   });
+
+  const applyCodexCapabilityResult = (result: CodexConnectivityCheckResponse) =>
+    createCapabilityState({
+      status: result.status,
+      detail: result.detail,
+      checkedAt: result.checked_at,
+      provider: "codex-cli",
+      model: result.model,
+      baseUrl: result.cli_path,
+      errorCategory: result.error_category ?? null,
+      cliVersion: result.cli_version,
+      authenticated: result.authenticated,
+      reasoningEffort: result.reasoning_effort
+    });
 
   const load = async () => {
     loading.value = true;
@@ -205,6 +234,9 @@ export const useConfigStore = defineStore("config", () => {
       embeddingStatus.value = createCapabilityState({
         detail: "配置已更新，请重新测试 Embedding 连通性。"
       });
+      codexStatus.value = createCapabilityState({
+        detail: "配置已更新，请重新检测 Codex CLI。"
+      });
       endpointUnavailable.value = false;
       connectionUnavailable.value = false;
 
@@ -261,6 +293,27 @@ export const useConfigStore = defineStore("config", () => {
     }
   };
 
+  const testCodexConnection = async () => {
+    codexStatus.value = createCapabilityState({
+      status: "checking",
+      detail: "正在检测 Codex CLI…"
+    });
+
+    try {
+      const result = await api.checkCodexConnection();
+      codexStatus.value = applyCodexCapabilityResult(result);
+      return result;
+    } catch (errorValue) {
+      codexStatus.value = createCapabilityState({
+        status: "failed",
+        detail: (errorValue as Error).message,
+        errorCategory:
+          errorValue instanceof ApiError ? errorValue.errorCategory ?? "API_ERROR" : "NETWORK_ERROR"
+      });
+      throw errorValue;
+    }
+  };
+
   const probeGenerationCapabilities = async () => {
     if (probingCapabilities.value) {
       return;
@@ -271,7 +324,11 @@ export const useConfigStore = defineStore("config", () => {
       if (!data.value || endpointUnavailable.value || connectionUnavailable.value) {
         return;
       }
-      await Promise.allSettled([testLlmConnection(), testEmbeddingConnection()]);
+      const generationProbe =
+        data.value.reasoning_executor === "codex-cli"
+          ? testCodexConnection()
+          : testLlmConnection();
+      await Promise.allSettled([generationProbe, testEmbeddingConnection()]);
     } finally {
       probingCapabilities.value = false;
     }
@@ -288,6 +345,8 @@ export const useConfigStore = defineStore("config", () => {
     backendStatus,
     llmStatus,
     embeddingStatus,
+    codexStatus,
+    selectedGenerationStatus,
     generationReady,
     generationBlockReason,
     probingCapabilities,
@@ -295,6 +354,7 @@ export const useConfigStore = defineStore("config", () => {
     save,
     testLlmConnection,
     testEmbeddingConnection,
+    testCodexConnection,
     probeGenerationCapabilities
   };
 });

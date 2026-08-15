@@ -7,12 +7,20 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
 
 import httpx
+from pydantic import BaseModel, ValidationError
 
 from backend.app.config import AppConfig
 from backend.app.errors import AppError
+from backend.app.services.reasoning.codex_exec import CodexExecResult, run_codex_exec
+from backend.app.services.reasoning.models import (
+    AnswerOutput,
+    QueryRewriteOutput,
+    SummaryLightweightOutput,
+    SummaryOutput,
+)
 
 
 _TOKEN_RE = re.compile(r"[a-zA-Z0-9\u4e00-\u9fff]{2,}")
@@ -319,7 +327,7 @@ def validate_provider_config(config: AppConfig) -> list[str]:
     missing: list[str] = []
 
     llm_provider = _normalize_llm_provider(config.llm_provider)
-    if llm_provider in {"openai", "openai-compatible"}:
+    if config.reasoning_executor == "llm" and llm_provider in {"openai", "openai-compatible"}:
         if llm_provider == "openai-compatible" and not config.llm_base_url:
             missing.append("llm_base_url")
         if not config.llm_api_key:
@@ -338,7 +346,19 @@ def validate_provider_config(config: AppConfig) -> list[str]:
     return missing
 
 
-def create_summary_provider(config: AppConfig) -> SummaryProvider:
+def create_summary_provider(
+    config: AppConfig,
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
+) -> SummaryProvider:
+    if config.reasoning_executor == "codex-cli":
+        return CodexSummaryProvider(config=config, cancellation_check=cancellation_check)
+    if config.reasoning_executor != "llm":
+        raise AppError(
+            status_code=400,
+            error_category="CONFIG_INVALID",
+            error_message=f"Unsupported reasoning_executor: {config.reasoning_executor}",
+        )
     provider = _normalize_llm_provider(config.llm_provider or "stub-llm")
     if provider == "stub-llm":
         return StubSummaryProvider(model_name=config.llm_model or "stub-summary-model")
@@ -364,6 +384,14 @@ def create_summary_provider(config: AppConfig) -> SummaryProvider:
 
 
 def create_answer_provider(config: AppConfig) -> AnswerProvider:
+    if config.reasoning_executor == "codex-cli":
+        return CodexAnswerProvider(config=config)
+    if config.reasoning_executor != "llm":
+        raise AppError(
+            status_code=400,
+            error_category="CONFIG_INVALID",
+            error_message=f"Unsupported reasoning_executor: {config.reasoning_executor}",
+        )
     provider = _normalize_llm_provider(config.llm_provider or "stub-llm")
     if provider == "stub-llm":
         return StubAnswerProvider(model_name=config.llm_model or "stub-answer-model")
@@ -389,6 +417,14 @@ def create_answer_provider(config: AppConfig) -> AnswerProvider:
 
 
 def create_query_rewrite_provider(config: AppConfig) -> QueryRewriteProvider:
+    if config.reasoning_executor == "codex-cli":
+        return CodexQueryRewriteProvider(config=config)
+    if config.reasoning_executor != "llm":
+        raise AppError(
+            status_code=400,
+            error_category="CONFIG_INVALID",
+            error_message=f"Unsupported reasoning_executor: {config.reasoning_executor}",
+        )
     provider = _normalize_llm_provider(config.llm_provider or "stub-llm")
     if provider == "stub-llm":
         return StubQueryRewriteProvider(model_name=config.llm_model or "stub-rewrite-model")
@@ -1709,6 +1745,299 @@ class StubSummaryProvider:
             summary_segments=summary_segments,
             quality_meta=quality_meta,
         )
+
+
+class CodexSummaryProvider:
+    def __init__(
+        self,
+        *,
+        config: AppConfig,
+        cancellation_check: Callable[[], bool] | None = None,
+    ) -> None:
+        self.config = config
+        self.cancellation_check = cancellation_check
+
+    def summarize(
+        self,
+        *,
+        title: str,
+        source_type: str,
+        source_value: str,
+        cleaning_level: str | None,
+        raw_content: str,
+        related_items: list[RelatedContextItem],
+        evidence_citations: list[dict[str, object]],
+    ) -> SummaryArtifact:
+        memory_context = "\n".join(
+            (
+                f"- title: {item.title}\n"
+                f"  category: {item.final_category or 'unknown'}\n"
+                f"  score: {item.score:.3f}\n"
+                f"  summary: {item.summary_text[:500]}"
+            )
+            for item in related_items[:5]
+        ) or "- none"
+        evidence_context = "\n".join(
+            (
+                f"- citation_id: {str(citation.get('citation_id') or '')}\n"
+                f"  title: {str(citation.get('title') or citation.get('source_name') or '')}\n"
+                f"  section: {str(citation.get('section_title') or '')}\n"
+                f"  snippet: {str(citation.get('snippet') or '')[:700]}\n"
+                f"  context: {str(citation.get('expanded_context_snippet') or citation.get('context_snippet') or '')[:900]}"
+            )
+            for citation in evidence_citations[:5]
+        ) or "- none"
+        prompt_variant, task_prompt = _build_summary_prompt(
+            title=title,
+            source_type=source_type,
+            source_value=source_value,
+            cleaning_level=cleaning_level,
+            raw_content=raw_content,
+            memory_context=memory_context,
+            evidence_context=evidence_context,
+        )
+        parsed, execution = _run_codex_output(
+            config=self.config,
+            prompt=_codex_task_prompt("knowledge_summary", task_prompt),
+            output_model=(
+                SummaryLightweightOutput if prompt_variant == "lightweight" else SummaryOutput
+            ),
+            cancellation_check=self.cancellation_check,
+        )
+        one_sentence_takeaway = _truncate_text(
+            _normalized_string(parsed.get("one_sentence_takeaway")) or title,
+            _TAKEAWAY_MAX_LENGTH,
+        )
+        summary_text_limit = 120 if prompt_variant == "lightweight" else _SUMMARY_TEXT_MAX_LENGTH
+        summary_text = _truncate_text(
+            _normalized_string(parsed.get("summary_text")) or raw_content,
+            summary_text_limit,
+        )
+        generated_tags = _normalize_tags(parsed.get("generated_tags"), fallback_source=raw_content)
+        grounded_claims = _normalize_grounded_claims(parsed.get("grounded_claims"))
+        reading_focus = _normalize_short_string_list(
+            parsed.get("reading_focus") if prompt_variant == "full" else [],
+            max_items=_READING_FOCUS_MAX_ITEMS,
+            max_length=_READING_FOCUS_MAX_LENGTH,
+        )
+        key_points = _normalize_short_string_list(
+            parsed.get("key_points"),
+            max_items=_KEY_POINTS_MAX_ITEMS if prompt_variant == "full" else 4,
+            max_length=_KEY_POINT_MAX_LENGTH if prompt_variant == "full" else 50,
+        )
+        keywords = _normalize_keywords(
+            parsed.get("keywords") if prompt_variant == "full" else [],
+            fallback_title=title,
+            fallback_source=raw_content,
+            source_type=source_type,
+        )
+        methods_or_process = _normalize_short_string_list(
+            parsed.get("methods_or_process") if prompt_variant == "full" else [],
+            max_items=_METHODS_MAX_ITEMS,
+            max_length=_METHOD_STEP_MAX_LENGTH,
+        )
+        pitfalls_or_limits = _normalize_short_string_list(
+            parsed.get("pitfalls_or_limits") if prompt_variant == "full" else [],
+            max_items=_PITFALLS_MAX_ITEMS,
+            max_length=_PITFALL_MAX_LENGTH,
+        )
+        code_examples = _normalize_code_examples(
+            parsed.get("code_examples") if prompt_variant == "full" else []
+        )
+        reader_guide = _normalize_reader_guide_v2(
+            parsed.get("reader_guide") if prompt_variant == "full" else None,
+            title=title,
+            raw_content=raw_content,
+            reading_focus=reading_focus,
+            key_points=key_points,
+            methods_or_process=methods_or_process,
+        )
+        summary_segments = _normalize_summary_segments(
+            parsed.get("summary_segments"),
+            fallback_grounded_claims=grounded_claims,
+        )
+        quality_meta = {
+            **_codex_quality_meta(execution),
+            "cleaning_level": cleaning_level or "unknown",
+            "memory_context_count": len(related_items),
+            "evidence_citation_count": len(evidence_citations),
+            "related_context_count": len(related_items),
+            "input_characters": len(raw_content),
+            "prompt_variant": prompt_variant,
+            "one_sentence_takeaway": one_sentence_takeaway,
+            "reading_focus": reading_focus,
+            "key_points": key_points,
+            "keywords": keywords,
+            "reader_guide": reader_guide,
+            "methods_or_process": methods_or_process,
+            "pitfalls_or_limits": pitfalls_or_limits,
+            "code_examples": code_examples,
+        }
+        return SummaryArtifact(
+            generated_category=_normalized_string(parsed.get("generated_category")) or "general",
+            generated_tags=generated_tags,
+            one_sentence_takeaway=one_sentence_takeaway,
+            summary_text=summary_text,
+            viewpoint_text=one_sentence_takeaway,
+            controversy_text=pitfalls_or_limits[0] if pitfalls_or_limits else None,
+            reading_focus=reading_focus,
+            key_points=key_points,
+            keywords=keywords,
+            methods_or_process=methods_or_process,
+            pitfalls_or_limits=pitfalls_or_limits,
+            code_examples=code_examples,
+            content_quality_score=_normalize_score(parsed.get("content_quality_score")),
+            grounded_claims=grounded_claims,
+            summary_segments=summary_segments,
+            quality_meta=quality_meta,
+        )
+
+
+class CodexQueryRewriteProvider:
+    def __init__(self, *, config: AppConfig) -> None:
+        self.config = config
+
+    def rewrite(
+        self,
+        *,
+        question: str,
+        mode: str,
+        history: list[dict[str, object]],
+        heuristic_rewrite: dict[str, object],
+    ) -> QueryRewriteArtifact:
+        history_context = "\n".join(
+            f"- {str(item.get('role') or '')}: {str(item.get('content') or '')[:240]}"
+            for item in history[-6:]
+        ) or "- none"
+        prompt = (
+            "Rewrite a user's knowledge-base QA question for retrieval.\n"
+            "Do not answer the question or add facts. Resolve omitted context only from history.\n"
+            "intent must be answer, knowledge_point, summary, source, follow_up, or unknown.\n"
+            f"mode: {mode}\n"
+            f"question: {question}\n"
+            f"heuristic_rewrite: {json.dumps(heuristic_rewrite, ensure_ascii=False)}\n"
+            f"history:\n{history_context}"
+        )
+        parsed, _execution = _run_codex_output(
+            config=self.config,
+            prompt=_codex_task_prompt("query_rewrite", prompt),
+            output_model=QueryRewriteOutput,
+        )
+        fallback = dict(heuristic_rewrite)
+        fallback.update(parsed)
+        return _normalize_query_rewrite_artifact(fallback, strategy="codex-cli")
+
+
+class CodexAnswerProvider:
+    def __init__(self, *, config: AppConfig) -> None:
+        self.config = config
+
+    def answer(
+        self,
+        *,
+        question: str,
+        mode: str,
+        evidence_citations: list[dict[str, object]],
+        grounded_items: list[dict[str, object]],
+    ) -> AnswerArtifact:
+        evidence_context = "\n".join(
+            (
+                f"- citation_id: {str(citation.get('citation_id') or '')}\n"
+                f"  title: {str(citation.get('title') or citation.get('source_name') or '')}\n"
+                f"  section: {str(citation.get('section_title') or '')}\n"
+                f"  snippet: {str(citation.get('snippet') or '')[:700]}\n"
+                f"  context: {str(citation.get('expanded_context_snippet') or citation.get('context_snippet') or '')[:900]}"
+            )
+            for citation in evidence_citations[:5]
+        ) or "- none"
+        grounded_context = "\n".join(
+            (
+                f"- title: {str(item.get('title') or '')}\n"
+                f"  category: {str(item.get('final_category') or '')}\n"
+                f"  claim: {str(item.get('claim') or '')}\n"
+                f"  evidence_titles: {', '.join(str(value) for value in item.get('evidence_titles', [])[:3])}"
+            )
+            for item in grounded_items[:5]
+        ) or "- none"
+        prompt = (
+            "Answer against the supplied personal knowledge-base evidence only.\n"
+            "citation_ids may only use ids present in evidence_context.\n"
+            "If evidence is insufficient, use answer_status=insufficient_evidence and do not invent facts.\n"
+            "If the question is too vague, use answer_status=needs_clarification.\n"
+            f"requested_mode: {mode}\n"
+            f"{_build_answer_mode_instruction(mode)}\n"
+            f"question: {question}\n\n"
+            f"evidence_context:\n{evidence_context}\n\n"
+            f"grounded_items:\n{grounded_context}\n"
+        )
+        parsed, execution = _run_codex_output(
+            config=self.config,
+            prompt=_codex_task_prompt("knowledge_answer", prompt),
+            output_model=AnswerOutput,
+        )
+        return AnswerArtifact(
+            answer=_normalized_string(parsed.get("answer")) or "未找到足够依据来回答该问题。",
+            answer_status=_normalize_answer_status(parsed.get("answer_status")),
+            confidence=_normalize_score(parsed.get("confidence")),
+            citation_ids=_normalize_citation_id_list(parsed.get("citation_ids")),
+            suggested_queries=_normalize_suggested_queries(
+                parsed.get("suggested_queries"),
+                question=question,
+            ),
+            quality_meta={
+                **_codex_quality_meta(execution),
+                "evidence_citation_count": len(evidence_citations),
+                "grounded_item_count": len(grounded_items),
+            },
+        )
+
+
+def _run_codex_output(
+    *,
+    config: AppConfig,
+    prompt: str,
+    output_model: type[BaseModel],
+    cancellation_check: Callable[[], bool] | None = None,
+) -> tuple[dict[str, object], CodexExecResult]:
+    execution = run_codex_exec(
+        cli_path=config.codex_cli_path,
+        prompt=prompt,
+        output_schema=output_model.model_json_schema(),
+        model=config.codex_model,
+        reasoning_effort=config.codex_reasoning_effort,
+        timeout_seconds=config.codex_timeout_seconds,
+        cancellation_check=cancellation_check,
+    )
+    try:
+        validated = output_model.model_validate(execution.output)
+    except ValidationError as exc:
+        raise AppError(
+            status_code=502,
+            error_category="CODEX_OUTPUT_SCHEMA_INVALID",
+            error_message="Codex final response did not match the required task schema.",
+        ) from exc
+    return validated.model_dump(), execution
+
+
+def _codex_task_prompt(task_type: str, prompt: str) -> str:
+    return (
+        "You are a structured reasoning backend embedded in FineJob.\n"
+        "Do not modify files, run commands, browse, call external tools, or perform side effects.\n"
+        "Use only the input below and return exactly one JSON object matching the supplied output schema.\n"
+        f"task_type: {task_type}\n\n"
+        f"{prompt}"
+    )
+
+
+def _codex_quality_meta(execution: CodexExecResult) -> dict[str, object]:
+    return {
+        "provider": "codex-cli",
+        "model": execution.model or "codex-default",
+        "reasoning_effort": execution.reasoning_effort or "inherit",
+        "cli_version": execution.cli_version,
+        "event_count": execution.event_count,
+        "usage": execution.usage or {},
+    }
 
 
 class OpenAICompatibleSummaryProvider:

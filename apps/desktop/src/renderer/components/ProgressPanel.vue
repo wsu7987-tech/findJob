@@ -35,6 +35,14 @@ defineProps<{
 
     <div class="progress-grid">
       <div>
+        <span>智能执行器</span>
+        <strong>{{ snapshot.executorType === "codex-cli" ? "Codex CLI" : "LLM" }}</strong>
+      </div>
+      <div>
+        <span>模型 / 推理强度</span>
+        <strong>{{ snapshot.modelName ?? "默认" }} / {{ snapshot.reasoningEffort ?? "默认" }}</strong>
+      </div>
+      <div>
         <span>总数</span>
         <strong>{{ snapshot.totalItems }}</strong>
       </div>

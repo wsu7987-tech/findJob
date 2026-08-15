@@ -544,6 +544,10 @@ export interface ApiRunSnapshot {
   finished_at?: string | null;
   report_week_key?: string | null;
   linked_report_version_id?: string | null;
+  executor_type?: string | null;
+  executor_version?: string | null;
+  model_name?: string | null;
+  reasoning_effort?: string | null;
   result_snapshots?: RunResultSnapshot[] | null;
 }
 
@@ -571,6 +575,10 @@ export interface UiRunSnapshot {
   finishedAt: string | null;
   reportWeekKey: string | null;
   linkedReportVersionId: string | null;
+  executorType: string;
+  executorVersion: string | null;
+  modelName: string | null;
+  reasoningEffort: string | null;
   resultSnapshots: RunResultSnapshot[];
 }
 
@@ -608,6 +616,11 @@ export interface AppConfigPayload {
   quick_capture_screenshot_hotkey?: string | null;
   close_to_tray?: boolean | null;
   quick_capture_always_on_top?: boolean | null;
+  reasoning_executor?: "llm" | "codex-cli" | null;
+  codex_cli_path?: string | null;
+  codex_model?: string | null;
+  codex_reasoning_effort?: "minimal" | "low" | "medium" | "high" | "xhigh" | null;
+  codex_timeout_seconds?: number | null;
 }
 
 export interface ProviderConnectivityCheckResponse {
@@ -617,6 +630,20 @@ export interface ProviderConnectivityCheckResponse {
   provider: string | null;
   model: string | null;
   base_url: string | null;
+  detail: string;
+  error_category?: string | null;
+  checked_at: string;
+}
+
+export interface CodexConnectivityCheckResponse {
+  capability: "codex-cli";
+  ok: boolean;
+  status: "ready" | "failed" | "invalid";
+  cli_path: string | null;
+  cli_version: string | null;
+  authenticated: boolean;
+  model: string | null;
+  reasoning_effort: string | null;
   detail: string;
   error_category?: string | null;
   checked_at: string;

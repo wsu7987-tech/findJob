@@ -46,6 +46,9 @@ const actionSummary = computed(() =>
 const connectivityActionLabel = computed(() =>
   configStore.generationReady ? "能力已就绪" : "一键联通测试"
 );
+const generationStatusLabel = computed(() =>
+  configStore.data?.reasoning_executor === "codex-cli" ? "Codex CLI 必需" : "LLM 必需"
+);
 const mainWindowAlwaysOnTop = ref(false);
 const updatingMainWindowPin = ref(false);
 const mainWindowPinLabel = computed(() =>
@@ -115,7 +118,10 @@ onMounted(() => {
 
         <div class="system-bar__status">
           <SystemStatusChip label="Backend" :state="configStore.backendStatus" />
-          <SystemStatusChip label="LLM 必需" :state="configStore.llmStatus" />
+          <SystemStatusChip
+            :label="generationStatusLabel"
+            :state="configStore.selectedGenerationStatus"
+          />
           <SystemStatusChip label="Embedding 可选" :state="configStore.embeddingStatus" />
         </div>
 

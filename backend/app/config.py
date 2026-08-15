@@ -30,6 +30,11 @@ PERSISTED_CONFIG_KEYS = {
     "embedding_concurrency",
     "fetch_timeout_seconds",
     "llm_timeout_seconds",
+    "reasoning_executor",
+    "codex_cli_path",
+    "codex_model",
+    "codex_reasoning_effort",
+    "codex_timeout_seconds",
     "embedding_timeout_seconds",
     "fetch_user_agent",
     "quick_capture_hotkey",
@@ -74,15 +79,19 @@ class AppConfig:
     quick_capture_screenshot_hotkey: str | None
     close_to_tray: bool
     quick_capture_always_on_top: bool
+    reasoning_executor: str = "llm"
+    codex_cli_path: str = "codex"
+    codex_model: str | None = None
+    codex_reasoning_effort: str | None = None
+    codex_timeout_seconds: int = 300
 
     def missing_runtime_fields(self) -> list[str]:
         missing: list[str] = []
-        for field_name in (
-            "llm_provider",
-            "llm_model",
-            "embedding_provider",
-            "embedding_model",
-        ):
+        required_fields: list[str] = []
+        if self.reasoning_executor == "llm":
+            required_fields.extend(["llm_provider", "llm_model"])
+        required_fields.extend(["embedding_provider", "embedding_model"])
+        for field_name in required_fields:
             if not getattr(self, field_name):
                 missing.append(field_name)
         return missing
@@ -275,6 +284,40 @@ def load_config() -> AppConfig:
             "quick_capture_always_on_top",
             _env("KNOWLEDGE_CURATOR_QUICK_CAPTURE_ALWAYS_ON_TOP"),
             default=True,
+        ),
+        reasoning_executor=(
+            _resolve_value(
+                local_overrides,
+                "reasoning_executor",
+                _env("FINE_JOB_REASONING_EXECUTOR", "llm"),
+            )
+            or "llm"
+        ),
+        codex_cli_path=(
+            _resolve_value(
+                local_overrides,
+                "codex_cli_path",
+                _env("FINE_JOB_CODEX_CLI_PATH", "codex"),
+            )
+            or "codex"
+        ),
+        codex_model=_resolve_value(
+            local_overrides,
+            "codex_model",
+            _env("FINE_JOB_CODEX_MODEL"),
+        ),
+        codex_reasoning_effort=_resolve_value(
+            local_overrides,
+            "codex_reasoning_effort",
+            _env("FINE_JOB_CODEX_REASONING_EFFORT"),
+        ),
+        codex_timeout_seconds=int(
+            _resolve_value(
+                local_overrides,
+                "codex_timeout_seconds",
+                _env("FINE_JOB_CODEX_TIMEOUT_SECONDS", "300"),
+            )
+            or "300"
         ),
     )
 

@@ -81,6 +81,10 @@ CREATE TABLE IF NOT EXISTS run_records (
   error_message TEXT,
   report_week_key TEXT,
   linked_report_version_id TEXT,
+  executor_type TEXT NOT NULL DEFAULT 'llm',
+  executor_version TEXT,
+  model_name TEXT,
+  reasoning_effort TEXT,
   cancel_requested INTEGER NOT NULL DEFAULT 0,
   CHECK (task_type IN ('summary', 'report')),
   CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled')),
@@ -472,6 +476,7 @@ class Database:
             self._ensure_retrieval_index_version_columns(connection)
             self._ensure_document_chunk_fts_index(connection)
             self._ensure_qa_message_trace_columns(connection)
+            self._ensure_run_record_executor_columns(connection)
             self._ensure_fj_platform_session_columns(connection)
 
     @contextmanager
@@ -601,6 +606,25 @@ class Database:
             connection.execute(
                 "ALTER TABLE qa_messages ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"
             )
+
+    def _ensure_run_record_executor_columns(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(run_records)")
+        }
+        migrations = {
+            "executor_type": (
+                "ALTER TABLE run_records ADD COLUMN executor_type TEXT NOT NULL DEFAULT 'llm'"
+            ),
+            "executor_version": "ALTER TABLE run_records ADD COLUMN executor_version TEXT",
+            "model_name": "ALTER TABLE run_records ADD COLUMN model_name TEXT",
+            "reasoning_effort": "ALTER TABLE run_records ADD COLUMN reasoning_effort TEXT",
+        }
+        for column, ddl in migrations.items():
+            if column not in columns:
+                connection.execute(ddl)
 
     def _ensure_fj_platform_session_columns(
         self,

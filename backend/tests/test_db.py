@@ -72,6 +72,21 @@ def test_database_initializes_document_parse_results_schema(
     assert "active_parse_result_id" in {column[1] for column in columns}
 
 
+def test_database_initializes_run_executor_columns(app_paths: dict[str, str]) -> None:
+    database = Database(app_paths["sqlite_path"])
+    database.initialize()
+
+    with database.connect() as connection:
+        columns = connection.execute("PRAGMA table_info(run_records)").fetchall()
+
+    assert {column[1] for column in columns} >= {
+        "executor_type",
+        "executor_version",
+        "model_name",
+        "reasoning_effort",
+    }
+
+
 def test_database_initializes_retrieval_index_versions_schema(
     app_paths: dict[str, str],
 ) -> None:

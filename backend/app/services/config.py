@@ -39,6 +39,11 @@ def serialize_config(config: AppConfig) -> dict[str, object]:
         "quick_capture_screenshot_hotkey": config.quick_capture_screenshot_hotkey,
         "close_to_tray": config.close_to_tray,
         "quick_capture_always_on_top": config.quick_capture_always_on_top,
+        "reasoning_executor": config.reasoning_executor,
+        "codex_cli_path": config.codex_cli_path,
+        "codex_model": config.codex_model,
+        "codex_reasoning_effort": config.codex_reasoning_effort,
+        "codex_timeout_seconds": config.codex_timeout_seconds,
     }
 
 
@@ -117,6 +122,18 @@ def update_config(config: AppConfig, payload: AppConfigPatchRequest) -> AppConfi
         config.close_to_tray = bool(updates["close_to_tray"])
     if "quick_capture_always_on_top" in updates:
         config.quick_capture_always_on_top = bool(updates["quick_capture_always_on_top"])
+    if "reasoning_executor" in updates:
+        config.reasoning_executor = str(updates["reasoning_executor"] or "llm")
+    if "codex_cli_path" in updates:
+        config.codex_cli_path = _normalize_optional_text(updates["codex_cli_path"]) or "codex"
+    if "codex_model" in updates:
+        config.codex_model = _normalize_optional_text(updates["codex_model"])
+    if "codex_reasoning_effort" in updates:
+        config.codex_reasoning_effort = _normalize_optional_text(
+            updates["codex_reasoning_effort"]
+        )
+    if "codex_timeout_seconds" in updates:
+        config.codex_timeout_seconds = int(updates["codex_timeout_seconds"])
 
     config.app_data_dir.mkdir(parents=True, exist_ok=True)
     config.sqlite_path.parent.mkdir(parents=True, exist_ok=True)

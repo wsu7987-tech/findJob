@@ -40,8 +40,27 @@ const form = reactive({
   llm_concurrency: 1,
   embedding_concurrency: 1,
   close_to_tray: true,
-  quick_capture_always_on_top: true
+  quick_capture_always_on_top: true,
+  reasoning_executor: "llm" as "llm" | "codex-cli",
+  codex_cli_path: "codex",
+  codex_model: "",
+  codex_reasoning_effort: "",
+  codex_timeout_seconds: 300
 });
+
+const reasoningExecutorOptions = [
+  { label: "现有 LLM 服务", value: "llm" },
+  { label: "本机 Codex CLI", value: "codex-cli" }
+] as const;
+
+const codexReasoningEffortOptions = [
+  { label: "跟随 Codex 默认", value: "" },
+  { label: "Minimal", value: "minimal" },
+  { label: "Low", value: "low" },
+  { label: "Medium", value: "medium" },
+  { label: "High", value: "high" },
+  { label: "XHigh（模型支持时）", value: "xhigh" }
+] as const;
 
 const llmProviderOptions = [
   { label: "OpenAI", value: "openai" },
@@ -75,8 +94,31 @@ const isLoadingState = computed(() => configStore.loading && !configStore.hasLoa
 const canEdit = computed(
   () => !configStore.loading && !configStore.connectionUnavailable && !configStore.endpointUnavailable
 );
-const llmReady = computed(
-  () => configStore.backendStatus.status === "ready" && configStore.llmStatus.status === "ready"
+const selectedGenerationStatus = computed(() =>
+  form.reasoning_executor === "codex-cli" ? configStore.codexStatus : configStore.llmStatus
+);
+const codexCheckFeedback = computed(() => {
+  const state = configStore.codexStatus;
+  if (state.status === "unknown" || state.status === "checking") {
+    return null;
+  }
+
+  const metadata = [
+    state.authenticated === true ? "已登录" : state.authenticated === false ? "未登录" : null,
+    state.cliVersion ? `CLI ${state.cliVersion}` : null,
+    state.model ? `模型 ${state.model}` : "模型跟随 Codex 默认",
+    state.reasoningEffort ? `推理强度 ${state.reasoningEffort}` : "推理强度跟随 Codex 默认",
+    state.baseUrl ? `路径 ${state.baseUrl}` : null
+  ].filter((value): value is string => Boolean(value));
+
+  return {
+    type: state.status === "ready" ? "success" : state.status === "invalid" ? "warning" : "error",
+    title: state.status === "ready" ? "Codex 能力检测通过" : "Codex 能力检测未通过",
+    description: [state.detail, metadata.join(" · ")].filter(Boolean).join("\n")
+  } as const;
+});
+const generationReady = computed(
+  () => configStore.backendStatus.status === "ready" && selectedGenerationStatus.value.status === "ready"
 );
 const llmApiKeyTouched = ref(false);
 const embeddingApiKeyTouched = ref(false);
@@ -100,7 +142,7 @@ const llmProviderHint = computed(() => {
   if (form.llm_provider === "stub-llm") {
     return "仅用于本地联调，不具备真实岗位判断和文案生成能力。";
   }
-  return "LLM 是开始投递的必需配置。";
+  return "选择现有 LLM 时必须完成此配置。";
 });
 
 const embeddingProviderHint = computed(() => {
@@ -130,7 +172,12 @@ const syncFormFromStore = () => {
     llm_concurrency: configStore.data?.llm_concurrency ?? 1,
     embedding_concurrency: configStore.data?.embedding_concurrency ?? 1,
     close_to_tray: configStore.data?.close_to_tray ?? true,
-    quick_capture_always_on_top: configStore.data?.quick_capture_always_on_top ?? true
+    quick_capture_always_on_top: configStore.data?.quick_capture_always_on_top ?? true,
+    reasoning_executor: configStore.data?.reasoning_executor ?? "llm",
+    codex_cli_path: configStore.data?.codex_cli_path ?? "codex",
+    codex_model: configStore.data?.codex_model ?? "",
+    codex_reasoning_effort: configStore.data?.codex_reasoning_effort ?? "",
+    codex_timeout_seconds: configStore.data?.codex_timeout_seconds ?? 300
   });
   llmApiKeyTouched.value = false;
   embeddingApiKeyTouched.value = false;
@@ -247,6 +294,23 @@ const runEmbeddingCheck = async () => {
   }
 };
 
+const runCodexCheck = async () => {
+  try {
+    const result = await configStore.testCodexConnection();
+    noticesStore.push({
+      kind: result.ok ? "success" : "warning",
+      title: result.ok ? "Codex 能力检测通过" : "Codex 能力检测未通过",
+      message: configStore.codexStatus.detail
+    });
+  } catch {
+    noticesStore.push({
+      kind: "warning",
+      title: "Codex CLI 检测失败",
+      message: configStore.codexStatus.detail
+    });
+  }
+};
+
 const markLlmApiKeyTouched = () => {
   llmApiKeyTouched.value = true;
 };
@@ -279,19 +343,22 @@ const pickDirectory = async (
       <section class="settings-hero">
         <div>
           <p class="panel-eyebrow">Required</p>
-          <h3>先配置 LLM，才能开始投递</h3>
+          <h3>先配置智能执行器，才能开始投递</h3>
           <p class="secondary-text">
-            LLM 用于岗位匹配、打招呼文案、HR 回复和事实校验。Embedding 是可选增强，不阻塞启动。
+            可使用现有 LLM 服务或本机已登录的 Codex CLI。所有结果仍由 FineJob 保存和展示。
           </p>
         </div>
-        <el-tag size="large" :type="llmReady ? 'success' : 'warning'">
-          {{ llmReady ? "LLM 已就绪" : "LLM 待配置" }}
+        <el-tag size="large" :type="generationReady ? 'success' : 'warning'">
+          {{ generationReady ? "执行器已就绪" : "执行器待配置" }}
         </el-tag>
       </section>
 
       <div class="settings-status-grid">
         <SystemStatusChip label="Backend" :state="configStore.backendStatus" />
-        <SystemStatusChip label="LLM 必需" :state="configStore.llmStatus" />
+        <SystemStatusChip
+          :label="form.reasoning_executor === 'codex-cli' ? 'Codex CLI' : 'LLM 服务'"
+          :state="selectedGenerationStatus"
+        />
         <SystemStatusChip label="Embedding 可选" :state="configStore.embeddingStatus" />
       </div>
 
@@ -324,12 +391,24 @@ const pickDirectory = async (
         <section class="settings-section settings-section--required">
           <div class="settings-section__header">
             <div>
-              <p class="panel-eyebrow">LLM</p>
-              <h4>模型服务，必需</h4>
+              <p class="panel-eyebrow">Reasoning</p>
+              <h4>智能执行器，必需</h4>
             </div>
-            <span class="secondary-text">保存后请点击测试，首页会根据 LLM 状态判断是否可开始。</span>
+            <span class="secondary-text">保存后请检测，首页会根据当前执行器状态判断是否可开始。</span>
           </div>
 
+          <el-form-item label="执行器">
+            <el-select v-model="form.reasoning_executor" style="width: 100%">
+              <el-option
+                v-for="option in reasoningExecutorOptions"
+                :key="option.value"
+                :label="option.label"
+                :value="option.value"
+              />
+            </el-select>
+          </el-form-item>
+
+          <template v-if="form.reasoning_executor === 'llm'">
           <el-form-item>
             <template #label>
               <span class="setting-label">
@@ -400,6 +479,80 @@ const pickDirectory = async (
               最近检测：{{ formatDateTime(configStore.llmStatus.checkedAt) }}
             </span>
           </div>
+          </template>
+
+          <template v-else>
+            <el-form-item label="Codex CLI 路径">
+              <el-input
+                v-model="form.codex_cli_path"
+                name="codex_cli_path"
+                autocomplete="off"
+                placeholder="codex，或 codex.exe / codex.cmd 的绝对路径"
+              />
+            </el-form-item>
+
+            <el-form-item label="模型">
+              <el-input
+                v-model="form.codex_model"
+                name="codex_model"
+                autocomplete="off"
+                placeholder="留空则跟随 Codex 默认模型"
+              />
+            </el-form-item>
+
+            <el-form-item label="推理强度">
+              <el-select v-model="form.codex_reasoning_effort" style="width: 100%">
+                <el-option
+                  v-for="option in codexReasoningEffortOptions"
+                  :key="option.value"
+                  :label="option.label"
+                  :value="option.value"
+                />
+              </el-select>
+            </el-form-item>
+
+            <el-form-item label="单次任务超时（秒）">
+              <el-input-number
+                v-model="form.codex_timeout_seconds"
+                :min="30"
+                :max="3600"
+                :step="30"
+                style="width: 100%"
+              />
+            </el-form-item>
+
+            <p class="secondary-text">
+              FineJob 只调用本机 CLI，不读取登录凭据。首版使用临时目录、只读沙箱和结构化输出，不允许浏览器操作或自动发送。
+            </p>
+
+            <div class="setting-actions">
+              <el-button type="primary" :loading="configStore.saving" :disabled="!canEdit" @click="save">
+                保存配置
+              </el-button>
+              <el-button
+                type="primary"
+                plain
+                :loading="configStore.codexStatus.status === 'checking'"
+                :disabled="!canEdit"
+                :icon="configStore.codexStatus.status === 'checking' ? Loading : undefined"
+                @click="runCodexCheck"
+              >
+                检测 Codex CLI
+              </el-button>
+              <span v-if="configStore.codexStatus.checkedAt" class="secondary-text">
+                最近检测：{{ formatDateTime(configStore.codexStatus.checkedAt) }}
+              </span>
+            </div>
+            <el-alert
+              v-if="codexCheckFeedback"
+              class="capability-check-result"
+              :title="codexCheckFeedback.title"
+              :description="codexCheckFeedback.description"
+              :type="codexCheckFeedback.type"
+              :closable="false"
+              show-icon
+            />
+          </template>
         </section>
 
         <section class="settings-section">
@@ -670,6 +823,10 @@ const pickDirectory = async (
   align-items: center;
   flex-wrap: wrap;
   margin-top: 8px;
+}
+
+.capability-check-result {
+  white-space: pre-line;
 }
 
 .settings-collapse-title {

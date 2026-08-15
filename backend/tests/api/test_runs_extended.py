@@ -98,8 +98,12 @@ def test_runs_list_orders_by_started_at_desc_then_id_desc_and_filters(
                 "updated_at": "2026-04-15T00:02:00Z",
                 "finished_at": "2026-04-15T00:02:00Z",
                 "report_week_key": None,
-                "linked_report_version_id": None,
-            }
+                    "linked_report_version_id": None,
+                    "executor_type": "llm",
+                    "executor_version": None,
+                    "model_name": None,
+                    "reasoning_effort": None,
+                }
         ],
         "total": 1,
     }

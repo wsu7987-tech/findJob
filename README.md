@@ -20,7 +20,7 @@ FineJob 是一个本地化的 AI 求职驾驶舱，目标是帮助用户管理�
 | 桌面端 | Electron, Vue 3, Pinia, Element Plus, Vite |
 | 后端 | FastAPI, Pydantic, LangGraph |
 | 存储 | SQLite, SQLite FTS5 |
-| AI | OpenAI-compatible LLM / Embedding provider, stub provider |
+| AI | OpenAI-compatible LLM / Codex CLI / Embedding provider / stub provider |
 | 文档解析 | PyMuPDF, pymupdf4llm, RapidOCR |
 | 网页自动化 | Playwright |
 | 测试 | pytest, Vitest, Vue Test Utils |
@@ -73,6 +73,19 @@ pnpm --filter desktop dev
 ./scripts/start-backend.ps1
 ```
 
+## 使用本机 Codex CLI
+
+FineJob 可以继续使用原有 LLM，也可以复用本机已经登录的 Codex CLI。先确认：
+
+```powershell
+codex --version
+codex login status
+```
+
+然后在桌面端“FineJob 配置 → 智能执行器”中选择“本机 Codex CLI”，可按需填写模型和推理强度；留空时跟随 Codex 默认值。保存后点击“检测 Codex CLI”。
+
+Codex 生成任务使用临时目录、只读沙箱、JSONL 事件和 JSON Schema 结果约束。FineJob 不读取 Codex 登录凭据，最终业务结果及运行元数据仍保存在 FineJob 中。
+
 ## 当前状态
 
 当前阶段是项目框架清理和 FineJob 产品骨架搭建：
@@ -87,4 +100,5 @@ pnpm --filter desktop dev
 - `docs/产品计划.md`
 - `docs/架构设计.md`
 - `docs/安全策略.md`
+- `docs/Codex执行器适配计划.md`
 - `docs/遗留代码参考.md`

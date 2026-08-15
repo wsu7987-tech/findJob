@@ -7,6 +7,7 @@ import { defineComponent } from "vue";
 
 import AppShell from "./AppShell.vue";
 import { useConfigStore } from "@/stores/config";
+import type { AppConfigPayload } from "@/types";
 
 const getMainWindowStateMock = vi.fn();
 const setMainWindowAlwaysOnTopMock = vi.fn();
@@ -36,6 +37,20 @@ vi.mock("@/services/desktop-bridge", () => ({
 
 const GenericStub = defineComponent({
   template: "<div><slot /></div>"
+});
+
+const SystemStatusChipStub = defineComponent({
+  props: {
+    label: {
+      type: String,
+      required: true
+    },
+    state: {
+      type: Object,
+      required: true
+    }
+  },
+  template: "<div data-testid='status-chip'>{{ label }}|{{ state.status }}|{{ state.detail }}</div>"
 });
 
 const ElButtonStub = defineComponent({
@@ -70,7 +85,7 @@ describe("AppShell", () => {
       },
       global: {
         stubs: {
-          SystemStatusChip: GenericStub,
+          SystemStatusChip: SystemStatusChipStub,
           ElTooltip: GenericStub,
           ElButton: ElButtonStub,
           ArrowRight: true,
@@ -98,6 +113,53 @@ describe("AppShell", () => {
     expect(probeSpy).toHaveBeenCalledTimes(1);
   });
 
+  it("shows the selected Codex executor status in the main system bar", async () => {
+    const configStore = useConfigStore();
+    configStore.data = {
+      reasoning_executor: "codex-cli"
+    } as AppConfigPayload;
+    configStore.codexStatus = {
+      status: "ready",
+      detail: "Codex CLI is installed and authenticated.",
+      checkedAt: "2026-08-16T04:00:00Z",
+      provider: "codex-cli",
+      model: null,
+      baseUrl: "codex",
+      errorCategory: null,
+      cliVersion: "0.147.0",
+      authenticated: true,
+      reasoningEffort: null
+    };
+
+    const wrapper = mount(AppShell, {
+      global: {
+        stubs: {
+          SystemStatusChip: SystemStatusChipStub,
+          ElTooltip: GenericStub,
+          ElButton: ElButtonStub,
+          ArrowRight: true,
+          Document: true,
+          Link: true,
+          List: true,
+          Monitor: true,
+          Setting: true,
+          Suitcase: true,
+          Top: true,
+          TrendCharts: true,
+          User: true,
+          Wallet: true
+        }
+      }
+    });
+
+    await flushPromises();
+
+    expect(wrapper.text()).toContain(
+      "Codex CLI 必需|ready|Codex CLI is installed and authenticated."
+    );
+    expect(wrapper.text()).not.toContain("LLM 必需");
+  });
+
   it("toggles main window always-on-top from the title bar action", async () => {
     const wrapper = mount(AppShell, {
       slots: {
@@ -105,7 +167,7 @@ describe("AppShell", () => {
       },
       global: {
         stubs: {
-          SystemStatusChip: GenericStub,
+          SystemStatusChip: SystemStatusChipStub,
           ElTooltip: GenericStub,
           ElButton: ElButtonStub,
           ArrowRight: true,

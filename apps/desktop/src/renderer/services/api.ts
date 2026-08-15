@@ -40,7 +40,7 @@
   SummaryPrecheckResponse,
   SummaryRunCreateResponse
 } from "../types";
-import type { ProviderConnectivityCheckResponse } from "../types";
+import type { CodexConnectivityCheckResponse, ProviderConnectivityCheckResponse } from "../types";
 import type {
   PdfDraftCommitResponse,
   PdfDraftCreateRequest,
@@ -374,6 +374,11 @@ export const api = {
   },
   async checkEmbeddingConnection() {
     return request<ProviderConnectivityCheckResponse>("/api/config/check-embedding", {
+      method: "POST"
+    });
+  },
+  async checkCodexConnection() {
+    return request<CodexConnectivityCheckResponse>("/api/config/check-codex", {
       method: "POST"
     });
   },

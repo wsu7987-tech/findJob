@@ -38,6 +38,31 @@ def _handle_item_failure(state: SummaryGraphState, *, db, exc: Exception) -> Non
         error_message = "Failed to persist summary output."
         status_code = 500
 
+    if error_category == "CODEX_CANCELLED":
+        _update_pool_processing_state(
+            db,
+            str(item["id"]),
+            current_status="pending",
+            last_summary_status="cancelled",
+            error_category=error_category,
+            error_message=error_message,
+        )
+        _update_run_state(
+            db,
+            run_id=str(state["run_id"]),
+            status="cancelled",
+            stage="cancelled",
+            succeeded_items=int(state.get("succeeded_items", 0)),
+            failed_items=int(state.get("failed_items", 0)),
+            skipped_items=len(list(state.get("pending_pool_ids", []))),
+            current_item_id=current_item_id,
+            current_item_label=current_item_label,
+            finished_at=utc_now(),
+            error_category="CANCELLED",
+            error_message="Run cancelled by user.",
+        )
+        raise exc
+
     _update_pool_processing_state(
         db,
         str(item["id"]),
@@ -78,7 +103,15 @@ def bootstrap_run(state: SummaryGraphState, *, db) -> SummaryGraphState:
     items = list(state.get("items", []))
     pending_pool_ids = list(state.get("pending_pool_ids", []))
     if not state.get("run_record_created"):
-        _create_run_record(db, run_id=run_id, started_at=started_at, total_items=len(items))
+        from backend.app.services.runs import restore_config_snapshot
+
+        _create_run_record(
+            db,
+            run_id=run_id,
+            started_at=started_at,
+            total_items=len(items),
+            config=restore_config_snapshot(dict(state["config_snapshot"])),
+        )
     return {
         "run_id": run_id,
         "started_at": started_at,
@@ -209,7 +242,15 @@ def generate_summary_artifact(state: SummaryGraphState, *, db) -> SummaryGraphSt
 
     item = dict(state["current_item"] or {})
     runtime_config = restore_config_snapshot(state["config_snapshot"])
-    summary_provider = create_summary_provider(runtime_config)
+    if _runtime_value(runtime_config, "reasoning_executor", "llm") == "codex-cli":
+        from backend.app.services.runs import _is_cancel_requested
+
+        summary_provider = create_summary_provider(
+            runtime_config,
+            cancellation_check=lambda: _is_cancel_requested(db, str(state["run_id"])),
+        )
+    else:
+        summary_provider = create_summary_provider(runtime_config)
     try:
         summary = summary_provider.summarize(
             title=str(item["title"]),
@@ -226,6 +267,28 @@ def generate_summary_artifact(state: SummaryGraphState, *, db) -> SummaryGraphSt
             ),
             evidence_citations=list(state.get("evidence_citations", [])),
         )
+        if summary.quality_meta.get("provider") == "codex-cli":
+            from backend.app.services.runs import _update_run_executor_details
+
+            _update_run_executor_details(
+                db,
+                run_id=str(state["run_id"]),
+                executor_version=(
+                    str(summary.quality_meta["cli_version"])
+                    if summary.quality_meta.get("cli_version")
+                    else None
+                ),
+                model_name=(
+                    str(summary.quality_meta["model"])
+                    if summary.quality_meta.get("model")
+                    else None
+                ),
+                reasoning_effort=(
+                    str(summary.quality_meta["reasoning_effort"])
+                    if summary.quality_meta.get("reasoning_effort")
+                    else None
+                ),
+            )
         return {"summary_payload": serialize_summary_artifact(summary)}
     except Exception as exc:
         _handle_item_failure(state, db=db, exc=exc)

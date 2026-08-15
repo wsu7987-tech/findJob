@@ -35,6 +35,11 @@ class AppConfigResponse(BaseModel):
     quick_capture_screenshot_hotkey: str | None
     close_to_tray: bool
     quick_capture_always_on_top: bool
+    reasoning_executor: Literal["llm", "codex-cli"]
+    codex_cli_path: str
+    codex_model: str | None
+    codex_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None
+    codex_timeout_seconds: int
 
 
 class AppConfigPatchRequest(BaseModel):
@@ -67,6 +72,11 @@ class AppConfigPatchRequest(BaseModel):
     quick_capture_screenshot_hotkey: str | None = None
     close_to_tray: bool | None = None
     quick_capture_always_on_top: bool | None = None
+    reasoning_executor: Literal["llm", "codex-cli"] | None = None
+    codex_cli_path: str | None = None
+    codex_model: str | None = None
+    codex_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
+    codex_timeout_seconds: int | None = Field(default=None, ge=1, le=3600)
 
 
 class ProviderConnectivityCheckResponse(BaseModel):
@@ -78,6 +88,20 @@ class ProviderConnectivityCheckResponse(BaseModel):
     provider: str | None
     model: str | None
     base_url: str | None
+    detail: str
+    error_category: str | None = None
+    checked_at: str
+
+
+class CodexConnectivityCheckResponse(BaseModel):
+    capability: Literal["codex-cli"]
+    ok: bool
+    status: Literal["ready", "failed", "invalid"]
+    cli_path: str | None
+    cli_version: str | None
+    authenticated: bool
+    model: str | None
+    reasoning_effort: str | None
     detail: str
     error_category: str | None = None
     checked_at: str

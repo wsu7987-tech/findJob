@@ -6,6 +6,9 @@ import httpx
 
 from backend.app.config import AppConfig
 from backend.app.services.ai import (
+    CodexAnswerProvider,
+    CodexQueryRewriteProvider,
+    CodexSummaryProvider,
     create_answer_provider,
     create_query_rewrite_provider,
     OpenAICompatibleEmbeddingProvider,
@@ -15,6 +18,7 @@ from backend.app.services.ai import (
 )
 from backend.app.services import ai as ai_service
 from backend.app.services.ai import RelatedContextItem
+from backend.app.services.reasoning.codex_exec import CodexExecResult
 
 
 def _build_config() -> AppConfig:
@@ -61,6 +65,63 @@ def test_create_summary_provider_accepts_deepseek_alias() -> None:
     assert isinstance(provider, OpenAICompatibleSummaryProvider)
     assert provider.base_url == "https://api.deepseek.com/v1"
     assert provider.model_name == "deepseek-chat"
+
+
+def test_codex_executor_routes_all_text_generation_providers() -> None:
+    config = _build_config()
+    config.reasoning_executor = "codex-cli"
+    config.codex_model = "gpt-5.6"
+    config.codex_reasoning_effort = "high"
+
+    assert isinstance(create_summary_provider(config), CodexSummaryProvider)
+    assert isinstance(create_answer_provider(config), CodexAnswerProvider)
+    assert isinstance(create_query_rewrite_provider(config), CodexQueryRewriteProvider)
+
+
+def test_codex_summary_provider_returns_finejob_artifact(monkeypatch) -> None:
+    config = _build_config()
+    config.reasoning_executor = "codex-cli"
+    config.codex_model = "gpt-5.6"
+    config.codex_reasoning_effort = "high"
+
+    def fake_run_codex_exec(**kwargs):
+        assert kwargs["model"] == "gpt-5.6"
+        assert kwargs["reasoning_effort"] == "high"
+        assert kwargs["output_schema"]["additionalProperties"] is False
+        return CodexExecResult(
+            output={
+                "generated_category": "engineering",
+                "generated_tags": ["python", "agent"],
+                "one_sentence_takeaway": "Codex 可作为结构化执行器。",
+                "summary_text": "FineJob 调用 Codex CLI，并保存经过 Schema 校验的结果。",
+                "key_points": ["使用 JSONL 事件", "使用 JSON Schema"],
+                "content_quality_score": 0.9,
+            },
+            cli_path="codex.exe",
+            cli_version="0.147.0",
+            model="gpt-5.6",
+            reasoning_effort="high",
+            usage={"input_tokens": 20, "output_tokens": 30},
+            event_count=4,
+        )
+
+    monkeypatch.setattr(ai_service, "run_codex_exec", fake_run_codex_exec)
+    provider = create_summary_provider(config)
+    result = provider.summarize(
+        title="Codex 适配",
+        source_type="text",
+        source_value="manual",
+        cleaning_level="enhanced",
+        raw_content="FineJob 使用 Codex CLI 完成结构化推理任务。",
+        related_items=[],
+        evidence_citations=[],
+    )
+
+    assert result.generated_category == "engineering"
+    assert result.summary_text.startswith("FineJob 调用 Codex CLI")
+    assert result.quality_meta["provider"] == "codex-cli"
+    assert result.quality_meta["cli_version"] == "0.147.0"
+    assert result.quality_meta["reasoning_effort"] == "high"
 
 
 def test_create_embedding_provider_accepts_qianwen_alias() -> None:
