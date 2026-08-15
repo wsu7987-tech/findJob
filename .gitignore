@@ -1,0 +1,73 @@
+# Dependencies
+.git-meta/
+node_modules/
+.pnpm-store/
+.venv/
+.uv-cache/
+.claude/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Build outputs
+dist/
+coverage/
+htmlcov/
+.coverage
+.coverage.*
+apps/desktop/dist/
+apps/desktop/dist-electron/
+apps/desktop/.vite/
+apps/desktop/.electron/
+*.tsbuildinfo
+
+# Local runtime data
+.local/
+.pytest-tmp/
+.pytest_cache/
+backend/.pytest-tmp/
+backend/.debug-*/
+backend/.sqlite-probe/
+backend/.tmp-debug/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+**/qdrant/
+
+# Test/cache artifacts
+.pytest_cache/
+__pycache__/
+*.py[cod]
+pytest-cache-files-*/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Logs and temporary probes
+*.log
+*.err.log
+*.out.log
+_tmp_*
+apps/desktop/.probe-app/
+apps/desktop/tmp-*
+apps/desktop/.tmp-*
+
+# Local agent/demo materials that are not part of the public repo
+.agents/
+skills-lock.json
+demo/
+docs/
+AGENTS.md
+
+# Editor and OS local files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini

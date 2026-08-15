@@ -1,0 +1,11 @@
+{
+  "name": "fine-job-workspace",
+  "private": true,
+  "packageManager": "pnpm@10.8.1",
+  "scripts": {
+    "dev": "pnpm --filter fine-job-desktop dev",
+    "build": "pnpm --filter fine-job-desktop build",
+    "test": "pnpm --filter fine-job-desktop test",
+    "test:run": "pnpm --filter fine-job-desktop test:run"
+  }
+}
