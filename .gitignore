@@ -71,3 +71,8 @@ AGENTS.md
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+
+/run-logs/
+/聊天记录.md
+/任务交接.md
