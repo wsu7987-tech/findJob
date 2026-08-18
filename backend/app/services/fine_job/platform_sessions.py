@@ -10,6 +10,7 @@ from backend.app.config import AppConfig
 from backend.app.db import Database
 from backend.app.errors import AppError
 from backend.app.schemas.fine_job.platform_sessions import FineJobPlatformSessionPayload
+from backend.app.services.fine_job.boss_scraper.service import boss_scraper_service
 from backend.app.utils import utc_now
 
 
@@ -94,27 +95,29 @@ def open_boss_login_window(
     db: Database,
     config: AppConfig,
     session: dict[str, object] | None = None,
-    login_window_runner=None,
+    browser_service=None,
 ) -> dict[str, object]:
     current = session or get_platform_session(db, DEFAULT_PLATFORM) or _default_boss_session()
-    browser_channel = str(current.get("browser_channel") or "chrome")
-    login_url = BOSS_LOGIN_URL
-    runner = login_window_runner or start_boss_login_helper
-    runner(
-        config=config,
-        login_url=login_url,
-        browser_channel=browser_channel,
-    )
+    service = browser_service or boss_scraper_service
+    # 新链路直接使用持久化 CDP profile；旧 Puppeteer 登录助手仍保留在本文件下方，
+    # 但不再从 FineJob 正式业务入口调用。
+    if service.start_browser(wait_login=False) != 0:
+        raise AppError(
+            status_code=502,
+            error_category="FETCH_FAILED",
+            error_message="FineJob 专用 Chrome 启动失败。",
+        )
+    service.open_login_page()
     return save_platform_session(
         db,
         FineJobPlatformSessionPayload(
             platform="boss",
             display_name=str(current.get("display_name") or "BOSS直聘"),
-            login_url=login_url,
+            login_url=BOSS_LOGIN_URL,
             browser_profile=str(current.get("browser_profile") or "fine-job-boss"),
-            browser_channel=browser_channel,
+            browser_channel="chrome",
             status="needs_login",
-            status_detail="登录窗口已打开。完成 BOSS 登录后，登录态会自动保存。",
+            status_detail="FineJob 专用 Chrome 已打开。请完成 BOSS 登录后点击检测登录状态。",
         ),
     )
 
@@ -123,11 +126,11 @@ def check_boss_login_status(
     *,
     db: Database,
     config: AppConfig,
-    session_checker=None,
+    browser_service=None,
 ) -> dict[str, object]:
     current = get_platform_session(db, DEFAULT_PLATFORM) or _default_boss_session()
-    checker = session_checker or detect_boss_login_status
-    ok, detail = checker(config=config)
+    service = browser_service or boss_scraper_service
+    ok, detail = service.check_login()
     return save_platform_session(
         db,
         FineJobPlatformSessionPayload(
@@ -135,7 +138,7 @@ def check_boss_login_status(
             display_name=str(current.get("display_name") or "BOSS直聘"),
             login_url=BOSS_LOGIN_URL,
             browser_profile=str(current.get("browser_profile") or "fine-job-boss"),
-            browser_channel=str(current.get("browser_channel") or "chrome"),
+            browser_channel="chrome",
             status="ready" if ok else "needs_login",
             status_detail=detail,
         ),
@@ -148,6 +151,7 @@ def start_boss_login_helper(
     login_url: str,
     browser_channel: str | None,
 ) -> None:
+    """旧 Puppeteer 登录助手，迁移期间保留，但不再由正式业务入口调用。"""
     paths = get_boss_auth_state_paths(config)
     paths["dir"].mkdir(parents=True, exist_ok=True)
     _write_json(paths["status"], {"status": "starting", "message": "登录助手启动中", "updated_at": utc_now()})
@@ -181,6 +185,7 @@ def start_boss_login_helper(
 
 
 def detect_boss_login_status(*, config: AppConfig) -> tuple[bool, str]:
+    """旧 Cookie 快照检测逻辑，迁移期间保留供回退和对照。"""
     if has_saved_boss_auth_state(config):
         return True, "已保存 BOSS 登录态，可以开始投递。"
 

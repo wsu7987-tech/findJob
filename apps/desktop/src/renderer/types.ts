@@ -170,6 +170,142 @@ export interface FineJobPlatformLoginActionEnvelope {
   detail: string;
 }
 
+export interface FineJobBossBrowserStatus {
+  running: boolean;
+  cdp_port: number;
+  current_url?: string | null;
+  current_title?: string | null;
+  is_search_page: boolean;
+}
+
+export interface FineJobBossCity {
+  name: string;
+  code: string;
+}
+
+export interface FineJobBossCityListResponse {
+  cities: FineJobBossCity[];
+}
+
+export interface FineJobBossSearchPageRequest {
+  keyword: string;
+  city: string;
+  filters?: Record<string, string>;
+}
+
+export interface FineJobBossSearchPageResponse {
+  url: string;
+  status: FineJobBossBrowserStatus;
+}
+
+export interface FineJobBossCaptureRequest extends FineJobBossSearchPageRequest {
+  pages: number;
+  include_details: boolean;
+  prefer_current_page: boolean;
+}
+
+export interface FineJobBossCapturedJob {
+  job_id?: string;
+  encrypt_job_id?: string;
+  title?: string;
+  boss_name?: string;
+  salary?: string;
+  location?: string;
+  experience?: string;
+  degree?: string;
+  company_scale?: string;
+  boss_active_status?: string;
+  job_link?: string;
+  tags?: string;
+  skills?: string;
+  job_labels?: string;
+  detail_status?: "not_collected" | "queued" | "collecting" | "completed" | "failed";
+  detail?: Record<string, unknown> | null;
+  detail_error?: string | null;
+  recommended?: boolean;
+  recommendation_source?: "strategy" | "ai" | null;
+  recommendation_reason?: string | null;
+  list_collected_at?: string | null;
+  detail_collected_at?: string | null;
+  is_previously_collected?: boolean;
+  first_collected_at?: string | null;
+  last_collected_at?: string | null;
+  collect_count?: number;
+  [key: string]: unknown;
+}
+
+export type FineJobBossCaptureTaskStatus = "queued" | "running" | "completed" | "failed";
+
+export interface FineJobBossCaptureTask {
+  id: string;
+  status: FineJobBossCaptureTaskStatus;
+  stage: string;
+  message: string;
+  keyword: string;
+  city: string;
+  pages: number;
+  auto_details: boolean;
+  used_current_page: boolean;
+  source_url?: string | null;
+  progress_current: number;
+  progress_total: number;
+  jobs_collected: number;
+  details_completed: number;
+  details_failed: number;
+  duplicate_jobs_count: number;
+  current_job?: Record<string, unknown> | null;
+  estimated_seconds_min: number;
+  estimated_seconds_max: number;
+  jobs: FineJobBossCapturedJob[];
+  jobs_path?: string | null;
+  details_path?: string | null;
+  created_at: string;
+  updated_at: string;
+  finished_at?: string | null;
+  error_message?: string | null;
+}
+
+export interface FineJobBossDetailSuggestionResponse {
+  selected_job_ids: string[];
+  task: FineJobBossCaptureTask;
+}
+
+export type FineJobBossHistorySortField =
+  | "last_collected_at"
+  | "first_collected_at"
+  | "collect_count"
+  | "title"
+  | "company_name";
+
+export interface FineJobBossHistoryQuery {
+  query?: string;
+  city?: string;
+  company_scale?: string;
+  detail_status?: string;
+  repeat_status?: "all" | "first_seen" | "repeated";
+  collected_from?: string;
+  collected_to?: string;
+  sort_by?: FineJobBossHistorySortField;
+  sort_order?: "asc" | "desc";
+  page?: number;
+  page_size?: number;
+}
+
+export interface FineJobBossHistoryJob extends FineJobBossCapturedJob {
+  id: string;
+  first_collected_at: string;
+  last_collected_at: string;
+  collect_count: number;
+  latest_capture_id: string;
+}
+
+export interface FineJobBossHistoryResponse {
+  items: FineJobBossHistoryJob[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
 export type FineJobAutomationLevel = "assist" | "semi_auto" | "auto_greeting";
 export type FineJobResumeSubmitMode = "manual" | "auto_on_invite";
 export type FineJobContactShareMode = "manual" | "auto_after_match";

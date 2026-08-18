@@ -7,6 +7,7 @@ from backend.app.config import load_config
 from backend.app.db import Database
 from backend.app.errors import register_error_handlers
 from backend.app.routers.config import router as config_router
+from backend.app.routers.fine_job.boss_capture import router as fine_job_boss_capture_router
 from backend.app.routers.fine_job.delivery_runs import router as fine_job_delivery_runs_router
 from backend.app.routers.fine_job.delivery_strategies import router as fine_job_delivery_strategies_router
 from backend.app.routers.fine_job.job_intents import router as fine_job_intents_router
@@ -67,6 +68,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health_router, prefix="/api")
     app.include_router(config_router, prefix="/api")
+    app.include_router(fine_job_boss_capture_router, prefix="/api")
     app.include_router(fine_job_delivery_runs_router, prefix="/api")
     app.include_router(fine_job_delivery_strategies_router, prefix="/api")
     app.include_router(fine_job_intents_router, prefix="/api")

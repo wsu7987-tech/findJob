@@ -444,6 +444,82 @@ CREATE TABLE IF NOT EXISTS fj_delivery_candidates (
 CREATE INDEX IF NOT EXISTS idx_fj_delivery_candidates_run_id
   ON fj_delivery_candidates(run_id);
 
+CREATE TABLE IF NOT EXISTS fj_boss_capture_batches (
+  id TEXT PRIMARY KEY,
+  keyword TEXT NOT NULL,
+  city TEXT NOT NULL,
+  pages INTEGER NOT NULL DEFAULT 1,
+  auto_details INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'queued',
+  source_url TEXT,
+  jobs_collected INTEGER NOT NULL DEFAULT 0,
+  details_completed INTEGER NOT NULL DEFAULT 0,
+  details_failed INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  finished_at TEXT,
+  CHECK (auto_details IN (0, 1)),
+  CHECK (status IN ('queued', 'running', 'completed', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_boss_capture_batches_created_at
+  ON fj_boss_capture_batches(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_boss_jobs (
+  id TEXT PRIMARY KEY,
+  dedupe_key TEXT NOT NULL UNIQUE,
+  source_job_id TEXT NOT NULL DEFAULT '',
+  encrypt_job_id TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL DEFAULT '',
+  company_name TEXT NOT NULL DEFAULT '',
+  company_scale TEXT NOT NULL DEFAULT '',
+  salary TEXT NOT NULL DEFAULT '',
+  location TEXT NOT NULL DEFAULT '',
+  experience TEXT NOT NULL DEFAULT '',
+  degree TEXT NOT NULL DEFAULT '',
+  boss_active_status TEXT NOT NULL DEFAULT '',
+  job_link TEXT NOT NULL DEFAULT '',
+  tags TEXT NOT NULL DEFAULT '',
+  skills TEXT NOT NULL DEFAULT '',
+  job_labels TEXT NOT NULL DEFAULT '',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  detail_json TEXT,
+  detail_status TEXT NOT NULL DEFAULT 'not_collected',
+  detail_error TEXT,
+  detail_collected_at TEXT,
+  first_collected_at TEXT NOT NULL,
+  last_collected_at TEXT NOT NULL,
+  collect_count INTEGER NOT NULL DEFAULT 1,
+  latest_batch_id TEXT NOT NULL,
+  FOREIGN KEY (latest_batch_id) REFERENCES fj_boss_capture_batches(id),
+  CHECK (detail_status IN ('not_collected', 'queued', 'collecting', 'completed', 'failed')),
+  CHECK (collect_count > 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_boss_jobs_last_collected_at
+  ON fj_boss_jobs(last_collected_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fj_boss_jobs_title
+  ON fj_boss_jobs(title);
+CREATE INDEX IF NOT EXISTS idx_fj_boss_jobs_company_name
+  ON fj_boss_jobs(company_name);
+CREATE INDEX IF NOT EXISTS idx_fj_boss_jobs_location
+  ON fj_boss_jobs(location);
+
+CREATE TABLE IF NOT EXISTS fj_boss_capture_batch_jobs (
+  capture_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  collected_at TEXT NOT NULL,
+  was_previously_collected INTEGER NOT NULL DEFAULT 0,
+  snapshot_json TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY (capture_id, job_id),
+  FOREIGN KEY (capture_id) REFERENCES fj_boss_capture_batches(id) ON DELETE CASCADE,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+  CHECK (was_previously_collected IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_boss_capture_batch_jobs_job_id
+  ON fj_boss_capture_batch_jobs(job_id, collected_at DESC);
+
 CREATE TABLE IF NOT EXISTS fj_action_logs (
   id TEXT PRIMARY KEY,
   run_id TEXT,

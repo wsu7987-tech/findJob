@@ -65,12 +65,16 @@ def test_open_boss_login_window_uses_selected_browser(configured_client, monkeyp
             "status_detail": "",
         },
     )
-    called: dict[str, str] = {}
+    called: dict[str, object] = {}
 
-    def fake_runner(*, config, login_url: str, browser_channel: str | None) -> None:
-        called["app_data_dir"] = str(config.app_data_dir)
-        called["login_url"] = login_url
-        called["browser_channel"] = browser_channel or ""
+    class FakeBrowserService:
+        def start_browser(self, *, wait_login: bool) -> int:
+            called["wait_login"] = wait_login
+            return 0
+
+        def open_login_page(self) -> str:
+            called["login_url"] = "https://www.zhipin.com/web/user/"
+            return str(called["login_url"])
 
     monkeypatch.setattr(
         "backend.app.routers.fine_job.platform_sessions.open_boss_login_window",
@@ -80,7 +84,7 @@ def test_open_boss_login_window_uses_selected_browser(configured_client, monkeyp
         ).open_boss_login_window(
             db=db,
             config=config,
-            login_window_runner=fake_runner,
+            browser_service=FakeBrowserService(),
         ),
     )
 
@@ -88,12 +92,16 @@ def test_open_boss_login_window_uses_selected_browser(configured_client, monkeyp
 
     assert response.status_code == 200
     assert called["login_url"] == "https://www.zhipin.com/web/user/"
-    assert called["browser_channel"] == "chrome"
-    assert called["app_data_dir"]
+    assert called["wait_login"] is False
     assert response.json()["session"]["status"] == "needs_login"
+    assert response.json()["session"]["browser_channel"] == "chrome"
 
 
 def test_check_boss_login_status_marks_ready(configured_client, monkeypatch) -> None:
+    class FakeBrowserService:
+        def check_login(self) -> tuple[bool, str]:
+            return True, "检测到 BOSS 登录态，登录态可用。"
+
     monkeypatch.setattr(
         "backend.app.routers.fine_job.platform_sessions.check_boss_login_status",
         lambda db, config: __import__(
@@ -102,7 +110,7 @@ def test_check_boss_login_status_marks_ready(configured_client, monkeypatch) -> 
         ).check_boss_login_status(
             db=db,
             config=config,
-            session_checker=lambda **_: (True, "检测到 BOSS 登录 cookie，登录态可用。"),
+            browser_service=FakeBrowserService(),
         ),
     )
 

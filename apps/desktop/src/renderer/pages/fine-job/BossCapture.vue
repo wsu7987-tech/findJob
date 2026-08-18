@@ -1,0 +1,552 @@
+<script setup lang="ts">
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { ElMessage } from "element-plus";
+
+import { useFineJobBossCaptureStore } from "@/stores/fineJobBossCapture";
+import { useFineJobIntentStore } from "@/stores/fineJobIntent";
+import { useFineJobPlatformSessionsStore } from "@/stores/fineJobPlatformSessions";
+import type { FineJobBossCapturedJob } from "@/types";
+
+const captureStore = useFineJobBossCaptureStore();
+const intentStore = useFineJobIntentStore();
+const platformStore = useFineJobPlatformSessionsStore();
+const form = reactive({
+  keyword: "",
+  city: "",
+  pages: 1,
+  includeDetails: false,
+  preferCurrentPage: true
+});
+const aiCommand = ref("");
+const selectedJobIds = ref<string[]>([]);
+const selectedJobId = ref<string | null>(null);
+const detailDrawerOpen = ref(false);
+const jobsTable = ref<{
+  clearSelection: () => void;
+  toggleRowSelection: (row: FineJobBossCapturedJob, selected: boolean) => void;
+} | null>(null);
+
+const hotCityNames = ["北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "南京", "苏州"];
+const cityOptions = computed(() =>
+  [...captureStore.cities].sort((left, right) => {
+    const leftHot = hotCityNames.indexOf(left.name);
+    const rightHot = hotCityNames.indexOf(right.name);
+    if (leftHot >= 0 || rightHot >= 0) {
+      if (leftHot < 0) return 1;
+      if (rightHot < 0) return -1;
+      return leftHot - rightHot;
+    }
+    return left.name.localeCompare(right.name, "zh-CN");
+  })
+);
+
+const browserStateLabel = computed(() => {
+  if (!captureStore.status?.running) return "未启动";
+  if (captureStore.status.is_search_page) return "已定位搜索页";
+  return "浏览器已启动";
+});
+const browserStateType = computed(() => {
+  if (!captureStore.status?.running) return "info";
+  return captureStore.status.is_search_page ? "success" : "warning";
+});
+const taskRunning = computed(
+  () => captureStore.task?.status === "queued" || captureStore.task?.status === "running"
+);
+const progressPercentage = computed(() => {
+  const task = captureStore.task;
+  if (!task?.progress_total) return task?.status === "completed" ? 100 : 0;
+  return Math.min(100, Math.round((task.progress_current / task.progress_total) * 100));
+});
+const preCaptureEstimate = computed(() => {
+  if (!form.includeDetails) return "";
+  const expectedJobs = form.pages * 30;
+  return `${formatDuration(expectedJobs * 25)}～${formatDuration(expectedJobs * 55)}`;
+});
+const remainingEstimate = computed(() => {
+  const task = captureStore.task;
+  if (!task || task.estimated_seconds_max <= 0) return "即将完成";
+  return `${formatDuration(task.estimated_seconds_min)}～${formatDuration(task.estimated_seconds_max)}`;
+});
+const currentDetailJob = computed(() =>
+  captureStore.task?.jobs.find((job) => job.job_id === selectedJobId.value) ?? null
+);
+const detailStatusSummary = computed(() => {
+  const jobs = captureStore.task?.jobs ?? [];
+  return {
+    selected: selectedJobIds.value.length,
+    recommended: jobs.filter((job) => job.recommended).length,
+    completed: jobs.filter((job) => job.detail_status === "completed").length,
+    failed: jobs.filter((job) => job.detail_status === "failed").length
+  };
+});
+
+onMounted(async () => {
+  const [, , intent] = await Promise.all([
+    captureStore.loadStatus(),
+    captureStore.loadCities(),
+    intentStore.load(),
+    platformStore.load()
+  ]);
+  form.keyword = intent?.keywords[0] || intent?.target_title || "";
+  form.city = intent?.cities[0] || "";
+  captureStore.resumePolling();
+});
+
+onBeforeUnmount(() => captureStore.stopPolling());
+
+const ensureSearchInput = () => {
+  if (!form.keyword.trim() || !form.city.trim()) {
+    ElMessage.warning("请先填写搜索关键词和城市");
+    return false;
+  }
+  return true;
+};
+
+const startBrowser = async () => {
+  try {
+    await platformStore.openBossLoginWindow();
+    await captureStore.loadStatus();
+    ElMessage.success("FineJob 专用 Chrome 已打开，请在浏览器中完成 BOSS 登录");
+  } catch {
+    ElMessage.error(platformStore.error ?? "打开 BOSS 浏览器失败");
+  }
+};
+
+const checkLogin = async () => {
+  try {
+    const response = await platformStore.checkBossLoginStatus();
+    response.session.status === "ready"
+      ? ElMessage.success("BOSS 登录状态可用")
+      : ElMessage.warning(response.detail || "尚未检测到有效登录状态");
+  } catch {
+    ElMessage.error(platformStore.error ?? "检测 BOSS 登录状态失败");
+  }
+};
+
+const stopBrowser = async () => {
+  try {
+    await captureStore.stopBrowser();
+    ElMessage.success("FineJob 专用 Chrome 已关闭，登录 profile 已保留");
+  } catch {
+    ElMessage.error(captureStore.error ?? "关闭 BOSS 浏览器失败");
+  }
+};
+
+const locateSearchPage = async () => {
+  if (!ensureSearchInput()) return;
+  try {
+    await captureStore.locate({ keyword: form.keyword.trim(), city: form.city.trim() });
+    ElMessage.success("已定位到 BOSS 搜索页，可在浏览器中继续调整筛选条件");
+  } catch {
+    ElMessage.error(captureStore.error ?? "定位 BOSS 搜索页失败");
+  }
+};
+
+const captureJobs = async () => {
+  if (!ensureSearchInput()) return;
+  selectedJobIds.value = [];
+  try {
+    await captureStore.capture({
+      keyword: form.keyword.trim(),
+      city: form.city.trim(),
+      pages: form.pages,
+      include_details: form.includeDetails,
+      prefer_current_page: form.preferCurrentPage
+    });
+    ElMessage.success("采集任务已启动，可在本页查看实时进度");
+  } catch {
+    ElMessage.error(captureStore.error ?? "BOSS 岗位采集失败");
+  }
+};
+
+const handleSelectionChange = (rows: FineJobBossCapturedJob[]) => {
+  selectedJobIds.value = rows.map((row) => row.job_id || "").filter(Boolean);
+};
+
+const applySuggestedSelection = async (mode: "strategy" | "ai") => {
+  try {
+    const ids = await captureStore.suggest(mode, aiCommand.value);
+    selectedJobIds.value = ids;
+    await nextTick();
+    jobsTable.value?.clearSelection();
+    for (const job of captureStore.task?.jobs ?? []) {
+      if (job.job_id && ids.includes(job.job_id)) {
+        jobsTable.value?.toggleRowSelection(job, true);
+      }
+    }
+    ElMessage.success(`${mode === "ai" ? "AI" : "投递策略"}建议选择 ${ids.length} 个岗位`);
+  } catch {
+    ElMessage.error(captureStore.error ?? "生成详情采集建议失败");
+  }
+};
+
+const captureSelectedDetails = async () => {
+  if (!selectedJobIds.value.length) {
+    ElMessage.warning("请先选择需要采集详情的岗位");
+    return;
+  }
+  try {
+    await captureStore.captureDetails(selectedJobIds.value);
+    ElMessage.success(`已开始采集选中的 ${selectedJobIds.value.length} 个岗位详情`);
+  } catch {
+    ElMessage.error(captureStore.error ?? "启动岗位详情采集失败");
+  }
+};
+
+const captureSingleDetail = async (job: FineJobBossCapturedJob) => {
+  const jobId = job.job_id;
+  if (!jobId) return;
+  const force = job.detail_status === "completed" || Boolean(job.detail);
+  try {
+    await captureStore.captureDetails([jobId], force);
+    ElMessage.success(`${detailActionLabel(job)}任务已启动`);
+  } catch {
+    ElMessage.error(captureStore.error ?? "启动岗位详情采集失败");
+  }
+};
+
+const detailActionLabel = (job: FineJobBossCapturedJob) =>
+  job.detail_status === "completed" || Boolean(job.detail) ? "重新采集详情" : "采集详情";
+
+const openDetail = (job: FineJobBossCapturedJob) => {
+  selectedJobId.value = job.job_id || null;
+  detailDrawerOpen.value = true;
+};
+
+const canSelectJob = (job: FineJobBossCapturedJob) =>
+  job.detail_status !== "completed" && job.detail_status !== "collecting";
+
+const detailStatusLabel = (status?: string) =>
+  ({
+    not_collected: "未采集",
+    queued: "等待采集",
+    collecting: "正在采集",
+    completed: "已完成",
+    failed: "采集失败"
+  })[status || "not_collected"] || "未采集";
+
+const detailStatusType = (status?: string) => {
+  if (status === "completed") return "success";
+  if (status === "failed") return "danger";
+  if (status === "collecting" || status === "queued") return "warning";
+  return "info";
+};
+
+function formatDuration(seconds: number) {
+  if (seconds < 60) return `${Math.max(1, Math.ceil(seconds))} 秒`;
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `${hours} 小时 ${rest} 分钟` : `${hours} 小时`;
+}
+</script>
+
+<template>
+  <section class="page-stack fine-job-page">
+    <div class="page-heading">
+      <div>
+        <p class="panel-eyebrow">BOSS Capture</p>
+        <h1>岗位采集</h1>
+        <p class="secondary-text">
+          可以一次采集列表和全部详情，也可以先获得列表，再手工或按建议选择详情。
+        </p>
+      </div>
+      <div class="card-actions">
+        <el-tag :type="browserStateType">{{ browserStateLabel }}</el-tag>
+        <el-button :loading="captureStore.loadingStatus" @click="captureStore.loadStatus()">
+          刷新状态
+        </el-button>
+      </div>
+    </div>
+
+    <el-alert
+      v-if="captureStore.error || platformStore.error"
+      type="error"
+      title="BOSS 岗位采集操作失败"
+      :description="captureStore.error || platformStore.error || ''"
+      show-icon
+    />
+
+    <section class="page-panel capture-browser-panel">
+      <div class="panel-title-row">
+        <div><p class="panel-eyebrow">Browser</p><h2>专用浏览器</h2></div>
+        <span class="secondary-text">CDP 端口：{{ captureStore.status?.cdp_port ?? 9222 }}</span>
+      </div>
+      <div class="platform-actions">
+        <el-button type="primary" :loading="platformStore.openingLogin" @click="startBrowser">
+          打开 BOSS 浏览器
+        </el-button>
+        <el-button type="success" plain :disabled="!captureStore.status?.running" :loading="platformStore.checking" @click="checkLogin">
+          检测登录状态
+        </el-button>
+        <el-button :disabled="!captureStore.status?.running || taskRunning" :loading="captureStore.locating" @click="locateSearchPage">
+          定位到搜索页
+        </el-button>
+        <el-button type="danger" plain :disabled="!captureStore.status?.running || taskRunning" :loading="captureStore.stopping" @click="stopBrowser">
+          关闭专用浏览器
+        </el-button>
+      </div>
+      <div class="capture-current-page">
+        <span>登录状态：{{ platformStore.bossReady ? "已登录" : "待检测" }}</span>
+        <span>当前页面</span>
+        <code>{{ captureStore.status?.current_url || "尚未识别 FineJob 管理的页面" }}</code>
+      </div>
+    </section>
+
+    <section class="page-panel">
+      <div class="panel-title-row">
+        <div><p class="panel-eyebrow">Search</p><h2>采集条件</h2></div>
+        <span class="secondary-text">未定位时会根据这里的条件自动打开搜索页。</span>
+      </div>
+      <el-form label-position="top" class="intent-form">
+        <div class="form-grid">
+          <el-form-item label="搜索关键词">
+            <el-input v-model="form.keyword" placeholder="例如：Python" />
+          </el-form-item>
+          <el-form-item label="城市">
+            <el-select v-model="form.city" filterable :loading="captureStore.loadingCities" placeholder="搜索并选择城市">
+              <el-option v-for="city in cityOptions" :key="city.code" :label="city.name" :value="city.name" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="采集页数">
+            <el-input-number v-model="form.pages" :min="1" :max="10" />
+          </el-form-item>
+        </div>
+        <div class="capture-options">
+          <el-switch v-model="form.preferCurrentPage" />
+          <span>优先采集当前 BOSS 搜索页；当前页无效时自动定位</span>
+        </div>
+        <div class="capture-options">
+          <el-switch v-model="form.includeDetails" />
+          <span>采集列表后，自动获取全部岗位详情</span>
+        </div>
+        <el-alert
+          v-if="form.includeDetails"
+          type="warning"
+          :title="`详情会逐个打开采集，预计约 ${preCaptureEstimate}`"
+          description="该时间按每页约 30 个岗位估算；列表完成后会按实际数量重新计算。遇到登录失效、安全验证或风控提示时任务会停止并显示原因。"
+          :closable="false"
+          show-icon
+        />
+      </el-form>
+      <div class="platform-actions capture-submit">
+        <el-button type="primary" size="large" :disabled="!captureStore.status?.running || taskRunning" :loading="captureStore.capturing" @click="captureJobs">
+          开始采集
+        </el-button>
+      </div>
+    </section>
+
+    <section v-if="captureStore.task && captureStore.task.status !== 'completed'" class="page-panel capture-progress-panel">
+      <div class="panel-title-row">
+        <div><p class="panel-eyebrow">Progress</p><h2>采集进度</h2></div>
+        <el-tag :type="captureStore.task.status === 'failed' ? 'danger' : 'warning'">
+          {{ captureStore.task.status === "failed" ? "失败" : "进行中" }}
+        </el-tag>
+      </div>
+      <el-progress :percentage="progressPercentage" :status="captureStore.task.status === 'failed' ? 'exception' : undefined" />
+      <p>{{ captureStore.task.message }}</p>
+      <div class="capture-metrics">
+        <span>岗位 {{ captureStore.task.jobs_collected }}</span>
+        <span>详情完成 {{ captureStore.task.details_completed }}</span>
+        <span>详情失败 {{ captureStore.task.details_failed }}</span>
+        <span>预计剩余 {{ remainingEstimate }}</span>
+      </div>
+      <p v-if="captureStore.task.current_job" class="secondary-text">
+        当前岗位：{{ captureStore.task.current_job.title }} / {{ captureStore.task.current_job.company }}
+      </p>
+    </section>
+
+    <section v-if="captureStore.task?.jobs.length" class="page-panel">
+      <div class="panel-title-row">
+        <div><p class="panel-eyebrow">Jobs</p><h2>岗位列表</h2></div>
+        <div class="capture-metrics">
+          <span>本次 {{ captureStore.task.jobs.length }}</span>
+          <span>新岗位 {{ captureStore.task.jobs.length - captureStore.task.duplicate_jobs_count }}</span>
+          <span>历史岗位 {{ captureStore.task.duplicate_jobs_count }}</span>
+          <span>已选择 {{ detailStatusSummary.selected }}</span>
+          <span>建议 {{ detailStatusSummary.recommended }}</span>
+          <span>详情完成 {{ detailStatusSummary.completed }}</span>
+          <span>失败 {{ detailStatusSummary.failed }}</span>
+        </div>
+      </div>
+
+      <div class="detail-actions">
+        <el-button :disabled="taskRunning" :loading="captureStore.suggesting" @click="applySuggestedSelection('strategy')">
+          按投递策略建议
+        </el-button>
+        <el-input v-model="aiCommand" :disabled="taskRunning" placeholder="可选：告诉 AI 优先选择哪些岗位" clearable />
+        <el-button type="primary" plain :disabled="taskRunning" :loading="captureStore.suggesting" @click="applySuggestedSelection('ai')">
+          AI 建议
+        </el-button>
+        <el-button type="success" :disabled="taskRunning || !selectedJobIds.length" @click="captureSelectedDetails">
+          采集选中的 {{ selectedJobIds.length }} 个岗位详情
+        </el-button>
+      </div>
+
+      <el-table
+        ref="jobsTable"
+        :data="captureStore.task.jobs"
+        row-key="job_id"
+        max-height="560"
+        empty-text="本次没有采集到岗位"
+        @selection-change="handleSelectionChange"
+        @row-click="openDetail"
+      >
+        <el-table-column type="selection" width="48" reserve-selection :selectable="canSelectJob" />
+        <el-table-column label="采集" width="90">
+          <template #default="scope">
+            <el-tag :type="scope.row.is_previously_collected ? 'warning' : 'success'" size="small">
+              {{ scope.row.is_previously_collected ? "历史岗位" : "新岗位" }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="title" label="岗位" min-width="180" />
+        <el-table-column prop="boss_name" label="公司" min-width="150" />
+        <el-table-column prop="company_scale" label="公司规模" width="120" />
+        <el-table-column prop="salary" label="薪资" width="110" />
+        <el-table-column prop="location" label="地点" min-width="140" />
+        <el-table-column prop="experience" label="经验" width="100" />
+        <el-table-column prop="degree" label="学历" width="90" />
+        <el-table-column label="详情" width="110">
+          <template #default="scope">
+            <el-tag :type="detailStatusType(scope.row.detail_status)" size="small">
+              {{ detailStatusLabel(scope.row.detail_status) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="建议" min-width="180">
+          <template #default="scope">
+            <span v-if="scope.row.recommended">{{ scope.row.recommendation_reason }}</span>
+            <span v-else class="secondary-text">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="210" fixed="right">
+          <template #default="scope">
+            <el-button link type="primary" @click.stop="openDetail(scope.row)">查看详情</el-button>
+            <el-button
+              link
+              type="success"
+              :disabled="taskRunning || !scope.row.job_id"
+              @click.stop="captureSingleDetail(scope.row)"
+            >
+              {{ detailActionLabel(scope.row) }}
+            </el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <div v-if="captureStore.task.jobs_path" class="capture-output-path">
+        <span>列表文件</span><code>{{ captureStore.task.jobs_path }}</code>
+        <template v-if="captureStore.task.details_path">
+          <span>详情文件</span><code>{{ captureStore.task.details_path }}</code>
+        </template>
+      </div>
+    </section>
+
+    <el-drawer v-model="detailDrawerOpen" size="48%" :title="currentDetailJob?.title || '岗位详情'">
+      <template v-if="currentDetailJob">
+        <div class="job-detail-heading">
+          <h2>{{ currentDetailJob.title }}</h2>
+          <p>{{ currentDetailJob.boss_name }} · {{ currentDetailJob.location }}</p>
+          <div class="detail-tags">
+            <el-tag>{{ currentDetailJob.salary || "薪资未知" }}</el-tag>
+            <el-tag v-if="currentDetailJob.experience" type="info">{{ currentDetailJob.experience }}</el-tag>
+            <el-tag v-if="currentDetailJob.degree" type="info">{{ currentDetailJob.degree }}</el-tag>
+            <el-tag :type="detailStatusType(currentDetailJob.detail_status)">{{ detailStatusLabel(currentDetailJob.detail_status) }}</el-tag>
+            <el-tag v-if="currentDetailJob.is_previously_collected" type="warning">历史岗位</el-tag>
+          </div>
+        </div>
+
+        <el-divider />
+        <h3>推荐信息</h3>
+        <p v-if="currentDetailJob.recommended">{{ currentDetailJob.recommendation_reason }}</p>
+        <p v-else class="secondary-text">当前没有策略或 AI 推荐记录。</p>
+
+        <el-divider />
+        <h3>技能与标签</h3>
+        <p>{{ currentDetailJob.skills || currentDetailJob.job_labels || currentDetailJob.tags || "暂无标签" }}</p>
+
+        <el-divider />
+        <h3>职位描述</h3>
+        <p v-if="currentDetailJob.detail_status === 'collecting'" class="secondary-text">正在采集该岗位详情……</p>
+        <el-alert v-else-if="currentDetailJob.detail_status === 'failed'" type="error" :title="currentDetailJob.detail_error || '详情采集失败'" show-icon />
+        <div v-else-if="currentDetailJob.detail?.jd" class="job-description">{{ currentDetailJob.detail.jd }}</div>
+        <p v-else class="secondary-text">尚未获取完整职位描述，可选择该岗位后采集详情。</p>
+        <el-button
+          v-if="currentDetailJob.detail_status !== 'queued' && currentDetailJob.detail_status !== 'collecting'"
+          type="primary"
+          :disabled="taskRunning"
+          @click="captureSingleDetail(currentDetailJob)"
+        >
+          {{ detailActionLabel(currentDetailJob) }}
+        </el-button>
+
+        <el-divider />
+        <h3>来源</h3>
+        <p class="secondary-text">列表采集：{{ currentDetailJob.list_collected_at || "未知" }}</p>
+        <p v-if="currentDetailJob.first_collected_at" class="secondary-text">首次采集：{{ currentDetailJob.first_collected_at }}</p>
+        <p v-if="currentDetailJob.collect_count" class="secondary-text">累计采集：{{ currentDetailJob.collect_count }} 次</p>
+        <p v-if="currentDetailJob.detail_collected_at" class="secondary-text">详情采集：{{ currentDetailJob.detail_collected_at }}</p>
+        <el-link v-if="currentDetailJob.job_link" :href="currentDetailJob.job_link" target="_blank" type="primary">
+          打开 BOSS 原始岗位页面
+        </el-link>
+      </template>
+    </el-drawer>
+  </section>
+</template>
+
+<style scoped>
+.capture-browser-panel,
+.capture-progress-panel,
+.capture-submit,
+.session-summary {
+  display: grid;
+  gap: 16px;
+}
+
+.capture-current-page,
+.capture-output-path {
+  display: grid;
+  gap: 6px;
+  color: var(--el-text-color-secondary);
+}
+
+.capture-current-page code,
+.capture-output-path code {
+  overflow-wrap: anywhere;
+  color: var(--el-text-color-regular);
+}
+
+.capture-options,
+.capture-metrics,
+.detail-actions,
+.detail-tags {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.capture-options {
+  margin: 12px 0;
+}
+
+.detail-actions {
+  margin-bottom: 16px;
+}
+
+.detail-actions .el-input {
+  min-width: 260px;
+  flex: 1;
+}
+
+.job-detail-heading h2 {
+  margin-bottom: 6px;
+}
+
+.job-description {
+  line-height: 1.8;
+  white-space: pre-wrap;
+}
+</style>

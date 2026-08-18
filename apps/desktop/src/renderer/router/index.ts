@@ -1,6 +1,8 @@
 import { createRouter, createWebHashHistory } from "vue-router";
 
 import AutomationLogsPage from "@/pages/fine-job/AutomationLogs.vue";
+import BossCapturePage from "@/pages/fine-job/BossCapture.vue";
+import BossCaptureHistoryPage from "@/pages/fine-job/BossCaptureHistory.vue";
 import DeliveryReadinessPage from "@/pages/fine-job/DeliveryReadiness.vue";
 import DeliveryRunStatusPage from "@/pages/fine-job/DeliveryRunStatus.vue";
 import DeliveryStrategyPage from "@/pages/fine-job/DeliveryStrategy.vue";
@@ -39,6 +41,18 @@ export const router = createRouter({
       name: "fine-job-platform",
       component: PlatformLoginPage,
       meta: { title: "平台登录" }
+    },
+    {
+      path: "/fine-job/capture",
+      name: "fine-job-capture",
+      component: BossCapturePage,
+      meta: { title: "岗位采集" }
+    },
+    {
+      path: "/fine-job/capture-history",
+      name: "fine-job-capture-history",
+      component: BossCaptureHistoryPage,
+      meta: { title: "历史采集" }
     },
     {
       path: "/fine-job/strategy",

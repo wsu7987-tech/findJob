@@ -1,23 +1,37 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 from backend.app.config import AppConfig
 from backend.app.db import Database
 from backend.app.errors import AppError
-from backend.app.services.fine_job.boss_puppeteer_collector import (
-    BossPuppeteerJob,
-    collect_boss_jobs_with_puppeteer,
+from backend.app.services.fine_job.boss_scraper.service import (
+    BossCaptureRequest,
+    boss_scraper_service,
 )
 from backend.app.services.fine_job.delivery_strategies import get_delivery_strategy
 from backend.app.services.fine_job.job_intents import get_job_intent
 from backend.app.services.fine_job.platform_sessions import (
     DEFAULT_PLATFORM,
     get_platform_session,
-    has_saved_boss_auth_state,
 )
 from backend.app.utils import new_id, utc_now
+
+
+@dataclass(slots=True)
+class BossCdpJob:
+    keyword: str
+    city: str
+    job_url: str
+    job_title: str
+    company_name: str
+    salary_text: str
+    location_text: str
+    experience_text: str
+    education_text: str
+    hr_active_text: str
+    jd_text: str
 
 
 def create_delivery_run(
@@ -119,7 +133,8 @@ def create_delivery_run(
         return get_delivery_run(db, run_id)
 
     session = get_platform_session(db, DEFAULT_PLATFORM)
-    if not session or not session.get("ready") or not has_saved_boss_auth_state(config):
+    browser_status = boss_scraper_service.get_browser_status()
+    if not session or not session.get("ready") or not browser_status.running:
         _pause_run(
             db,
             run_id=run_id,
@@ -128,7 +143,6 @@ def create_delivery_run(
         )
         return get_delivery_run(db, run_id)
 
-    browser_channel = str(session.get("browser_channel") or "chrome")
     candidates: list[dict[str, object]] = []
     seen_urls: set[str] = set()
     try:
@@ -142,12 +156,24 @@ def create_delivery_run(
                     message=f"开始采集 BOSS：{city} / {keyword}。",
                     detail={"city": city, "keyword": keyword},
                 )
-                jobs = collect_boss_jobs_with_puppeteer(
-                    config=config,
-                    browser_channel=browser_channel,
+                # 旧 Puppeteer 采集模块保留在 boss_puppeteer_collector.py，
+                # 正式投递准备链路从这里开始统一调用内置 CDP 服务。
+                capture_result = boss_scraper_service.capture_jobs(
+                    BossCaptureRequest(
+                        keyword=keyword,
+                        city=city,
+                        pages=1,
+                        include_details=True,
+                        max_details=3,
+                        output_dir=config.output_root / "fine-job" / "boss-capture",
+                    )
+                )
+                jobs = _map_cdp_jobs(
+                    capture_result.list_data,
+                    capture_result.details,
                     keyword=keyword,
                     city=city,
-                    max_jobs=3,
+                    limit=3,
                 )
                 for job in jobs:
                     if job.job_url in seen_urls:
@@ -178,6 +204,18 @@ def create_delivery_run(
             run_id=run_id,
             stage="boss_collection_paused",
             message=exc.error_message,
+            searched_count=len(candidates),
+            skipped_count=sum(1 for item in candidates if item["decision"] == "skipped"),
+        )
+        return get_delivery_run(db, run_id)
+    except RuntimeError as exc:
+        if candidates:
+            _save_candidates(db, candidates)
+        _pause_run(
+            db,
+            run_id=run_id,
+            stage="boss_collection_paused",
+            message=str(exc),
             searched_count=len(candidates),
             skipped_count=sum(1 for item in candidates if item["decision"] == "skipped"),
         )
@@ -461,10 +499,53 @@ def _build_search_keywords(intent: dict[str, object]) -> list[str]:
     return result
 
 
+def _map_cdp_jobs(
+    list_data: dict[str, object],
+    details: list[dict[str, object]] | None,
+    *,
+    keyword: str,
+    city: str,
+    limit: int,
+) -> list[BossCdpJob]:
+    """把内置 CDP 输出转换为现有候选岗位评估所需的稳定结构。"""
+    details_by_id = {
+        str(detail.get("job_id") or ""): detail
+        for detail in details or []
+        if detail.get("job_id")
+    }
+    jobs: list[BossCdpJob] = []
+    for raw in list_data.get("jobs") or []:
+        if not isinstance(raw, dict):
+            continue
+        detail = details_by_id.get(str(raw.get("job_id") or ""), {})
+        jobs.append(
+            BossCdpJob(
+                keyword=keyword,
+                city=city,
+                job_url=str(raw.get("job_link") or ""),
+                job_title=str(raw.get("title") or ""),
+                company_name=str(raw.get("boss_name") or ""),
+                salary_text=str(raw.get("salary") or ""),
+                location_text=str(raw.get("location") or ""),
+                experience_text=str(raw.get("experience") or raw.get("tags") or ""),
+                education_text=str(raw.get("degree") or ""),
+                hr_active_text=str(
+                    detail.get("boss_active_status")
+                    or raw.get("boss_active_status")
+                    or ""
+                ),
+                jd_text=str(detail.get("jd") or ""),
+            )
+        )
+        if len(jobs) >= limit:
+            break
+    return jobs
+
+
 def _build_candidate_from_job(
     *,
     run_id: str,
-    job: BossPuppeteerJob,
+    job: BossCdpJob,
     intent: dict[str, object],
     strategy: dict[str, object],
     min_match_score: float,
@@ -502,7 +583,7 @@ def _build_candidate_from_job(
 
 def _evaluate_job(
     *,
-    job: BossPuppeteerJob,
+    job: BossCdpJob,
     intent: dict[str, object],
     strategy: dict[str, object],
     min_match_score: float,

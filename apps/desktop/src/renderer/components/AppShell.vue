@@ -3,10 +3,12 @@ import { computed, onMounted, ref } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 import {
   ArrowRight,
+  Clock,
   Document,
   Link,
   List,
   Monitor,
+  Search,
   Setting,
   Suitcase,
   Top,
@@ -31,6 +33,8 @@ const navigation = [
   { label: "简历资料", routeName: "fine-job-resumes", icon: Document },
   { label: "期望岗位", routeName: "fine-job-intent", icon: Suitcase },
   { label: "平台登录", routeName: "fine-job-platform", icon: Monitor },
+  { label: "岗位采集", routeName: "fine-job-capture", icon: Search },
+  { label: "历史采集", routeName: "fine-job-capture-history", icon: Clock },
   { label: "投递策略", routeName: "fine-job-strategy", icon: Wallet },
   { label: "运行状态", routeName: "fine-job-runs", icon: List },
   { label: "待确认", routeName: "fine-job-review", icon: User },

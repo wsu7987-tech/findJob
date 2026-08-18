@@ -87,6 +87,25 @@ def test_database_initializes_run_executor_columns(app_paths: dict[str, str]) ->
     }
 
 
+def test_database_initializes_boss_capture_history_tables(app_paths: dict[str, str]) -> None:
+    database = Database(app_paths["sqlite_path"])
+    database.initialize()
+
+    with database.connect() as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+
+    assert {
+        "fj_boss_capture_batches",
+        "fj_boss_jobs",
+        "fj_boss_capture_batch_jobs",
+    } <= tables
+
+
 def test_database_initializes_retrieval_index_versions_schema(
     app_paths: dict[str, str],
 ) -> None:

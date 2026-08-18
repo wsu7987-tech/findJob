@@ -22,6 +22,15 @@
   FineJobPlatformSessionEnvelope,
   FineJobPlatformLoginActionEnvelope,
   FineJobPlatformSessionListEnvelope,
+  FineJobBossBrowserStatus,
+  FineJobBossCityListResponse,
+  FineJobBossCaptureRequest,
+  FineJobBossCaptureTask,
+  FineJobBossDetailSuggestionResponse,
+  FineJobBossHistoryQuery,
+  FineJobBossHistoryResponse,
+  FineJobBossSearchPageRequest,
+  FineJobBossSearchPageResponse,
   PoolCreateRequest,
   PoolCreateResponse,
   PoolCommitMetadataRequest,
@@ -445,6 +454,80 @@ export const api = {
     return request<FineJobPlatformLoginActionEnvelope>(
       "/api/fine-job/platform-sessions/boss/check",
       { method: "POST" }
+    );
+  },
+  async getFineJobBossBrowserStatus() {
+    return request<FineJobBossBrowserStatus>("/api/fine-job/boss-capture/status");
+  },
+  async listFineJobBossCities() {
+    return request<FineJobBossCityListResponse>("/api/fine-job/boss-capture/cities");
+  },
+  async startFineJobBossBrowser() {
+    return request<FineJobBossBrowserStatus>("/api/fine-job/boss-capture/browser/start", {
+      method: "POST"
+    });
+  },
+  async stopFineJobBossBrowser() {
+    return request<FineJobBossBrowserStatus>("/api/fine-job/boss-capture/browser/stop", {
+      method: "POST"
+    });
+  },
+  async locateFineJobBossSearchPage(payload: FineJobBossSearchPageRequest) {
+    return request<FineJobBossSearchPageResponse>("/api/fine-job/boss-capture/locate", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  },
+  async captureFineJobBossJobs(payload: FineJobBossCaptureRequest) {
+    return request<FineJobBossCaptureTask>("/api/fine-job/boss-capture/capture", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  },
+  async getFineJobBossCaptureTask(taskId: string) {
+    return request<FineJobBossCaptureTask>(`/api/fine-job/boss-capture/tasks/${taskId}`);
+  },
+  async listFineJobBossCaptureHistory(query: FineJobBossHistoryQuery) {
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined && value !== null && value !== "") {
+        search.set(key, String(value));
+      }
+    }
+    const suffix = search.size ? `?${search.toString()}` : "";
+    return request<FineJobBossHistoryResponse>(
+      `/api/fine-job/boss-capture/history${suffix}`
+    );
+  },
+  async captureSelectedFineJobBossDetails(
+    taskId: string,
+    jobIds: string[],
+    force = false
+  ) {
+    return request<FineJobBossCaptureTask>(
+      `/api/fine-job/boss-capture/tasks/${taskId}/details`,
+      {
+        method: "POST",
+        body: JSON.stringify({ job_ids: jobIds, force })
+      }
+    );
+  },
+  async captureFineJobBossHistoryDetails(historyJobId: string) {
+    return request<FineJobBossCaptureTask>(
+      `/api/fine-job/boss-capture/history/${historyJobId}/details`,
+      { method: "POST" }
+    );
+  },
+  async suggestFineJobBossDetails(
+    taskId: string,
+    payload: { mode: "strategy" | "ai"; command?: string }
+  ) {
+    return request<FineJobBossDetailSuggestionResponse>(
+      `/api/fine-job/boss-capture/tasks/${taskId}/suggestions`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
     );
   },
   async listFineJobResumes() {
