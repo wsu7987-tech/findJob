@@ -125,10 +125,10 @@ def record_capture_jobs(
                       welfare, salary, location, experience, degree,
                       boss_active_status, job_link, tags, skills,
                       job_labels, payload_json, detail_json, detail_status,
-                      detail_error, detail_collected_at, first_collected_at,
+                      detail_error, delivery_evaluation_json, detail_collected_at, first_collected_at,
                       last_collected_at, collect_count, latest_batch_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         history_job_id,
@@ -154,6 +154,7 @@ def record_capture_jobs(
                         detail_json,
                         detail_status,
                         _optional_text(job.get("detail_error")),
+                        _json_or_none(job.get("delivery_evaluation")),
                         _optional_text(job.get("detail_collected_at")),
                         first_collected_at,
                         now,
@@ -171,6 +172,10 @@ def record_capture_jobs(
                     collect_count = int(existing["collect_count"])
                 first_collected_at = str(existing["first_collected_at"])
                 detail_json = _json_or_none(job.get("detail")) or existing["detail_json"]
+                delivery_evaluation_json = (
+                    _json_or_none(job.get("delivery_evaluation"))
+                    or existing["delivery_evaluation_json"]
+                )
                 incoming_status = str(job.get("detail_status") or "not_collected")
                 detail_status = (
                     incoming_status
@@ -186,6 +191,7 @@ def record_capture_jobs(
                         experience = ?, degree = ?, boss_active_status = ?, job_link = ?,
                         tags = ?, skills = ?, job_labels = ?, payload_json = ?,
                         detail_json = ?, detail_status = ?, detail_error = ?,
+                        delivery_evaluation_json = ?,
                         detail_collected_at = COALESCE(?, detail_collected_at),
                         last_collected_at = ?, collect_count = ?, latest_batch_id = ?
                     WHERE id = ?
@@ -212,6 +218,7 @@ def record_capture_jobs(
                         detail_json,
                         detail_status,
                         _optional_text(job.get("detail_error")),
+                        delivery_evaluation_json,
                         _optional_text(job.get("detail_collected_at")),
                         now,
                         collect_count,
@@ -240,6 +247,11 @@ def record_capture_jobs(
             enriched.append(
                 {
                     **job,
+                    "delivery_evaluation": _load_json(
+                        delivery_evaluation_json
+                        if existing is not None
+                        else _json_or_none(job.get("delivery_evaluation"))
+                    ),
                     "is_previously_collected": was_previously_collected,
                     "first_collected_at": first_collected_at,
                     "last_collected_at": now,
@@ -300,6 +312,49 @@ def update_capture_job_detail(
             )
 
 
+def update_capture_job_delivery_evaluation(
+    db: Database,
+    *,
+    job: dict[str, object],
+    evaluation: dict[str, object],
+) -> None:
+    """持久化投递评估，供历史采集页面继续查看。"""
+    # 历史详情接口返回的是历史行 id；详情采集任务则携带 history_record_id。
+    # 两种调用都要优先按历史主键回写，避免无来源岗位编号时无法定位记录。
+    history_record_id = _text(job.get("history_record_id") or job.get("id"))
+    identity_column = "id" if history_record_id else "dedupe_key"
+    identity_value = history_record_id or build_job_dedupe_key(job)
+    with db.connect() as connection:
+        row = connection.execute(
+            f"SELECT payload_json FROM fj_boss_jobs WHERE {identity_column} = ?",
+            (identity_value,),
+        ).fetchone()
+        if row is None:
+            return
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        payload.update(
+            {
+                "delivery_evaluation": evaluation,
+                "recommended": evaluation.get("decision") == "recommend",
+                "recommendation_source": evaluation.get("source"),
+                "recommendation_reason": "；".join(
+                    str(value) for value in evaluation.get("reasons") or []
+                ),
+            }
+        )
+        connection.execute(
+            f"""
+            UPDATE fj_boss_jobs
+            SET delivery_evaluation_json = ?, payload_json = ?
+            WHERE {identity_column} = ?
+            """,
+            (_json(evaluation), _json(payload), identity_value),
+        )
+
+
 def get_capture_history_job(db: Database, history_job_id: str) -> dict[str, object]:
     with db.connect() as connection:
         row = connection.execute(
@@ -308,7 +363,7 @@ def get_capture_history_job(db: Database, history_job_id: str) -> dict[str, obje
                    company_scale, company_stage, company_industry, welfare,
                    salary, location, experience, degree,
                    boss_active_status, job_link, tags, skills, job_labels,
-                   detail_json, detail_status, detail_error, detail_collected_at,
+                   detail_json, detail_status, detail_error, delivery_evaluation_json, detail_collected_at,
                    first_collected_at, last_collected_at, collect_count,
                    latest_batch_id
             FROM fj_boss_jobs
@@ -390,7 +445,7 @@ def list_capture_history(
                    company_stage, company_industry, welfare, location, experience,
                    degree, boss_active_status, job_link,
                    tags, skills, job_labels, detail_json, detail_status,
-                   detail_error, detail_collected_at, first_collected_at,
+                   detail_error, delivery_evaluation_json, detail_collected_at, first_collected_at,
                    last_collected_at, collect_count, latest_batch_id
             FROM fj_boss_jobs
             {where_sql}
@@ -456,6 +511,17 @@ def _serialize_history_row(row) -> dict[str, object]:
         "skills": row["skills"],
         "job_labels": row["job_labels"],
         "detail": detail,
+        "delivery_evaluation": _load_json(row["delivery_evaluation_json"]),
+        "recommended": (
+            (_load_json(row["delivery_evaluation_json"]) or {}).get("decision") == "recommend"
+        ),
+        "recommendation_source": (
+            (_load_json(row["delivery_evaluation_json"]) or {}).get("source")
+        ),
+        "recommendation_reason": "；".join(
+            str(value)
+            for value in ((_load_json(row["delivery_evaluation_json"]) or {}).get("reasons") or [])
+        ) or None,
         "detail_status": row["detail_status"],
         "detail_error": row["detail_error"],
         "detail_collected_at": row["detail_collected_at"],
@@ -469,6 +535,15 @@ def _serialize_history_row(row) -> dict[str, object]:
 
 def _company(job: dict[str, object]) -> str:
     return _text(job.get("boss_name") or job.get("company"))
+
+
+def _load_json(value: object) -> object:
+    if not value:
+        return None
+    try:
+        return json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return None
 
 
 def _text(value: object) -> str:

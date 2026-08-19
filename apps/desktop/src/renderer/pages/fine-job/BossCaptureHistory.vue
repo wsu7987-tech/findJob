@@ -5,12 +5,15 @@ import { ElMessage } from "element-plus";
 import { formatDateTime } from "@/services/format";
 import { useFineJobBossCaptureStore } from "@/stores/fineJobBossCapture";
 import { useFineJobBossHistoryStore } from "@/stores/fineJobBossHistory";
+import { useFineJobStrategiesStore } from "@/stores/fineJobStrategies";
 import type { FineJobBossHistoryJob, FineJobBossHistorySortField } from "@/types";
 
 const captureStore = useFineJobBossCaptureStore();
 const historyStore = useFineJobBossHistoryStore();
+const strategiesStore = useFineJobStrategiesStore();
 const selectedJob = ref<FineJobBossHistoryJob | null>(null);
 const detailDrawerOpen = ref(false);
+const recommendationStrategyId = ref<string | null>(null);
 const dateRange = ref<string[]>([]);
 const filters = reactive({
   query: "",
@@ -52,6 +55,9 @@ const queryPayload = computed(() => ({
 }));
 const detailTaskRunning = computed(
   () => historyStore.detailTask?.status === "queued" || historyStore.detailTask?.status === "running"
+);
+const historyActionRunning = computed(
+  () => detailTaskRunning.value || historyStore.deliveryJobId !== null
 );
 const detailProgressPercentage = computed(() => {
   const task = historyStore.detailTask;
@@ -131,6 +137,26 @@ const captureHistoryDetails = async (job: FineJobBossHistoryJob) => {
   }
 };
 
+const evaluateHistoryDelivery = async (job: FineJobBossHistoryJob) => {
+  if (!recommendationStrategyId.value) {
+    ElMessage.warning("请先选择岗位建议投递策略");
+    return;
+  }
+  if (job.detail_status !== "completed") {
+    ElMessage.warning("请先完成该岗位详情采集");
+    return;
+  }
+  try {
+    const updated = await historyStore.evaluateDelivery(job.id, {
+      recommendation_strategy_id: recommendationStrategyId.value
+    });
+    selectedJob.value = updated;
+    ElMessage.success("投递建议已获取");
+  } catch {
+    ElMessage.error(historyStore.error ?? "获取投递建议失败");
+  }
+};
+
 const detailActionLabel = (job: FineJobBossHistoryJob) =>
   job.detail_status === "completed" || Boolean(job.detail) ? "重新采集详情" : "采集详情";
 
@@ -154,8 +180,27 @@ const detailStatusType = (status?: string) => {
   return "info";
 };
 
+const deliveryDecisionLabel = (decision?: string) =>
+  ({ recommend: "建议投递", reject: "不建议", review: "待判断" }[decision || ""] || "未评估");
+const deliveryDecisionType = (decision?: string) =>
+  decision === "recommend" ? "success" : decision === "reject" ? "danger" : decision === "review" ? "warning" : "info";
+const deliveryEvaluationReasons = (job: FineJobBossHistoryJob) =>
+  (job.delivery_evaluation?.reasons ?? []).join("；") || job.recommendation_reason || "暂无评估理由";
+const deliveryEvaluationRisks = (job: FineJobBossHistoryJob) =>
+  (job.delivery_evaluation?.risks ?? []).join("；");
+const deliveryEvaluationMissingFields = (job: FineJobBossHistoryJob) =>
+  (job.delivery_evaluation?.missing_fields ?? []).join("、");
+
 onMounted(async () => {
-  await Promise.all([captureStore.loadCities(), captureStore.loadStatus(), loadHistory()]);
+  await Promise.all([
+    captureStore.loadCities(),
+    captureStore.loadStatus(),
+    loadHistory(),
+    strategiesStore.load()
+  ]);
+  const initialRecommendation = strategiesStore.recommendations.find((item) => item.enabled)
+    ?? strategiesStore.recommendations[0];
+  recommendationStrategyId.value = initialRecommendation?.id ?? null;
 });
 
 onBeforeUnmount(() => historyStore.stopDetailPolling());
@@ -251,6 +296,14 @@ watch(
         </div>
       </el-form>
       <div class="history-filter-actions">
+        <el-select v-model="recommendationStrategyId" clearable placeholder="选择建议投递策略">
+          <el-option
+            v-for="item in strategiesStore.recommendations"
+            :key="item.id"
+            :label="item.name"
+            :value="item.id"
+          />
+        </el-select>
         <el-button type="primary" :loading="historyStore.loading" @click="search">查询</el-button>
         <el-button :disabled="historyStore.loading" @click="reset">重置</el-button>
       </div>
@@ -318,10 +371,21 @@ watch(
           <template #default="{ row }">
             <el-button link type="primary" @click.stop="openDetail(row)">查看详情</el-button>
             <el-button
+              v-if="row.detail_status === 'completed' && !row.delivery_evaluation"
+              link
+              type="warning"
+              :loading="historyStore.deliveryJobId === row.id"
+              :disabled="historyActionRunning || !recommendationStrategyId"
+              @click.stop="evaluateHistoryDelivery(row)"
+            >
+              获取投递详情
+            </el-button>
+            <el-button
+              v-else-if="row.detail_status !== 'completed'"
               link
               type="success"
               :loading="historyStore.detailJobId === row.id"
-              :disabled="detailTaskRunning && historyStore.detailJobId !== row.id"
+              :disabled="historyActionRunning && historyStore.detailJobId !== row.id"
               @click.stop="captureHistoryDetails(row)"
             >
               {{ detailActionLabel(row) }}
@@ -370,10 +434,40 @@ watch(
         <h3>职位描述</h3>
         <div v-if="selectedJob.detail?.jd" class="job-description">{{ selectedJob.detail.jd }}</div>
         <p v-else class="secondary-text">该岗位尚未采集完整详情。</p>
+        <el-divider />
+        <h3>投递建议</h3>
+        <template v-if="selectedJob.delivery_evaluation">
+          <div class="history-evaluation-summary">
+            <el-tag :type="deliveryDecisionType(selectedJob.delivery_evaluation.decision)">
+              {{ deliveryDecisionLabel(selectedJob.delivery_evaluation.decision) }}
+            </el-tag>
+            <span class="secondary-text">
+              置信度：{{ Math.round(selectedJob.delivery_evaluation.confidence * 100) }}%
+            </span>
+          </div>
+          <p>{{ deliveryEvaluationReasons(selectedJob) }}</p>
+          <p v-if="deliveryEvaluationRisks(selectedJob)" class="evaluation-warning">
+            风险：{{ deliveryEvaluationRisks(selectedJob) }}
+          </p>
+          <p v-if="deliveryEvaluationMissingFields(selectedJob)" class="secondary-text">
+            缺失信息：{{ deliveryEvaluationMissingFields(selectedJob) }}
+          </p>
+        </template>
+        <p v-else class="secondary-text">尚未获取投递建议。</p>
+        <el-button
+          v-if="selectedJob.detail_status === 'completed'"
+          type="warning"
+          :loading="historyStore.deliveryJobId === selectedJob.id"
+          :disabled="historyActionRunning && historyStore.deliveryJobId !== selectedJob.id || !recommendationStrategyId"
+          @click="evaluateHistoryDelivery(selectedJob)"
+        >
+          {{ selectedJob.delivery_evaluation ? "重新获取投递建议" : "获取投递建议" }}
+        </el-button>
+        <el-divider />
         <el-button
           type="primary"
           :loading="historyStore.detailJobId === selectedJob.id"
-          :disabled="detailTaskRunning && historyStore.detailJobId !== selectedJob.id"
+          :disabled="historyActionRunning && historyStore.detailJobId !== selectedJob.id"
           @click="captureHistoryDetails(selectedJob)"
         >
           {{ detailActionLabel(selectedJob) }}
@@ -410,6 +504,17 @@ watch(
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+}
+
+.history-evaluation-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.evaluation-warning {
+  color: var(--el-color-warning);
 }
 
 .history-pagination {

@@ -126,6 +126,11 @@ class BossDeliveryEvaluationResponse(BaseModel):
     task: BossCaptureTaskResponse
 
 
+class BossHistoryDeliveryEvaluationResponse(BaseModel):
+    evaluation: BossJobDeliveryEvaluation
+    job: dict[str, Any]
+
+
 class BossCaptureHistoryResponse(BaseModel):
     items: list[dict[str, Any]] = Field(default_factory=list)
     total: int

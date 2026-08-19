@@ -173,6 +173,60 @@ def test_list_boss_capture_history_supports_filters_sort_and_pagination(
     assert response.json()["items"][0]["company_scale"] == "100-499人"
 
 
+def test_history_delivery_evaluation_is_persisted_and_returned(
+    configured_client,
+) -> None:
+    from backend.app.services.fine_job.boss_capture_history import (
+        create_capture_batch,
+        record_capture_jobs,
+    )
+
+    strategy = configured_client.post(
+        "/api/fine-job/strategies/recommendations",
+        json={"name": "历史岗位投递建议", "evaluation_method": "rules"},
+    ).json()["strategy"]
+    db = configured_client.app.state.db
+    create_capture_batch(
+        db,
+        capture_id="history-evaluation-capture",
+        keyword="Python",
+        city="上海",
+        pages=1,
+        auto_details=False,
+        created_at="2026-08-18T10:00:00Z",
+    )
+    record_capture_jobs(
+        db,
+        capture_id="history-evaluation-capture",
+        jobs=[
+            {
+                "title": "Python 开发",
+                "boss_name": "示例科技",
+                "detail_status": "completed",
+                "detail": {"jd": "使用 Python 开发服务"},
+            }
+        ],
+        collected_at="2026-08-18T10:01:00Z",
+    )
+    history_job = configured_client.get(
+        "/api/fine-job/boss-capture/history",
+        params={"page": 1, "page_size": 10},
+    ).json()["items"][0]
+
+    response = configured_client.post(
+        f"/api/fine-job/boss-capture/history/{history_job['id']}/delivery-evaluations",
+        json={"recommendation_strategy_id": strategy["id"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["job"]["delivery_evaluation"]["source"] == "rules"
+    refreshed = configured_client.get(
+        "/api/fine-job/boss-capture/history",
+        params={"page": 1, "page_size": 10},
+    ).json()["items"][0]
+    assert refreshed["delivery_evaluation"]["decision"] == "recommend"
+
+
 def test_capture_selected_details_returns_same_task(configured_client, monkeypatch) -> None:
     monkeypatch.setattr(
         "backend.app.routers.fine_job.boss_capture.boss_capture_task_manager.start_details",

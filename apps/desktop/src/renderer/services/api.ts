@@ -35,6 +35,7 @@
   FineJobBossDetailSuggestionResponse,
   FineJobBossFilterApplicationResponse,
   FineJobBossDeliveryEvaluationResponse,
+  FineJobBossHistoryDeliveryEvaluationResponse,
   FineJobBossHistoryQuery,
   FineJobBossHistoryResponse,
   FineJobBossSearchPageRequest,
@@ -607,6 +608,22 @@ export const api = {
     return request<FineJobBossDeliveryEvaluationResponse>(
       `/api/fine-job/boss-capture/tasks/${taskId}/delivery-evaluations`,
       { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
+  async evaluateFineJobBossHistoryDelivery(
+    historyJobId: string,
+    payload: {
+      recommendation_strategy_id: string;
+      filter_strategy_id?: string | null;
+      extra_requirement?: string;
+    }
+  ) {
+    return request<FineJobBossHistoryDeliveryEvaluationResponse>(
+      `/api/fine-job/boss-capture/history/${historyJobId}/delivery-evaluations`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
     );
   },
   async listFineJobResumes() {

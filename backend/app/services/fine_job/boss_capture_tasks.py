@@ -12,6 +12,7 @@ from backend.app.services.fine_job.boss_capture_history import (
     record_capture_jobs,
     update_capture_batch,
     update_capture_job_detail,
+    update_capture_job_delivery_evaluation,
 )
 from backend.app.services.fine_job.boss_scraper.service import (
     BossCaptureRequest,
@@ -289,6 +290,13 @@ class BossCaptureTaskManager:
                 job["recommendation_reason"] = "；".join(
                     str(value) for value in evaluation.get("reasons") or []
                 )
+                db = task.get("_db")
+                if isinstance(db, Database):
+                    update_capture_job_delivery_evaluation(
+                        db,
+                        job=job,
+                        evaluation=evaluation,
+                    )
             task["updated_at"] = utc_now()
         return self.get_task(task_id)
 

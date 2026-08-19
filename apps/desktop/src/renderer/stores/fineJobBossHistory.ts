@@ -18,6 +18,7 @@ export const useFineJobBossHistoryStore = defineStore("fineJobBossHistory", () =
   const error = ref<string | null>(null);
   const detailTask = ref<FineJobBossCaptureTask | null>(null);
   const detailJobId = ref<string | null>(null);
+  const deliveryJobId = ref<string | null>(null);
   let detailPollTimer: ReturnType<typeof setTimeout> | null = null;
 
   const load = async (query: FineJobBossHistoryQuery = {}) => {
@@ -53,6 +54,29 @@ export const useFineJobBossHistoryStore = defineStore("fineJobBossHistory", () =
       detailJobId.value = null;
       error.value = mapError(errorValue);
       throw errorValue;
+    }
+  };
+
+  const evaluateDelivery = async (
+    historyJobId: string,
+    payload: {
+      recommendation_strategy_id: string;
+      filter_strategy_id?: string | null;
+      extra_requirement?: string;
+    }
+  ) => {
+    error.value = null;
+    deliveryJobId.value = historyJobId;
+    try {
+      const response = await api.evaluateFineJobBossHistoryDelivery(historyJobId, payload);
+      const index = items.value.findIndex((item) => item.id === historyJobId);
+      if (index >= 0) items.value[index] = response.job;
+      return response.job;
+    } catch (errorValue) {
+      error.value = mapError(errorValue);
+      throw errorValue;
+    } finally {
+      deliveryJobId.value = null;
     }
   };
 
@@ -103,8 +127,10 @@ export const useFineJobBossHistoryStore = defineStore("fineJobBossHistory", () =
     error,
     detailTask,
     detailJobId,
+    deliveryJobId,
     load,
     captureDetails,
+    evaluateDelivery,
     stopDetailPolling,
     clearDetailTask
   };

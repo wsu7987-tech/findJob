@@ -307,6 +307,11 @@ export interface FineJobBossDeliveryEvaluationResponse {
   task: FineJobBossCaptureTask;
 }
 
+export interface FineJobBossHistoryDeliveryEvaluationResponse {
+  evaluation: FineJobBossDeliveryEvaluation;
+  job: FineJobBossHistoryJob;
+}
+
 export type FineJobBossHistorySortField =
   | "last_collected_at"
   | "first_collected_at"

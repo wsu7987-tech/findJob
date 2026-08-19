@@ -17,6 +17,7 @@ from backend.app.schemas.fine_job.boss_capture import (
     BossDetailCaptureRequest,
     BossDeliveryEvaluationRequest,
     BossDeliveryEvaluationResponse,
+    BossHistoryDeliveryEvaluationResponse,
     BossDetailSuggestionRequest,
     BossDetailSuggestionResponse,
     BossFilterApplicationRequest,
@@ -30,6 +31,7 @@ from backend.app.services.fine_job.boss_capture_history import (
     HistorySortOrder,
     get_capture_history_job,
     list_capture_history,
+    update_capture_job_delivery_evaluation,
 )
 from backend.app.services.fine_job.boss_detail_suggestions import (
     suggest_by_ai,
@@ -365,4 +367,47 @@ def evaluate_boss_deliveries(
     return BossDeliveryEvaluationResponse(
         evaluations=evaluations,
         task=BossCaptureTaskResponse(**updated),
+    )
+
+
+@router.post(
+    "/history/{history_job_id}/delivery-evaluations",
+    response_model=BossHistoryDeliveryEvaluationResponse,
+)
+def evaluate_history_job_delivery(
+    history_job_id: str,
+    payload: BossDeliveryEvaluationRequest,
+    db: Database = Depends(get_database),
+    config: AppConfig = Depends(get_config),
+) -> BossHistoryDeliveryEvaluationResponse:
+    job = get_capture_history_job(db, history_job_id)
+    if job.get("detail_status") != "completed":
+        raise AppError(
+            status_code=409,
+            error_category="CAPTURE_NOT_READY",
+            error_message="请先完成历史岗位详情采集。",
+        )
+    recommendation_strategy = get_recommendation_strategy(
+        db, payload.recommendation_strategy_id
+    )
+    filter_strategy_id = payload.filter_strategy_id or recommendation_strategy.get(
+        "filter_strategy_id"
+    )
+    filter_strategy = (
+        get_filter_strategy(db, str(filter_strategy_id)) if filter_strategy_id else None
+    )
+    resume_id = str(recommendation_strategy.get("resume_id") or "")
+    facts = list_resume_facts(db, resume_id) if resume_id else []
+    evaluation = evaluate_delivery_jobs(
+        [job],
+        filter_strategy=filter_strategy,
+        recommendation_strategy=recommendation_strategy,
+        resume_facts=facts,
+        extra_requirement=payload.extra_requirement,
+        config=config,
+    )[0]
+    update_capture_job_delivery_evaluation(db, job=job, evaluation=evaluation)
+    return BossHistoryDeliveryEvaluationResponse(
+        evaluation=evaluation,
+        job=get_capture_history_job(db, history_job_id),
     )

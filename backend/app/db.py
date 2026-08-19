@@ -554,6 +554,7 @@ CREATE TABLE IF NOT EXISTS fj_boss_jobs (
   detail_json TEXT,
   detail_status TEXT NOT NULL DEFAULT 'not_collected',
   detail_error TEXT,
+  delivery_evaluation_json TEXT,
   detail_collected_at TEXT,
   first_collected_at TEXT NOT NULL,
   last_collected_at TEXT NOT NULL,
@@ -820,6 +821,9 @@ class Database:
                 "ALTER TABLE fj_boss_jobs ADD COLUMN company_industry TEXT NOT NULL DEFAULT ''"
             ),
             "welfare": "ALTER TABLE fj_boss_jobs ADD COLUMN welfare TEXT NOT NULL DEFAULT ''",
+            "delivery_evaluation_json": (
+                "ALTER TABLE fj_boss_jobs ADD COLUMN delivery_evaluation_json TEXT"
+            ),
         }
         for column, ddl in migrations.items():
             if column not in columns:
@@ -851,3 +855,19 @@ class Database:
                     row["id"],
                 ),
             )
+
+        # 兼容早期已经写入 payload_json 的投递评估结果。
+        evaluation_rows = connection.execute(
+            "SELECT id, payload_json FROM fj_boss_jobs WHERE delivery_evaluation_json IS NULL"
+        ).fetchall()
+        for row in evaluation_rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            evaluation = payload.get("delivery_evaluation")
+            if evaluation is not None:
+                connection.execute(
+                    "UPDATE fj_boss_jobs SET delivery_evaluation_json = ? WHERE id = ?",
+                    (json.dumps(evaluation, ensure_ascii=False), row["id"]),
+                )
