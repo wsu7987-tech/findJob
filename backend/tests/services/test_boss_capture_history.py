@@ -29,6 +29,9 @@ def test_capture_history_deduplicates_across_batches_and_counts_once_per_batch(t
         "title": "Python 开发",
         "boss_name": "示例科技",
         "company_scale": "100-499人",
+        "company_stage": "A轮",
+        "company_industry": "人工智能",
+        "welfare": "五险一金 | 年终奖",
         "salary": "20-30K",
         "location": "上海·浦东新区",
         "job_link": "https://www.zhipin.com/job_detail/encrypted-1.html",
@@ -50,7 +53,7 @@ def test_capture_history_deduplicates_across_batches_and_counts_once_per_batch(t
     second = record_capture_jobs(
         test_db,
         capture_id="capture-2",
-        jobs=[{**job, "company_scale": "500-999人"}],
+        jobs=[{**job, "company_scale": "500-999人", "company_stage": "B轮"}],
         collected_at="2026-08-19T10:01:00Z",
     )
 
@@ -68,6 +71,9 @@ def test_capture_history_deduplicates_across_batches_and_counts_once_per_batch(t
     assert history["total"] == 1
     item = history["items"][0]
     assert item["company_scale"] == "500-999人"
+    assert item["company_stage"] == "B轮"
+    assert item["company_industry"] == "人工智能"
+    assert item["welfare"] == "五险一金 | 年终奖"
     assert item["first_collected_at"] == "2026-08-18T10:01:00Z"
     assert item["last_collected_at"] == "2026-08-19T10:01:00Z"
     assert item["collect_count"] == 2

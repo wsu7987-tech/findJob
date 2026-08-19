@@ -15,8 +15,12 @@ from backend.app.schemas.fine_job.boss_capture import (
     BossCaptureTaskResponse,
     BossCityListResponse,
     BossDetailCaptureRequest,
+    BossDeliveryEvaluationRequest,
+    BossDeliveryEvaluationResponse,
     BossDetailSuggestionRequest,
     BossDetailSuggestionResponse,
+    BossFilterApplicationRequest,
+    BossFilterApplicationResponse,
     BossSearchPageRequest,
     BossSearchPageResponse,
 )
@@ -37,6 +41,15 @@ from backend.app.services.fine_job.boss_scraper.service import (
 )
 from backend.app.services.fine_job.delivery_strategies import get_delivery_strategy
 from backend.app.services.fine_job.job_intents import get_job_intent
+from backend.app.services.fine_job.job_evaluation import (
+    evaluate_delivery_jobs,
+    evaluate_filter_strategy,
+)
+from backend.app.services.fine_job.resumes import list_resume_facts
+from backend.app.services.fine_job.strategies import (
+    get_filter_strategy,
+    get_recommendation_strategy,
+)
 
 
 router = APIRouter(prefix="/fine-job/boss-capture", tags=["fine-job-boss-capture"])
@@ -135,6 +148,8 @@ def get_boss_capture_history(
     query: str = "",
     city: str = "",
     company_scale: str = "",
+    company_industry: str = "",
+    company_stage: str = "",
     detail_status: str = "",
     repeat_status: str = Query(default="all", pattern="^(all|first_seen|repeated)$"),
     collected_from: str = "",
@@ -151,6 +166,8 @@ def get_boss_capture_history(
             query=query,
             city=city,
             company_scale=company_scale,
+            company_industry=company_industry,
+            company_stage=company_stage,
             detail_status=detail_status,
             repeat_status=repeat_status,
             collected_from=collected_from,
@@ -213,6 +230,31 @@ def capture_selected_boss_details(
 
 
 @router.post(
+    "/tasks/{task_id}/filters",
+    response_model=BossFilterApplicationResponse,
+)
+def apply_boss_filter_strategy(
+    task_id: str,
+    payload: BossFilterApplicationRequest,
+    db: Database = Depends(get_database),
+) -> BossFilterApplicationResponse:
+    task = boss_capture_task_manager.get_task(task_id)
+    strategy = get_filter_strategy(db, payload.strategy_id)
+    results = evaluate_filter_strategy(task["jobs"], strategy)
+    selected_ids = [
+        str(result["job_id"])
+        for result in results
+        if result["status"] in {"pass", "review"}
+    ]
+    updated = boss_capture_task_manager.apply_filter_results(task_id, results)
+    return BossFilterApplicationResponse(
+        selected_job_ids=selected_ids,
+        results=results,
+        task=BossCaptureTaskResponse(**updated),
+    )
+
+
+@router.post(
     "/tasks/{task_id}/suggestions",
     response_model=BossDetailSuggestionResponse,
 )
@@ -224,6 +266,38 @@ def suggest_boss_details(
 ) -> BossDetailSuggestionResponse:
     task = boss_capture_task_manager.get_task(task_id)
     jobs = task["jobs"]
+    if payload.filter_strategy_id:
+        filter_strategy = get_filter_strategy(db, payload.filter_strategy_id)
+        filter_results = evaluate_filter_strategy(jobs, filter_strategy)
+        boss_capture_task_manager.apply_filter_results(task_id, filter_results)
+    else:
+        filter_strategy = None
+    if payload.mode == "ai" and payload.recommendation_strategy_id:
+        recommendation_strategy = get_recommendation_strategy(
+            db, payload.recommendation_strategy_id
+        )
+        resume_id = str(recommendation_strategy.get("resume_id") or "")
+        facts = list_resume_facts(db, resume_id) if resume_id else []
+        evaluations = evaluate_delivery_jobs(
+            jobs,
+            filter_strategy=filter_strategy,
+            recommendation_strategy=recommendation_strategy,
+            resume_facts=facts,
+            extra_requirement=payload.extra_requirement or payload.command,
+            config=config,
+        )
+        selected_ids = [
+            str(item["job_id"])
+            for item in evaluations
+            if item["decision"] in {"recommend", "review"}
+        ]
+        updated = boss_capture_task_manager.apply_delivery_evaluations(
+            task_id, evaluations
+        )
+        return BossDetailSuggestionResponse(
+            selected_job_ids=selected_ids,
+            task=BossCaptureTaskResponse(**updated),
+        )
     intent = get_job_intent(db)
     strategy = get_delivery_strategy(db)
     if payload.mode == "ai":
@@ -243,5 +317,44 @@ def suggest_boss_details(
     )
     return BossDetailSuggestionResponse(
         selected_job_ids=list(recommendations),
+        task=BossCaptureTaskResponse(**updated),
+    )
+
+
+@router.post(
+    "/tasks/{task_id}/delivery-evaluations",
+    response_model=BossDeliveryEvaluationResponse,
+)
+def evaluate_boss_deliveries(
+    task_id: str,
+    payload: BossDeliveryEvaluationRequest,
+    db: Database = Depends(get_database),
+    config: AppConfig = Depends(get_config),
+) -> BossDeliveryEvaluationResponse:
+    task = boss_capture_task_manager.get_task(task_id)
+    recommendation_strategy = get_recommendation_strategy(
+        db, payload.recommendation_strategy_id
+    )
+    filter_strategy_id = payload.filter_strategy_id or recommendation_strategy.get(
+        "filter_strategy_id"
+    )
+    filter_strategy = (
+        get_filter_strategy(db, str(filter_strategy_id)) if filter_strategy_id else None
+    )
+    resume_id = str(recommendation_strategy.get("resume_id") or "")
+    facts = list_resume_facts(db, resume_id) if resume_id else []
+    evaluations = evaluate_delivery_jobs(
+        task["jobs"],
+        filter_strategy=filter_strategy,
+        recommendation_strategy=recommendation_strategy,
+        resume_facts=facts,
+        extra_requirement=payload.extra_requirement,
+        config=config,
+    )
+    updated = boss_capture_task_manager.apply_delivery_evaluations(
+        task_id, evaluations
+    )
+    return BossDeliveryEvaluationResponse(
+        evaluations=evaluations,
         task=BossCaptureTaskResponse(**updated),
     )

@@ -5,8 +5,7 @@ import BossCapturePage from "@/pages/fine-job/BossCapture.vue";
 import BossCaptureHistoryPage from "@/pages/fine-job/BossCaptureHistory.vue";
 import DeliveryReadinessPage from "@/pages/fine-job/DeliveryReadiness.vue";
 import DeliveryRunStatusPage from "@/pages/fine-job/DeliveryRunStatus.vue";
-import DeliveryStrategyPage from "@/pages/fine-job/DeliveryStrategy.vue";
-import JobIntentPage from "@/pages/fine-job/JobIntent.vue";
+import StrategyManagementPage from "@/pages/fine-job/StrategyManagement.vue";
 import PlatformLoginPage from "@/pages/fine-job/PlatformLogin.vue";
 import ResumeProfilePage from "@/pages/fine-job/ResumeProfile.vue";
 import ReviewQueuePage from "@/pages/fine-job/ReviewQueue.vue";
@@ -32,9 +31,7 @@ export const router = createRouter({
     },
     {
       path: "/fine-job/intent",
-      name: "fine-job-intent",
-      component: JobIntentPage,
-      meta: { title: "期望岗位" }
+      redirect: "/fine-job/strategy"
     },
     {
       path: "/fine-job/platform",
@@ -57,8 +54,8 @@ export const router = createRouter({
     {
       path: "/fine-job/strategy",
       name: "fine-job-strategy",
-      component: DeliveryStrategyPage,
-      meta: { title: "投递策略" }
+      component: StrategyManagementPage,
+      meta: { title: "策略管理" }
     },
     {
       path: "/fine-job/runs",

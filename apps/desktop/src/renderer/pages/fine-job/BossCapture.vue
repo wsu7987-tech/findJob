@@ -3,13 +3,13 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "v
 import { ElMessage } from "element-plus";
 
 import { useFineJobBossCaptureStore } from "@/stores/fineJobBossCapture";
-import { useFineJobIntentStore } from "@/stores/fineJobIntent";
 import { useFineJobPlatformSessionsStore } from "@/stores/fineJobPlatformSessions";
+import { useFineJobStrategiesStore } from "@/stores/fineJobStrategies";
 import type { FineJobBossCapturedJob } from "@/types";
 
 const captureStore = useFineJobBossCaptureStore();
-const intentStore = useFineJobIntentStore();
 const platformStore = useFineJobPlatformSessionsStore();
+const strategiesStore = useFineJobStrategiesStore();
 const form = reactive({
   keyword: "",
   city: "",
@@ -18,11 +18,24 @@ const form = reactive({
   preferCurrentPage: true
 });
 const aiCommand = ref("");
+const filterStrategyId = ref<string | null>(null);
+const recommendationStrategyId = ref<string | null>(null);
 const selectedJobIds = ref<string[]>([]);
 const selectedJobId = ref<string | null>(null);
 const detailDrawerOpen = ref(false);
+type SortableJobColumn =
+  | "is_previously_collected"
+  | "filter_status"
+  | "title"
+  | "company_scale"
+  | "salary"
+  | "experience"
+  | "boss_active_status";
+type JobSortOrder = "ascending" | "descending";
+type JobSortCriterion = { prop: SortableJobColumn; order: JobSortOrder };
 const jobsTable = ref<{
   clearSelection: () => void;
+  clearSort: () => void;
   toggleRowSelection: (row: FineJobBossCapturedJob, selected: boolean) => void;
 } | null>(null);
 
@@ -70,25 +83,96 @@ const remainingEstimate = computed(() => {
 const currentDetailJob = computed(() =>
   captureStore.task?.jobs.find((job) => job.job_id === selectedJobId.value) ?? null
 );
+const filterStatusRank = (status?: FineJobBossCapturedJob["filter_status"]) => {
+  if (status === "pass") return 0;
+  if (status === "review") return 1;
+  if (status === "reject") return 2;
+  return 3;
+};
+const firstNumber = (value?: string | null) => {
+  const match = value?.match(/\d+(?:\.\d+)?/);
+  return match ? Number(match[0]) : Number.POSITIVE_INFINITY;
+};
+const sortByCollection = (left: FineJobBossCapturedJob, right: FineJobBossCapturedJob) =>
+  Number(Boolean(left.is_previously_collected)) - Number(Boolean(right.is_previously_collected));
+const sortByFilterStatus = (left: FineJobBossCapturedJob, right: FineJobBossCapturedJob) =>
+  filterStatusRank(left.filter_status) - filterStatusRank(right.filter_status);
+const sortByTitle = (left: FineJobBossCapturedJob, right: FineJobBossCapturedJob) =>
+  String(left.title ?? "").localeCompare(String(right.title ?? ""), "zh-CN", { numeric: true });
+const sortByCompanyScale = (left: FineJobBossCapturedJob, right: FineJobBossCapturedJob) =>
+  firstNumber(left.company_scale) - firstNumber(right.company_scale);
+const sortBySalary = (left: FineJobBossCapturedJob, right: FineJobBossCapturedJob) =>
+  firstNumber(left.salary) - firstNumber(right.salary);
+const experienceOrder = ["经验不限", "在校/应届", "1年以内", "1-3年", "3-5年", "5-10年", "10年以上"];
+const activeStatusOrder = ["在线", "刚刚活跃", "今日活跃", "3日内活跃", "本周活跃", "本月活跃"];
+const orderedLabelRank = (value: string | undefined, order: string[]) => {
+  const index = order.findIndex((item) => value?.includes(item));
+  return index >= 0 ? index : order.length;
+};
+const sortByExperience = (left: FineJobBossCapturedJob, right: FineJobBossCapturedJob) =>
+  orderedLabelRank(left.experience, experienceOrder) - orderedLabelRank(right.experience, experienceOrder);
+const sortByBossActiveStatus = (left: FineJobBossCapturedJob, right: FineJobBossCapturedJob) =>
+  orderedLabelRank(left.boss_active_status, activeStatusOrder) - orderedLabelRank(right.boss_active_status, activeStatusOrder);
+const sortComparators: Record<SortableJobColumn, (left: FineJobBossCapturedJob, right: FineJobBossCapturedJob) => number> = {
+  is_previously_collected: sortByCollection,
+  filter_status: sortByFilterStatus,
+  title: sortByTitle,
+  company_scale: sortByCompanyScale,
+  salary: sortBySalary,
+  experience: sortByExperience,
+  boss_active_status: sortByBossActiveStatus
+};
+const defaultJobSort = (): JobSortCriterion[] => [{ prop: "filter_status", order: "ascending" }];
+const jobSortCriteria = ref<JobSortCriterion[]>(defaultJobSort());
+const sortedJobs = computed(() => {
+  const criteria = jobSortCriteria.value.length ? jobSortCriteria.value : defaultJobSort();
+  return [...(captureStore.task?.jobs ?? [])].sort((left, right) => {
+    for (const criterion of criteria) {
+      const result = sortComparators[criterion.prop](left, right);
+      if (result !== 0) return criterion.order === "ascending" ? result : -result;
+    }
+    return 0;
+  });
+});
+const handleJobSortChange = ({ prop, order }: { prop: string; order: JobSortOrder | null }) => {
+  if (!(prop in sortComparators)) return;
+  const column = prop as SortableJobColumn;
+  const remaining = jobSortCriteria.value.filter((criterion) => criterion.prop !== column);
+  jobSortCriteria.value = order
+    ? [{ prop: column, order }, ...remaining]
+    : remaining.length ? remaining : defaultJobSort();
+};
+const resetJobSort = () => {
+  jobSortCriteria.value = defaultJobSort();
+  jobsTable.value?.clearSort();
+};
 const detailStatusSummary = computed(() => {
   const jobs = captureStore.task?.jobs ?? [];
   return {
     selected: selectedJobIds.value.length,
     recommended: jobs.filter((job) => job.recommended).length,
+    passed: jobs.filter((job) => job.filter_status === "pass").length,
+    rejected: jobs.filter((job) => job.filter_status === "reject").length,
+    review: jobs.filter((job) => job.filter_status === "review").length,
     completed: jobs.filter((job) => job.detail_status === "completed").length,
     failed: jobs.filter((job) => job.detail_status === "failed").length
   };
 });
+const hasCompletedDetails = computed(() => detailStatusSummary.value.completed > 0);
 
 onMounted(async () => {
-  const [, , intent] = await Promise.all([
+  await Promise.all([
     captureStore.loadStatus(),
     captureStore.loadCities(),
-    intentStore.load(),
+    strategiesStore.load(),
     platformStore.load()
   ]);
-  form.keyword = intent?.keywords[0] || intent?.target_title || "";
-  form.city = intent?.cities[0] || "";
+  const initialFilter = strategiesStore.filters.find((item) => item.enabled) ?? strategiesStore.filters[0];
+  const initialRecommendation = strategiesStore.recommendations.find((item) => item.enabled) ?? strategiesStore.recommendations[0];
+  filterStrategyId.value = initialFilter?.id ?? null;
+  recommendationStrategyId.value = initialRecommendation?.id ?? null;
+  form.keyword = initialFilter?.search_keywords[0] || initialFilter?.title_include_any[0] || "";
+  form.city = initialFilter?.cities[0] || "";
   captureStore.resumePolling();
 });
 
@@ -164,19 +248,53 @@ const handleSelectionChange = (rows: FineJobBossCapturedJob[]) => {
 };
 
 const applySuggestedSelection = async (mode: "strategy" | "ai") => {
+  if (mode === "strategy" && !filterStrategyId.value) {
+    ElMessage.warning("请先选择岗位筛选策略");
+    return;
+  }
+  if (mode === "ai" && !recommendationStrategyId.value) {
+    ElMessage.warning("请先选择岗位建议投递策略");
+    return;
+  }
   try {
-    const ids = await captureStore.suggest(mode, aiCommand.value);
+    const ids = mode === "strategy"
+      ? await captureStore.applyFilter(filterStrategyId.value!)
+      : await captureStore.suggest("ai", aiCommand.value, {
+          filterStrategyId: filterStrategyId.value,
+          recommendationStrategyId: recommendationStrategyId.value
+        });
     selectedJobIds.value = ids;
     await nextTick();
+    // 应用筛选后恢复默认状态顺序，避免沿用用户之前的标题排序。
+    resetJobSort();
     jobsTable.value?.clearSelection();
     for (const job of captureStore.task?.jobs ?? []) {
       if (job.job_id && ids.includes(job.job_id)) {
         jobsTable.value?.toggleRowSelection(job, true);
       }
     }
-    ElMessage.success(`${mode === "ai" ? "AI" : "投递策略"}建议选择 ${ids.length} 个岗位`);
+    ElMessage.success(`${mode === "ai" ? "AI 初筛" : "筛选策略"}选择 ${ids.length} 个岗位`);
   } catch {
     ElMessage.error(captureStore.error ?? "生成详情采集建议失败");
+  }
+};
+
+const evaluateDeliveries = async () => {
+  if (!recommendationStrategyId.value) {
+    ElMessage.warning("请先选择岗位建议投递策略");
+    return;
+  }
+  try {
+    const evaluations = await captureStore.evaluateDeliveries(
+      recommendationStrategyId.value,
+      filterStrategyId.value,
+      aiCommand.value
+    );
+    const recommended = evaluations.filter((item) => item.decision === "recommend").length;
+    const review = evaluations.filter((item) => item.decision === "review").length;
+    ElMessage.success(`投递评估完成：建议 ${recommended}，待判断 ${review}`);
+  } catch {
+    ElMessage.error(captureStore.error ?? "生成投递建议失败");
   }
 };
 
@@ -231,6 +349,15 @@ const detailStatusType = (status?: string) => {
   if (status === "collecting" || status === "queued") return "warning";
   return "info";
 };
+
+const filterStatusLabel = (status?: string) => ({ pass: "通过", reject: "排除", review: "待判断" }[status || ""] || "未筛选");
+const filterStatusType = (status?: string) => status === "pass" ? "success" : status === "reject" ? "danger" : status === "review" ? "warning" : "info";
+const deliveryDecisionLabel = (decision?: string) => ({ recommend: "建议投递", reject: "不建议", review: "待判断" }[decision || ""] || "未评估");
+const deliveryDecisionType = (decision?: string) => decision === "recommend" ? "success" : decision === "reject" ? "danger" : decision === "review" ? "warning" : "info";
+const filterReasonText = (job: FineJobBossCapturedJob) => [
+  ...(job.filter_reasons ?? []),
+  ...(job.filter_missing_fields ?? []).map((item) => `缺少：${item}`)
+].join("；") || "尚未应用筛选策略";
 
 function formatDuration(seconds: number) {
   if (seconds < 60) return `${Math.max(1, Math.ceil(seconds))} 秒`;
@@ -365,49 +492,76 @@ function formatDuration(seconds: number) {
           <span>新岗位 {{ captureStore.task.jobs.length - captureStore.task.duplicate_jobs_count }}</span>
           <span>历史岗位 {{ captureStore.task.duplicate_jobs_count }}</span>
           <span>已选择 {{ detailStatusSummary.selected }}</span>
-          <span>建议 {{ detailStatusSummary.recommended }}</span>
+          <span>筛选通过 {{ detailStatusSummary.passed }}</span>
+          <span>待判断 {{ detailStatusSummary.review }}</span>
+          <span>已排除 {{ detailStatusSummary.rejected }}</span>
+          <span>建议投递 {{ detailStatusSummary.recommended }}</span>
           <span>详情完成 {{ detailStatusSummary.completed }}</span>
           <span>失败 {{ detailStatusSummary.failed }}</span>
         </div>
       </div>
 
       <div class="detail-actions">
+        <el-select v-model="filterStrategyId" clearable placeholder="选择岗位筛选策略">
+          <el-option v-for="item in strategiesStore.filters" :key="item.id" :label="item.name" :value="item.id" />
+        </el-select>
         <el-button :disabled="taskRunning" :loading="captureStore.suggesting" @click="applySuggestedSelection('strategy')">
-          按投递策略建议
+          应用筛选策略
         </el-button>
-        <el-input v-model="aiCommand" :disabled="taskRunning" placeholder="可选：告诉 AI 优先选择哪些岗位" clearable />
+        <el-select v-model="recommendationStrategyId" clearable placeholder="选择建议投递策略">
+          <el-option v-for="item in strategiesStore.recommendations" :key="item.id" :label="item.name" :value="item.id" />
+        </el-select>
+        <el-input v-model="aiCommand" :disabled="taskRunning" placeholder="本次额外要求（可选）" clearable />
         <el-button type="primary" plain :disabled="taskRunning" :loading="captureStore.suggesting" @click="applySuggestedSelection('ai')">
-          AI 建议
+          AI 初筛详情岗位
         </el-button>
         <el-button type="success" :disabled="taskRunning || !selectedJobIds.length" @click="captureSelectedDetails">
           采集选中的 {{ selectedJobIds.length }} 个岗位详情
+        </el-button>
+        <el-button type="warning" :disabled="taskRunning || !hasCompletedDetails" :loading="captureStore.suggesting" @click="evaluateDeliveries">
+          生成投递建议
         </el-button>
       </div>
 
       <el-table
         ref="jobsTable"
-        :data="captureStore.task.jobs"
+        :data="sortedJobs"
         row-key="job_id"
         max-height="560"
         empty-text="本次没有采集到岗位"
+        @sort-change="handleJobSortChange"
         @selection-change="handleSelectionChange"
         @row-click="openDetail"
       >
         <el-table-column type="selection" width="48" reserve-selection :selectable="canSelectJob" />
-        <el-table-column label="采集" width="90">
+        <el-table-column prop="is_previously_collected" label="采集" width="90" sortable="custom">
           <template #default="scope">
             <el-tag :type="scope.row.is_previously_collected ? 'warning' : 'success'" size="small">
               {{ scope.row.is_previously_collected ? "历史岗位" : "新岗位" }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="title" label="岗位" min-width="180" />
+        <el-table-column prop="filter_status" label="筛选" min-width="100" sortable="custom">
+          <template #default="scope">
+            <el-tooltip :content="filterReasonText(scope.row)">
+              <el-tag :type="filterStatusType(scope.row.filter_status)" size="small">{{ filterStatusLabel(scope.row.filter_status) }}</el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+        <el-table-column prop="title" label="岗位" min-width="180" sortable="custom" />
         <el-table-column prop="boss_name" label="公司" min-width="150" />
-        <el-table-column prop="company_scale" label="公司规模" width="120" />
-        <el-table-column prop="salary" label="薪资" width="110" />
+        <el-table-column prop="company_scale" label="公司规模" width="120" sortable="custom" />
+        <el-table-column prop="company_industry" label="行业" width="120" show-overflow-tooltip />
+        <el-table-column prop="salary" label="薪资" width="110" sortable="custom" />
         <el-table-column prop="location" label="地点" min-width="140" />
-        <el-table-column prop="experience" label="经验" width="100" />
+        <el-table-column prop="experience" label="经验" width="100" sortable="custom" />
         <el-table-column prop="degree" label="学历" width="90" />
+        <el-table-column prop="boss_active_status" label="招聘者活跃" width="120" sortable="custom">
+          <template #default="scope">
+            <span :class="{ 'secondary-text': !scope.row.boss_active_status }">{{ scope.row.boss_active_status || "未获取" }}</span>
+          </template>
+        </el-table-column>
+
         <el-table-column label="详情" width="110">
           <template #default="scope">
             <el-tag :type="detailStatusType(scope.row.detail_status)" size="small">
@@ -415,10 +569,13 @@ function formatDuration(seconds: number) {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="建议" min-width="180">
+        <el-table-column label="投递建议" min-width="180">
           <template #default="scope">
-            <span v-if="scope.row.recommended">{{ scope.row.recommendation_reason }}</span>
-            <span v-else class="secondary-text">—</span>
+            <el-tooltip :content="scope.row.recommendation_reason || '尚未生成投递建议'">
+              <el-tag :type="deliveryDecisionType(scope.row.delivery_evaluation?.decision)" size="small">
+                {{ deliveryDecisionLabel(scope.row.delivery_evaluation?.decision) }}
+              </el-tag>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="210" fixed="right">
@@ -453,6 +610,8 @@ function formatDuration(seconds: number) {
             <el-tag>{{ currentDetailJob.salary || "薪资未知" }}</el-tag>
             <el-tag v-if="currentDetailJob.experience" type="info">{{ currentDetailJob.experience }}</el-tag>
             <el-tag v-if="currentDetailJob.degree" type="info">{{ currentDetailJob.degree }}</el-tag>
+            <el-tag v-if="currentDetailJob.company_industry" type="info">{{ currentDetailJob.company_industry }}</el-tag>
+            <el-tag :type="currentDetailJob.boss_active_status ? 'success' : 'info'">招聘者：{{ currentDetailJob.boss_active_status || "未获取" }}</el-tag>
             <el-tag :type="detailStatusType(currentDetailJob.detail_status)">{{ detailStatusLabel(currentDetailJob.detail_status) }}</el-tag>
             <el-tag v-if="currentDetailJob.is_previously_collected" type="warning">历史岗位</el-tag>
           </div>

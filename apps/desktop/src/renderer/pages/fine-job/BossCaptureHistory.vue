@@ -16,6 +16,8 @@ const filters = reactive({
   query: "",
   city: "",
   companyScale: "",
+  companyIndustry: "",
+  companyStage: "",
   detailStatus: "",
   repeatStatus: "all" as "all" | "first_seen" | "repeated",
   sortBy: "last_collected_at" as FineJobBossHistorySortField,
@@ -30,11 +32,15 @@ const companyScaleOptions = [
   "1000-9999人",
   "10000人以上"
 ];
+const companyStageOptions = ["未融资", "不需要融资", "天使轮", "A轮", "B轮", "C轮", "D轮及以上", "已上市"];
+const companyIndustryOptions = ["人工智能", "互联网", "计算机软件", "电子商务", "云计算", "游戏", "移动互联网"];
 
 const queryPayload = computed(() => ({
   query: filters.query.trim(),
   city: filters.city,
   company_scale: filters.companyScale,
+  company_industry: filters.companyIndustry,
+  company_stage: filters.companyStage,
   detail_status: filters.detailStatus,
   repeat_status: filters.repeatStatus,
   collected_from: dateRange.value[0] ? `${dateRange.value[0]}T00:00:00Z` : "",
@@ -71,6 +77,8 @@ const reset = async () => {
     query: "",
     city: "",
     companyScale: "",
+    companyIndustry: "",
+    companyStage: "",
     detailStatus: "",
     repeatStatus: "all"
   });
@@ -205,6 +213,16 @@ watch(
               <el-option v-for="scale in companyScaleOptions" :key="scale" :label="scale" :value="scale" />
             </el-select>
           </el-form-item>
+          <el-form-item label="公司行业">
+            <el-select v-model="filters.companyIndustry" filterable clearable allow-create placeholder="全部行业">
+              <el-option v-for="item in companyIndustryOptions" :key="item" :label="item" :value="item" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="融资阶段">
+            <el-select v-model="filters.companyStage" filterable clearable allow-create placeholder="全部阶段">
+              <el-option v-for="item in companyStageOptions" :key="item" :label="item" :value="item" />
+            </el-select>
+          </el-form-item>
           <el-form-item label="详情状态">
             <el-select v-model="filters.detailStatus" clearable placeholder="全部状态">
               <el-option label="已采详情" value="completed" />
@@ -276,6 +294,8 @@ watch(
         <el-table-column prop="title" label="岗位" min-width="180" show-overflow-tooltip sortable="custom" />
         <el-table-column prop="boss_name" label="公司" min-width="150" show-overflow-tooltip sortable="custom" />
         <el-table-column prop="company_scale" label="公司规模" width="120" />
+        <el-table-column prop="company_industry" label="行业" width="120" show-overflow-tooltip />
+        <el-table-column prop="company_stage" label="融资阶段" width="110" />
         <el-table-column prop="salary" label="薪资" width="110" />
         <el-table-column prop="location" label="地点" min-width="130" show-overflow-tooltip />
         <el-table-column prop="experience" label="经验" width="100" />
@@ -343,6 +363,9 @@ watch(
         <el-divider />
         <h3>技能与标签</h3>
         <p>{{ selectedJob.skills || selectedJob.job_labels || selectedJob.tags || "暂无标签" }}</p>
+        <p>行业：{{ selectedJob.company_industry || "未知" }}；融资阶段：{{ selectedJob.company_stage || "未知" }}</p>
+        <p>福利：{{ selectedJob.welfare || "暂无" }}</p>
+        <p>招聘者活跃：{{ selectedJob.boss_active_status || "未获取" }}</p>
         <el-divider />
         <h3>职位描述</h3>
         <div v-if="selectedJob.detail?.jd" class="job-description">{{ selectedJob.detail.jd }}</div>

@@ -76,10 +76,52 @@ class BossDetailCaptureRequest(BaseModel):
 class BossDetailSuggestionRequest(BaseModel):
     mode: Literal["strategy", "ai"] = "strategy"
     command: str = ""
+    filter_strategy_id: str | None = None
+    recommendation_strategy_id: str | None = None
+    extra_requirement: str = ""
+
+
+class BossFilterApplicationRequest(BaseModel):
+    strategy_id: str
+
+
+class BossDeliveryEvaluationRequest(BaseModel):
+    recommendation_strategy_id: str
+    filter_strategy_id: str | None = None
+    extra_requirement: str = ""
+
+
+class BossJobFilterResult(BaseModel):
+    job_id: str
+    status: Literal["pass", "reject", "review"]
+    reasons: list[str] = Field(default_factory=list)
+    missing_fields: list[str] = Field(default_factory=list)
+    strategy_id: str | None = None
+
+
+class BossJobDeliveryEvaluation(BaseModel):
+    job_id: str
+    decision: Literal["recommend", "review", "reject"]
+    confidence: float
+    reasons: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    missing_fields: list[str] = Field(default_factory=list)
+    source: Literal["rules", "llm"]
 
 
 class BossDetailSuggestionResponse(BaseModel):
     selected_job_ids: list[str]
+    task: BossCaptureTaskResponse
+
+
+class BossFilterApplicationResponse(BaseModel):
+    selected_job_ids: list[str]
+    results: list[BossJobFilterResult]
+    task: BossCaptureTaskResponse
+
+
+class BossDeliveryEvaluationResponse(BaseModel):
+    evaluations: list[BossJobDeliveryEvaluation]
     task: BossCaptureTaskResponse
 
 

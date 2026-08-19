@@ -127,14 +127,67 @@ export const useFineJobBossCaptureStore = defineStore("fineJobBossCapture", () =
     }
   };
 
-  const suggest = async (mode: "strategy" | "ai", command = "") => {
+  const suggest = async (
+    mode: "strategy" | "ai",
+    command = "",
+    options: {
+      filterStrategyId?: string | null;
+      recommendationStrategyId?: string | null;
+    } = {}
+  ) => {
     if (!task.value) return [];
     suggesting.value = true;
     error.value = null;
     try {
-      const response = await api.suggestFineJobBossDetails(task.value.id, { mode, command });
+      const response = await api.suggestFineJobBossDetails(task.value.id, {
+        mode,
+        command,
+        filter_strategy_id: options.filterStrategyId,
+        recommendation_strategy_id: options.recommendationStrategyId,
+        extra_requirement: command
+      });
       task.value = response.task;
       return response.selected_job_ids;
+    } catch (errorValue) {
+      error.value = mapError(errorValue);
+      throw errorValue;
+    } finally {
+      suggesting.value = false;
+    }
+  };
+
+  const applyFilter = async (strategyId: string) => {
+    if (!task.value) return [];
+    suggesting.value = true;
+    error.value = null;
+    try {
+      const response = await api.applyFineJobBossFilter(task.value.id, strategyId);
+      task.value = response.task;
+      return response.selected_job_ids;
+    } catch (errorValue) {
+      error.value = mapError(errorValue);
+      throw errorValue;
+    } finally {
+      suggesting.value = false;
+    }
+  };
+
+  const evaluateDeliveries = async (
+    recommendationStrategyId: string,
+    filterStrategyId?: string | null,
+    extraRequirement = ""
+  ) => {
+    if (!task.value) return [];
+    suggesting.value = true;
+    error.value = null;
+    try {
+      const response = await api.evaluateFineJobBossDeliveries(task.value.id, {
+        recommendation_strategy_id: recommendationStrategyId,
+        filter_strategy_id: filterStrategyId,
+        extra_requirement: extraRequirement
+      });
+      task.value = response.task;
+      return response.evaluations;
     } catch (errorValue) {
       error.value = mapError(errorValue);
       throw errorValue;
@@ -202,6 +255,8 @@ export const useFineJobBossCaptureStore = defineStore("fineJobBossCapture", () =
     capture,
     captureDetails,
     suggest,
+    applyFilter,
+    evaluateDeliveries,
     refreshTask,
     resumePolling,
     stopPolling

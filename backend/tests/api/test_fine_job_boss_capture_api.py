@@ -231,3 +231,80 @@ def test_capture_history_job_details_starts_standalone_task(
     assert response.status_code == 202
     assert response.json()["id"] == "history-detail-task"
     assert captured["job"]["id"] == "history-job-1"
+
+
+def test_apply_filter_strategy_to_capture_task(configured_client, monkeypatch) -> None:
+    strategy = configured_client.post(
+        "/api/fine-job/strategies/filters",
+        json={
+            "name": "Agent 正职",
+            "title_include_any": ["Agent"],
+            "title_exclude": ["销售"],
+            "unknown_value_policy": "review",
+        },
+    ).json()["strategy"]
+    task = _task_payload(
+        status="completed",
+        jobs=[{"job_id": "job-1", "title": "AI Agent 开发"}],
+    )
+    monkeypatch.setattr(
+        "backend.app.routers.fine_job.boss_capture.boss_capture_task_manager.get_task",
+        lambda task_id: task,
+    )
+    monkeypatch.setattr(
+        "backend.app.routers.fine_job.boss_capture.boss_capture_task_manager.apply_filter_results",
+        lambda task_id, results: task,
+    )
+
+    response = configured_client.post(
+        "/api/fine-job/boss-capture/tasks/task-1/filters",
+        json={"strategy_id": strategy["id"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["selected_job_ids"] == ["job-1"]
+    assert response.json()["results"][0]["status"] == "pass"
+
+
+def test_rules_delivery_evaluation_endpoint_does_not_require_llm(
+    configured_client,
+    monkeypatch,
+) -> None:
+    strategy = configured_client.post(
+        "/api/fine-job/strategies/recommendations",
+        json={
+            "name": "规则投递建议",
+            "evaluation_method": "rules",
+            "required_skills": ["Python"],
+            "preferred_skills": ["LangGraph"],
+        },
+    ).json()["strategy"]
+    task = _task_payload(
+        status="completed",
+        jobs=[
+            {
+                "job_id": "job-1",
+                "title": "AI Agent 开发",
+                "skills": "Python | LangGraph",
+                "detail_status": "completed",
+                "detail": {"jd": "使用 Python 和 LangGraph 开发 Agent"},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "backend.app.routers.fine_job.boss_capture.boss_capture_task_manager.get_task",
+        lambda task_id: task,
+    )
+    monkeypatch.setattr(
+        "backend.app.routers.fine_job.boss_capture.boss_capture_task_manager.apply_delivery_evaluations",
+        lambda task_id, evaluations: task,
+    )
+
+    response = configured_client.post(
+        "/api/fine-job/boss-capture/tasks/task-1/delivery-evaluations",
+        json={"recommendation_strategy_id": strategy["id"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["evaluations"][0]["decision"] == "recommend"
+    assert response.json()["evaluations"][0]["source"] == "rules"

@@ -214,6 +214,9 @@ export interface FineJobBossCapturedJob {
   experience?: string;
   degree?: string;
   company_scale?: string;
+  company_industry?: string;
+  company_stage?: string;
+  welfare?: string;
   boss_active_status?: string;
   job_link?: string;
   tags?: string;
@@ -223,8 +226,13 @@ export interface FineJobBossCapturedJob {
   detail?: Record<string, unknown> | null;
   detail_error?: string | null;
   recommended?: boolean;
-  recommendation_source?: "strategy" | "ai" | null;
+  recommendation_source?: "strategy" | "ai" | "rules" | "llm" | null;
   recommendation_reason?: string | null;
+  filter_status?: "pass" | "reject" | "review" | null;
+  filter_reasons?: string[];
+  filter_missing_fields?: string[];
+  filter_strategy_id?: string | null;
+  delivery_evaluation?: FineJobBossDeliveryEvaluation | null;
   list_collected_at?: string | null;
   detail_collected_at?: string | null;
   is_previously_collected?: boolean;
@@ -270,6 +278,35 @@ export interface FineJobBossDetailSuggestionResponse {
   task: FineJobBossCaptureTask;
 }
 
+export interface FineJobBossFilterResult {
+  job_id: string;
+  status: "pass" | "reject" | "review";
+  reasons: string[];
+  missing_fields: string[];
+  strategy_id?: string | null;
+}
+
+export interface FineJobBossFilterApplicationResponse {
+  selected_job_ids: string[];
+  results: FineJobBossFilterResult[];
+  task: FineJobBossCaptureTask;
+}
+
+export interface FineJobBossDeliveryEvaluation {
+  job_id: string;
+  decision: "recommend" | "review" | "reject";
+  confidence: number;
+  reasons: string[];
+  risks: string[];
+  missing_fields: string[];
+  source: "rules" | "llm";
+}
+
+export interface FineJobBossDeliveryEvaluationResponse {
+  evaluations: FineJobBossDeliveryEvaluation[];
+  task: FineJobBossCaptureTask;
+}
+
 export type FineJobBossHistorySortField =
   | "last_collected_at"
   | "first_collected_at"
@@ -281,6 +318,8 @@ export interface FineJobBossHistoryQuery {
   query?: string;
   city?: string;
   company_scale?: string;
+  company_industry?: string;
+  company_stage?: string;
   detail_status?: string;
   repeat_status?: "all" | "first_seen" | "repeated";
   collected_from?: string;
@@ -332,6 +371,78 @@ export interface FineJobDeliveryStrategy {
 
 export interface FineJobDeliveryStrategyEnvelope {
   strategy: FineJobDeliveryStrategy | null;
+}
+
+export type FineJobUnknownValuePolicy = "keep" | "review" | "exclude";
+export type FineJobJobType = "full_time" | "internship" | "part_time";
+
+export interface FineJobFilterStrategy {
+  id?: string;
+  name: string;
+  enabled: boolean;
+  search_keywords: string[];
+  cities: string[];
+  title_include_any: string[];
+  title_include_all: string[];
+  title_exclude: string[];
+  company_include: string[];
+  company_exclude: string[];
+  company_scales: string[];
+  company_industries: string[];
+  company_stages: string[];
+  degrees: string[];
+  experiences: string[];
+  job_types: FineJobJobType[];
+  monthly_salary_min?: number | null;
+  monthly_salary_max_at_least?: number | null;
+  daily_salary_min?: number | null;
+  skill_include_any: string[];
+  skill_include_all: string[];
+  skill_exclude: string[];
+  boss_active_statuses: string[];
+  unknown_value_policy: FineJobUnknownValuePolicy;
+  notes: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface FineJobFilterStrategyListEnvelope {
+  strategies: FineJobFilterStrategy[];
+}
+
+export interface FineJobFilterStrategyEnvelope {
+  strategy: FineJobFilterStrategy;
+}
+
+export type FineJobEvaluationMethod = "rules" | "llm" | "hybrid";
+
+export interface FineJobRecommendationStrategy {
+  id?: string;
+  name: string;
+  enabled: boolean;
+  filter_strategy_id?: string | null;
+  resume_id?: string | null;
+  evaluation_method: FineJobEvaluationMethod;
+  desired_responsibilities: string[];
+  required_skills: string[];
+  preferred_skills: string[];
+  excluded_terms: string[];
+  preferred_industries: string[];
+  work_preferences: string;
+  risk_notes: string;
+  minimum_confidence: number;
+  insufficient_info_action: "review" | "reject";
+  notes: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface FineJobRecommendationStrategyListEnvelope {
+  strategies: FineJobRecommendationStrategy[];
+}
+
+export interface FineJobRecommendationStrategyEnvelope {
+  strategy: FineJobRecommendationStrategy;
 }
 
 export type FineJobDeliveryRunMode = "dry_run" | "live";

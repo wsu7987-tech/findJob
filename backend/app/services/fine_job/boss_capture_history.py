@@ -121,13 +121,14 @@ def record_capture_jobs(
                     """
                     INSERT INTO fj_boss_jobs (
                       id, dedupe_key, source_job_id, encrypt_job_id, title,
-                      company_name, company_scale, salary, location, experience,
-                      degree, boss_active_status, job_link, tags, skills,
+                      company_name, company_scale, company_stage, company_industry,
+                      welfare, salary, location, experience, degree,
+                      boss_active_status, job_link, tags, skills,
                       job_labels, payload_json, detail_json, detail_status,
                       detail_error, detail_collected_at, first_collected_at,
                       last_collected_at, collect_count, latest_batch_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         history_job_id,
@@ -137,6 +138,9 @@ def record_capture_jobs(
                         _text(job.get("title")),
                         _company(job),
                         _text(job.get("company_scale")),
+                        _text(job.get("company_stage")),
+                        _text(job.get("company_industry")),
+                        _text(job.get("welfare")),
                         _text(job.get("salary")),
                         _text(job.get("location")),
                         _text(job.get("experience")),
@@ -177,7 +181,8 @@ def record_capture_jobs(
                     """
                     UPDATE fj_boss_jobs
                     SET source_job_id = ?, encrypt_job_id = ?, title = ?,
-                        company_name = ?, company_scale = ?, salary = ?, location = ?,
+                        company_name = ?, company_scale = ?, company_stage = ?,
+                        company_industry = ?, welfare = ?, salary = ?, location = ?,
                         experience = ?, degree = ?, boss_active_status = ?, job_link = ?,
                         tags = ?, skills = ?, job_labels = ?, payload_json = ?,
                         detail_json = ?, detail_status = ?, detail_error = ?,
@@ -191,6 +196,9 @@ def record_capture_jobs(
                         _prefer(job.get("title"), existing["title"]),
                         _prefer(_company(job), existing["company_name"]),
                         _prefer(job.get("company_scale"), existing["company_scale"]),
+                        _prefer(job.get("company_stage"), existing["company_stage"]),
+                        _prefer(job.get("company_industry"), existing["company_industry"]),
+                        _prefer(job.get("welfare"), existing["welfare"]),
                         _prefer(job.get("salary"), existing["salary"]),
                         _prefer(job.get("location"), existing["location"]),
                         _prefer(job.get("experience"), existing["experience"]),
@@ -262,14 +270,24 @@ def update_capture_job_detail(
         if existing is None:
             return
         if status == "completed":
+            detail_payload = detail if isinstance(detail, dict) else {}
             connection.execute(
                 f"""
                 UPDATE fj_boss_jobs
                 SET detail_json = ?, detail_status = 'completed', detail_error = NULL,
-                    detail_collected_at = ?
+                    detail_collected_at = ?,
+                    boss_active_status = CASE
+                      WHEN ? <> '' THEN ? ELSE boss_active_status
+                    END
                 WHERE {identity_column} = ?
                 """,
-                (_json_or_none(detail), now, identity_value),
+                (
+                    _json_or_none(detail),
+                    now,
+                    _text(detail_payload.get("boss_active_status")),
+                    _text(detail_payload.get("boss_active_status")),
+                    identity_value,
+                ),
             )
         elif existing["detail_json"] is None:
             connection.execute(
@@ -287,7 +305,8 @@ def get_capture_history_job(db: Database, history_job_id: str) -> dict[str, obje
         row = connection.execute(
             """
             SELECT id, source_job_id, encrypt_job_id, title, company_name,
-                   company_scale, salary, location, experience, degree,
+                   company_scale, company_stage, company_industry, welfare,
+                   salary, location, experience, degree,
                    boss_active_status, job_link, tags, skills, job_labels,
                    detail_json, detail_status, detail_error, detail_collected_at,
                    first_collected_at, last_collected_at, collect_count,
@@ -312,6 +331,8 @@ def list_capture_history(
     query: str = "",
     city: str = "",
     company_scale: str = "",
+    company_industry: str = "",
+    company_stage: str = "",
     detail_status: str = "",
     repeat_status: str = "all",
     collected_from: str = "",
@@ -333,6 +354,12 @@ def list_capture_history(
     if company_scale.strip():
         conditions.append("company_scale = ?")
         values.append(company_scale.strip())
+    if company_industry.strip():
+        conditions.append("company_industry = ?")
+        values.append(company_industry.strip())
+    if company_stage.strip():
+        conditions.append("company_stage = ?")
+        values.append(company_stage.strip())
     if detail_status.strip():
         conditions.append("detail_status = ?")
         values.append(detail_status.strip())
@@ -360,7 +387,8 @@ def list_capture_history(
         rows = connection.execute(
             f"""
             SELECT id, source_job_id, encrypt_job_id, title, company_name, company_scale, salary,
-                   location, experience, degree, boss_active_status, job_link,
+                   company_stage, company_industry, welfare, location, experience,
+                   degree, boss_active_status, job_link,
                    tags, skills, job_labels, detail_json, detail_status,
                    detail_error, detail_collected_at, first_collected_at,
                    last_collected_at, collect_count, latest_batch_id
@@ -415,6 +443,9 @@ def _serialize_history_row(row) -> dict[str, object]:
         "title": row["title"],
         "boss_name": row["company_name"],
         "company_scale": row["company_scale"],
+        "company_stage": row["company_stage"],
+        "company_industry": row["company_industry"],
+        "welfare": row["welfare"],
         "salary": row["salary"],
         "location": row["location"],
         "experience": row["experience"],

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -395,6 +396,70 @@ CREATE TABLE IF NOT EXISTS fj_delivery_strategies (
   CHECK (pause_on_risk IN (0, 1))
 );
 
+CREATE TABLE IF NOT EXISTS fj_job_filter_strategies (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  search_keywords_json TEXT NOT NULL DEFAULT '[]',
+  cities_json TEXT NOT NULL DEFAULT '[]',
+  title_include_any_json TEXT NOT NULL DEFAULT '[]',
+  title_include_all_json TEXT NOT NULL DEFAULT '[]',
+  title_exclude_json TEXT NOT NULL DEFAULT '[]',
+  company_include_json TEXT NOT NULL DEFAULT '[]',
+  company_exclude_json TEXT NOT NULL DEFAULT '[]',
+  company_scales_json TEXT NOT NULL DEFAULT '[]',
+  company_industries_json TEXT NOT NULL DEFAULT '[]',
+  company_stages_json TEXT NOT NULL DEFAULT '[]',
+  degrees_json TEXT NOT NULL DEFAULT '[]',
+  experiences_json TEXT NOT NULL DEFAULT '[]',
+  job_types_json TEXT NOT NULL DEFAULT '[]',
+  monthly_salary_min INTEGER,
+  monthly_salary_max_at_least INTEGER,
+  daily_salary_min INTEGER,
+  skill_include_any_json TEXT NOT NULL DEFAULT '[]',
+  skill_include_all_json TEXT NOT NULL DEFAULT '[]',
+  skill_exclude_json TEXT NOT NULL DEFAULT '[]',
+  boss_active_statuses_json TEXT NOT NULL DEFAULT '[]',
+  unknown_value_policy TEXT NOT NULL DEFAULT 'review',
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (enabled IN (0, 1)),
+  CHECK (unknown_value_policy IN ('keep', 'review', 'exclude'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_job_filter_strategies_updated_at
+  ON fj_job_filter_strategies(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_job_recommendation_strategies (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  filter_strategy_id TEXT,
+  resume_id TEXT,
+  evaluation_method TEXT NOT NULL DEFAULT 'hybrid',
+  desired_responsibilities_json TEXT NOT NULL DEFAULT '[]',
+  required_skills_json TEXT NOT NULL DEFAULT '[]',
+  preferred_skills_json TEXT NOT NULL DEFAULT '[]',
+  excluded_terms_json TEXT NOT NULL DEFAULT '[]',
+  preferred_industries_json TEXT NOT NULL DEFAULT '[]',
+  work_preferences TEXT NOT NULL DEFAULT '',
+  risk_notes TEXT NOT NULL DEFAULT '',
+  minimum_confidence REAL NOT NULL DEFAULT 0.7,
+  insufficient_info_action TEXT NOT NULL DEFAULT 'review',
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (filter_strategy_id) REFERENCES fj_job_filter_strategies(id) ON DELETE SET NULL,
+  FOREIGN KEY (resume_id) REFERENCES fj_resumes(id) ON DELETE SET NULL,
+  CHECK (enabled IN (0, 1)),
+  CHECK (evaluation_method IN ('rules', 'llm', 'hybrid')),
+  CHECK (insufficient_info_action IN ('review', 'reject'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_job_recommendation_strategies_updated_at
+  ON fj_job_recommendation_strategies(updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS fj_delivery_runs (
   id TEXT PRIMARY KEY,
   mode TEXT NOT NULL DEFAULT 'dry_run',
@@ -473,6 +538,9 @@ CREATE TABLE IF NOT EXISTS fj_boss_jobs (
   title TEXT NOT NULL DEFAULT '',
   company_name TEXT NOT NULL DEFAULT '',
   company_scale TEXT NOT NULL DEFAULT '',
+  company_stage TEXT NOT NULL DEFAULT '',
+  company_industry TEXT NOT NULL DEFAULT '',
+  welfare TEXT NOT NULL DEFAULT '',
   salary TEXT NOT NULL DEFAULT '',
   location TEXT NOT NULL DEFAULT '',
   experience TEXT NOT NULL DEFAULT '',
@@ -554,6 +622,7 @@ class Database:
             self._ensure_qa_message_trace_columns(connection)
             self._ensure_run_record_executor_columns(connection)
             self._ensure_fj_platform_session_columns(connection)
+            self._ensure_fj_boss_job_columns(connection)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -735,3 +804,50 @@ class Database:
         }.items():
             if column not in candidate_columns:
                 connection.execute(ddl)
+
+    def _ensure_fj_boss_job_columns(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(fj_boss_jobs)")
+        }
+        migrations = {
+            "company_stage": (
+                "ALTER TABLE fj_boss_jobs ADD COLUMN company_stage TEXT NOT NULL DEFAULT ''"
+            ),
+            "company_industry": (
+                "ALTER TABLE fj_boss_jobs ADD COLUMN company_industry TEXT NOT NULL DEFAULT ''"
+            ),
+            "welfare": "ALTER TABLE fj_boss_jobs ADD COLUMN welfare TEXT NOT NULL DEFAULT ''",
+        }
+        for column, ddl in migrations.items():
+            if column not in columns:
+                connection.execute(ddl)
+
+        # 旧岗位已经保留完整 payload；迁移时回填正式列，避免要求用户重新采集。
+        rows = connection.execute(
+            """
+            SELECT id, payload_json, company_stage, company_industry, welfare
+            FROM fj_boss_jobs
+            WHERE company_stage = '' OR company_industry = '' OR welfare = ''
+            """
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            connection.execute(
+                """
+                UPDATE fj_boss_jobs
+                SET company_stage = ?, company_industry = ?, welfare = ?
+                WHERE id = ?
+                """,
+                (
+                    row["company_stage"] or str(payload.get("company_stage") or ""),
+                    row["company_industry"] or str(payload.get("company_industry") or ""),
+                    row["welfare"] or str(payload.get("welfare") or ""),
+                    row["id"],
+                ),
+            )

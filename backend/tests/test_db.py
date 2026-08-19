@@ -98,12 +98,19 @@ def test_database_initializes_boss_capture_history_tables(app_paths: dict[str, s
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
+        boss_job_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(fj_boss_jobs)").fetchall()
+        }
 
     assert {
         "fj_boss_capture_batches",
         "fj_boss_jobs",
         "fj_boss_capture_batch_jobs",
+        "fj_job_filter_strategies",
+        "fj_job_recommendation_strategies",
     } <= tables
+    assert {"company_stage", "company_industry", "welfare"} <= boss_job_columns
 
 
 def test_database_initializes_retrieval_index_versions_schema(

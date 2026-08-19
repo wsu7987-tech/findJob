@@ -249,6 +249,49 @@ class BossCaptureTaskManager:
             task["updated_at"] = utc_now()
         return self.get_task(task_id)
 
+    def apply_filter_results(
+        self,
+        task_id: str,
+        results: list[dict[str, object]],
+    ) -> dict[str, object]:
+        by_id = {str(result.get("job_id") or ""): result for result in results}
+        with self._lock:
+            task = self._require_task(task_id)
+            for job in task["jobs"]:
+                result = by_id.get(str(job.get("job_id") or ""))
+                if not result:
+                    continue
+                job["filter_status"] = result.get("status")
+                job["filter_reasons"] = list(result.get("reasons") or [])
+                job["filter_missing_fields"] = list(result.get("missing_fields") or [])
+                job["filter_strategy_id"] = result.get("strategy_id")
+            task["updated_at"] = utc_now()
+        return self.get_task(task_id)
+
+    def apply_delivery_evaluations(
+        self,
+        task_id: str,
+        evaluations: list[dict[str, object]],
+    ) -> dict[str, object]:
+        by_id = {
+            str(evaluation.get("job_id") or ""): evaluation
+            for evaluation in evaluations
+        }
+        with self._lock:
+            task = self._require_task(task_id)
+            for job in task["jobs"]:
+                evaluation = by_id.get(str(job.get("job_id") or ""))
+                if not evaluation:
+                    continue
+                job["delivery_evaluation"] = evaluation
+                job["recommended"] = evaluation.get("decision") == "recommend"
+                job["recommendation_source"] = evaluation.get("source")
+                job["recommendation_reason"] = "；".join(
+                    str(value) for value in evaluation.get("reasons") or []
+                )
+            task["updated_at"] = utc_now()
+        return self.get_task(task_id)
+
     def _run_capture(self, task_id: str) -> None:
         with self._lock:
             task = self._require_task(task_id)
@@ -399,7 +442,11 @@ class BossCaptureTaskManager:
             if job:
                 job["detail_status"] = status
                 if status == "completed":
-                    job["detail"] = event.get("detail")
+                    detail = event.get("detail")
+                    job["detail"] = detail
+                    if isinstance(detail, dict) and detail.get("boss_active_status"):
+                        # 列表接口常不返回活跃状态，详情完成后同步到表格正式字段。
+                        job["boss_active_status"] = str(detail["boss_active_status"])
                     job["detail_error"] = None
                     job["detail_collected_at"] = utc_now()
                 elif status == "failed":
@@ -478,6 +525,11 @@ class BossCaptureTaskManager:
                     "recommended": previous.get("recommended", False),
                     "recommendation_source": previous.get("recommendation_source"),
                     "recommendation_reason": previous.get("recommendation_reason"),
+                    "filter_status": previous.get("filter_status"),
+                    "filter_reasons": previous.get("filter_reasons", []),
+                    "filter_missing_fields": previous.get("filter_missing_fields", []),
+                    "filter_strategy_id": previous.get("filter_strategy_id"),
+                    "delivery_evaluation": previous.get("delivery_evaluation"),
                     "list_collected_at": previous.get("list_collected_at") or utc_now(),
                     "detail_collected_at": previous.get("detail_collected_at"),
                 }

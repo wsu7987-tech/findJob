@@ -13,6 +13,12 @@
   FineJobIntentEnvelope,
   FineJobDeliveryStrategy,
   FineJobDeliveryStrategyEnvelope,
+  FineJobFilterStrategy,
+  FineJobFilterStrategyEnvelope,
+  FineJobFilterStrategyListEnvelope,
+  FineJobRecommendationStrategy,
+  FineJobRecommendationStrategyEnvelope,
+  FineJobRecommendationStrategyListEnvelope,
   FineJobActionLogListEnvelope,
   FineJobDeliveryCandidateListEnvelope,
   FineJobDeliveryRunCreateRequest,
@@ -27,6 +33,8 @@
   FineJobBossCaptureRequest,
   FineJobBossCaptureTask,
   FineJobBossDetailSuggestionResponse,
+  FineJobBossFilterApplicationResponse,
+  FineJobBossDeliveryEvaluationResponse,
   FineJobBossHistoryQuery,
   FineJobBossHistoryResponse,
   FineJobBossSearchPageRequest,
@@ -409,6 +417,51 @@ export const api = {
       body: JSON.stringify(payload)
     });
   },
+  async listFineJobFilterStrategies() {
+    return request<FineJobFilterStrategyListEnvelope>("/api/fine-job/strategies/filters");
+  },
+  async createFineJobFilterStrategy(payload: FineJobFilterStrategy) {
+    return request<FineJobFilterStrategyEnvelope>("/api/fine-job/strategies/filters", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  },
+  async updateFineJobFilterStrategy(strategyId: string, payload: FineJobFilterStrategy) {
+    return request<FineJobFilterStrategyEnvelope>(
+      `/api/fine-job/strategies/filters/${strategyId}`,
+      { method: "PUT", body: JSON.stringify(payload) }
+    );
+  },
+  async deleteFineJobFilterStrategy(strategyId: string) {
+    return request<void>(`/api/fine-job/strategies/filters/${strategyId}`, {
+      method: "DELETE"
+    });
+  },
+  async listFineJobRecommendationStrategies() {
+    return request<FineJobRecommendationStrategyListEnvelope>(
+      "/api/fine-job/strategies/recommendations"
+    );
+  },
+  async createFineJobRecommendationStrategy(payload: FineJobRecommendationStrategy) {
+    return request<FineJobRecommendationStrategyEnvelope>(
+      "/api/fine-job/strategies/recommendations",
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
+  async updateFineJobRecommendationStrategy(
+    strategyId: string,
+    payload: FineJobRecommendationStrategy
+  ) {
+    return request<FineJobRecommendationStrategyEnvelope>(
+      `/api/fine-job/strategies/recommendations/${strategyId}`,
+      { method: "PUT", body: JSON.stringify(payload) }
+    );
+  },
+  async deleteFineJobRecommendationStrategy(strategyId: string) {
+    return request<void>(`/api/fine-job/strategies/recommendations/${strategyId}`, {
+      method: "DELETE"
+    });
+  },
   async listFineJobDeliveryRuns() {
     return request<FineJobDeliveryRunListEnvelope>("/api/fine-job/delivery-runs");
   },
@@ -520,7 +573,13 @@ export const api = {
   },
   async suggestFineJobBossDetails(
     taskId: string,
-    payload: { mode: "strategy" | "ai"; command?: string }
+    payload: {
+      mode: "strategy" | "ai";
+      command?: string;
+      filter_strategy_id?: string | null;
+      recommendation_strategy_id?: string | null;
+      extra_requirement?: string;
+    }
   ) {
     return request<FineJobBossDetailSuggestionResponse>(
       `/api/fine-job/boss-capture/tasks/${taskId}/suggestions`,
@@ -528,6 +587,25 @@ export const api = {
         method: "POST",
         body: JSON.stringify(payload)
       }
+    );
+  },
+  async applyFineJobBossFilter(taskId: string, strategyId: string) {
+    return request<FineJobBossFilterApplicationResponse>(
+      `/api/fine-job/boss-capture/tasks/${taskId}/filters`,
+      { method: "POST", body: JSON.stringify({ strategy_id: strategyId }) }
+    );
+  },
+  async evaluateFineJobBossDeliveries(
+    taskId: string,
+    payload: {
+      recommendation_strategy_id: string;
+      filter_strategy_id?: string | null;
+      extra_requirement?: string;
+    }
+  ) {
+    return request<FineJobBossDeliveryEvaluationResponse>(
+      `/api/fine-job/boss-capture/tasks/${taskId}/delivery-evaluations`,
+      { method: "POST", body: JSON.stringify(payload) }
     );
   },
   async listFineJobResumes() {
