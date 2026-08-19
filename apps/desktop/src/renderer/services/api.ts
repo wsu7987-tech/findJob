@@ -601,6 +601,7 @@ export const api = {
       recommendation_strategy_id: string;
       filter_strategy_id?: string | null;
       extra_requirement?: string;
+      job_ids?: string[];
     }
   ) {
     return request<FineJobBossDeliveryEvaluationResponse>(

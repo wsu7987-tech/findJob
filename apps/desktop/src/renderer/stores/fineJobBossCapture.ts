@@ -175,7 +175,8 @@ export const useFineJobBossCaptureStore = defineStore("fineJobBossCapture", () =
   const evaluateDeliveries = async (
     recommendationStrategyId: string,
     filterStrategyId?: string | null,
-    extraRequirement = ""
+    extraRequirement = "",
+    jobIds?: string[]
   ) => {
     if (!task.value) return [];
     suggesting.value = true;
@@ -184,7 +185,8 @@ export const useFineJobBossCaptureStore = defineStore("fineJobBossCapture", () =
       const response = await api.evaluateFineJobBossDeliveries(task.value.id, {
         recommendation_strategy_id: recommendationStrategyId,
         filter_strategy_id: filterStrategyId,
-        extra_requirement: extraRequirement
+        extra_requirement: extraRequirement,
+        job_ids: jobIds
       });
       task.value = response.task;
       return response.evaluations;

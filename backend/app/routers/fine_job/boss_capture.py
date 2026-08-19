@@ -341,10 +341,18 @@ def evaluate_boss_deliveries(
     filter_strategy = (
         get_filter_strategy(db, str(filter_strategy_id)) if filter_strategy_id else None
     )
+    # 投递建议只处理前端明确选中的已完成详情岗位；其他岗位保持原状态。
+    requested_job_ids = set(payload.job_ids) if payload.job_ids is not None else None
+    completed_jobs = [
+        job
+        for job in task["jobs"]
+        if job.get("detail_status") == "completed"
+        and (requested_job_ids is None or str(job.get("job_id") or "") in requested_job_ids)
+    ]
     resume_id = str(recommendation_strategy.get("resume_id") or "")
     facts = list_resume_facts(db, resume_id) if resume_id else []
     evaluations = evaluate_delivery_jobs(
-        task["jobs"],
+        completed_jobs,
         filter_strategy=filter_strategy,
         recommendation_strategy=recommendation_strategy,
         resume_facts=facts,

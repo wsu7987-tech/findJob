@@ -86,6 +86,11 @@ export const mapApiError = (
     return apiErrorMap[payload.error_category];
   }
 
+  // 业务接口也可能返回 404（例如内存任务在后端重启后已失效），优先展示后端给出的具体原因。
+  if (typeof payload.error_message === "string" && payload.error_message.length > 0) {
+    return payload.error_message;
+  }
+
   if (payload.statusCode === 404 || payload.statusCode === 501) {
     return "当前后端暂未提供这个接口，请确认后端版本是否已更新。";
   }

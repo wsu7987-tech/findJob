@@ -91,6 +91,16 @@ describe("mapApiError", () => {
     expect(mapApiError({ error_category: "FETCH_FAILED" })).toContain("抓取");
     expect(mapApiError({ error_category: "UNKNOWN" })).toContain("未知");
   });
+
+  it("keeps a concrete backend message for business 404 responses", () => {
+    expect(
+      mapApiError({
+        statusCode: 404,
+        error_category: "TASK_NOT_FOUND",
+        error_message: "BOSS 采集任务不存在。"
+      })
+    ).toBe("BOSS 采集任务不存在。");
+  });
 });
 
 describe("deriveSourceLabel", () => {

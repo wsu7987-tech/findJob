@@ -89,6 +89,7 @@ class BossDeliveryEvaluationRequest(BaseModel):
     recommendation_strategy_id: str
     filter_strategy_id: str | None = None
     extra_requirement: str = ""
+    job_ids: list[str] | None = None
 
 
 class BossJobFilterResult(BaseModel):

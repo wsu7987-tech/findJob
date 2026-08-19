@@ -308,3 +308,64 @@ def test_rules_delivery_evaluation_endpoint_does_not_require_llm(
     assert response.status_code == 200
     assert response.json()["evaluations"][0]["decision"] == "recommend"
     assert response.json()["evaluations"][0]["source"] == "rules"
+
+
+def test_delivery_evaluation_only_uses_selected_completed_details(
+    configured_client,
+    monkeypatch,
+) -> None:
+    strategy = configured_client.post(
+        "/api/fine-job/strategies/recommendations",
+        json={"name": "按选中岗位评估", "evaluation_method": "rules"},
+    ).json()["strategy"]
+    task = _task_payload(
+        status="completed",
+        jobs=[
+            {
+                "job_id": "job-selected",
+                "title": "已选岗位",
+                "detail_status": "completed",
+                "detail": {"jd": "完整 JD"},
+            },
+            {
+                "job_id": "job-unselected",
+                "title": "未选岗位",
+                "detail_status": "completed",
+                "detail": {"jd": "完整 JD"},
+            },
+            {
+                "job_id": "job-pending",
+                "title": "未完成详情岗位",
+                "detail_status": "not_collected",
+            },
+        ],
+    )
+    evaluated_job_ids = []
+
+    def evaluate(jobs, **_kwargs):
+        evaluated_job_ids.extend(job["job_id"] for job in jobs)
+        return []
+
+    monkeypatch.setattr(
+        "backend.app.routers.fine_job.boss_capture.boss_capture_task_manager.get_task",
+        lambda task_id: task,
+    )
+    monkeypatch.setattr(
+        "backend.app.routers.fine_job.boss_capture.evaluate_delivery_jobs",
+        evaluate,
+    )
+    monkeypatch.setattr(
+        "backend.app.routers.fine_job.boss_capture.boss_capture_task_manager.apply_delivery_evaluations",
+        lambda task_id, evaluations: task,
+    )
+
+    response = configured_client.post(
+        "/api/fine-job/boss-capture/tasks/task-1/delivery-evaluations",
+        json={
+            "recommendation_strategy_id": strategy["id"],
+            "job_ids": ["job-selected"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert evaluated_job_ids == ["job-selected"]

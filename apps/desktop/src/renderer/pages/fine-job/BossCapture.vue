@@ -158,7 +158,19 @@ const detailStatusSummary = computed(() => {
     failed: jobs.filter((job) => job.detail_status === "failed").length
   };
 });
-const hasCompletedDetails = computed(() => detailStatusSummary.value.completed > 0);
+const selectedJobs = computed(() =>
+  (captureStore.task?.jobs ?? []).filter((job) => selectedJobIds.value.includes(job.job_id || ""))
+);
+const selectedDetailJobIds = computed(() =>
+  selectedJobs.value
+    .filter((job) => job.job_id && job.detail_status !== "completed" && job.detail_status !== "collecting")
+    .map((job) => job.job_id as string)
+);
+const selectedDeliveryJobIds = computed(() =>
+  selectedJobs.value
+    .filter((job) => job.job_id && job.detail_status === "completed" && !job.delivery_evaluation)
+    .map((job) => job.job_id as string)
+);
 
 onMounted(async () => {
   await Promise.all([
@@ -279,16 +291,21 @@ const applySuggestedSelection = async (mode: "strategy" | "ai") => {
   }
 };
 
-const evaluateDeliveries = async () => {
+const evaluateDeliveries = async (jobIds: string[]) => {
   if (!recommendationStrategyId.value) {
     ElMessage.warning("请先选择岗位建议投递策略");
+    return;
+  }
+  if (!jobIds.length) {
+    ElMessage.warning("请先选择尚未获取投递建议的已完成详情岗位");
     return;
   }
   try {
     const evaluations = await captureStore.evaluateDeliveries(
       recommendationStrategyId.value,
       filterStrategyId.value,
-      aiCommand.value
+      aiCommand.value,
+      jobIds
     );
     const recommended = evaluations.filter((item) => item.decision === "recommend").length;
     const review = evaluations.filter((item) => item.decision === "review").length;
@@ -298,14 +315,22 @@ const evaluateDeliveries = async () => {
   }
 };
 
+const evaluateSingleDelivery = async (job: FineJobBossCapturedJob) => {
+  if (job.detail_status !== "completed" || !job.job_id) {
+    ElMessage.warning("请先完成该岗位详情采集");
+    return;
+  }
+  await evaluateDeliveries([job.job_id]);
+};
+
 const captureSelectedDetails = async () => {
-  if (!selectedJobIds.value.length) {
+  if (!selectedDetailJobIds.value.length) {
     ElMessage.warning("请先选择需要采集详情的岗位");
     return;
   }
   try {
-    await captureStore.captureDetails(selectedJobIds.value);
-    ElMessage.success(`已开始采集选中的 ${selectedJobIds.value.length} 个岗位详情`);
+    await captureStore.captureDetails(selectedDetailJobIds.value);
+    ElMessage.success(`已开始采集选中的 ${selectedDetailJobIds.value.length} 个岗位详情`);
   } catch {
     ElMessage.error(captureStore.error ?? "启动岗位详情采集失败");
   }
@@ -325,6 +350,8 @@ const captureSingleDetail = async (job: FineJobBossCapturedJob) => {
 
 const detailActionLabel = (job: FineJobBossCapturedJob) =>
   job.detail_status === "completed" || Boolean(job.detail) ? "重新采集详情" : "采集详情";
+const deliveryDetailActionLabel = (job: FineJobBossCapturedJob) =>
+  job.delivery_evaluation ? "重新获取投递建议" : "获取投递建议";
 
 const openDetail = (job: FineJobBossCapturedJob) => {
   selectedJobId.value = job.job_id || null;
@@ -332,7 +359,7 @@ const openDetail = (job: FineJobBossCapturedJob) => {
 };
 
 const canSelectJob = (job: FineJobBossCapturedJob) =>
-  job.detail_status !== "completed" && job.detail_status !== "collecting";
+  job.detail_status !== "queued" && job.detail_status !== "collecting";
 
 const detailStatusLabel = (status?: string) =>
   ({
@@ -354,6 +381,12 @@ const filterStatusLabel = (status?: string) => ({ pass: "通过", reject: "排�
 const filterStatusType = (status?: string) => status === "pass" ? "success" : status === "reject" ? "danger" : status === "review" ? "warning" : "info";
 const deliveryDecisionLabel = (decision?: string) => ({ recommend: "建议投递", reject: "不建议", review: "待判断" }[decision || ""] || "未评估");
 const deliveryDecisionType = (decision?: string) => decision === "recommend" ? "success" : decision === "reject" ? "danger" : decision === "review" ? "warning" : "info";
+const deliveryEvaluationReasons = (job: FineJobBossCapturedJob) =>
+  (job.delivery_evaluation?.reasons ?? []).join("；") || job.recommendation_reason || "暂无评估理由";
+const deliveryEvaluationRisks = (job: FineJobBossCapturedJob) =>
+  (job.delivery_evaluation?.risks ?? []).join("；");
+const deliveryEvaluationMissingFields = (job: FineJobBossCapturedJob) =>
+  (job.delivery_evaluation?.missing_fields ?? []).join("、");
 const filterReasonText = (job: FineJobBossCapturedJob) => [
   ...(job.filter_reasons ?? []),
   ...(job.filter_missing_fields ?? []).map((item) => `缺少：${item}`)
@@ -446,7 +479,7 @@ function formatDuration(seconds: number) {
         </div>
         <div class="capture-options">
           <el-switch v-model="form.includeDetails" />
-          <span>采集列表后，自动获取全部岗位详情</span>
+          <span>采集列表后，自动获取全部岗位详情（不建议）</span>
         </div>
         <el-alert
           v-if="form.includeDetails"
@@ -515,11 +548,16 @@ function formatDuration(seconds: number) {
         <el-button type="primary" plain :disabled="taskRunning" :loading="captureStore.suggesting" @click="applySuggestedSelection('ai')">
           AI 初筛详情岗位
         </el-button>
-        <el-button type="success" :disabled="taskRunning || !selectedJobIds.length" @click="captureSelectedDetails">
-          采集选中的 {{ selectedJobIds.length }} 个岗位详情
+        <el-button type="success" :disabled="taskRunning || !selectedDetailJobIds.length" @click="captureSelectedDetails">
+          采集选中的 {{ selectedDetailJobIds.length }} 个岗位详情
         </el-button>
-        <el-button type="warning" :disabled="taskRunning || !hasCompletedDetails" :loading="captureStore.suggesting" @click="evaluateDeliveries">
-          生成投递建议
+        <el-button
+          type="warning"
+          :disabled="taskRunning || !recommendationStrategyId || !selectedDeliveryJobIds.length"
+          :loading="captureStore.suggesting"
+          @click="evaluateDeliveries(selectedDeliveryJobIds)"
+        >
+          获取未评估岗位投递建议（{{ selectedDeliveryJobIds.length }}）
         </el-button>
       </div>
 
@@ -548,11 +586,20 @@ function formatDuration(seconds: number) {
             </el-tooltip>
           </template>
         </el-table-column>
+        <el-table-column label="投递建议" min-width="100">
+          <template #default="scope">
+            <el-tooltip :content="scope.row.recommendation_reason || '尚未生成投递建议'">
+              <el-tag :type="deliveryDecisionType(scope.row.delivery_evaluation?.decision)" size="small">
+                {{ deliveryDecisionLabel(scope.row.delivery_evaluation?.decision) }}
+              </el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
         <el-table-column prop="title" label="岗位" min-width="180" sortable="custom" />
         <el-table-column prop="boss_name" label="公司" min-width="150" />
+        <el-table-column prop="salary" label="薪资" width="110" sortable="custom" />
         <el-table-column prop="company_scale" label="公司规模" width="120" sortable="custom" />
         <el-table-column prop="company_industry" label="行业" width="120" show-overflow-tooltip />
-        <el-table-column prop="salary" label="薪资" width="110" sortable="custom" />
         <el-table-column prop="location" label="地点" min-width="140" />
         <el-table-column prop="experience" label="经验" width="100" sortable="custom" />
         <el-table-column prop="degree" label="学历" width="90" />
@@ -569,19 +616,22 @@ function formatDuration(seconds: number) {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="投递建议" min-width="180">
-          <template #default="scope">
-            <el-tooltip :content="scope.row.recommendation_reason || '尚未生成投递建议'">
-              <el-tag :type="deliveryDecisionType(scope.row.delivery_evaluation?.decision)" size="small">
-                {{ deliveryDecisionLabel(scope.row.delivery_evaluation?.decision) }}
-              </el-tag>
-            </el-tooltip>
-          </template>
-        </el-table-column>
+
         <el-table-column label="操作" width="210" fixed="right">
           <template #default="scope">
             <el-button link type="primary" @click.stop="openDetail(scope.row)">查看详情</el-button>
             <el-button
+              v-if="scope.row.detail_status === 'completed' && !scope.row.delivery_evaluation"
+              link
+              type="warning"
+              :disabled="taskRunning || !scope.row.job_id || !recommendationStrategyId"
+              :loading="captureStore.suggesting"
+              @click.stop="evaluateSingleDelivery(scope.row)"
+            >
+              获取投递详情
+            </el-button>
+            <el-button
+              v-else-if="scope.row.detail_status !== 'completed'"
               link
               type="success"
               :disabled="taskRunning || !scope.row.job_id"
@@ -619,7 +669,24 @@ function formatDuration(seconds: number) {
 
         <el-divider />
         <h3>推荐信息</h3>
-        <p v-if="currentDetailJob.recommended">{{ currentDetailJob.recommendation_reason }}</p>
+        <template v-if="currentDetailJob.delivery_evaluation">
+          <div class="detail-evaluation-summary">
+            <el-tag :type="deliveryDecisionType(currentDetailJob.delivery_evaluation.decision)">
+              {{ deliveryDecisionLabel(currentDetailJob.delivery_evaluation.decision) }}
+            </el-tag>
+            <span class="secondary-text">
+              置信度：{{ Math.round(currentDetailJob.delivery_evaluation.confidence * 100) }}%
+            </span>
+          </div>
+          <p>{{ deliveryEvaluationReasons(currentDetailJob) }}</p>
+          <p v-if="deliveryEvaluationRisks(currentDetailJob)" class="evaluation-warning">
+            风险：{{ deliveryEvaluationRisks(currentDetailJob) }}
+          </p>
+          <p v-if="deliveryEvaluationMissingFields(currentDetailJob)" class="secondary-text">
+            缺失信息：{{ deliveryEvaluationMissingFields(currentDetailJob) }}
+          </p>
+        </template>
+        <p v-else-if="currentDetailJob.recommended">{{ currentDetailJob.recommendation_reason }}</p>
         <p v-else class="secondary-text">当前没有策略或 AI 推荐记录。</p>
 
         <el-divider />
@@ -639,6 +706,15 @@ function formatDuration(seconds: number) {
           @click="captureSingleDetail(currentDetailJob)"
         >
           {{ detailActionLabel(currentDetailJob) }}
+        </el-button>
+        <el-button
+          v-if="currentDetailJob.detail_status === 'completed'"
+          type="warning"
+          :disabled="taskRunning || !recommendationStrategyId"
+          :loading="captureStore.suggesting"
+          @click="evaluateSingleDelivery(currentDetailJob)"
+        >
+          {{ deliveryDetailActionLabel(currentDetailJob) }}
         </el-button>
 
         <el-divider />
@@ -702,6 +778,17 @@ function formatDuration(seconds: number) {
 
 .job-detail-heading h2 {
   margin-bottom: 6px;
+}
+
+.detail-evaluation-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.evaluation-warning {
+  color: var(--el-color-warning);
 }
 
 .job-description {

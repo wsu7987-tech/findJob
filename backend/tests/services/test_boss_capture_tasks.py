@@ -150,6 +150,44 @@ def test_force_recaptures_a_completed_job_detail(monkeypatch, tmp_path: Path) ->
     assert refreshed["jobs"][0]["detail"]["jd"] == "重新采集的岗位描述"
 
 
+def test_delivery_evaluation_is_written_to_job_detail_snapshot(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        "backend.app.services.fine_job.boss_capture_tasks.Thread",
+        ImmediateThread,
+    )
+    manager = BossCaptureTaskManager(scraper=FakeScraper())
+    task = manager.start_capture(
+        BossCaptureRequest(
+            keyword="Python",
+            city="上海",
+            pages=1,
+            include_details=True,
+            output_dir=tmp_path,
+        ),
+        output_dir=tmp_path,
+    )
+
+    updated = manager.apply_delivery_evaluations(
+        task["id"],
+        [
+            {
+                "job_id": "job-1",
+                "decision": "review",
+                "confidence": 0.45,
+                "reasons": ["信息不足"],
+                "risks": ["缺少关键信息"],
+                "missing_fields": ["完整 JD"],
+                "source": "rules",
+            }
+        ],
+    )
+
+    job = updated["jobs"][0]
+    assert job["delivery_evaluation"]["decision"] == "review"
+    assert job["recommendation_reason"] == "信息不足"
+    assert job["recommended"] is False
+
+
 def test_history_detail_task_updates_detail_without_incrementing_count(
     monkeypatch,
     tmp_path: Path,
