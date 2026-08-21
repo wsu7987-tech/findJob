@@ -589,6 +589,79 @@ CREATE TABLE IF NOT EXISTS fj_boss_capture_batch_jobs (
 CREATE INDEX IF NOT EXISTS idx_fj_boss_capture_batch_jobs_job_id
   ON fj_boss_capture_batch_jobs(job_id, collected_at DESC);
 
+CREATE TABLE IF NOT EXISTS fj_job_evaluations (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  evaluation_version TEXT NOT NULL DEFAULT '2.0',
+  recommendation_strategy_id TEXT,
+  filter_strategy_id TEXT,
+  resume_id TEXT,
+  source TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 0,
+  evaluation_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+  CHECK (source IN ('rules', 'llm')),
+  CHECK (decision IN ('recommend', 'review', 'reject'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_job_evaluations_job_created_at
+  ON fj_job_evaluations(job_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_review_items (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  evaluation_id TEXT NOT NULL,
+  action_type TEXT NOT NULL DEFAULT 'start_conversation',
+  status TEXT NOT NULL DEFAULT 'pending',
+  ai_decision TEXT NOT NULL,
+  draft_message TEXT NOT NULL DEFAULT '',
+  final_message TEXT NOT NULL DEFAULT '',
+  resolution_note TEXT NOT NULL DEFAULT '',
+  auto_approved INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  resolved_at TEXT,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+  FOREIGN KEY (evaluation_id) REFERENCES fj_job_evaluations(id) ON DELETE CASCADE,
+  UNIQUE (evaluation_id, action_type),
+  CHECK (action_type IN ('start_conversation')),
+  CHECK (status IN ('pending', 'approved', 'rejected', 'dismissed')),
+  CHECK (ai_decision IN ('recommend', 'review', 'reject')),
+  CHECK (auto_approved IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_review_items_status_created_at
+  ON fj_review_items(status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_automation_actions (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  evaluation_id TEXT NOT NULL,
+  review_item_id TEXT NOT NULL,
+  action_type TEXT NOT NULL DEFAULT 'start_conversation',
+  status TEXT NOT NULL DEFAULT 'queued',
+  idempotency_key TEXT NOT NULL UNIQUE,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  lease_owner TEXT,
+  lease_expires_at TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+  FOREIGN KEY (evaluation_id) REFERENCES fj_job_evaluations(id) ON DELETE CASCADE,
+  FOREIGN KEY (review_item_id) REFERENCES fj_review_items(id) ON DELETE CASCADE,
+  CHECK (action_type IN ('start_conversation')),
+  CHECK (status IN ('queued', 'leased', 'succeeded', 'failed', 'blocked', 'unknown', 'cancelled')),
+  CHECK (attempt_count >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_automation_actions_status_created_at
+  ON fj_automation_actions(status, created_at ASC);
+
 CREATE TABLE IF NOT EXISTS fj_action_logs (
   id TEXT PRIMARY KEY,
   run_id TEXT,

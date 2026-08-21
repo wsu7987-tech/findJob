@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
+import backend.app.services.fine_job.job_evaluation as job_evaluation_service
+
 from backend.app.services.fine_job.job_evaluation import (
     evaluate_delivery_jobs,
     evaluate_filter_strategy,
@@ -119,3 +124,96 @@ def test_rules_delivery_evaluation_works_without_llm() -> None:
 
     assert result["decision"] == "recommend"
     assert result["source"] == "rules"
+    assert result["evaluation_version"] == "2.0"
+    assert result["greeting_draft"]["status"] == "ready"
+
+
+def test_llm_v2_evaluates_exactly_one_job_per_call(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class DummyProvider:
+        def answer(self, **kwargs):
+            calls.append(kwargs)
+            job_id = str(kwargs["evidence_citations"][0]["citation_id"])
+            return SimpleNamespace(
+                answer=json.dumps(
+                    {
+                        "job_id": job_id,
+                        "decision": "recommend",
+                        "confidence": 0.86,
+                        "summary": "技能和项目方向匹配",
+                        "reasons": ["Python 技能匹配"],
+                        "risks": [],
+                        "missing_information": [],
+                        "hard_requirements": [
+                            {
+                                "name": "Python",
+                                "status": "pass",
+                                "jd_evidence": "岗位要求 Python",
+                                "resume_evidence": "有 Python 项目经验",
+                            }
+                        ],
+                        "match_dimensions": {"core_skills": 0.9},
+                        "strengths": ["Python 技能匹配"],
+                        "gaps": [],
+                        "resume_suggestions": [
+                            {
+                                "section": "项目经历",
+                                "suggestion": "突出接口性能优化",
+                                "basis": "JD 强调性能",
+                            }
+                        ],
+                        "greeting_draft": {
+                            "status": "ready",
+                            "text": "您好，我有 Python 项目经验，对该岗位很感兴趣。",
+                            "facts_used": ["Python"],
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                confidence=0.86,
+                citation_ids=[job_id],
+            )
+
+    monkeypatch.setattr(
+        job_evaluation_service,
+        "create_answer_provider",
+        lambda _config: DummyProvider(),
+    )
+    jobs = [
+        {
+            "job_id": f"job-{index}",
+            "title": "Python 开发",
+            "detail": {"jd": "负责 Python 服务开发与性能优化"},
+        }
+        for index in (1, 2)
+    ]
+    strategy = {
+        "evaluation_method": "llm",
+        "minimum_confidence": 0.7,
+        "insufficient_info_action": "review",
+    }
+
+    results = evaluate_delivery_jobs(
+        jobs,
+        filter_strategy=None,
+        recommendation_strategy=strategy,
+        resume_facts=[
+            {
+                "fact_type": "skill",
+                "fact_key": "技能",
+                "fact_value": "Python 项目经验",
+                "sensitive": False,
+                "user_confirmed": True,
+            }
+        ],
+        extra_requirement="",
+        config=SimpleNamespace(reasoning_executor="codex-cli", llm_provider="custom"),
+    )
+
+    assert len(calls) == 2
+    assert all(len(call["evidence_citations"]) == 1 for call in calls)
+    assert all("suggested_questions" not in str(call["question"]) for call in calls)
+    assert [result["job_id"] for result in results] == ["job-1", "job-2"]
+    assert all(result["evaluation_version"] == "2.0" for result in results)
+    assert all(result["greeting_draft"]["status"] == "ready" for result in results)

@@ -36,6 +36,7 @@ def evaluate_delivery_jobs(
             job,
             strategy=recommendation_strategy,
             filter_result=rule_results.get(str(job.get("job_id") or "")),
+            resume_facts=resume_facts,
         )
         for job in jobs
     ]
@@ -154,6 +155,7 @@ def _evaluate_delivery_rules(
     *,
     strategy: dict[str, object],
     filter_result: dict[str, object] | None,
+    resume_facts: list[dict[str, object]],
 ) -> dict[str, object]:
     job_id = str(job.get("job_id") or "")
     detail = job.get("detail") if isinstance(job.get("detail"), dict) else {}
@@ -167,15 +169,26 @@ def _evaluate_delivery_rules(
     risks: list[str] = []
     missing: list[str] = []
     if filter_result and filter_result.get("status") == "reject":
-        return {
-            "job_id": job_id,
-            "decision": "reject",
-            "confidence": 1.0,
-            "reasons": list(filter_result.get("reasons") or []),
-            "risks": ["未通过岗位筛选策略"],
-            "missing_fields": list(filter_result.get("missing_fields") or []),
-            "source": "rules",
-        }
+        reasons = list(filter_result.get("reasons") or [])
+        missing_fields = list(filter_result.get("missing_fields") or [])
+        return _build_v2_result(
+            job=job,
+            decision="reject",
+            confidence=1.0,
+            summary="岗位未通过已配置的硬性筛选条件。",
+            reasons=reasons,
+            risks=["未通过岗位筛选策略"],
+            missing_fields=missing_fields,
+            source="rules",
+            hard_requirements=[
+                {
+                    "name": "岗位筛选策略",
+                    "status": "fail",
+                    "jd_evidence": "；".join(str(value) for value in reasons),
+                    "resume_evidence": "",
+                }
+            ],
+        )
     if not jd:
         missing.append("完整JD")
     required = _strings(strategy.get("required_skills"))
@@ -211,15 +224,39 @@ def _evaluate_delivery_rules(
         decision = "recommend"
     else:
         decision = "review"
-    return {
-        "job_id": job_id,
-        "decision": decision,
-        "confidence": round(confidence, 2),
-        "reasons": reasons or ["符合已配置的结构化条件"],
-        "risks": risks,
-        "missing_fields": missing,
-        "source": "rules",
-    }
+    normalized_reasons = reasons or ["符合已配置的结构化条件"]
+    hard_requirements = []
+    for value in required:
+        hard_requirements.append(
+            {
+                "name": value,
+                "status": "fail" if value in missing_required else "pass",
+                "jd_evidence": f"建议投递策略要求技能：{value}",
+                "resume_evidence": _find_resume_evidence(resume_facts, value),
+            }
+        )
+    gaps = [
+        {"item": value, "severity": "high", "can_fix_by_resume": False}
+        for value in missing_required
+    ]
+    return _build_v2_result(
+        job=job,
+        decision=decision,
+        confidence=round(confidence, 2),
+        summary=_rule_summary(decision, normalized_reasons, risks, missing),
+        reasons=normalized_reasons,
+        risks=risks,
+        missing_fields=missing,
+        source="rules",
+        hard_requirements=hard_requirements,
+        match_dimensions={
+            "core_skills": round(max(0.0, 1.0 - len(missing_required) * 0.35), 2),
+            "job_relevance": round(confidence, 2),
+        },
+        strengths=normalized_reasons,
+        gaps=gaps,
+        greeting_draft=_safe_greeting_draft(job, decision=decision),
+    )
 
 
 def _evaluate_delivery_by_llm(
@@ -241,7 +278,12 @@ def _evaluate_delivery_by_llm(
     provider = create_answer_provider(config)
     results: list[dict[str, object]] = []
     resume_context = [
-        f"{fact.get('fact_key')}：{fact.get('fact_value')}"
+        {
+            "fact_type": fact.get("fact_type"),
+            "fact_key": fact.get("fact_key"),
+            "fact_value": fact.get("fact_value"),
+            "user_confirmed": bool(fact.get("user_confirmed")),
+        }
         for fact in resume_facts
         if not fact.get("sensitive") and str(fact.get("fact_value") or "").strip()
     ]
@@ -250,111 +292,339 @@ def _evaluate_delivery_by_llm(
         for key, value in strategy.items()
         if key not in {"created_at", "updated_at"}
     }
-    for start in range(0, len(jobs), 5):
-        batch = jobs[start:start + 5]
-        citations = []
-        for job in batch:
-            detail = job.get("detail") if isinstance(job.get("detail"), dict) else {}
-            citations.append(
-                {
-                    "citation_id": str(job.get("job_id") or ""),
-                    "title": _text(job.get("title")),
-                    "source_name": _text(job.get("boss_name") or job.get("company")),
-                    "snippet": " | ".join(
+    # V2 固定一岗一调用，避免多岗位的 JD 和简历证据相互污染。
+    for job in jobs:
+        detail = job.get("detail") if isinstance(job.get("detail"), dict) else {}
+        job_id = str(job.get("job_id") or "")
+        citations = [
+            {
+                "citation_id": job_id,
+                "title": _text(job.get("title")),
+                "source_name": _text(job.get("boss_name") or job.get("company")),
+                "snippet": " | ".join(
+                    _text(job.get(key))
+                    for key in (
+                        "salary",
+                        "location",
+                        "experience",
+                        "degree",
+                        "company_industry",
+                        "company_scale",
+                    )
+                ),
+                "context_snippet": (
+                    "技能与标签："
+                    + " | ".join(
                         _text(job.get(key))
-                        for key in ("salary", "location", "experience", "degree", "company_industry")
-                    ),
-                    "context_snippet": (
-                        " | ".join(
-                            _text(job.get(key))
-                            for key in ("skills", "job_labels", "company_scale", "boss_active_status")
-                        )
-                        + "\nJD："
-                        + _text(detail.get("jd"))[:1500]
-                    ),
-                }
-            )
+                        for key in ("skills", "job_labels", "boss_active_status")
+                    )
+                    + "\n完整 JD："
+                    + _text(detail.get("jd"))[:6000]
+                ),
+            }
+        ]
         artifact = provider.answer(
             question=(
-                "请逐个评估岗位是否值得投递。answer 字段必须是 JSON 数组字符串，每项包含 "
-                "job_id、decision、confidence、reasons、risks、missing_fields；"
-                "decision 只能是 recommend、review、reject。只引用 decision=recommend 的岗位。"
-                f"\n投递策略：{strategy_context}"
-                f"\n简历事实：{resume_context[:30]}"
+                "你是 FineJob 岗位投递评估器。只评估当前一个岗位。"
+                "answer 字段必须是一个严格 JSON 对象字符串，禁止 Markdown 代码块和额外说明。"
+                "JSON 必须包含：job_id、decision、confidence、summary、reasons、risks、"
+                "missing_information、hard_requirements、match_dimensions、strengths、gaps、"
+                "resume_suggestions、greeting_draft。"
+                "decision 只能是 recommend、review、reject；不确定或证据缺失时必须使用 review。"
+                "hard_requirements 每项包含 name、status(pass/fail/unknown)、jd_evidence、resume_evidence。"
+                "match_dimensions 是 0 到 1 的数字对象，至少考虑 job_direction、core_skills、"
+                "experience、project_relevance、industry_relevance、salary_location。"
+                "gaps 每项包含 item、severity(high/medium/low)、can_fix_by_resume。"
+                "resume_suggestions 每项包含 section、suggestion、basis；不得建议伪造经历。"
+                "greeting_draft 包含 status(ready/not_generated)、text、facts_used。"
+                "recommend 和 review 生成简洁中文招呼语；reject 必须返回 not_generated 和空文本。"
+                "招呼语只能使用简历事实中的真实内容；没有简历证据时使用不带能力断言的通用表达。"
+                "不要生成向招聘者追问的问题，也不要输出此类字段。"
+                f"\n岗位 ID：{job_id}"
+                f"\n投递策略：{json.dumps(strategy_context, ensure_ascii=False)}"
+                f"\n简历事实：{json.dumps(resume_context, ensure_ascii=False)}"
                 f"\n本次额外要求：{extra_requirement.strip() or '无'}"
-                "\n回答中说明主要匹配依据和风险，不得虚构简历或岗位信息。"
+                "\n所有判断必须能从岗位证据或简历事实中找到依据。"
             ),
             mode="answer",
             evidence_citations=citations,
             grounded_items=[],
         )
-        structured = _parse_llm_evaluations(artifact.answer, batch)
+        structured = _parse_llm_evaluation_v2(
+            artifact.answer,
+            job=job,
+            resume_facts=resume_facts,
+        )
         if structured:
-            results.extend(structured)
+            results.append(structured)
             continue
-        selected = set(artifact.citation_ids)
-        for job in batch:
-            job_id = str(job.get("job_id") or "")
-            detail = job.get("detail") if isinstance(job.get("detail"), dict) else {}
-            has_detail = bool(_text(detail.get("jd")))
-            if job_id in selected:
-                decision = "recommend"
-            elif not has_detail:
-                decision = (
-                    "reject" if strategy.get("insufficient_info_action") == "reject" else "review"
-                )
-            else:
-                decision = "review"
-            results.append(
-                {
-                    "job_id": job_id,
-                    "decision": decision,
-                    "confidence": round(float(artifact.confidence), 2),
-                    "reasons": [artifact.answer],
-                    "risks": [] if decision == "recommend" else ["AI 未将该岗位列为明确推荐"],
-                    "missing_fields": [] if has_detail else ["完整JD"],
-                    "source": "llm",
-                }
+        has_detail = bool(_text(detail.get("jd")))
+        missing = [] if has_detail else ["完整JD"]
+        results.append(
+            _build_v2_result(
+                job=job,
+                decision="review",
+                confidence=min(0.5, round(float(artifact.confidence), 2)),
+                summary="AI 未返回符合 V2 协议的结构化结果，已转入人工确认。",
+                reasons=[artifact.answer] if artifact.answer.strip() else ["AI 结构化输出无效"],
+                risks=["AI 结构化输出校验失败"],
+                missing_fields=missing,
+                source="llm",
+                greeting_draft=_safe_greeting_draft(job, decision="review"),
             )
+        )
     return results
 
 
-def _parse_llm_evaluations(
+def _parse_llm_evaluation_v2(
     answer: str,
-    batch: list[dict[str, object]],
-) -> list[dict[str, object]]:
-    """解析 AnswerProvider 的内层逐岗位 JSON；不合格时由调用方走兼容回退。"""
+    *,
+    job: dict[str, object],
+    resume_facts: list[dict[str, object]],
+) -> dict[str, object] | None:
+    """解析并收紧单岗位 V2 JSON；不合格时由调用方转人工确认。"""
     text = answer.strip()
-    match = re.search(r"\[.*\]", text, flags=re.DOTALL)
-    if not match:
-        return []
     try:
-        parsed = json.loads(match.group(0))
+        parsed = json.loads(text)
     except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            return None
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(parsed, dict):
+        return None
+    job_id = str(job.get("job_id") or "")
+    decision = str(parsed.get("decision") or "")
+    if str(parsed.get("job_id") or "") != job_id or decision not in {
+        "recommend",
+        "review",
+        "reject",
+    }:
+        return None
+
+    hard_requirements = _normalize_hard_requirements(parsed.get("hard_requirements"))
+    match_dimensions = _normalize_dimensions(parsed.get("match_dimensions"))
+    gaps = _normalize_gaps(parsed.get("gaps"))
+    resume_suggestions = _normalize_resume_suggestions(parsed.get("resume_suggestions"))
+    greeting_draft, greeting_risks = _normalize_greeting_draft(
+        parsed.get("greeting_draft"),
+        job=job,
+        decision=decision,
+        resume_facts=resume_facts,
+    )
+    missing = _strings(parsed.get("missing_information"))
+    risks = [*_strings(parsed.get("risks")), *greeting_risks]
+    reasons = _strings(parsed.get("reasons"))
+    strengths = _strings(parsed.get("strengths"))
+    summary = _text(parsed.get("summary"))
+    if not summary:
+        return None
+    return _build_v2_result(
+        job=job,
+        decision=decision,
+        confidence=round(_clamp_score(parsed.get("confidence")), 2),
+        summary=summary,
+        reasons=reasons or strengths or [summary],
+        risks=risks,
+        missing_fields=missing,
+        source="llm",
+        hard_requirements=hard_requirements,
+        match_dimensions=match_dimensions,
+        strengths=strengths,
+        gaps=gaps,
+        resume_suggestions=resume_suggestions,
+        greeting_draft=greeting_draft,
+    )
+
+
+def _build_v2_result(
+    *,
+    job: dict[str, object],
+    decision: str,
+    confidence: float,
+    summary: str,
+    reasons: list[str],
+    risks: list[str],
+    missing_fields: list[str],
+    source: str,
+    hard_requirements: list[dict[str, object]] | None = None,
+    match_dimensions: dict[str, float] | None = None,
+    strengths: list[str] | None = None,
+    gaps: list[dict[str, object]] | None = None,
+    resume_suggestions: list[dict[str, object]] | None = None,
+    greeting_draft: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "evaluation_version": "2.0",
+        "job_id": str(job.get("job_id") or ""),
+        "decision": decision,
+        "confidence": round(max(0.0, min(1.0, confidence)), 2),
+        "summary": summary,
+        # 保留 V1 字段，确保旧页面和历史数据读取逻辑继续工作。
+        "reasons": reasons,
+        "risks": risks,
+        "missing_fields": missing_fields,
+        "missing_information": missing_fields,
+        "hard_requirements": hard_requirements or [],
+        "match_dimensions": match_dimensions or {},
+        "strengths": strengths or reasons,
+        "gaps": gaps or [],
+        "resume_suggestions": resume_suggestions or [],
+        "greeting_draft": greeting_draft or _safe_greeting_draft(job, decision=decision),
+        "source": source,
+    }
+
+
+def _safe_greeting_draft(
+    job: dict[str, object],
+    *,
+    decision: str,
+) -> dict[str, object]:
+    if decision == "reject":
+        return {"status": "not_generated", "text": "", "facts_used": []}
+    title = _text(job.get("title")) or "该岗位"
+    return {
+        "status": "ready",
+        "text": f"您好，我对贵司的{title}很感兴趣，希望有机会进一步沟通，谢谢。",
+        "facts_used": [],
+    }
+
+
+def _normalize_greeting_draft(
+    value: object,
+    *,
+    job: dict[str, object],
+    decision: str,
+    resume_facts: list[dict[str, object]],
+) -> tuple[dict[str, object], list[str]]:
+    if decision == "reject":
+        return _safe_greeting_draft(job, decision=decision), []
+    if not isinstance(value, dict):
+        return _safe_greeting_draft(job, decision=decision), ["AI 招呼语结构无效，已使用安全模板"]
+    text = _text(value.get("text"))
+    facts_used = _strings(value.get("facts_used"))
+    resume_text = "\n".join(
+        _text(fact.get("fact_value"))
+        for fact in resume_facts
+        if not fact.get("sensitive") and _text(fact.get("fact_value"))
+    ).lower()
+    unsupported = [
+        fact
+        for fact in facts_used
+        if not resume_text
+        or not any(
+            part and part in resume_text
+            for part in re.split(r"[，,、；;：:\s]+", fact.lower())
+            if len(part) >= 2
+        )
+    ]
+    if not text or unsupported:
+        risk = (
+            f"招呼语引用了未验证的简历事实：{'、'.join(unsupported)}"
+            if unsupported
+            else "AI 未生成有效招呼语"
+        )
+        return _safe_greeting_draft(job, decision=decision), [f"{risk}，已使用安全模板"]
+    return {"status": "ready", "text": text[:300], "facts_used": facts_used}, []
+
+
+def _normalize_hard_requirements(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
         return []
-    if not isinstance(parsed, list):
-        return []
-    valid = {str(job.get("job_id") or ""): job for job in batch}
-    normalized: list[dict[str, object]] = []
-    for item in parsed:
+    normalized = []
+    for item in value:
         if not isinstance(item, dict):
             continue
-        job_id = str(item.get("job_id") or "")
-        decision = str(item.get("decision") or "")
-        if job_id not in valid or decision not in {"recommend", "review", "reject"}:
+        name = _text(item.get("name"))
+        status = _text(item.get("status"))
+        if not name or status not in {"pass", "fail", "unknown"}:
             continue
         normalized.append(
             {
-                "job_id": job_id,
-                "decision": decision,
-                "confidence": round(max(0.0, min(1.0, float(item.get("confidence") or 0))), 2),
-                "reasons": _strings(item.get("reasons")),
-                "risks": _strings(item.get("risks")),
-                "missing_fields": _strings(item.get("missing_fields")),
-                "source": "llm",
+                "name": name,
+                "status": status,
+                "jd_evidence": _text(item.get("jd_evidence")),
+                "resume_evidence": _text(item.get("resume_evidence")),
             }
         )
-    return normalized if len(normalized) == len(valid) else []
+    return normalized
+
+
+def _normalize_dimensions(value: object) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): round(_clamp_score(score), 2)
+        for key, score in value.items()
+        if str(key).strip()
+    }
+
+
+def _normalize_gaps(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    normalized = []
+    for item in value:
+        if not isinstance(item, dict) or not _text(item.get("item")):
+            continue
+        severity = _text(item.get("severity"))
+        normalized.append(
+            {
+                "item": _text(item.get("item")),
+                "severity": severity if severity in {"high", "medium", "low"} else "medium",
+                "can_fix_by_resume": bool(item.get("can_fix_by_resume")),
+            }
+        )
+    return normalized
+
+
+def _normalize_resume_suggestions(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    normalized = []
+    for item in value:
+        if not isinstance(item, dict) or not _text(item.get("suggestion")):
+            continue
+        normalized.append(
+            {
+                "section": _text(item.get("section")) or "简历",
+                "suggestion": _text(item.get("suggestion")),
+                "basis": _text(item.get("basis")),
+            }
+        )
+    return normalized
+
+
+def _find_resume_evidence(resume_facts: list[dict[str, object]], keyword: str) -> str:
+    for fact in resume_facts:
+        value = _text(fact.get("fact_value"))
+        if not fact.get("sensitive") and keyword.lower() in value.lower():
+            return value[:240]
+    return ""
+
+
+def _rule_summary(
+    decision: str,
+    reasons: list[str],
+    risks: list[str],
+    missing: list[str],
+) -> str:
+    label = {"recommend": "建议投递", "review": "需要人工确认", "reject": "不建议投递"}.get(
+        decision, "需要人工确认"
+    )
+    evidence = risks or missing or reasons
+    return f"{label}：{'；'.join(evidence[:3])}"
+
+
+def _clamp_score(value: object) -> float:
+    try:
+        score = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, score))
 
 
 def _evaluate_salary(job, strategy, reasons, failures, missing) -> None:

@@ -52,6 +52,7 @@ from backend.app.services.fine_job.strategies import (
     get_filter_strategy,
     get_recommendation_strategy,
 )
+from backend.app.services.fine_job.workflow import record_evaluation_and_route
 
 
 router = APIRouter(prefix="/fine-job/boss-capture", tags=["fine-job-boss-capture"])
@@ -364,6 +365,22 @@ def evaluate_boss_deliveries(
     updated = boss_capture_task_manager.apply_delivery_evaluations(
         task_id, evaluations
     )
+    delivery_strategy = get_delivery_strategy(db)
+    completed_by_id = {
+        str(job.get("job_id") or ""): job for job in completed_jobs
+    }
+    for evaluation in evaluations:
+        job = completed_by_id.get(str(evaluation.get("job_id") or ""))
+        if job:
+            record_evaluation_and_route(
+                db,
+                job=job,
+                evaluation=evaluation,
+                recommendation_strategy=recommendation_strategy,
+                filter_strategy=filter_strategy,
+                resume_id=resume_id or None,
+                delivery_strategy=delivery_strategy,
+            )
     return BossDeliveryEvaluationResponse(
         evaluations=evaluations,
         task=BossCaptureTaskResponse(**updated),
@@ -407,6 +424,15 @@ def evaluate_history_job_delivery(
         config=config,
     )[0]
     update_capture_job_delivery_evaluation(db, job=job, evaluation=evaluation)
+    record_evaluation_and_route(
+        db,
+        job=job,
+        evaluation=evaluation,
+        recommendation_strategy=recommendation_strategy,
+        filter_strategy=filter_strategy,
+        resume_id=resume_id or None,
+        delivery_strategy=get_delivery_strategy(db),
+    )
     return BossHistoryDeliveryEvaluationResponse(
         evaluation=evaluation,
         job=get_capture_history_job(db, history_job_id),

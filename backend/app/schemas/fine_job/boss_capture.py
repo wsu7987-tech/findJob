@@ -101,12 +101,21 @@ class BossJobFilterResult(BaseModel):
 
 
 class BossJobDeliveryEvaluation(BaseModel):
+    evaluation_version: Literal["2.0"] = "2.0"
     job_id: str
     decision: Literal["recommend", "review", "reject"]
     confidence: float
+    summary: str = ""
     reasons: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     missing_fields: list[str] = Field(default_factory=list)
+    missing_information: list[str] = Field(default_factory=list)
+    hard_requirements: list[dict[str, Any]] = Field(default_factory=list)
+    match_dimensions: dict[str, float] = Field(default_factory=dict)
+    strengths: list[str] = Field(default_factory=list)
+    gaps: list[dict[str, Any]] = Field(default_factory=list)
+    resume_suggestions: list[dict[str, Any]] = Field(default_factory=list)
+    greeting_draft: dict[str, Any] = Field(default_factory=dict)
     source: Literal["rules", "llm"]
 
 

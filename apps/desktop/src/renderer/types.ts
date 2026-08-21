@@ -293,12 +293,38 @@ export interface FineJobBossFilterApplicationResponse {
 }
 
 export interface FineJobBossDeliveryEvaluation {
+  evaluation_version: "2.0";
   job_id: string;
   decision: "recommend" | "review" | "reject";
   confidence: number;
+  summary: string;
   reasons: string[];
   risks: string[];
   missing_fields: string[];
+  missing_information: string[];
+  hard_requirements: Array<{
+    name: string;
+    status: "pass" | "fail" | "unknown";
+    jd_evidence: string;
+    resume_evidence: string;
+  }>;
+  match_dimensions: Record<string, number>;
+  strengths: string[];
+  gaps: Array<{
+    item: string;
+    severity: "high" | "medium" | "low";
+    can_fix_by_resume: boolean;
+  }>;
+  resume_suggestions: Array<{
+    section: string;
+    suggestion: string;
+    basis: string;
+  }>;
+  greeting_draft: {
+    status: "ready" | "not_generated";
+    text: string;
+    facts_used: string[];
+  };
   source: "rules" | "llm";
 }
 
@@ -525,6 +551,70 @@ export interface FineJobActionLog {
 
 export interface FineJobActionLogListEnvelope {
   logs: FineJobActionLog[];
+}
+
+export type FineJobReviewStatus = "pending" | "approved" | "rejected" | "dismissed";
+export type FineJobAutomationActionStatus =
+  | "queued"
+  | "leased"
+  | "succeeded"
+  | "failed"
+  | "blocked"
+  | "unknown"
+  | "cancelled";
+
+export interface FineJobReviewItem {
+  id: string;
+  job_id: string;
+  evaluation_id: string;
+  action_type: "start_conversation";
+  status: FineJobReviewStatus;
+  ai_decision: "recommend" | "review" | "reject";
+  draft_message: string;
+  final_message: string;
+  resolution_note: string;
+  auto_approved: boolean;
+  job_title: string;
+  company_name: string;
+  job_link: string;
+  evaluation: FineJobBossDeliveryEvaluation;
+  created_at: string;
+  updated_at: string;
+  resolved_at?: string | null;
+}
+
+export interface FineJobReviewItemListEnvelope {
+  items: FineJobReviewItem[];
+  total: number;
+}
+
+export interface FineJobAutomationAction {
+  id: string;
+  job_id: string;
+  evaluation_id: string;
+  review_item_id: string;
+  action_type: "start_conversation";
+  status: FineJobAutomationActionStatus;
+  idempotency_key: string;
+  payload: Record<string, unknown>;
+  lease_owner?: string | null;
+  lease_expires_at?: string | null;
+  attempt_count: number;
+  last_error?: string | null;
+  job_title: string;
+  company_name: string;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string | null;
+}
+
+export interface FineJobAutomationActionEnvelope {
+  action: FineJobAutomationAction;
+}
+
+export interface FineJobAutomationActionListEnvelope {
+  actions: FineJobAutomationAction[];
+  total: number;
 }
 
 export interface PdfDraftCreateRequest {

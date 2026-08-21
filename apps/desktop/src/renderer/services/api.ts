@@ -40,6 +40,11 @@
   FineJobBossHistoryResponse,
   FineJobBossSearchPageRequest,
   FineJobBossSearchPageResponse,
+  FineJobReviewItemListEnvelope,
+  FineJobReviewStatus,
+  FineJobAutomationActionEnvelope,
+  FineJobAutomationActionListEnvelope,
+  FineJobAutomationActionStatus,
   PoolCreateRequest,
   PoolCreateResponse,
   PoolCommitMetadataRequest,
@@ -624,6 +629,31 @@ export const api = {
         method: "POST",
         body: JSON.stringify(payload)
       }
+    );
+  },
+  async listFineJobReviewItems(status?: FineJobReviewStatus) {
+    const suffix = status ? `?status=${encodeURIComponent(status)}` : "";
+    return request<FineJobReviewItemListEnvelope>(`/api/fine-job/review-items${suffix}`);
+  },
+  async approveFineJobReviewItem(
+    reviewItemId: string,
+    payload: { message?: string; allow_override?: boolean }
+  ) {
+    return request<FineJobAutomationActionEnvelope>(
+      `/api/fine-job/review-items/${reviewItemId}/approve`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
+  async rejectFineJobReviewItem(reviewItemId: string, note = "") {
+    return request(`/api/fine-job/review-items/${reviewItemId}/reject`, {
+      method: "POST",
+      body: JSON.stringify({ note })
+    });
+  },
+  async listFineJobAutomationActions(status?: FineJobAutomationActionStatus) {
+    const suffix = status ? `?status=${encodeURIComponent(status)}` : "";
+    return request<FineJobAutomationActionListEnvelope>(
+      `/api/fine-job/automation-actions${suffix}`
     );
   },
   async listFineJobResumes() {

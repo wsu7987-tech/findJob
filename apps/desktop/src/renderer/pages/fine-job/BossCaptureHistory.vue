@@ -445,13 +445,34 @@ watch(
               置信度：{{ Math.round(selectedJob.delivery_evaluation.confidence * 100) }}%
             </span>
           </div>
-          <p>{{ deliveryEvaluationReasons(selectedJob) }}</p>
+          <p>{{ selectedJob.delivery_evaluation.summary || deliveryEvaluationReasons(selectedJob) }}</p>
+          <p v-if="selectedJob.delivery_evaluation.strengths?.length">
+            优势：{{ selectedJob.delivery_evaluation.strengths.join("；") }}
+          </p>
+          <p v-if="selectedJob.delivery_evaluation.gaps?.length">
+            差距：{{ selectedJob.delivery_evaluation.gaps.map((item) => item.item).join("；") }}
+          </p>
           <p v-if="deliveryEvaluationRisks(selectedJob)" class="evaluation-warning">
             风险：{{ deliveryEvaluationRisks(selectedJob) }}
           </p>
           <p v-if="deliveryEvaluationMissingFields(selectedJob)" class="secondary-text">
             缺失信息：{{ deliveryEvaluationMissingFields(selectedJob) }}
           </p>
+          <template v-if="selectedJob.delivery_evaluation.resume_suggestions?.length">
+            <h4>简历优化</h4>
+            <ul>
+              <li
+                v-for="item in selectedJob.delivery_evaluation.resume_suggestions"
+                :key="`${item.section}-${item.suggestion}`"
+              >
+                {{ item.section }}：{{ item.suggestion }}<span v-if="item.basis">（{{ item.basis }}）</span>
+              </li>
+            </ul>
+          </template>
+          <template v-if="selectedJob.delivery_evaluation.greeting_draft?.text">
+            <h4>招呼语草稿</h4>
+            <p>{{ selectedJob.delivery_evaluation.greeting_draft.text }}</p>
+          </template>
         </template>
         <p v-else class="secondary-text">尚未获取投递建议。</p>
         <el-button
