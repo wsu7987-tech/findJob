@@ -1,0 +1,35 @@
+{
+  "name": "fine-job-boss-executor",
+  "displayName": "FineJob BOSS 执行器",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.8.1",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
+  "scripts": {
+    "postinstall": "wxt prepare",
+    "dev": "wxt -b chrome",
+    "typecheck": "vue-tsc --noEmit",
+    "test": "vitest run",
+    "build": "pnpm run typecheck && pnpm run test && wxt build -b chrome",
+    "zip": "wxt zip -b chrome"
+  },
+  "dependencies": {
+    "comctx": "1.7.5",
+    "vue": "3.5.41"
+  },
+  "devDependencies": {
+    "@types/chrome": "0.2.5",
+    "@wxt-dev/module-vue": "1.0.3",
+    "jsdom": "26.0.0",
+    "typescript": "5.8.3",
+    "vite": "6.3.4",
+    "vitest": "3.1.1",
+    "vue-tsc": "2.2.8",
+    "wxt": "0.21.3"
+  }
+}
