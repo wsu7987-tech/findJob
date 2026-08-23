@@ -7,6 +7,7 @@ import type { FineJobDeliveryStrategy } from "@/types";
 export const emptyDeliveryStrategy = (): FineJobDeliveryStrategy => ({
   automation_level: "assist",
   auto_greeting_enabled: false,
+  force_contact_verification_enabled: false,
   daily_greeting_limit: 20,
   hourly_greeting_limit: 5,
   min_match_score: 0.72,

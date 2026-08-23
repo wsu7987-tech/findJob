@@ -6,11 +6,16 @@ import {
   type MainWorldStatus
 } from "../executor/framework-mode";
 import { isBossReadOnlySnapshot } from "../platform/boss/types";
+import type {
+  MainWorldCommand,
+  MainWorldExecutionResult
+} from "../finejob/types";
 
 export const CONTENT_NAMESPACE = "fine-job:boss-executor:content:v1";
 
 export class ContentService {
   private readonly mainWorldWaiters = new Set<() => void>();
+  private readonly mainCommands: MainWorldCommand[] = [];
 
   constructor(
     private readonly background: BackgroundService,
@@ -21,7 +26,7 @@ export class ContentService {
     try {
       const health = await this.background.health();
       this.status.background =
-        health.ok && health.frameworkMode && !health.realActionsEnabled ? "ready" : "error";
+        health.ok && !health.frameworkMode && health.realActionsEnabled ? "ready" : "error";
     } catch {
       this.status.background = "error";
     }
@@ -53,6 +58,30 @@ export class ContentService {
     this.status.bossProbe = value.state;
     this.status.bossSnapshot = value;
     this.status.page = value.pathname;
+    await this.background.reportBossSnapshot(value);
+    return { accepted: true };
+  }
+
+  async enqueueMainCommand(command: MainWorldCommand): Promise<{ accepted: true }> {
+    if (
+      command.type !== "BOSS_DEFAULT_GREETING" ||
+      !command.actionId ||
+      command.executionEpoch < 1 ||
+      !command.encryptJobId
+    ) throw new Error("执行命令载荷无效");
+    const duplicate = this.mainCommands.some(
+      (item) => item.actionId === command.actionId && item.executionEpoch === command.executionEpoch
+    );
+    if (!duplicate) this.mainCommands.push(command);
+    return { accepted: true };
+  }
+
+  async takeMainCommand(): Promise<MainWorldCommand | null> {
+    return this.mainCommands.shift() ?? null;
+  }
+
+  async reportExecutionResult(result: MainWorldExecutionResult): Promise<{ accepted: true }> {
+    await this.background.reportExecutionResult(result);
     return { accepted: true };
   }
 

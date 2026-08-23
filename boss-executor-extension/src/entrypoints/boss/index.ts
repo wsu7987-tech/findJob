@@ -3,6 +3,7 @@ import { defineUnlistedScript } from "#imports";
 import type { MainWorldStatus } from "../../executor/framework-mode";
 import { contentService, initContentService } from "../../message";
 import { readBossPageSnapshot, snapshotFingerprint } from "../../platform/boss/read-only-probe";
+import { executeDefaultGreeting } from "../../platform/boss/default-greeting";
 
 const currentStatus = (): MainWorldStatus => ({
   component: "main-world",
@@ -14,7 +15,7 @@ const currentStatus = (): MainWorldStatus => ({
 
 export default defineUnlistedScript(async () => {
   try {
-    // MAIN World 仅只读指定的岗位身份字段；不读取 Cookie/token，也不执行平台动作。
+    // MAIN World平时只读取最小岗位身份；只有收到单个已授权命令时才读取token并执行一次平台动作。
     initContentService();
     await contentService.reportMainWorldReady(currentStatus());
 
@@ -42,7 +43,22 @@ export default defineUnlistedScript(async () => {
         console.error("[FineJob BOSS 执行器] 岗位只读识别失败", error);
       });
     }, 1000);
+    let commandRunning = false;
+    const commandTimer = window.setInterval(() => {
+      if (commandRunning) return;
+      commandRunning = true;
+      void contentService.takeMainCommand().then(async (command) => {
+        if (!command) return;
+        const result = await executeDefaultGreeting(command);
+        await contentService.reportExecutionResult(result);
+      }).catch((error) => {
+        console.error("[FineJob BOSS 执行器] 默认招呼动作执行失败", error);
+      }).finally(() => {
+        commandRunning = false;
+      });
+    }, 250);
     window.addEventListener("pagehide", () => window.clearInterval(probeTimer), { once: true });
+    window.addEventListener("pagehide", () => window.clearInterval(commandTimer), { once: true });
   } catch (error) {
     console.error("[FineJob BOSS 执行器] 无法向 Content 报告状态", error);
   }

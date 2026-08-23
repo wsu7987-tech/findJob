@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Literal
+from urllib.parse import urlparse
 
 from backend.app.db import Database
 from backend.app.errors import AppError
@@ -154,6 +156,7 @@ def list_review_items(
         rows = connection.execute(
             f"""
             SELECT r.*, j.title AS job_title, j.company_name, j.job_link,
+                   j.source_job_id, j.encrypt_job_id,
                    e.evaluation_json
             FROM fj_review_items r
             JOIN fj_boss_jobs j ON j.id = r.job_id
@@ -291,8 +294,11 @@ def claim_next_action(
             """
             SELECT id
             FROM fj_automation_actions
-            WHERE status = 'queued'
-               OR (status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+            WHERE action_type = 'start_conversation'
+              AND (
+                status = 'queued'
+                OR (status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+              )
             ORDER BY created_at ASC, id ASC
             LIMIT 1
             """,
@@ -357,7 +363,7 @@ def _enqueue_action(
     review_item_id: str,
     message: str,
 ) -> dict[str, object]:
-    idempotency_key = f"boss:{job_id}:start_conversation"
+    idempotency_key = f"boss:{job_id}:BOSS_DEFAULT_GREETING"
     now = utc_now()
     with db.connect() as connection:
         job = connection.execute(
@@ -368,21 +374,36 @@ def _enqueue_action(
             (job_id,),
         ).fetchone()
         assert job is not None
+        encrypt_job_id = _resolve_encrypt_job_id(job)
+        if not encrypt_job_id:
+            raise AppError(
+                status_code=409,
+                error_category="JOB_ID_MISSING",
+                error_message="岗位缺少可验证的BOSS加密岗位标识，不能加入打招呼队列。",
+            )
+        if not str(job["encrypt_job_id"] or ""):
+            # 兼容早期仅保存详情页链接的岗位，提取后回填正式身份列。
+            connection.execute(
+                "UPDATE fj_boss_jobs SET encrypt_job_id = ? WHERE id = ?",
+                (encrypt_job_id, job_id),
+            )
         payload = {
             "platform": "boss",
-            "action_type": "start_conversation",
+            "action_type": "BOSS_DEFAULT_GREETING",
             "history_job_id": job_id,
             "source_job_id": job["source_job_id"],
-            "encrypt_job_id": job["encrypt_job_id"],
+            "encrypt_job_id": encrypt_job_id,
             "job_title": job["title"],
             "company_name": job["company_name"],
             "job_link": job["job_link"],
+            # 仅为旧桌面端响应兼容保留审批文本；插件按动作类型固定使用 BOSS 默认招呼语，
+            # 绝不能把这个字段作为发送内容。
             "message": message,
             "evaluation_id": evaluation_id,
             "review_item_id": review_item_id,
         }
         existing = connection.execute(
-            "SELECT id, status FROM fj_automation_actions WHERE idempotency_key = ?",
+            "SELECT id, status, last_status_code FROM fj_automation_actions WHERE idempotency_key = ?",
             (idempotency_key,),
         ).fetchone()
         if existing is None:
@@ -391,8 +412,10 @@ def _enqueue_action(
                 """
                 INSERT INTO fj_automation_actions (
                   id, job_id, evaluation_id, review_item_id, action_type,
-                  status, idempotency_key, payload_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'start_conversation', 'queued', ?, ?, ?, ?)
+                  status, idempotency_key, payload_json, execution_state,
+                  queue_position, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'BOSS_DEFAULT_GREETING', 'queued', ?, ?, 'queued',
+                  COALESCE((SELECT MAX(queue_position) + 1 FROM fj_automation_actions), 1), ?, ?)
                 """,
                 (
                     action_id,
@@ -413,6 +436,33 @@ def _enqueue_action(
                     """
                     UPDATE fj_automation_actions
                     SET evaluation_id = ?, review_item_id = ?, payload_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (evaluation_id, review_item_id, _json(payload), now, action_id),
+                )
+            elif (
+                existing["status"] == "cancelled"
+                and existing["last_status_code"] == "MANUAL_CONFIRMED_NOT_CONTACTED"
+            ):
+                # 只有用户人工确认“尚未沟通”并再次批准后，才允许复用原幂等动作。
+                # 重新批准只恢复队列状态，不会在本事务内发起任何BOSS请求。
+                connection.execute(
+                    """
+                    UPDATE fj_automation_actions
+                    SET evaluation_id = ?, review_item_id = ?, payload_json = ?,
+                        status = 'queued', execution_state = 'queued',
+                        execution_epoch = execution_epoch + 1,
+                        queue_position = COALESCE((SELECT MAX(queue_position) + 1 FROM fj_automation_actions), 1),
+                        lease_owner = NULL, lease_expires_at = NULL,
+                        page_deadline_at = NULL, dispatch_started_at = NULL,
+                        request_accepted_at = NULL, verification_state = 'not_required',
+                        verification_method = 'none', verification_delay_seconds = NULL,
+                        verification_due_at = NULL, verification_started_at = NULL,
+                        verification_completed_at = NULL, verification_attempts = 0,
+                        cooldown_seconds = NULL, next_eligible_at = NULL,
+                        last_status_code = 'REAPPROVED_AFTER_MANUAL_NOT_CONTACTED',
+                        last_error = NULL, result_json = '{}', completed_at = NULL,
+                        updated_at = ?
                     WHERE id = ?
                     """,
                     (evaluation_id, review_item_id, _json(payload), now, action_id),
@@ -519,12 +569,43 @@ def _serialize_action(row) -> dict[str, object]:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "completed_at": row["completed_at"],
+        "execution_state": row["execution_state"],
+        "execution_epoch": row["execution_epoch"],
+        "queue_position": row["queue_position"],
+        "page_open_attempts": row["page_open_attempts"],
+        "page_deadline_at": row["page_deadline_at"],
+        "dispatch_started_at": row["dispatch_started_at"],
+        "request_accepted_at": row["request_accepted_at"],
+        "verification_state": row["verification_state"],
+        "verification_method": row["verification_method"],
+        "verification_delay_seconds": row["verification_delay_seconds"],
+        "verification_due_at": row["verification_due_at"],
+        "verification_started_at": row["verification_started_at"],
+        "verification_completed_at": row["verification_completed_at"],
+        "verification_attempts": row["verification_attempts"],
+        "cooldown_seconds": row["cooldown_seconds"],
+        "next_eligible_at": row["next_eligible_at"],
+        "last_status_code": row["last_status_code"],
+        "result": _load_json(row["result_json"]),
+        "navigation_task_id": row["navigation_task_id"],
     }
 
 
 def _generic_greeting(job: dict[str, object]) -> str:
     title = str(job.get("title") or "该岗位").strip() or "该岗位"
     return f"您好，我对贵司的{title}很感兴趣，希望有机会进一步沟通，谢谢。"
+
+
+def _resolve_encrypt_job_id(job) -> str:
+    direct = str(job["encrypt_job_id"] or "").strip()
+    if direct:
+        return direct
+    link = str(job["job_link"] or "").strip()
+    parsed = urlparse(link)
+    if parsed.scheme != "https" or parsed.hostname not in {"www.zhipin.com", "zhipin.com"}:
+        return ""
+    matched = re.search(r"/job_detail/([^/]+?)\.html(?:/|$)", parsed.path)
+    return matched.group(1) if matched else ""
 
 
 def _log(db: Database, action_type: str, message: str, *, level: str = "info") -> None:

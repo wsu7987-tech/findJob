@@ -50,7 +50,7 @@ class FineJobAutomationActionResponse(BaseModel):
     job_id: str
     evaluation_id: str
     review_item_id: str
-    action_type: Literal["start_conversation"]
+    action_type: Literal["start_conversation", "BOSS_DEFAULT_GREETING"]
     status: ActionStatus
     idempotency_key: str
     payload: dict[str, Any]
@@ -63,6 +63,25 @@ class FineJobAutomationActionResponse(BaseModel):
     created_at: str
     updated_at: str
     completed_at: str | None = None
+    execution_state: str = "queued"
+    execution_epoch: int = 0
+    queue_position: int = 0
+    page_open_attempts: int = 0
+    page_deadline_at: str | None = None
+    dispatch_started_at: str | None = None
+    request_accepted_at: str | None = None
+    verification_state: str = "not_required"
+    verification_method: str = "none"
+    verification_delay_seconds: int | None = None
+    verification_due_at: str | None = None
+    verification_started_at: str | None = None
+    verification_completed_at: str | None = None
+    verification_attempts: int = 0
+    cooldown_seconds: int | None = None
+    next_eligible_at: str | None = None
+    last_status_code: str | None = None
+    result: dict[str, Any] = Field(default_factory=dict)
+    navigation_task_id: str | None = None
 
 
 class FineJobAutomationActionEnvelope(BaseModel):

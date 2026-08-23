@@ -9,13 +9,15 @@ const createBackground = (ok = true): BackgroundService =>
     health: vi.fn().mockResolvedValue({
       ok,
       component: "background",
-      frameworkMode: true,
-      realActionsEnabled: false
-    })
+      frameworkMode: false,
+      realActionsEnabled: true
+    }),
+    reportBossSnapshot: vi.fn().mockResolvedValue({ accepted: true }),
+    reportExecutionResult: vi.fn().mockResolvedValue({ accepted: true })
   }) as unknown as BackgroundService;
 
 describe("Content 服务", () => {
-  it("串联 Background 与 MAIN World 的只读健康状态", async () => {
+  it("串联 Background 与 MAIN World 的执行器健康状态", async () => {
     const status = createFrameworkStatus("/");
     const service = new ContentService(createBackground(), status);
 

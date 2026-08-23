@@ -264,6 +264,13 @@ const cloneDelivery = (value: FineJobDeliveryStrategy): FineJobDeliveryStrategy 
             <div class="form-grid">
               <el-form-item label="自动化等级"><el-select v-model="deliveryForm.automation_level"><el-option label="辅助模式" value="assist" /><el-option label="半自动" value="semi_auto" /><el-option label="自动打招呼" value="auto_greeting" /></el-select></el-form-item>
               <el-form-item label="允许自动打招呼"><el-switch v-model="deliveryForm.auto_greeting_enabled" /></el-form-item>
+              <el-form-item label="发送后强制刷新验证沟通状态">
+                <el-switch v-model="deliveryForm.force_contact_verification_enabled" />
+                <p class="secondary-text verification-help">
+                  开启后，平台返回成功时会随机等待10～30秒，刷新当前岗位页面一次并检查是否已变为“继续沟通”。
+                  每个岗位会额外增加10～30秒等待及页面加载时间；页面异常时最长还可能增加一次30秒状态等待。
+                </p>
+              </el-form-item>
               <el-form-item label="遇到风险立即暂停"><el-switch v-model="deliveryForm.pause_on_risk" /></el-form-item>
               <el-form-item label="每日打招呼上限"><el-input-number v-model="deliveryForm.daily_greeting_limit" :min="1" :max="500" /></el-form-item>
               <el-form-item label="每小时打招呼上限"><el-input-number v-model="deliveryForm.hourly_greeting_limit" :min="1" :max="100" /></el-form-item>
@@ -325,5 +332,6 @@ const cloneDelivery = (value: FineJobDeliveryStrategy): FineJobDeliveryStrategy 
 .strategy-item > div { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .strategy-form { min-width: 0; }
 .strategy-form h3 { margin: 18px 0 10px; }
+.verification-help { margin: 8px 0 0; line-height: 1.55; }
 @media (max-width: 900px) { .strategy-layout { grid-template-columns: 1fr; } }
 </style>

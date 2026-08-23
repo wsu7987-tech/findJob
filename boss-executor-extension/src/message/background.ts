@@ -2,13 +2,20 @@ import type { Adapter, Message, OnMessage, SendMessage } from "comctx";
 
 import { browser } from "#imports";
 
+import { fineJobExecutorClient } from "../finejob/client";
+import type {
+  ExecutorRuntimeState,
+  MainWorldExecutionResult
+} from "../finejob/types";
+import type { BossReadOnlySnapshot } from "../platform/boss/types";
+
 export const BACKGROUND_NAMESPACE = "fine-job:boss-executor:background:v1";
 
 export type BackgroundHealth = {
   ok: true;
   component: "background";
-  frameworkMode: true;
-  realActionsEnabled: false;
+  frameworkMode: false;
+  realActionsEnabled: true;
 };
 
 export class BackgroundService {
@@ -16,9 +23,38 @@ export class BackgroundService {
     return {
       ok: true,
       component: "background",
-      frameworkMode: true,
-      realActionsEnabled: false
+      frameworkMode: false,
+      realActionsEnabled: true
     };
+  }
+
+  async getExecutorState(): Promise<ExecutorRuntimeState> {
+    return fineJobExecutorClient.getState();
+  }
+
+  async pair(code: string): Promise<{ accepted: true }> {
+    await fineJobExecutorClient.pair(code);
+    return { accepted: true };
+  }
+
+  async control(command: "allow" | "pause" | "resume" | "emergency_stop"): Promise<{ accepted: true }> {
+    await fineJobExecutorClient.control(command);
+    return { accepted: true };
+  }
+
+  async returnToReview(actionId: string): Promise<{ accepted: true }> {
+    await fineJobExecutorClient.returnToReview(actionId);
+    return { accepted: true };
+  }
+
+  async reportBossSnapshot(snapshot: BossReadOnlySnapshot): Promise<{ accepted: true }> {
+    await fineJobExecutorClient.reportSnapshot(snapshot);
+    return { accepted: true };
+  }
+
+  async reportExecutionResult(result: MainWorldExecutionResult): Promise<{ accepted: true }> {
+    await fineJobExecutorClient.reportExecutionResult(result);
+    return { accepted: true };
   }
 }
 

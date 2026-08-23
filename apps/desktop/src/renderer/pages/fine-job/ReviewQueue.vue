@@ -1,15 +1,21 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 
 import { formatDateTime } from "@/services/format";
 import { useFineJobWorkflowStore } from "@/stores/fineJobWorkflow";
-import type { FineJobReviewItem, FineJobReviewStatus } from "@/types";
+import { useFineJobBossExecutorStore } from "@/stores/fineJobBossExecutor";
+import type {
+  FineJobBossExecutorQueueAction,
+  FineJobReviewItem,
+  FineJobReviewStatus
+} from "@/types";
 
 const workflowStore = useFineJobWorkflowStore();
-const dialogOpen = ref(false);
-const activeItem = ref<FineJobReviewItem | null>(null);
-const editedMessage = ref("");
+const executorStore = useFineJobBossExecutorStore();
+let executorPollTimer: number | null = null;
+let countdownTimer: number | null = null;
+const nowMs = ref(Date.now());
 
 const pageDescription = computed(() => {
   if (workflowStore.selectedStatus === "rejected") {
@@ -29,19 +35,11 @@ const loadStatus = async (status: FineJobReviewStatus) => {
   }
 };
 
-const openApproval = (item: FineJobReviewItem) => {
-  activeItem.value = item;
-  editedMessage.value = item.draft_message || `您好，我对贵司的${item.job_title}很感兴趣，希望有机会进一步沟通，谢谢。`;
-  dialogOpen.value = true;
-};
-
-const approve = async () => {
-  const item = activeItem.value;
-  if (!item) return;
+const approve = async (item: FineJobReviewItem) => {
   if (item.status === "rejected") {
     try {
       await ElMessageBox.confirm(
-        "该岗位原结论为不建议。确认后只会加入持久化动作队列，当前版本不会真实发送。",
+        "该岗位原结论为不建议。确认后会加入BOSS默认招呼队列；只有插件另行开启自动打招呼权限才会执行。",
         "仍要沟通",
         { type: "warning", confirmButtonText: "确认加入队列" }
       );
@@ -50,12 +48,88 @@ const approve = async () => {
     }
   }
   try {
-    await workflowStore.approve(item, editedMessage.value, item.status === "rejected");
-    dialogOpen.value = false;
-    activeItem.value = null;
-    ElMessage.success("已加入打招呼动作队列；当前不会真实发送");
+    await workflowStore.approve(item, "", item.status === "rejected");
+    await executorStore.load();
+    ElMessage.success("已加入BOSS默认招呼队列");
   } catch {
     ElMessage.error(workflowStore.error ?? "批准失败");
+  }
+};
+
+const openInDedicatedBrowser = async (item: FineJobReviewItem) => {
+  try {
+    await executorStore.openJob(item.id, "review");
+    ElMessage.success("已打开对应岗位详情页；该操作不会打招呼");
+  } catch {
+    ElMessage.error(executorStore.error ?? "打开岗位页面失败");
+  }
+};
+
+const actionFor = (item: FineJobReviewItem) =>
+  executorStore.dashboard?.queue.actions.find((action) => action.job_id === item.job_id) ?? null;
+const canReturnToReview = (item: FineJobReviewItem) => {
+  const action = actionFor(item);
+  return Boolean(
+    action && ![
+      "dispatch_started", "request_accepted", "succeeded", "failed_after_dispatch", "unknown_after_dispatch"
+    ].includes(action.execution_state)
+  );
+};
+
+const returnToReview = async (item: FineJobReviewItem) => {
+  const action = actionFor(item);
+  if (!action) return;
+  try {
+    await executorStore.returnToReview(action.id);
+    await workflowStore.load("approved");
+    ElMessage.success("已取消未发送动作并返回待确认列表");
+  } catch {
+    ElMessage.error(executorStore.error ?? "退回待确认失败");
+  }
+};
+
+const manualVerifyUnknown = async (action: FineJobBossExecutorQueueAction) => {
+  try {
+    await executorStore.openJob(action.job_id, "review");
+  } catch {
+    ElMessage.error(executorStore.error ?? "无法打开未知错误岗位");
+    return;
+  }
+
+  let contacted: boolean;
+  try {
+    await ElMessageBox.confirm(
+      "对应岗位详情页已经打开。请等待页面加载并核对按钮：显示“继续沟通”请选择“确认已沟通”；显示“立即沟通”请选择“确认未沟通”。关闭窗口不会修改状态。",
+      "人工核验未知错误",
+      {
+        type: "warning",
+        confirmButtonText: "确认已沟通",
+        cancelButtonText: "确认未沟通",
+        distinguishCancelAndClose: true,
+        closeOnClickModal: false
+      }
+    );
+    contacted = true;
+  } catch (value) {
+    if (value !== "cancel") return;
+    contacted = false;
+  }
+
+  try {
+    await executorStore.manualVerifyUnknown(action.id, contacted);
+    await workflowStore.load(workflowStore.selectedStatus);
+    ElMessage.success(contacted ? "已记录人工确认：岗位已沟通" : "已返回待确认列表，重新批准前不会发送");
+  } catch {
+    ElMessage.error(executorStore.error ?? "人工核验结果保存失败");
+  }
+};
+
+const createPairingCode = async () => {
+  try {
+    await executorStore.createPairingCode();
+    ElMessage.success("配对码已生成，请在5分钟内输入插件面板");
+  } catch {
+    ElMessage.error(executorStore.error ?? "生成配对码失败");
   }
 };
 
@@ -93,7 +167,37 @@ const dimensionLabel = (name: string) => dimensionLabels[name] ?? name;
 const requirementType = (status: "pass" | "fail" | "unknown") =>
   status === "pass" ? "success" : status === "fail" ? "danger" : "warning";
 
-onMounted(() => void loadStatus("pending"));
+const verificationRemaining = (action: FineJobBossExecutorQueueAction) => {
+  if (!action.verification_due_at) return null;
+  return Math.max(0, Math.ceil((new Date(action.verification_due_at).getTime() - nowMs.value) / 1000));
+};
+
+const executorActionLabel = (action: FineJobBossExecutorQueueAction) => {
+  if (action.execution_state === "request_accepted") {
+    if (action.verification_state === "waiting_refresh") {
+      return `平台已受理，${verificationRemaining(action) ?? 0}秒后刷新验证`;
+    }
+    if (action.verification_state === "refreshing") return "正在刷新当前岗位页面";
+    if (action.verification_state === "waiting_snapshot") return "正在确认是否已建立沟通";
+    if (action.verification_state === "pending") return "已提交，页面暂未确认";
+    if (action.verification_state === "not_required") return "平台已受理，待后续验证";
+  }
+  if (action.verification_state === "page_confirmed") return "页面验证成功";
+  if (action.verification_state === "manual_confirmed") return "人工核验完成";
+  if (action.execution_state === "unknown_after_dispatch") return "未知错误";
+  return action.execution_state;
+};
+
+onMounted(() => {
+  void loadStatus("pending");
+  void executorStore.load();
+  executorPollTimer = window.setInterval(() => void executorStore.load().catch(() => undefined), 3000);
+  countdownTimer = window.setInterval(() => { nowMs.value = Date.now(); }, 1000);
+});
+onBeforeUnmount(() => {
+  if (executorPollTimer !== null) window.clearInterval(executorPollTimer);
+  if (countdownTimer !== null) window.clearInterval(countdownTimer);
+});
 </script>
 
 <template>
@@ -113,8 +217,8 @@ onMounted(() => void loadStatus("pending"));
       type="info"
       :closable="false"
       show-icon
-      title="动作队列尚未连接真实浏览器执行器"
-      description="批准后只会生成可恢复、可审计的排队动作，不会点击 BOSS 页面或发送消息。"
+      title="打开岗位页面与打招呼是两个独立动作"
+      description="批准只会加入默认招呼队列；插件必须已配对且用户主动允许自动打招呼，才会串行执行。"
     />
 
     <el-alert
@@ -137,6 +241,58 @@ onMounted(() => void loadStatus("pending"));
         <p>SQLite 持久化队列</p>
       </article>
     </div>
+
+    <section class="page-panel executor-panel">
+      <div class="executor-heading">
+        <div>
+          <h2>BOSS执行器</h2>
+          <p class="secondary-text">
+            {{ executorStore.dashboard?.executor
+              ? `插件 ${executorStore.dashboard.executor.plugin_version} · ${executorStore.dashboard.executor.queue_state}`
+              : "尚未配对插件" }}
+          </p>
+        </div>
+        <el-button :loading="executorStore.loading" @click="createPairingCode">生成插件配对码</el-button>
+      </div>
+      <el-alert
+        v-if="executorStore.pairingCode"
+        type="warning"
+        :closable="false"
+        :title="`配对码：${executorStore.pairingCode}`"
+        :description="`有效期至 ${formatDateTime(executorStore.pairingExpiresAt || '')}`"
+        show-icon
+      />
+      <div v-if="executorStore.dashboard?.executor" class="executor-status-grid">
+        <span>自动权限：{{ executorStore.dashboard.executor.permission_state }}</span>
+        <span>队列：{{ executorStore.dashboard.executor.queue_state }}</span>
+        <span>风险：{{ executorStore.dashboard.executor.risk_state }}</span>
+        <span>插件浏览器：{{ executorStore.dashboard.executor.browser_connected ? "正常" : "未连接" }}</span>
+      </div>
+      <el-table
+        v-if="executorStore.dashboard?.queue.actions.length"
+        :data="executorStore.dashboard.queue.actions"
+        size="small"
+        row-key="id"
+      >
+        <el-table-column prop="job_title" label="打招呼队列" min-width="180" />
+        <el-table-column prop="company_name" label="公司" min-width="150" />
+        <el-table-column label="执行状态" min-width="240">
+          <template #default="{ row }">{{ executorActionLabel(row) }}</template>
+        </el-table-column>
+        <el-table-column prop="page_open_attempts" label="打开次数" width="90" />
+        <el-table-column label="操作" width="120">
+          <template #default="{ row }">
+            <el-button
+              v-if="row.execution_state === 'unknown_after_dispatch'"
+              link
+              type="warning"
+              :loading="executorStore.openingJobId === row.job_id"
+              @click="manualVerifyUnknown(row)"
+            >人工核验</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </section>
 
     <section class="page-panel">
       <el-tabs
@@ -225,42 +381,31 @@ onMounted(() => void loadStatus("pending"));
         <el-table-column label="操作" width="200" fixed="right">
           <template #default="{ row }">
             <template v-if="row.status === 'pending'">
-              <el-button link type="primary" @click="openApproval(row)">编辑并批准</el-button>
+              <el-button link type="primary" @click="approve(row)">批准并加入默认招呼队列</el-button>
               <el-button link type="danger" @click="reject(row)">拒绝</el-button>
             </template>
-            <el-button v-else-if="row.status === 'rejected'" link type="warning" @click="openApproval(row)">
+            <el-button v-else-if="row.status === 'rejected'" link type="warning" @click="approve(row)">
               仍要沟通
             </el-button>
-            <el-tag v-else type="success">{{ row.auto_approved ? "策略自动批准" : "用户批准" }}</el-tag>
+            <template v-else>
+              <el-tag type="success">{{ row.auto_approved ? "策略自动批准" : "用户批准" }}</el-tag>
+              <el-button
+                v-if="canReturnToReview(row)"
+                link
+                type="danger"
+                @click="returnToReview(row)"
+              >退回待确认</el-button>
+            </template>
+            <el-button
+              link
+              type="primary"
+              :loading="executorStore.openingJobId === row.id"
+              @click="openInDedicatedBrowser(row)"
+            >打开岗位</el-button>
           </template>
         </el-table-column>
       </el-table>
     </section>
-
-    <el-dialog v-model="dialogOpen" width="620px" title="确认打招呼内容">
-      <template v-if="activeItem">
-        <p>{{ activeItem.company_name }} · {{ activeItem.job_title }}</p>
-        <el-input
-          v-model="editedMessage"
-          type="textarea"
-          :rows="5"
-          maxlength="300"
-          show-word-limit
-          placeholder="请输入最终打招呼内容"
-        />
-      </template>
-      <template #footer>
-        <el-button @click="dialogOpen = false">取消</el-button>
-        <el-button
-          type="primary"
-          :loading="workflowStore.processingId === activeItem?.id"
-          :disabled="!editedMessage.trim()"
-          @click="approve"
-        >
-          加入动作队列
-        </el-button>
-      </template>
-    </el-dialog>
   </section>
 </template>
 
@@ -288,5 +433,21 @@ onMounted(() => void loadStatus("pending"));
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 8px 18px;
+}
+
+.executor-panel,
+.executor-heading,
+.executor-status-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.executor-heading {
+  grid-template-columns: 1fr auto;
+  align-items: center;
+}
+
+.executor-status-grid {
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
 }
 </style>

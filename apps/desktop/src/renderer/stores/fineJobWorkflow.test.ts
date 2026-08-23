@@ -69,22 +69,30 @@ describe("fineJobWorkflow store", () => {
     expect(store.items[0].evaluation.evaluation_version).toBe("2.0");
   });
 
-  it("approves edited greeting and refreshes the current list", async () => {
+  it("批准默认招呼动作并刷新当前列表", async () => {
     vi.spyOn(api, "approveFineJobReviewItem").mockResolvedValue({
       action: {
         id: "action-1",
         job_id: "history-job-1",
         evaluation_id: "evaluation-1",
         review_item_id: "review-1",
-        action_type: "start_conversation",
+        action_type: "BOSS_DEFAULT_GREETING",
         status: "queued",
         idempotency_key: "boss:history-job-1:start_conversation",
-        payload: { message: "编辑后的招呼语" },
+        payload: { message: "" },
         attempt_count: 0,
         job_title: "Python 开发",
         company_name: "示例科技",
         created_at: "2026-08-21T10:00:00Z",
-        updated_at: "2026-08-21T10:00:00Z"
+        updated_at: "2026-08-21T10:00:00Z",
+        execution_state: "queued",
+        execution_epoch: 0,
+        queue_position: 1,
+        page_open_attempts: 0,
+        verification_state: "not_required",
+        verification_method: "none",
+        verification_attempts: 0,
+        result: {}
       }
     });
     vi.spyOn(api, "listFineJobReviewItems").mockResolvedValue({ items: [], total: 0 });
@@ -94,10 +102,10 @@ describe("fineJobWorkflow store", () => {
     });
     const store = useFineJobWorkflowStore();
 
-    const action = await store.approve(reviewItem(), "编辑后的招呼语");
+    const action = await store.approve(reviewItem(), "");
 
     expect(api.approveFineJobReviewItem).toHaveBeenCalledWith("review-1", {
-      message: "编辑后的招呼语",
+      message: "",
       allow_override: false
     });
     expect(action.status).toBe("queued");

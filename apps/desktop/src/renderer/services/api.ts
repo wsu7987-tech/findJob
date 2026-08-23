@@ -45,6 +45,8 @@
   FineJobAutomationActionEnvelope,
   FineJobAutomationActionListEnvelope,
   FineJobAutomationActionStatus,
+  FineJobBossExecutorDashboard,
+  FineJobBossNavigationTask,
   PoolCreateRequest,
   PoolCreateResponse,
   PoolCommitMetadataRequest,
@@ -654,6 +656,45 @@ export const api = {
     const suffix = status ? `?status=${encodeURIComponent(status)}` : "";
     return request<FineJobAutomationActionListEnvelope>(
       `/api/fine-job/automation-actions${suffix}`
+    );
+  },
+  async getFineJobBossExecutorStatus() {
+    return request<FineJobBossExecutorDashboard>("/api/fine-job/boss-executor/status");
+  },
+  async createFineJobBossPairingCode() {
+    return request<{ code: string; expires_at: string }>(
+      "/api/fine-job/boss-executor/pairing-code",
+      { method: "POST" }
+    );
+  },
+  async openFineJobBossJob(
+    jobId: string,
+    sourceContext: "capture" | "history" | "review"
+  ) {
+    return request<{ navigation: FineJobBossNavigationTask }>(
+      "/api/fine-job/boss-navigation/open",
+      {
+        method: "POST",
+        body: JSON.stringify({ job_id: jobId, source_context: sourceContext })
+      }
+    );
+  },
+  async returnFineJobBossActionToReview(actionId: string, reason = "用户退回待确认") {
+    return request<FineJobAutomationActionEnvelope>(
+      `/api/fine-job/automation-actions/${actionId}/return-to-review`,
+      { method: "POST", body: JSON.stringify({ reason }) }
+    );
+  },
+  async manualVerifyFineJobBossUnknownAction(actionId: string, contacted: boolean) {
+    return request<FineJobAutomationActionEnvelope>(
+      `/api/fine-job/automation-actions/${actionId}/manual-verify`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          contacted,
+          note: contacted ? "用户人工确认岗位已经沟通" : "用户人工确认岗位尚未沟通"
+        })
+      }
     );
   },
   async listFineJobResumes() {

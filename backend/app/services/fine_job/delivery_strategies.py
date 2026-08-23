@@ -12,7 +12,8 @@ def get_delivery_strategy(db: Database) -> dict[str, object] | None:
     with db.connect() as connection:
         row = connection.execute(
             """
-            SELECT id, automation_level, auto_greeting_enabled, daily_greeting_limit,
+            SELECT id, automation_level, auto_greeting_enabled,
+                   force_contact_verification_enabled, daily_greeting_limit,
                    hourly_greeting_limit, min_match_score, resume_submit_mode,
                    contact_share_mode, interview_accept_mode, only_online_interview,
                    pause_on_risk, notes, confirmed_at, created_at, updated_at
@@ -37,15 +38,17 @@ def save_delivery_strategy(
         connection.execute(
             """
             INSERT INTO fj_delivery_strategies (
-              id, automation_level, auto_greeting_enabled, daily_greeting_limit,
+              id, automation_level, auto_greeting_enabled,
+              force_contact_verification_enabled, daily_greeting_limit,
               hourly_greeting_limit, min_match_score, resume_submit_mode,
               contact_share_mode, interview_accept_mode, only_online_interview,
               pause_on_risk, notes, confirmed_at, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               automation_level = excluded.automation_level,
               auto_greeting_enabled = excluded.auto_greeting_enabled,
+              force_contact_verification_enabled = excluded.force_contact_verification_enabled,
               daily_greeting_limit = excluded.daily_greeting_limit,
               hourly_greeting_limit = excluded.hourly_greeting_limit,
               min_match_score = excluded.min_match_score,
@@ -62,6 +65,7 @@ def save_delivery_strategy(
                 DEFAULT_STRATEGY_ID,
                 payload.automation_level,
                 1 if payload.auto_greeting_enabled else 0,
+                1 if payload.force_contact_verification_enabled else 0,
                 payload.daily_greeting_limit,
                 payload.hourly_greeting_limit,
                 payload.min_match_score,
@@ -87,6 +91,7 @@ def _serialize_strategy(row) -> dict[str, object]:
         "id": row["id"],
         "automation_level": row["automation_level"],
         "auto_greeting_enabled": bool(row["auto_greeting_enabled"]),
+        "force_contact_verification_enabled": bool(row["force_contact_verification_enabled"]),
         "daily_greeting_limit": row["daily_greeting_limit"],
         "hourly_greeting_limit": row["hourly_greeting_limit"],
         "min_match_score": row["min_match_score"],

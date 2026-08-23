@@ -10,10 +10,10 @@ export default defineConfig({
   modules: ["@wxt-dev/module-vue"],
   manifest: {
     name: packageJson.displayName,
-    description: "FineJob 的只读 BOSS 浏览器执行器框架；当前版本不执行真实动作。",
+    description: "FineJob 的BOSS默认招呼串行执行器；真实动作受插件权限和队列状态双重控制。",
     version: packageJson.version,
-    permissions: [],
-    host_permissions: bossMatches,
+    permissions: ["storage", "tabs"],
+    host_permissions: [...bossMatches, "http://127.0.0.1:8000/*"],
     web_accessible_resources: [
       {
         resources: ["boss.js"],

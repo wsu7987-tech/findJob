@@ -174,6 +174,79 @@ class BossScraperService:
         finally:
             cdp.close()
 
+    def open_job_page(
+        self,
+        url: str,
+        *,
+        cdp_port: int = engine.DEFAULT_CDP_PORT,
+    ) -> str:
+        """在FineJob专用Chrome的交互标签页打开岗位，但不执行任何平台动作。"""
+        parsed = urlparse(url)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname not in {"www.zhipin.com", "zhipin.com"}
+            or "/job_detail/" not in parsed.path
+        ):
+            raise ValueError("岗位地址不是受支持的 BOSS HTTPS 详情页。")
+        if not engine.is_cdp_ready(cdp_port):
+            raise RuntimeError("FineJob 专用 Chrome 未启动，请先打开浏览器。")
+
+        cdp = engine.CDPSession(cdp_port)
+        try:
+            target = self._find_interactive_target(cdp_port)
+            if target:
+                target_id = str(target["targetId"])
+                session_id = engine.attach_page_session(cdp, target_id)
+                cdp.send("Page.navigate", {"url": url}, session_id)
+                cdp.send("Target.activateTarget", {"targetId": target_id})
+            else:
+                created = cdp.send("Target.createTarget", {"url": url, "background": False})
+                target_id = str(created["result"]["targetId"])
+            self._interactive_target_id = target_id
+            return target_id
+        finally:
+            cdp.close()
+
+    def reload_job_page(
+        self,
+        target_id: str,
+        expected_encrypt_job_id: str,
+        *,
+        cdp_port: int = engine.DEFAULT_CDP_PORT,
+    ) -> str:
+        """只刷新已记录的同一岗位标签页，不创建新页面，也不执行平台业务动作。"""
+        if not engine.is_cdp_ready(cdp_port):
+            raise RuntimeError("FineJob 专用 Chrome 未启动，请先打开浏览器。")
+        expected_encrypt_job_id = expected_encrypt_job_id.strip()
+        if not target_id or not expected_encrypt_job_id:
+            raise ValueError("刷新验证缺少目标标签页或岗位标识。")
+
+        cdp = engine.CDPSession(cdp_port)
+        try:
+            response = cdp.send("Target.getTargets")
+            target = next(
+                (
+                    item for item in response.get("result", {}).get("targetInfos", [])
+                    if item.get("type") == "page" and str(item.get("targetId") or "") == target_id
+                ),
+                None,
+            )
+            if target is None:
+                raise RuntimeError("用于验证的BOSS岗位标签页已经关闭。")
+            current_url = str(target.get("url") or "")
+            if not (
+                "/job_detail/" in urlparse(current_url).path
+                and expected_encrypt_job_id in urlparse(current_url).path
+            ):
+                raise RuntimeError("用于验证的标签页已经不是原岗位详情页。")
+            session_id = engine.attach_page_session(cdp, target_id)
+            cdp.send("Page.reload", {"ignoreCache": False}, session_id)
+            cdp.send("Target.activateTarget", {"targetId": target_id})
+            self._interactive_target_id = target_id
+            return target_id
+        finally:
+            cdp.close()
+
     def capture_jobs(
         self,
         request: BossCaptureRequest,

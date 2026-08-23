@@ -14,6 +14,7 @@ InterviewAcceptMode = Literal["manual", "auto_in_selected_slots"]
 class FineJobDeliveryStrategyPayload(BaseModel):
     automation_level: AutomationLevel = "assist"
     auto_greeting_enabled: bool = False
+    force_contact_verification_enabled: bool = False
     daily_greeting_limit: int = Field(default=20, ge=1, le=500)
     hourly_greeting_limit: int = Field(default=5, ge=1, le=100)
     min_match_score: float = Field(default=0.72, ge=0, le=1)

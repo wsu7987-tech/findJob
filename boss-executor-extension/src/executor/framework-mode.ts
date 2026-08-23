@@ -1,9 +1,10 @@
 import type { BossProbeState, BossReadOnlySnapshot } from "../platform/boss/types";
+import type { ExecutorRuntimeState } from "../finejob/types";
 
 export const FRAMEWORK_MODE = Object.freeze({
-  name: "只读框架",
-  realActionsEnabled: false,
-  fineJobConnected: false
+  name: "FineJob串行执行器",
+  realActionsEnabled: true,
+  fineJobConnected: true
 });
 
 export type FrameworkMode = typeof FRAMEWORK_MODE;
@@ -26,6 +27,7 @@ export type FrameworkStatus = {
   bossSnapshot: BossReadOnlySnapshot | null;
   page: string;
   detail: string;
+  executor: ExecutorRuntimeState;
 };
 
 export const createFrameworkStatus = (pathname: string): FrameworkStatus => ({
@@ -35,7 +37,16 @@ export const createFrameworkStatus = (pathname: string): FrameworkStatus => ({
   bossProbe: "waiting",
   bossSnapshot: null,
   page: pathname,
-  detail: `正在检查三层扩展上下文；模式：${FRAMEWORK_MODE.name}`
+  detail: `正在检查三层扩展上下文；模式：${FRAMEWORK_MODE.name}`,
+  executor: {
+    connected: false,
+    paired: false,
+    detail: "尚未与FineJob配对",
+    executor: null,
+    queue: [],
+    currentAction: null,
+    lastResult: ""
+  }
 });
 
 export const isMainWorldStatus = (value: unknown): value is MainWorldStatus => {
@@ -52,14 +63,16 @@ export const isMainWorldStatus = (value: unknown): value is MainWorldStatus => {
 
 export const refreshFrameworkDetail = (status: FrameworkStatus): void => {
   if (status.background === "error") {
-    status.detail = "Background 健康检查失败；真实动作仍保持禁用";
+    status.detail = "Background 健康检查失败；真实动作已阻断";
     return;
   }
   if (status.mainWorld === "error") {
-    status.detail = "Main World 健康检查失败；真实动作仍保持禁用";
+    status.detail = "Main World 健康检查失败；真实动作已阻断";
     return;
   }
   if (status.background === "ready" && status.mainWorld === "ready") {
-    status.detail = "三层框架通信正常；当前不会连接 FineJob 或执行真实动作";
+    status.detail = status.executor.connected
+      ? "三层扩展与FineJob通信正常"
+      : "三层扩展正常，正在等待FineJob通信";
   }
 };

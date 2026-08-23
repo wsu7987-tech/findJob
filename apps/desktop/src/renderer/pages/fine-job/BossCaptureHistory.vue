@@ -4,11 +4,13 @@ import { ElMessage } from "element-plus";
 
 import { formatDateTime } from "@/services/format";
 import { useFineJobBossCaptureStore } from "@/stores/fineJobBossCapture";
+import { useFineJobBossExecutorStore } from "@/stores/fineJobBossExecutor";
 import { useFineJobBossHistoryStore } from "@/stores/fineJobBossHistory";
 import { useFineJobStrategiesStore } from "@/stores/fineJobStrategies";
 import type { FineJobBossHistoryJob, FineJobBossHistorySortField } from "@/types";
 
 const captureStore = useFineJobBossCaptureStore();
+const executorStore = useFineJobBossExecutorStore();
 const historyStore = useFineJobBossHistoryStore();
 const strategiesStore = useFineJobStrategiesStore();
 const selectedJob = ref<FineJobBossHistoryJob | null>(null);
@@ -163,6 +165,15 @@ const detailActionLabel = (job: FineJobBossHistoryJob) =>
 const openDetail = (job: FineJobBossHistoryJob) => {
   selectedJob.value = job;
   detailDrawerOpen.value = true;
+};
+
+const openInDedicatedBrowser = async (job: FineJobBossHistoryJob) => {
+  try {
+    await executorStore.openJob(job.id, "history");
+    ElMessage.success("已在FineJob专用浏览器打开该岗位；未执行打招呼");
+  } catch {
+    ElMessage.error(executorStore.error ?? "打开岗位页面失败");
+  }
 };
 
 const detailStatusLabel = (status?: string) => ({
@@ -367,9 +378,17 @@ watch(
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="210" fixed="right">
+        <el-table-column label="操作" width="285" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click.stop="openDetail(row)">查看详情</el-button>
+            <el-button
+              link
+              type="primary"
+              :loading="executorStore.openingJobId === row.id"
+              @click.stop="openInDedicatedBrowser(row)"
+            >
+              专用浏览器打开
+            </el-button>
             <el-button
               v-if="row.detail_status === 'completed' && !row.delivery_evaluation"
               link
@@ -494,6 +513,13 @@ watch(
           {{ detailActionLabel(selectedJob) }}
         </el-button>
         <el-divider />
+        <el-button
+          type="primary"
+          :loading="executorStore.openingJobId === selectedJob.id"
+          @click="openInDedicatedBrowser(selectedJob)"
+        >
+          在专用浏览器打开（不打招呼）
+        </el-button>
         <el-link v-if="selectedJob.job_link" :href="selectedJob.job_link" target="_blank" type="primary">
           打开 BOSS 原始岗位页面
         </el-link>

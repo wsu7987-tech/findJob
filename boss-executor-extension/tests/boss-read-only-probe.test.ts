@@ -161,10 +161,10 @@ describe("BOSS 岗位只读识别", () => {
     document.body.innerHTML = `
       <div class="job-detail">
         <div class="job-boss-info"><h2 class="name">王晓丽<i></i></h2></div>
-        <a class="btn btn-startchat" data-isfriend="false" lid="lid-1"
+        <div class="job-op"><a class="btn btn-startchat" data-isfriend="false" lid="lid-1"
           data-url="/wapi/zpgeek/friend/add.json?securityId=security-detail-1&jobId=job-encrypted-1">
           立即沟通
-        </a>
+        </a></div>
       </div>
     `;
 
@@ -193,10 +193,10 @@ describe("BOSS 岗位只读识别", () => {
     document.body.innerHTML = `
       <div class="job-detail">
         <div class="job-boss-info"><h2 class="name">王晓丽</h2></div>
-        <a class="btn btn-startchat" data-isfriend="true"
+        <div class="job-op"><a class="btn btn-startchat" data-isfriend="true"
           data-url="/wapi/zpgeek/friend/add.json?securityId=security-detail-1&jobId=job-encrypted-1">
           继续沟通
-        </a>
+        </a></div>
       </div>
     `;
 
@@ -221,10 +221,10 @@ describe("BOSS 岗位只读识别", () => {
     document.body.innerHTML = `
       <div class="job-detail">
         <div class="job-boss-info"><h2 class="name">王晓丽</h2></div>
-        <a class="btn btn-startchat" data-isfriend="true"
+        <div class="job-op"><a class="btn btn-startchat" data-isfriend="true"
           data-url="/wapi/zpgeek/friend/add.json?securityId=security-detail-1&jobId=job-encrypted-1">
           立即沟通
-        </a>
+        </a></div>
       </div>
     `;
 

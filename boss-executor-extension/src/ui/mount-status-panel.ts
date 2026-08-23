@@ -1,11 +1,15 @@
 import { createApp } from "vue";
 
 import type { FrameworkStatus } from "../executor/framework-mode";
+import type { ExecutorPanelController } from "../finejob/types";
 import StatusPanel from "./StatusPanel.vue";
 
 const PANEL_HOST_ID = "fine-job-boss-executor-framework";
 
-export const mountStatusPanel = (status: FrameworkStatus): (() => void) => {
+export const mountStatusPanel = (
+  status: FrameworkStatus,
+  controller: ExecutorPanelController
+): (() => void) => {
   const existing = document.getElementById(PANEL_HOST_ID);
   if (existing) return () => undefined;
 
@@ -33,12 +37,21 @@ export const mountStatusPanel = (status: FrameworkStatus): (() => void) => {
     .probe { margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(156,163,175,.22); }
     .probe-title { color: #5eead4; font-weight: 700; }
     .page, .detail { color: #9ca3af; overflow-wrap: anywhere; }
+    button, input { font: inherit; }
+    input { box-sizing: border-box; width: 100%; margin-top: 8px; padding: 6px 8px;
+      color: #e5e7eb; background: #111827; border: 1px solid #4b5563; border-radius: 6px; }
+    .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+    button { padding: 5px 8px; border: 1px solid #4b5563; border-radius: 6px;
+      color: #e5e7eb; background: #1f2937; cursor: pointer; }
+    button.primary { color: #052e2b; background: #5eead4; border-color: #5eead4; }
+    button.danger { color: #fecaca; border-color: #ef4444; }
+    .queue { max-height: 150px; overflow: auto; margin: 6px 0 0; padding-left: 18px; }
   `;
 
   const mountPoint = document.createElement("div");
   shadowRoot.append(style, mountPoint);
   document.documentElement.append(host);
-  const app = createApp(StatusPanel, { status });
+  const app = createApp(StatusPanel, { status, controller });
   app.mount(mountPoint);
 
   // 页面卸载时同步释放 Vue 实例，避免站内导航或扩展重载留下旧状态。

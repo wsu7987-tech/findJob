@@ -3,11 +3,13 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "v
 import { ElMessage } from "element-plus";
 
 import { useFineJobBossCaptureStore } from "@/stores/fineJobBossCapture";
+import { useFineJobBossExecutorStore } from "@/stores/fineJobBossExecutor";
 import { useFineJobPlatformSessionsStore } from "@/stores/fineJobPlatformSessions";
 import { useFineJobStrategiesStore } from "@/stores/fineJobStrategies";
 import type { FineJobBossCapturedJob } from "@/types";
 
 const captureStore = useFineJobBossCaptureStore();
+const executorStore = useFineJobBossExecutorStore();
 const platformStore = useFineJobPlatformSessionsStore();
 const strategiesStore = useFineJobStrategiesStore();
 const form = reactive({
@@ -358,6 +360,16 @@ const openDetail = (job: FineJobBossCapturedJob) => {
   detailDrawerOpen.value = true;
 };
 
+const openInDedicatedBrowser = async (job: FineJobBossCapturedJob) => {
+  if (!job.job_id) return;
+  try {
+    await executorStore.openJob(job.job_id, "capture");
+    ElMessage.success("已在FineJob专用浏览器打开该岗位；未执行打招呼");
+  } catch {
+    ElMessage.error(executorStore.error ?? "打开岗位页面失败");
+  }
+};
+
 const canSelectJob = (job: FineJobBossCapturedJob) =>
   job.detail_status !== "queued" && job.detail_status !== "collecting";
 
@@ -617,9 +629,17 @@ function formatDuration(seconds: number) {
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="210" fixed="right">
+        <el-table-column label="操作" width="285" fixed="right">
           <template #default="scope">
             <el-button link type="primary" @click.stop="openDetail(scope.row)">查看详情</el-button>
+            <el-button
+              link
+              type="primary"
+              :loading="executorStore.openingJobId === scope.row.job_id"
+              @click.stop="openInDedicatedBrowser(scope.row)"
+            >
+              专用浏览器打开
+            </el-button>
             <el-button
               v-if="scope.row.detail_status === 'completed' && !scope.row.delivery_evaluation"
               link
@@ -744,6 +764,13 @@ function formatDuration(seconds: number) {
         <p v-if="currentDetailJob.first_collected_at" class="secondary-text">首次采集：{{ currentDetailJob.first_collected_at }}</p>
         <p v-if="currentDetailJob.collect_count" class="secondary-text">累计采集：{{ currentDetailJob.collect_count }} 次</p>
         <p v-if="currentDetailJob.detail_collected_at" class="secondary-text">详情采集：{{ currentDetailJob.detail_collected_at }}</p>
+        <el-button
+          type="primary"
+          :loading="executorStore.openingJobId === currentDetailJob.job_id"
+          @click="openInDedicatedBrowser(currentDetailJob)"
+        >
+          在专用浏览器打开（不打招呼）
+        </el-button>
         <el-link v-if="currentDetailJob.job_link" :href="currentDetailJob.job_link" target="_blank" type="primary">
           打开 BOSS 原始岗位页面
         </el-link>
