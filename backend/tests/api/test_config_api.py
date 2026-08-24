@@ -80,3 +80,25 @@ def test_codex_connectivity_endpoint_returns_cli_status(
         "error_category": None,
         "checked_at": response.json()["checked_at"],
     }
+
+
+def test_codex_model_list_endpoint_returns_models(client, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "backend.app.routers.config.list_codex_models",
+        lambda cli_path: {
+            "capability": "codex-models",
+            "models": [
+                {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna", "reasoning_efforts": ["low", "high"]},
+            ],
+            "fetched_at": "2026-08-25T00:00:00+00:00",
+        },
+    )
+
+    response = client.post("/api/config/codex-models", json={"cli_path": "codex"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "capability": "codex-models",
+        "models": [{"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna", "reasoning_efforts": ["low", "high"]}],
+        "fetched_at": "2026-08-25T00:00:00+00:00",
+    }

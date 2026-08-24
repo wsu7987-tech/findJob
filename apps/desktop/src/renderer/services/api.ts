@@ -71,7 +71,11 @@
   SummaryPrecheckResponse,
   SummaryRunCreateResponse
 } from "../types";
-import type { CodexConnectivityCheckResponse, ProviderConnectivityCheckResponse } from "../types";
+import type {
+  CodexConnectivityCheckResponse,
+  CodexModelListResponse,
+  ProviderConnectivityCheckResponse
+} from "../types";
 import type {
   PdfDraftCommitResponse,
   PdfDraftCreateRequest,
@@ -411,6 +415,12 @@ export const api = {
   async checkCodexConnection() {
     return request<CodexConnectivityCheckResponse>("/api/config/check-codex", {
       method: "POST"
+    });
+  },
+  async listCodexModels(cliPath: string) {
+    return request<CodexModelListResponse>("/api/config/codex-models", {
+      method: "POST",
+      body: JSON.stringify({ cli_path: cliPath })
     });
   },
   async getFineJobIntent() {

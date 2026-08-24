@@ -104,3 +104,20 @@ class CodexConnectivityCheckResponse(BaseModel):
     detail: str
     error_category: str | None = None
     checked_at: str
+
+
+class CodexModelListRequest(BaseModel):
+    # 只使用本机 Codex CLI 配置和登录状态，不读取登录凭据。
+    cli_path: str = "codex"
+
+
+class CodexModelItem(BaseModel):
+    id: str
+    label: str | None = None
+    reasoning_efforts: list[str] = Field(default_factory=list)
+
+
+class CodexModelListResponse(BaseModel):
+    capability: Literal["codex-models"]
+    models: list[CodexModelItem]
+    fetched_at: str

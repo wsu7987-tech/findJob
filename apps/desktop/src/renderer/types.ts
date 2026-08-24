@@ -1212,6 +1212,18 @@ export interface CodexConnectivityCheckResponse {
   checked_at: string;
 }
 
+export interface CodexModelItem {
+  id: string;
+  label?: string | null;
+  reasoning_efforts?: string[];
+}
+
+export interface CodexModelListResponse {
+  capability: "codex-models";
+  models: CodexModelItem[];
+  fetched_at: string;
+}
+
 export interface ReportPrecheckResponse {
   week_key?: string;
   available_week_keys?: string[];

@@ -11,6 +11,8 @@ from backend.app.schemas.config import (
     AppConfigPatchRequest,
     AppConfigResponse,
     CodexConnectivityCheckResponse,
+    CodexModelListRequest,
+    CodexModelListResponse,
     ProviderConnectivityCheckResponse,
 )
 from backend.app.services.config import (
@@ -23,6 +25,7 @@ from backend.app.services.reasoning.codex_exec import (
     check_codex_cli,
     validate_codex_options,
 )
+from backend.app.services.codex_models import list_codex_models
 from backend.app.errors import AppError
 
 
@@ -131,3 +134,9 @@ def check_config_codex_connectivity(
         error_category=result.error_category,
         checked_at=datetime.now(UTC).isoformat(),
     )
+
+
+@router.post("/codex-models", response_model=CodexModelListResponse)
+def list_config_codex_models(payload: CodexModelListRequest) -> CodexModelListResponse:
+    result = list_codex_models(payload.cli_path)
+    return CodexModelListResponse(**result)

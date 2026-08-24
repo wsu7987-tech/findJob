@@ -86,7 +86,7 @@ codex --version
 codex login status
 ```
 
-然后在桌面端“FineJob 配置 → 智能执行器”中选择“本机 Codex CLI”，可按需填写模型和推理强度；留空时跟随 Codex 默认值。保存后点击“检测 Codex CLI”。
+然后在桌面端“FineJob 配置 → 智能执行器”中选择“本机 Codex CLI”。模型支持下拉选择，也可以直接输入自定义模型 ID；点击“刷新模型列表”会调用 `codex debug models` 获取当前 Codex 模型目录，不需要额外填写 API Key。推理强度支持默认、Minimal、Low、Medium、High 和 XHigh。模型或推理强度留空时跟随 Codex 默认值。保存后点击“检测 Codex CLI”。
 
 Codex 生成任务使用临时目录、只读沙箱、JSONL 事件和 JSON Schema 结果约束。FineJob 不读取 Codex 登录凭据，最终业务结果及运行元数据仍保存在 FineJob 中。
 

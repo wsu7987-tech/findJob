@@ -6,9 +6,10 @@ import { ElMessageBox } from "element-plus";
 import { chooseDirectory, hasDirectoryPicker, updateShellConfig } from "@/services/desktop-bridge";
 import { formatDateTime } from "@/services/format";
 import { buildSettingsSavePayload } from "@/services/settingsShellConfig";
+import { api } from "@/services/api";
 import { useConfigStore } from "@/stores/config";
 import { useNoticesStore } from "@/stores/notices";
-import type { AppConfigPayload } from "@/types";
+import type { AppConfigPayload, CodexModelItem } from "@/types";
 import EndpointNotice from "./EndpointNotice.vue";
 import SystemStatusChip from "./SystemStatusChip.vue";
 
@@ -53,13 +54,26 @@ const reasoningExecutorOptions = [
   { label: "本机 Codex CLI", value: "codex-cli" }
 ] as const;
 
+const fallbackCodexModelOptions = [
+  { label: "跟随 Codex 默认", value: "" },
+  { label: "GPT-5.6 Sol（gpt-5.6）", value: "gpt-5.6" },
+  { label: "GPT-5.6 Terra（gpt-5.6-terra）", value: "gpt-5.6-terra" },
+  { label: "GPT-5.6 Luna（gpt-5.6-luna）", value: "gpt-5.6-luna" }
+] as const;
+
+const codexModelOptions = ref<Array<{ label: string; value: string }>>([
+  ...fallbackCodexModelOptions
+]);
+const codexModelsLoading = ref(false);
+const codexModelsFetchedAt = ref<string | null>(null);
+
 const codexReasoningEffortOptions = [
   { label: "跟随 Codex 默认", value: "" },
-  { label: "Minimal", value: "minimal" },
-  { label: "Low", value: "low" },
-  { label: "Medium", value: "medium" },
-  { label: "High", value: "high" },
-  { label: "XHigh（模型支持时）", value: "xhigh" }
+  { label: "低（Minimal）— 更快", value: "minimal" },
+  { label: "较低（Low）— 速度优先", value: "low" },
+  { label: "中（Medium）— 日常推荐", value: "medium" },
+  { label: "高（High）— 复杂任务", value: "high" },
+  { label: "极高（XHigh）— 模型支持时", value: "xhigh" }
 ] as const;
 
 const llmProviderOptions = [
@@ -73,6 +87,75 @@ const embeddingProviderOptions = [
   { label: "OpenAI Compatible", value: "openai-compatible" },
   { label: "Stub，本地测试", value: "stub-embedding" }
 ] as const;
+
+const getCodexModelLabel = (modelId: string) => {
+  const knownLabels: Record<string, string> = {
+    "gpt-5.6": "GPT-5.6 Sol（gpt-5.6）",
+    "gpt-5.6-sol": "GPT-5.6 Sol（gpt-5.6-sol）",
+    "gpt-5.6-terra": "GPT-5.6 Terra（gpt-5.6-terra）",
+    "gpt-5.6-luna": "GPT-5.6 Luna（gpt-5.6-luna）"
+  };
+  return knownLabels[modelId] ?? modelId;
+};
+
+const normalizeCodexModels = (models: CodexModelItem[], includeFallback = true) => {
+  const values = new Map<string, { label: string; value: string }>();
+  if (includeFallback) {
+    for (const option of fallbackCodexModelOptions) {
+      values.set(option.value, option);
+    }
+  }
+  for (const model of models) {
+    const modelId = model.id.trim();
+    if (modelId) {
+      values.set(modelId, { label: model.label?.trim() || getCodexModelLabel(modelId), value: modelId });
+    }
+  }
+  return [...values.values()];
+};
+
+const loadCachedCodexModels = () => {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    const cached = JSON.parse(window.localStorage.getItem("fine-job.codex-model-options") ?? "null");
+    if (Array.isArray(cached?.models)) {
+      codexModelOptions.value = normalizeCodexModels(cached.models);
+      codexModelsFetchedAt.value = typeof cached.fetchedAt === "string" ? cached.fetchedAt : null;
+    }
+  } catch {
+    // 缓存损坏时回退到内置模型列表。
+  }
+};
+
+const refreshCodexModels = async () => {
+  codexModelsLoading.value = true;
+  try {
+    const result = await api.listCodexModels(form.codex_cli_path || "codex");
+    codexModelOptions.value = normalizeCodexModels(result.models, false);
+    codexModelsFetchedAt.value = result.fetched_at;
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(
+        "fine-job.codex-model-options",
+        JSON.stringify({ models: result.models, fetchedAt: result.fetched_at })
+      );
+    }
+    noticesStore.push({
+      kind: "success",
+      title: "模型列表已刷新",
+      message: `已从 Codex CLI 获取 ${result.models.length} 个模型。`
+    });
+  } catch (errorValue) {
+    noticesStore.push({
+      kind: "warning",
+      title: "模型列表刷新失败",
+      message: errorValue instanceof Error ? errorValue.message : "请检查 Codex CLI 安装、登录状态和路径。"
+    });
+  } finally {
+    codexModelsLoading.value = false;
+  }
+};
 
 const normalizeLlmProvider = (value: string | null | undefined) => {
   const normalized = value?.trim().toLowerCase() ?? "";
@@ -183,6 +266,8 @@ const syncFormFromStore = () => {
   embeddingApiKeyTouched.value = false;
   savedFormSnapshot.value = JSON.stringify(form);
 };
+
+loadCachedCodexModels();
 
 watch(
   () => props.open,
@@ -492,12 +577,34 @@ const pickDirectory = async (
             </el-form-item>
 
             <el-form-item label="模型">
-              <el-input
+              <el-select
                 v-model="form.codex_model"
+                filterable
+                allow-create
+                default-first-option
+                reserve-keyword
                 name="codex_model"
-                autocomplete="off"
-                placeholder="留空则跟随 Codex 默认模型"
-              />
+                placeholder="选择或输入模型 ID，留空则跟随 Codex 默认"
+                style="width: 100%"
+              >
+                <el-option
+                  v-for="option in codexModelOptions"
+                  :key="option.value || 'default'"
+                  :label="option.label"
+                  :value="option.value"
+                />
+              </el-select>
+              <div class="secondary-text">
+                可直接输入其他模型 ID。刷新列表会调用当前 Codex CLI 的模型目录，不会读取或修改登录凭据。
+              </div>
+              <div class="setting-actions">
+                <el-button :loading="codexModelsLoading" @click="refreshCodexModels">
+                  刷新模型列表
+                </el-button>
+                <span v-if="codexModelsFetchedAt" class="secondary-text">
+                  最近刷新：{{ formatDateTime(codexModelsFetchedAt) }}
+                </span>
+              </div>
             </el-form-item>
 
             <el-form-item label="推理强度">
