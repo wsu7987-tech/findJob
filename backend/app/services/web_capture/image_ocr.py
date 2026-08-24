@@ -7,21 +7,21 @@ from backend.app.errors import AppError
 
 try:
     import numpy as np
-except ImportError:  # pragma: no cover - runtime dependency
+except ImportError:  # pragma: no cover - 运行时依赖
     np = None
 
 try:
     import cv2
-except ImportError:  # pragma: no cover - runtime dependency
+except ImportError:  # pragma: no cover - 运行时依赖
     cv2 = None
 
 try:
     from rapidocr import RapidOCR
     RAPID_OCR_IMPORT_ERROR = None
-except ImportError:  # pragma: no cover - runtime dependency
+except ImportError:  # pragma: no cover - 运行时依赖
     RapidOCR = None
     RAPID_OCR_IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - runtime dependency
+except Exception as exc:  # pragma: no cover - 运行时依赖
     RapidOCR = None
     RAPID_OCR_IMPORT_ERROR = str(exc)
 

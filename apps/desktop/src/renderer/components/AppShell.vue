@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 import {
   ArrowRight,
+  ChatDotRound,
   Clock,
   Document,
   Link,
@@ -36,6 +37,7 @@ const navigation = [
   { label: "策略管理", routeName: "fine-job-strategy", icon: Wallet },
   { label: "运行状态", routeName: "fine-job-runs", icon: List },
   { label: "待确认", routeName: "fine-job-review", icon: User },
+  { label: "自动代聊", routeName: "fine-job-chat", icon: ChatDotRound },
   { label: "动作日志", routeName: "fine-job-logs", icon: User }
 ];
 

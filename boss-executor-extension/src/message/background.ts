@@ -3,7 +3,11 @@ import type { Adapter, Message, OnMessage, SendMessage } from "comctx";
 import { browser } from "#imports";
 
 import { fineJobExecutorClient } from "../finejob/client";
+import { bossChatCoordinator } from "../finejob/chat-coordinator";
 import type {
+  ChatObservedMessage,
+  ChatSendExecutionResult,
+  ChatTabHeartbeat,
   ExecutorRuntimeState,
   MainWorldExecutionResult
 } from "../finejob/types";
@@ -56,6 +60,23 @@ export class BackgroundService {
     await fineJobExecutorClient.reportExecutionResult(result);
     return { accepted: true };
   }
+
+  async reportChatTabHeartbeat(heartbeat: ChatTabHeartbeat): Promise<{ isLeader: boolean; leaderEpoch: number }> {
+    return bossChatCoordinator.reportTabHeartbeat(heartbeat);
+  }
+
+  async isChatListeningEnabled(): Promise<boolean> {
+    return bossChatCoordinator.isListeningEnabled();
+  }
+
+  async reportChatMessage(tabId: string, message: ChatObservedMessage): Promise<{ accepted: boolean }> {
+    return bossChatCoordinator.reportMessage(tabId, message);
+  }
+
+  async reportChatSendResult(result: ChatSendExecutionResult): Promise<{ accepted: true }> {
+    await bossChatCoordinator.reportSendResult(result);
+    return { accepted: true };
+  }
 }
 
 type MessageMeta = {
@@ -63,7 +84,7 @@ type MessageMeta = {
   injector: "content";
 };
 
-// 适配自 boss-helper：Background 根据发起页面把 comctx 响应送回对应标签页。
+// 根据发起页面把 comctx 响应送回对应标签页。
 export class ProvideBackgroundAdapter implements Adapter<MessageMeta> {
   sendMessage: SendMessage<MessageMeta> = async (message) => {
     const tabs = await browser.tabs.query({ url: message.meta.url });
@@ -81,7 +102,7 @@ export class ProvideBackgroundAdapter implements Adapter<MessageMeta> {
   };
 }
 
-// 适配自 boss-helper：Content 通过扩展 runtime 访问 Background 服务。
+// Content 通过扩展 runtime 访问 Background 服务。
 export class InjectBackgroundAdapter implements Adapter<MessageMeta> {
   sendMessage: SendMessage<MessageMeta> = (message) => {
     void browser.runtime.sendMessage(browser.runtime.id, {

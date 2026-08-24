@@ -51,8 +51,8 @@ class BossBrowserStatus:
 class BossScraperService:
     """FineJob 内部调用 CDP 采集引擎的薄服务层。
 
-    关键边界：上游脚本保留采集实现，本类只负责稳定的函数接口、输出路径和
-    单次任务隔离。其他 FineJob 模块应调用这里，不直接依赖引擎内部细节。
+    关键边界：本类只负责稳定的函数接口、输出路径和单次任务隔离。
+    其他 FineJob 模块应调用这里，不直接依赖引擎内部细节。
     """
 
     def __init__(self) -> None:

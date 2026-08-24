@@ -1059,7 +1059,7 @@ body.shellless-route #app {
   }
 }
 
-/* Workbench redesign: dense desktop tool, not a warm marketing surface. */
+/* 工作台重新设计：面向桌面工具的紧凑布局，不采用营销页面风格。 */
 :root {
   color: #202723;
   background: #eef1ec;

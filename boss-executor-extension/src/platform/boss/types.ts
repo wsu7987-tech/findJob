@@ -2,7 +2,6 @@ export type BossPageKind = "search" | "recommend" | "detail" | "other";
 
 export type BossProbeState = "ready" | "waiting" | "unsupported" | "mismatch" | "unavailable";
 
-// 字段子集适配自 boss-helper 的 BossZpJobItemData，只保留只读身份识别所需内容。
 export type BossJobItemSubset = {
   securityId: string;
   encryptBossId: string;
@@ -14,7 +13,6 @@ export type BossJobItemSubset = {
   contact: boolean | null;
 };
 
-// 字段子集适配自 boss-helper 的 BossZpDetailData，不包含简历、聊天或 token 数据。
 export type BossJobDetailSubset = {
   securityId: string;
   lid: string;

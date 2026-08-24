@@ -20,6 +20,8 @@
   },
   "dependencies": {
     "comctx": "1.7.5",
+    "mqtt": "5.15.2",
+    "protobufjs": "7.5.4",
     "vue": "3.5.41"
   },
   "devDependencies": {

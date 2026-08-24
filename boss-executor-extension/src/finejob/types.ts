@@ -58,11 +58,78 @@ export type ExecutorRuntimeState = {
   lastResult: string;
 };
 
-export type MainWorldCommand = {
+export type DefaultGreetingCommand = {
   type: "BOSS_DEFAULT_GREETING";
   actionId: string;
   executionEpoch: number;
   encryptJobId: string;
+};
+
+export type ChatObservedMessage = {
+  eventId: string;
+  accountUid: string;
+  platformMessageId: string;
+  direction: "inbound" | "outbound";
+  messageType: "text" | "image" | "system" | "unknown";
+  content: string;
+  senderUid: string;
+  receiverUid: string;
+  clientMid: string;
+  peerUid: string;
+  encryptPeerUid: string;
+  securityId: string;
+  encryptJobId: string;
+  jobTitle: string;
+  peerName: string;
+  companyName: string;
+  sentAt: string;
+  observedAt: string;
+  source: "websocket" | "manual" | "assistant";
+  rawMeta: Record<string, unknown>;
+};
+
+export type ChatIdentity = {
+  accountUid: string;
+  loggedIn: boolean;
+  pathname: string;
+  observedAt: number;
+};
+
+export type ChatTabHeartbeat = ChatIdentity & {
+  tabId: string;
+  visible: boolean;
+};
+
+export type FineJobChatSendAction = {
+  id: string;
+  session_id: string;
+  status: string;
+  text: string;
+  execution_epoch: number;
+  account_uid: string;
+  peer_uid: string;
+  encrypt_peer_uid: string;
+  security_id: string;
+  encrypt_job_id: string;
+};
+
+export type ChatSendCommand = {
+  type: "BOSS_CHAT_SEND";
+  targetTabId: string;
+  action: FineJobChatSendAction;
+};
+
+export type MainWorldCommand = DefaultGreetingCommand | ChatSendCommand;
+
+export type ChatSendExecutionResult = {
+  actionId: string;
+  executionEpoch: number;
+  outcome: "accepted" | "failed" | "unknown";
+  platformMessageId: string;
+  clientMid: string;
+  statusCode: string;
+  message: string;
+  evidence: Record<string, unknown>;
 };
 
 export type MainWorldExecutionResult = {

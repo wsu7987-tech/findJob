@@ -346,7 +346,7 @@ export const useWebDraftStore = defineStore("webDraft", () => {
           const draftResponse = await api.getWebDraft(job.draft_id);
           applyDraft(draftResponse.draft, { activate: false, openDrawer: false });
         } catch {
-          // ignore stale draft fetch failures during refresh
+          // 刷新期间忽略过期草稿的获取失败。
         }
       }
     }
@@ -373,7 +373,7 @@ export const useWebDraftStore = defineStore("webDraft", () => {
               openDrawer: activeDraftId.value === draftId && drawerOpen.value
             });
           } catch {
-            // ignore missing drafts during poll refresh
+            // 轮询刷新期间忽略已不存在草稿的获取失败。
           }
         }
         if (!response.some((item) => item.status === "queued" || item.status === "running")) {

@@ -345,7 +345,7 @@ def run_managed_session_login(
 ) -> None:
     try:
         sync_playwright = PlaywrightRunner._get_sync_playwright()
-    except ImportError as exc:  # pragma: no cover - runtime dependency
+    except ImportError as exc:  # pragma: no cover - 运行时依赖
         raise AppError(
             status_code=500,
             error_category="FETCH_FAILED",
@@ -388,7 +388,7 @@ def run_managed_session_login(
                     pass
     except AppError:
         raise
-    except Exception as exc:  # pragma: no cover - runtime dependency
+    except Exception as exc:  # pragma: no cover - 运行时依赖
         raise AppError(
             status_code=502,
             error_category="FETCH_FAILED",

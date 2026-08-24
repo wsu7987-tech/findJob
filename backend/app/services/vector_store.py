@@ -12,7 +12,7 @@ from backend.app.services.ai import RelatedContextItem
 
 try:
     from qdrant_client import QdrantClient, models
-except ImportError:  # pragma: no cover - exercised in runtime verification instead
+except ImportError:  # pragma: no cover - 在运行时验证中覆盖
     QdrantClient = None
     models = None
 

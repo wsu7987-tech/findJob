@@ -6,8 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class AppConfigResponse(BaseModel):
-    # FineJob-retained contract: desktop settings uses these fields for
-    # LLM/Embedding configuration and local runtime readiness checks.
+    # FineJob 保留的契约：桌面端设置使用这些字段配置 LLM/Embedding，
+    # 并执行本地运行时就绪检查。
     app_data_dir: str
     sqlite_path: str
     qdrant_path: str
@@ -43,8 +43,8 @@ class AppConfigResponse(BaseModel):
 
 
 class AppConfigPatchRequest(BaseModel):
-    # FineJob-retained contract: PATCH /api/config persists model provider,
-    # key, endpoint, and local runtime settings used before delivery can start.
+    # FineJob 保留的契约：PATCH /api/config 持久化模型服务商、密钥、
+    # 端点和投递启动前使用的本地运行时设置。
     model_config = ConfigDict(extra="forbid")
 
     app_data_dir: str | None = None
@@ -80,8 +80,7 @@ class AppConfigPatchRequest(BaseModel):
 
 
 class ProviderConnectivityCheckResponse(BaseModel):
-    # FineJob-retained contract: used by the desktop configuration UI to test
-    # required LLM and optional Embedding connectivity.
+    # FineJob 保留的契约：供桌面端配置界面检查必需的 LLM 和可选的 Embedding 连通性。
     capability: Literal["llm", "embedding"]
     ok: bool
     status: Literal["ready", "failed", "invalid"]

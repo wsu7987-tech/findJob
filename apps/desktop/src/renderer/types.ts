@@ -728,6 +728,116 @@ export interface FineJobBossNavigationTask {
   opened_at?: string | null;
 }
 
+export type FineJobChatSessionStatus = "active" | "human_takeover" | "paused" | "unsupported";
+export type FineJobChatReplyStatus =
+  | "pending_generation"
+  | "generating"
+  | "awaiting_review"
+  | "confirmed"
+  | "cancelled"
+  | "stale"
+  | "failed";
+
+export interface FineJobChatRuntime {
+  id: "boss";
+  listen_enabled: boolean;
+  generation_enabled: boolean;
+  send_enabled: boolean;
+  trigger_mode: "immediate" | "interval" | "manual";
+  interval_minutes: 0 | 5 | 10 | 30 | 60;
+  last_scheduled_at?: string | null;
+  leader_executor_id?: string | null;
+  leader_tab_id?: string | null;
+  leader_epoch: number;
+  leader_lease_expires_at?: string | null;
+  updated_at: string;
+}
+
+export interface FineJobChatSession {
+  id: string;
+  platform: "boss";
+  account_uid: string;
+  peer_uid: string;
+  encrypt_peer_uid: string;
+  security_id: string;
+  job_id?: string | null;
+  encrypt_job_id: string;
+  job_title: string;
+  peer_name: string;
+  company_name: string;
+  status: FineJobChatSessionStatus;
+  session_version: number;
+  latest_message_id?: string | null;
+  latest_inbound_message_id?: string | null;
+  last_message_at?: string | null;
+  latest_message_content?: string;
+  latest_message_direction?: "inbound" | "outbound";
+  reply_task_id?: string | null;
+  reply_task_status?: FineJobChatReplyStatus | null;
+  reply_draft_text?: string;
+  reply_final_text?: string;
+  unhandled_count?: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FineJobChatMessage {
+  id: string;
+  session_id: string;
+  platform_message_id: string;
+  direction: "inbound" | "outbound";
+  message_type: "text" | "image" | "system" | "unknown";
+  content: string;
+  source: "websocket" | "manual" | "assistant";
+  sent_at: string;
+  observed_at: string;
+  raw_meta: Record<string, unknown>;
+}
+
+export interface FineJobChatReplyTask {
+  id: string;
+  session_id: string;
+  trigger_source: "realtime" | "interval" | "manual";
+  status: FineJobChatReplyStatus;
+  based_on_message_id: string;
+  based_on_session_version: number;
+  context: Record<string, unknown>;
+  draft_text: string;
+  final_text: string;
+  generation_model: string;
+  generation_error?: string | null;
+  generated_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FineJobChatSendAction {
+  id: string;
+  reply_task_id: string;
+  session_id: string;
+  status: "queued" | "leased" | "dispatching" | "accepted" | "failed" | "unknown" | "cancelled";
+  text: string;
+  execution_epoch: number;
+  outcome?: "accepted" | "failed" | "unknown" | null;
+  status_code: string;
+  error_message: string;
+  evidence: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FineJobChatSessionDetail {
+  session: FineJobChatSession;
+  messages: FineJobChatMessage[];
+  reply_tasks: FineJobChatReplyTask[];
+  send_actions: FineJobChatSendAction[];
+}
+
+export interface FineJobChatRuntimeEnvelope { runtime: FineJobChatRuntime }
+export interface FineJobChatSessionListEnvelope { sessions: FineJobChatSession[] }
+export interface FineJobChatReplyEnvelope { reply_task: FineJobChatReplyTask }
+export interface FineJobChatSendActionEnvelope { action: FineJobChatSendAction }
+
 export interface PdfDraftCreateRequest {
   file_path: string;
   title?: string | null;

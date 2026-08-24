@@ -343,7 +343,7 @@ class WebDraftService:
                 warnings=[exc.error_message],
             )
             self._job_store.mark_failed(job_id, error_message=exc.error_message)
-        except Exception as exc:  # pragma: no cover - defensive guard
+        except Exception as exc:  # pragma: no cover - 防御性保护
             self._draft_store.update_parse_result(
                 draft_id=draft_id,
                 parse_result_id=preview_result_id,

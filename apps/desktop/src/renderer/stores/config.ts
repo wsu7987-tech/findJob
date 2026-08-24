@@ -41,7 +41,7 @@ const writeStoredSecret = (field: SecretField, value: string | null | undefined)
 
     window.localStorage.removeItem(storageKey);
   } catch {
-    // Ignore storage failures so settings save can still succeed.
+    // 忽略存储失败，确保设置仍然可以保存。
   }
 };
 

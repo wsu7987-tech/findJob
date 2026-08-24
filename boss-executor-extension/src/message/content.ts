@@ -7,6 +7,9 @@ import {
 } from "../executor/framework-mode";
 import { isBossReadOnlySnapshot } from "../platform/boss/types";
 import type {
+  ChatIdentity,
+  ChatObservedMessage,
+  ChatSendExecutionResult,
   MainWorldCommand,
   MainWorldExecutionResult
 } from "../finejob/types";
@@ -16,6 +19,9 @@ export const CONTENT_NAMESPACE = "fine-job:boss-executor:content:v1";
 export class ContentService {
   private readonly mainWorldWaiters = new Set<() => void>();
   private readonly mainCommands: MainWorldCommand[] = [];
+  private readonly tabId = typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
   constructor(
     private readonly background: BackgroundService,
@@ -62,15 +68,22 @@ export class ContentService {
     return { accepted: true };
   }
 
-  async enqueueMainCommand(command: MainWorldCommand): Promise<{ accepted: true }> {
-    if (
-      command.type !== "BOSS_DEFAULT_GREETING" ||
-      !command.actionId ||
-      command.executionEpoch < 1 ||
-      !command.encryptJobId
+  async enqueueMainCommand(command: MainWorldCommand): Promise<{ accepted: boolean }> {
+    if (command.type === "BOSS_CHAT_SEND") {
+      if (command.targetTabId !== this.tabId) return { accepted: false };
+      if (!command.action?.id || command.action.execution_epoch < 1 || !command.action.text) {
+        throw new Error("聊天发送命令载荷无效");
+      }
+    } else if (
+      !command.actionId || command.executionEpoch < 1 || !command.encryptJobId
     ) throw new Error("执行命令载荷无效");
     const duplicate = this.mainCommands.some(
-      (item) => item.actionId === command.actionId && item.executionEpoch === command.executionEpoch
+      (item) => item.type === command.type && (
+        item.type === "BOSS_CHAT_SEND" && command.type === "BOSS_CHAT_SEND"
+          ? item.action.id === command.action.id && item.action.execution_epoch === command.action.execution_epoch
+          : item.type === "BOSS_DEFAULT_GREETING" && command.type === "BOSS_DEFAULT_GREETING"
+            && item.actionId === command.actionId && item.executionEpoch === command.executionEpoch
+      )
     );
     if (!duplicate) this.mainCommands.push(command);
     return { accepted: true };
@@ -82,6 +95,32 @@ export class ContentService {
 
   async reportExecutionResult(result: MainWorldExecutionResult): Promise<{ accepted: true }> {
     await this.background.reportExecutionResult(result);
+    return { accepted: true };
+  }
+
+  async reportChatIdentity(identity: ChatIdentity): Promise<{ accepted: true }> {
+    if (!identity.accountUid || !identity.loggedIn) return { accepted: true };
+    await this.background.reportChatTabHeartbeat({
+      ...identity,
+      tabId: this.tabId,
+      visible: document.visibilityState === "visible"
+    });
+    return { accepted: true };
+  }
+
+  async isChatListeningEnabled(): Promise<boolean> {
+    return this.background.isChatListeningEnabled();
+  }
+
+  async reportChatMessage(message: ChatObservedMessage): Promise<{ accepted: boolean }> {
+    if (!message.eventId || !message.accountUid || !message.peerUid || !message.platformMessageId) {
+      throw new Error("聊天观察消息载荷无效");
+    }
+    return this.background.reportChatMessage(this.tabId, message);
+  }
+
+  async reportChatSendResult(result: ChatSendExecutionResult): Promise<{ accepted: true }> {
+    await this.background.reportChatSendResult(result);
     return { accepted: true };
   }
 

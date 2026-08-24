@@ -23,7 +23,7 @@ export default defineContentScript({
   async main() {
     const status = reactive(createFrameworkStatus(window.location.pathname));
 
-    // 适配 boss-helper 的两级 comctx 代理：MAIN → Content → Background。
+    // 通过两级 comctx 代理连接 MAIN、Content 与 Background。
     const [, injectBackgroundService] = defineProxy(() => ({}) as BackgroundService, {
       namespace: BACKGROUND_NAMESPACE
     });
@@ -46,7 +46,10 @@ export default defineContentScript({
     await contentService.refreshBackground();
 
     const runtimeHandler = (message?: { type?: string; command?: MainWorldCommand }) => {
-      if (message?.type !== "finejob:boss-executor:execute:v1" || !message.command) return;
+      if (![
+        "finejob:boss-executor:execute:v1",
+        "finejob:boss-chat:execute:v1"
+      ].includes(message?.type ?? "") || !message?.command) return;
       return contentService.enqueueMainCommand(message.command);
     };
     browser.runtime.onMessage.addListener(runtimeHandler);

@@ -47,6 +47,12 @@
   FineJobAutomationActionStatus,
   FineJobBossExecutorDashboard,
   FineJobBossNavigationTask,
+  FineJobChatRuntime,
+  FineJobChatRuntimeEnvelope,
+  FineJobChatSessionDetail,
+  FineJobChatSessionListEnvelope,
+  FineJobChatReplyEnvelope,
+  FineJobChatSendActionEnvelope,
   PoolCreateRequest,
   PoolCreateResponse,
   PoolCommitMetadataRequest,
@@ -695,6 +701,67 @@ export const api = {
           note: contacted ? "用户人工确认岗位已经沟通" : "用户人工确认岗位尚未沟通"
         })
       }
+    );
+  },
+  async getFineJobChatRuntime() {
+    return request<FineJobChatRuntimeEnvelope>("/api/fine-job/boss-chat/runtime");
+  },
+  async updateFineJobChatRuntime(payload: Partial<Pick<
+    FineJobChatRuntime,
+    "listen_enabled" | "generation_enabled" | "send_enabled" | "trigger_mode" | "interval_minutes"
+  >>) {
+    return request<FineJobChatRuntimeEnvelope>("/api/fine-job/boss-chat/runtime", {
+      method: "PATCH",
+      body: JSON.stringify(payload)
+    });
+  },
+  async checkFineJobChatNow() {
+    return request<{ generated: number }>("/api/fine-job/boss-chat/check", { method: "POST" });
+  },
+  async listFineJobChatSessions() {
+    return request<FineJobChatSessionListEnvelope>("/api/fine-job/boss-chat/sessions");
+  },
+  async getFineJobChatSession(sessionId: string) {
+    return request<FineJobChatSessionDetail>(
+      `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}`
+    );
+  },
+  async generateFineJobChatReply(sessionId: string, instruction = "", regenerate = false) {
+    const operation = regenerate ? "regenerate" : "generate";
+    return request<FineJobChatReplyEnvelope>(
+      `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/${operation}`,
+      { method: "POST", body: JSON.stringify({ instruction }) }
+    );
+  },
+  async setFineJobChatSessionStatus(
+    sessionId: string,
+    operation: "take-over" | "resume" | "pause",
+    reason: string
+  ) {
+    return request<{ session: FineJobChatSessionDetail["session"] }>(
+      `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/${operation}`,
+      { method: "POST", body: JSON.stringify({ reason }) }
+    );
+  },
+  async editFineJobChatReply(taskId: string, finalText: string) {
+    return request<FineJobChatReplyEnvelope>(
+      `/api/fine-job/boss-chat/reply-tasks/${encodeURIComponent(taskId)}`,
+      { method: "PATCH", body: JSON.stringify({ final_text: finalText }) }
+    );
+  },
+  async confirmFineJobChatReply(
+    taskId: string,
+    payload: { final_text: string; based_on_message_id: string; based_on_session_version: number }
+  ) {
+    return request<FineJobChatSendActionEnvelope>(
+      `/api/fine-job/boss-chat/reply-tasks/${encodeURIComponent(taskId)}/confirm`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
+  async cancelFineJobChatReply(taskId: string, reason = "用户取消回复") {
+    return request<FineJobChatReplyEnvelope>(
+      `/api/fine-job/boss-chat/reply-tasks/${encodeURIComponent(taskId)}/cancel`,
+      { method: "POST", body: JSON.stringify({ reason }) }
     );
   },
   async listFineJobResumes() {

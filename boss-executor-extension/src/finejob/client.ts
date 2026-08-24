@@ -3,7 +3,11 @@ import { browser } from "#imports";
 import packageJson from "../../package.json";
 import type { BossReadOnlySnapshot } from "../platform/boss/types";
 import type {
+  ChatObservedMessage,
+  ChatSendExecutionResult,
+  ChatTabHeartbeat,
   ExecutorRuntimeState,
+  FineJobChatSendAction,
   FineJobQueueAction,
   MainWorldExecutionResult
 } from "./types";
@@ -13,7 +17,15 @@ const CREDENTIALS_KEY = "finejobBossExecutorCredentialsV1";
 const PENDING_RESULTS_KEY = "finejobBossExecutorPendingResultsV1";
 const COMMAND_MESSAGE = "finejob:boss-executor:execute:v1";
 const PROTOCOL_VERSION = "1.1";
-const CAPABILITIES = ["default_greeting", "page_identity", "queue_control", "contact_verification_snapshot"];
+const CAPABILITIES = [
+  "default_greeting",
+  "page_identity",
+  "queue_control",
+  "contact_verification_snapshot",
+  "chat_observe",
+  "chat_send",
+  "chat_multitab_leader"
+];
 
 type Credentials = { executorId: string; token: string };
 
@@ -137,6 +149,107 @@ export class FineJobExecutorClient {
     } catch (error) {
       this.state.detail = (error as Error).message;
     }
+  }
+
+  async getChatRuntime(): Promise<{
+    listen_enabled: boolean;
+    generation_enabled: boolean;
+    send_enabled: boolean;
+  }> {
+    const response = await this.chatRequest<{ runtime: {
+      listen_enabled: boolean;
+      generation_enabled: boolean;
+      send_enabled: boolean;
+    } }>("/runtime", { method: "GET" }, false);
+    return response.runtime;
+  }
+
+  async reportChatHeartbeat(heartbeat: ChatTabHeartbeat, leaderEpoch: number): Promise<void> {
+    await this.chatRequest("/executor/heartbeat", {
+      method: "POST",
+      body: JSON.stringify({
+        account_uid: heartbeat.accountUid,
+        tab_id: heartbeat.tabId,
+        leader_epoch: leaderEpoch,
+        is_leader: true,
+        lease_expires_at: new Date(Date.now() + 20_000).toISOString()
+      })
+    });
+  }
+
+  async reportChatMessages(messages: ChatObservedMessage[], leaderEpoch: number): Promise<void> {
+    await this.chatRequest("/executor/events/batch", {
+      method: "POST",
+      body: JSON.stringify({
+        events: messages.map((message) => ({
+          event_id: message.eventId,
+          event_type: "message",
+          account_uid: message.accountUid,
+          leader_epoch: leaderEpoch,
+          message: {
+            platform_message_id: message.platformMessageId,
+            direction: message.direction,
+            message_type: message.messageType,
+            content: message.content,
+            sender_uid: message.senderUid,
+            receiver_uid: message.receiverUid,
+            client_mid: message.clientMid,
+            peer_uid: message.peerUid,
+            encrypt_peer_uid: message.encryptPeerUid,
+            security_id: message.securityId,
+            encrypt_job_id: message.encryptJobId,
+            job_title: message.jobTitle,
+            peer_name: message.peerName,
+            company_name: message.companyName,
+            sent_at: message.sentAt,
+            observed_at: message.observedAt,
+            source: message.source,
+            raw_meta: message.rawMeta
+          }
+        }))
+      })
+    });
+  }
+
+  async claimChatSendAction(
+    accountUid: string,
+    tabId: string,
+    leaderEpoch: number
+  ): Promise<FineJobChatSendAction | null> {
+    const response = await this.chatRequest<{ action: FineJobChatSendAction | null }>(
+      "/executor/actions/claim",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          account_uid: accountUid,
+          tab_id: tabId,
+          leader_epoch: leaderEpoch
+        })
+      }
+    );
+    return response.action;
+  }
+
+  async markChatDispatchStarted(action: FineJobChatSendAction): Promise<void> {
+    await this.chatRequest(`/executor/actions/${encodeURIComponent(action.id)}/dispatch-started`, {
+      method: "POST",
+      body: JSON.stringify({ execution_epoch: action.execution_epoch })
+    });
+  }
+
+  async completeChatSend(result: ChatSendExecutionResult): Promise<void> {
+    await this.chatRequest(`/executor/actions/${encodeURIComponent(result.actionId)}/complete`, {
+      method: "POST",
+      body: JSON.stringify({
+        execution_epoch: result.executionEpoch,
+        outcome: result.outcome,
+        platform_message_id: result.platformMessageId,
+        client_mid: result.clientMid,
+        status_code: result.statusCode,
+        message: result.message,
+        evidence: result.evidence
+      })
+    });
   }
 
   private async tick(): Promise<void> {
@@ -325,6 +438,32 @@ export class FineJobExecutorClient {
     if (!response.ok) {
       throw new Error(String(body.error_message || `FineJob请求失败：${response.status}`));
     }
+    return body as T;
+  }
+
+  private async chatRequest<T = unknown>(
+    path: string,
+    init: RequestInit,
+    authenticated = true
+  ): Promise<T> {
+    const headers = new Headers(init.headers);
+    headers.set("Content-Type", "application/json");
+    if (authenticated) {
+      if (!this.credentials) throw new Error("插件尚未与FineJob配对");
+      headers.set("Authorization", `Bearer ${this.credentials.token}`);
+    }
+    let response: Response;
+    try {
+      response = await fetch(`http://127.0.0.1:8000/api/fine-job/boss-chat${path}`, {
+        ...init,
+        headers,
+        signal: AbortSignal.timeout(5000)
+      });
+    } catch {
+      throw new Error("无法连接FineJob自动代聊服务");
+    }
+    const body = await response.json().catch(() => ({})) as Record<string, unknown>;
+    if (!response.ok) throw new Error(String(body.error_message || `自动代聊请求失败：${response.status}`));
     return body as T;
   }
 }

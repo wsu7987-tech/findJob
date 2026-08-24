@@ -7,8 +7,7 @@ from backend.app.schemas.config import AppConfigPatchRequest
 
 
 def serialize_config(config: AppConfig) -> dict[str, object]:
-    # FineJob-retained service: serializes model/provider configuration used
-    # by the desktop "FineJob 配置" drawer and readiness checks.
+    # FineJob 保留的服务：序列化桌面端“FineJob 配置”抽屉和就绪检查使用的模型/服务商配置。
     return {
         "app_data_dir": str(config.app_data_dir),
         "sqlite_path": str(config.sqlite_path),
@@ -48,8 +47,8 @@ def serialize_config(config: AppConfig) -> dict[str, object]:
 
 
 def update_config(config: AppConfig, payload: AppConfigPatchRequest) -> AppConfig:
-    # FineJob-retained service: updates local LLM/Embedding configuration and
-    # runtime paths. Keep this path while removing legacy summary/report logic.
+    # FineJob 保留的服务：更新本地 LLM/Embedding 配置和运行时路径。
+    # 清理旧的总结/报告逻辑时保留这条路径。
     updates = payload.model_dump(exclude_unset=True)
 
     old_output_root = config.output_root
@@ -145,7 +144,7 @@ def update_config(config: AppConfig, payload: AppConfigPatchRequest) -> AppConfi
 
 
 def persist_config_updates(config: AppConfig, payload: AppConfigPatchRequest) -> None:
-    # FineJob-retained service: persists model settings to the local user config.
+    # FineJob 保留的服务：将模型设置持久化到本地用户配置。
     updates = payload.model_dump(exclude_unset=True)
     persisted = read_persisted_config(config.local_config_path)
     for key in updates:

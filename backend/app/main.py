@@ -8,6 +8,7 @@ from backend.app.db import Database
 from backend.app.errors import register_error_handlers
 from backend.app.routers.config import router as config_router
 from backend.app.routers.fine_job.boss_capture import router as fine_job_boss_capture_router
+from backend.app.routers.fine_job.boss_chat import router as fine_job_boss_chat_router
 from backend.app.routers.fine_job.boss_executor import router as fine_job_boss_executor_router
 from backend.app.routers.fine_job.delivery_runs import router as fine_job_delivery_runs_router
 from backend.app.routers.fine_job.delivery_strategies import router as fine_job_delivery_strategies_router
@@ -35,6 +36,7 @@ from backend.app.services.pdf_reparse_job_store import PdfReparseJobStore
 from backend.app.services.web_draft_store import WebDraftStore
 from backend.app.services.web_reparse_job_store import WebReparseJobStore
 from backend.app.services.web_session_profiles import WebSessionProfileStore
+from backend.app.services.fine_job.boss_chat import BossChatScheduler
 
 
 def create_app() -> FastAPI:
@@ -66,12 +68,17 @@ def create_app() -> FastAPI:
     app.state.web_session_profile_store = WebSessionProfileStore(
         config.app_data_dir / "web-session-profiles.json"
     )
+    app.state.boss_chat_scheduler = BossChatScheduler(db, config)
+    # 当前 FastAPI 版本由 Router 暴露生命周期注册接口。
+    app.router.add_event_handler("startup", app.state.boss_chat_scheduler.start)
+    app.router.add_event_handler("shutdown", app.state.boss_chat_scheduler.stop)
 
     register_error_handlers(app)
 
     app.include_router(health_router, prefix="/api")
     app.include_router(config_router, prefix="/api")
     app.include_router(fine_job_boss_capture_router, prefix="/api")
+    app.include_router(fine_job_boss_chat_router, prefix="/api")
     app.include_router(fine_job_boss_executor_router, prefix="/api")
     app.include_router(fine_job_delivery_runs_router, prefix="/api")
     app.include_router(fine_job_delivery_strategies_router, prefix="/api")

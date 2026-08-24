@@ -8,16 +8,20 @@ import {
   ProvideBackgroundAdapter
 } from "../message/background";
 import { fineJobExecutorClient } from "../finejob/client";
+import { bossChatCoordinator } from "../finejob/chat-coordinator";
 
 export default defineBackground({
   main() {
-    // 适配 boss-helper 的 Background 服务入口；执行凭证和FineJob队列只保留在Background。
+    // Background 负责服务入口、执行凭证和 FineJob 队列。
     const [provideBackgroundService] = defineProxy(() => new BackgroundService(), {
       namespace: BACKGROUND_NAMESPACE
     });
     provideBackgroundService(new ProvideBackgroundAdapter());
     void fineJobExecutorClient.start().catch((error) => {
       console.error("[FineJob BOSS 执行器] 后端通信启动失败", error);
+    });
+    void bossChatCoordinator.start().catch((error) => {
+      console.error("[FineJob BOSS 执行器] 自动代聊协调器启动失败", error);
     });
   }
 });

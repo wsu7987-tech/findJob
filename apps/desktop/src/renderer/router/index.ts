@@ -9,6 +9,7 @@ import StrategyManagementPage from "@/pages/fine-job/StrategyManagement.vue";
 import PlatformLoginPage from "@/pages/fine-job/PlatformLogin.vue";
 import ResumeProfilePage from "@/pages/fine-job/ResumeProfile.vue";
 import ReviewQueuePage from "@/pages/fine-job/ReviewQueue.vue";
+import BossChatPage from "@/pages/fine-job/BossChat.vue";
 
 export const router = createRouter({
   history: createWebHashHistory(),
@@ -68,6 +69,12 @@ export const router = createRouter({
       name: "fine-job-review",
       component: ReviewQueuePage,
       meta: { title: "待确认" }
+    },
+    {
+      path: "/fine-job/chat",
+      name: "fine-job-chat",
+      component: BossChatPage,
+      meta: { title: "自动代聊" }
     },
     {
       path: "/fine-job/logs",

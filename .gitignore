@@ -1,4 +1,4 @@
-# Dependencies
+# 依赖项
 .git-meta/
 node_modules/
 .pnpm-store/
@@ -6,12 +6,12 @@ node_modules/
 .uv-cache/
 .claude/
 
-# Environment and secrets
+# 环境与敏感信息
 .env
 .env.*
 !.env.example
 
-# Build outputs
+# 构建产物
 dist/
 coverage/
 htmlcov/
@@ -23,7 +23,7 @@ apps/desktop/.vite/
 apps/desktop/.electron/
 *.tsbuildinfo
 
-# Local runtime data
+# 本地运行数据
 .local/
 .pytest-tmp/
 .pytest_cache/
@@ -37,7 +37,7 @@ backend/.tmp-debug/
 *.sqlite3
 **/qdrant/
 
-# Test/cache artifacts
+# 测试与缓存产物
 .pytest_cache/
 __pycache__/
 *.py[cod]
@@ -47,7 +47,7 @@ pytest-cache-files-*/
 .tox/
 .nox/
 
-# Logs and temporary probes
+# 日志与临时探测文件
 *.log
 *.err.log
 *.out.log
@@ -56,14 +56,15 @@ apps/desktop/.probe-app/
 apps/desktop/tmp-*
 apps/desktop/.tmp-*
 
-# Local agent/demo materials that are not part of the public repo
+# 不纳入公开仓库的本地代理/演示材料
 .agents/
 skills-lock.json
 demo/
 docs/
+docs-old/
 AGENTS.md
 
-# Editor and OS local files
+# 编辑器与操作系统本地文件
 .vscode/
 .idea/
 *.swp

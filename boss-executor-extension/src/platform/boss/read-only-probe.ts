@@ -62,7 +62,6 @@ const readStandaloneJobIdentity = (value: unknown): BossJobIdentity | null => {
     lid: "",
     contacted: null,
     identitySource: "standalone-job-info",
-    // 保存页面和参考项目尚未证明 user_id 的业务语义，后续动作必须继续阻断。
     bossIdentifierVerified: false
   };
 };

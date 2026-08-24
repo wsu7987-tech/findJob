@@ -8,27 +8,27 @@ from backend.app.services.pdf_parse.types import PdfParsePage, PdfParseResult
 
 try:
     import numpy as np
-except ImportError:  # pragma: no cover - exercised via runtime wiring
+except ImportError:  # pragma: no cover - 通过运行时装配覆盖
     np = None
 
 try:
     from rapidocr import RapidOCR
     RAPID_OCR_IMPORT_ERROR = None
-except ImportError:  # pragma: no cover - exercised via runtime wiring
+except ImportError:  # pragma: no cover - 通过运行时装配覆盖
     RapidOCR = None
     RAPID_OCR_IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - runtime import failures vary by env
+except Exception as exc:  # pragma: no cover - 不同环境的运行时导入失败情况不同
     RapidOCR = None
     RAPID_OCR_IMPORT_ERROR = str(exc)
 
 try:
     import pymupdf
-except ImportError:  # pragma: no cover - exercised via runtime wiring
+except ImportError:  # pragma: no cover - 通过运行时装配覆盖
     pymupdf = SimpleNamespace(open=None, Matrix=None)
 
 try:
     import cv2
-except ImportError:  # pragma: no cover - exercised via runtime wiring
+except ImportError:  # pragma: no cover - 通过运行时装配覆盖
     cv2 = None
 
 

@@ -9,12 +9,12 @@ from backend.app.services.pdf_parse.types import PdfParsePage, PdfParseResult
 
 try:
     import pymupdf
-except ImportError:  # pragma: no cover - exercised via runtime wiring
+except ImportError:  # pragma: no cover - 通过运行时装配覆盖
     pymupdf = SimpleNamespace(open=None)
 
 try:
     import pymupdf4llm
-except ImportError:  # pragma: no cover - exercised via runtime wiring
+except ImportError:  # pragma: no cover - 通过运行时装配覆盖
     pymupdf4llm = SimpleNamespace(to_markdown=None)
 
 

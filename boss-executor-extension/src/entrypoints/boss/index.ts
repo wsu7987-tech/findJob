@@ -4,6 +4,11 @@ import type { MainWorldStatus } from "../../executor/framework-mode";
 import { contentService, initContentService } from "../../message";
 import { readBossPageSnapshot, snapshotFingerprint } from "../../platform/boss/read-only-probe";
 import { executeDefaultGreeting } from "../../platform/boss/default-greeting";
+import {
+  installBossChatObserver,
+  readBossChatIdentity
+} from "../../platform/boss/chat/observer";
+import { bossChatSender } from "../../platform/boss/chat/sender";
 
 const currentStatus = (): MainWorldStatus => ({
   component: "main-world",
@@ -18,6 +23,25 @@ export default defineUnlistedScript(async () => {
     // MAIN World平时只读取最小岗位身份；只有收到单个已授权命令时才读取token并执行一次平台动作。
     initContentService();
     await contentService.reportMainWorldReady(currentStatus());
+    const chatObserver = installBossChatObserver(async (message) => {
+      await contentService.reportChatMessage(message);
+    });
+
+    const syncChatObservationPermission = async () => {
+      chatObserver.setEnabled(await contentService.isChatListeningEnabled());
+    };
+    await syncChatObservationPermission();
+    const chatPermissionTimer = window.setInterval(() => {
+      void syncChatObservationPermission().catch(() => chatObserver.setEnabled(false));
+    }, 2_000);
+
+    const reportChatIdentity = async () => {
+      await contentService.reportChatIdentity(readBossChatIdentity());
+    };
+    await reportChatIdentity();
+    const chatIdentityTimer = window.setInterval(() => {
+      void reportChatIdentity().catch(() => undefined);
+    }, 5_000);
 
     let previousFingerprint = "";
     let reportRunning = false;
@@ -49,8 +73,13 @@ export default defineUnlistedScript(async () => {
       commandRunning = true;
       void contentService.takeMainCommand().then(async (command) => {
         if (!command) return;
-        const result = await executeDefaultGreeting(command);
-        await contentService.reportExecutionResult(result);
+        if (command.type === "BOSS_DEFAULT_GREETING") {
+          const result = await executeDefaultGreeting(command);
+          await contentService.reportExecutionResult(result);
+        } else {
+          const result = await bossChatSender.send(command.action);
+          await contentService.reportChatSendResult(result);
+        }
       }).catch((error) => {
         console.error("[FineJob BOSS 执行器] 默认招呼动作执行失败", error);
       }).finally(() => {
@@ -59,6 +88,11 @@ export default defineUnlistedScript(async () => {
     }, 250);
     window.addEventListener("pagehide", () => window.clearInterval(probeTimer), { once: true });
     window.addEventListener("pagehide", () => window.clearInterval(commandTimer), { once: true });
+    window.addEventListener("pagehide", () => {
+      window.clearInterval(chatIdentityTimer);
+      window.clearInterval(chatPermissionTimer);
+      chatObserver.uninstall();
+    }, { once: true });
   } catch (error) {
     console.error("[FineJob BOSS 执行器] 无法向 Content 报告状态", error);
   }

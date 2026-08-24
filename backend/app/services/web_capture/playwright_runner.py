@@ -22,7 +22,7 @@ class PlaywrightRunner:
         self._raise_if_cancelled(cancel_check)
         try:
             sync_playwright = self._get_sync_playwright()
-        except ImportError as exc:  # pragma: no cover - depends on local runtime install
+        except ImportError as exc:  # pragma: no cover - 依赖本地运行环境安装
             raise AppError(
                 status_code=500,
                 error_category="FETCH_FAILED",
@@ -120,7 +120,7 @@ class PlaywrightRunner:
                         browser.close()
         except AppError:
             raise
-        except Exception as exc:  # pragma: no cover - depends on site/browser runtime
+        except Exception as exc:  # pragma: no cover - 依赖站点/浏览器运行环境
             raise AppError(
                 status_code=502,
                 error_category="FETCH_FAILED",

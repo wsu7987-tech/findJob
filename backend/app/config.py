@@ -8,9 +8,6 @@ from typing import Any
 
 
 PERSISTED_CONFIG_KEYS = {
-    # FineJob-retained configuration keys. The current desktop setup page
-    # depends on the LLM/Embedding provider fields and local runtime paths.
-    # Keep these during legacy KnowledgeCurator cleanup.
     "app_data_dir",
     "sqlite_path",
     "qdrant_path",

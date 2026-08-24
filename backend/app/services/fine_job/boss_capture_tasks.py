@@ -347,7 +347,7 @@ class BossCaptureTaskManager:
                     finished_at=utc_now(),
                 )
                 self._sync_capture_batch(task, status="completed", finished=True)
-        except Exception as exc:  # noqa: BLE001 - background task boundary
+        except Exception as exc:  # noqa: BLE001 - 后台任务边界
             self._mark_failed(task_id, exc)
 
     def _run_selected_details(self, task_id: str, job_ids: list[str]) -> None:
@@ -397,7 +397,7 @@ class BossCaptureTaskManager:
                     finished_at=utc_now(),
                 )
                 self._sync_capture_batch(task, status="completed", finished=True)
-        except Exception as exc:  # noqa: BLE001 - background task boundary
+        except Exception as exc:  # noqa: BLE001 - 后台任务边界
             self._mark_failed(task_id, exc)
 
     def _handle_progress(self, task_id: str, event: dict[str, object]) -> None:

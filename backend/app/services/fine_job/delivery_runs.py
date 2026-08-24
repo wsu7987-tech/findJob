@@ -220,7 +220,7 @@ def create_delivery_run(
             skipped_count=sum(1 for item in candidates if item["decision"] == "skipped"),
         )
         return get_delivery_run(db, run_id)
-    except Exception as exc:  # pragma: no cover - defensive guard
+    except Exception as exc:  # pragma: no cover - 防御性保护
         if candidates:
             _save_candidates(db, candidates)
         _finish_run(

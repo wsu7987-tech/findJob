@@ -356,7 +356,7 @@ class PdfDraftService:
                 warnings=[exc.error_message],
             )
             self._job_store.mark_failed(job_id, error_message=exc.error_message)
-        except Exception as exc:  # pragma: no cover - defensive guard for worker crashes
+        except Exception as exc:  # pragma: no cover - 防御工作进程崩溃
             self._draft_store.update_parse_result(
                 draft_id=draft_id,
                 parse_result_id=preview_result_id,

@@ -2,7 +2,7 @@ import type { Adapter, Message, OnMessage, SendMessage } from "comctx";
 
 const PAGE_MESSAGE_EVENT = "fine-job:boss-executor:page-message:v1";
 
-// 适配自 boss-helper：使用注入脚本元素承载 ISOLATED 与 MAIN World 的序列化消息。
+// 使用注入脚本元素承载 ISOLATED 与 MAIN World 的序列化消息。
 export class ScriptElementAdapter implements Adapter {
   constructor(private readonly script: HTMLScriptElement) {}
 

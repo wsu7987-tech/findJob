@@ -1,4 +1,4 @@
-import type { MainWorldCommand, MainWorldExecutionResult } from "../../finejob/types";
+import type { DefaultGreetingCommand, MainWorldExecutionResult } from "../../finejob/types";
 import { readBossPageSnapshot } from "./read-only-probe";
 
 type BossCookieApi = { get(name: string): string | undefined };
@@ -9,11 +9,10 @@ const readBossToken = (): string => {
 };
 
 /**
- * 参数与请求入口适配自MIT许可的boss-helper sendPublishReq。
  * FineJob版本只发送一次，不自动重试、不确认平台限额、不发送自定义文本。
  */
 export const executeDefaultGreeting = async (
-  command: MainWorldCommand
+  command: DefaultGreetingCommand
 ): Promise<MainWorldExecutionResult> => {
   const snapshot = readBossPageSnapshot();
   if (

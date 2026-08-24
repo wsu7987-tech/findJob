@@ -2,7 +2,7 @@
 
 FineJob 是一个本地化的 AI 求职驾驶舱，目标是帮助用户管理简历、求职目标、岗位筛选、HR 沟通和待处理事项，并在用户授权下执行可控的浏览器自动化。
 
-当前项目基于原 KnowledgeCurator 技术底座改造，保留可复用的 OCR、PDF 解析、Playwright、FastAPI、LangGraph、SQLite、LLM Provider 等能力；前端产品层会重做为求职场景。
+当前项目提供可复用的 OCR、PDF 解析、Playwright、FastAPI、LangGraph、SQLite、LLM Provider 等能力，前端产品层聚焦求职场景。
 
 ## 产品方向
 
@@ -24,6 +24,7 @@ FineJob 是一个本地化的 AI 求职驾驶舱，目标是帮助用户管理�
 | 文档解析 | PyMuPDF, pymupdf4llm, RapidOCR |
 | 网页自动化 | Playwright |
 | BOSS 岗位采集 | Chrome CDP + 页面原生 API 响应旁听 |
+| BOSS 执行器 | WXT + Chrome MV3 + MQTT + Protobuf |
 | 测试 | pytest, Vitest, Vue Test Utils |
 
 ## 项目结构
@@ -45,6 +46,7 @@ backend/
 
 docs/                       产品和架构文档
 scripts/                    backend start and helper scripts
+boss-executor-extension/    BOSS 默认招呼与自动代聊 Chrome 执行器
 ```
 
 ## 本地启动
@@ -90,9 +92,7 @@ Codex 生成任务使用临时目录、只读沙箱、JSONL 事件和 JSON Schem
 
 ## 内置 BOSS CDP 采集模块
 
-FineJob 在 `backend/app/services/fine_job/boss_scraper/` 内置 BOSS CDP 采集能力。核心实现基于
-`eatmoreduck/boss-zhipin-scraper` 2.2.0（基线提交
-`2bc40f56a3ca3249ce3b98cdda0187e0bd612aa5`，MIT），保留核心脚本结构，并通过
+FineJob 在 `backend/app/services/fine_job/boss_scraper/` 内置 BOSS CDP 采集能力，并通过
 `service.py` 向 FineJob 其他模块提供稳定调用入口。
 
 FineJob 已将平台登录、岗位采集页和投递准备中的真实采集统一切换到该 CDP 服务。桌面端
@@ -116,9 +116,9 @@ AI，输出硬性条件证据、分维度匹配、优势、差距、风险、缺
 每次 V2 评估还会写入不可变的 `fj_job_evaluations` 记录，并按投递执行策略路由到待确认池或
 `fj_automation_actions` 持久化队列。推荐但未授权自动打招呼、以及 AI 待确认岗位进入待确认池；
 不建议岗位保留原结论并允许用户明确覆盖。桌面端“待确认”页面支持编辑招呼语、批准、拒绝和查看
-已批准项。动作队列提供领取租约和结果回写 API，但尚未连接真实浏览器执行器。
+已批准项。动作队列已连接独立 Chrome 执行器，可在用户授权后串行执行 BOSS 默认招呼。
 旧 Puppeteer 登录和采集文件仍保留用于迁移期对照，但正式业务入口不再调用；
-当前仍不提供自动打招呼、真实投递或“最新发布”专用逻辑。
+当前不提供真实投递或“最新发布”专用逻辑。
 调试 CLI 可直接从 FineJob 环境运行：
 
 ```powershell
@@ -126,6 +126,20 @@ uv run python -m backend.app.services.fine_job.boss_scraper.boss_cdp_raw --check
 uv run python -m backend.app.services.fine_job.boss_scraper.boss_cdp_raw --setup-chrome
 uv run python -m backend.app.services.fine_job.boss_scraper.boss_cdp_raw --keyword "AI Agent" --city 上海 --pages 1
 ```
+
+## BOSS 自动代聊（首版）
+
+桌面端新增“自动代聊”工作台，扩展在用户开启监听后观察 BOSS `chat` WebSocket 的新消息，后端按
+实时、定时或手动三种触发方式生成回复草稿。草稿可以重新生成和人工编辑；只有用户点击“确认发送”
+且草稿依据的最后入站消息与会话版本仍一致时，才会创建一次发送动作。
+
+首版明确不读取 BOSS 历史聊天、不提供回复置信率、不使用 QA 集、不自动发送简历或联系方式，也不会
+自动确认 AI 草稿。发送使用 BOSS 的 `chat` MQTT/Protobuf 通道；`publish` 未抛错只展示为“已提交发送”，
+不表示平台已经送达。多个 BOSS 沟通页通过账号级租约选出一个领导标签页，领导失效后递增 epoch 切换，
+未知发送结果不会自动重试。
+
+实现和限制见《自动代聊功能具体执行方案.md》，扩展安装与验证见
+《boss-executor-extension/README.md》。
 
 ## 当前状态
 
@@ -143,3 +157,4 @@ uv run python -m backend.app.services.fine_job.boss_scraper.boss_cdp_raw --keywo
 - `docs/安全策略.md`
 - `docs/Codex执行器适配计划.md`
 - `docs/遗留代码参考.md`
+- `自动代聊功能具体执行方案.md`

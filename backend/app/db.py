@@ -757,6 +757,163 @@ CREATE TABLE IF NOT EXISTS fj_action_logs (
 
 CREATE INDEX IF NOT EXISTS idx_fj_action_logs_run_created_at
   ON fj_action_logs(run_id, created_at DESC);
+
+-- 自动代聊运行开关。首版默认全部关闭，必须由桌面端显式启用。
+CREATE TABLE IF NOT EXISTS fj_chat_runtime (
+  id TEXT PRIMARY KEY,
+  listen_enabled INTEGER NOT NULL DEFAULT 0,
+  generation_enabled INTEGER NOT NULL DEFAULT 0,
+  send_enabled INTEGER NOT NULL DEFAULT 0,
+  trigger_mode TEXT NOT NULL DEFAULT 'interval',
+  interval_minutes INTEGER NOT NULL DEFAULT 30,
+  last_scheduled_at TEXT,
+  leader_executor_id TEXT,
+  leader_tab_id TEXT,
+  leader_epoch INTEGER NOT NULL DEFAULT 0,
+  leader_lease_expires_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (listen_enabled IN (0, 1)),
+  CHECK (generation_enabled IN (0, 1)),
+  CHECK (send_enabled IN (0, 1)),
+  CHECK (trigger_mode IN ('immediate', 'interval', 'manual')),
+  CHECK (interval_minutes IN (0, 5, 10, 30, 60))
+);
+
+CREATE TABLE IF NOT EXISTS fj_chat_sessions (
+  id TEXT PRIMARY KEY,
+  platform TEXT NOT NULL DEFAULT 'boss',
+  account_uid TEXT NOT NULL,
+  peer_uid TEXT NOT NULL,
+  encrypt_peer_uid TEXT NOT NULL DEFAULT '',
+  security_id TEXT NOT NULL DEFAULT '',
+  job_id TEXT,
+  encrypt_job_id TEXT NOT NULL DEFAULT '',
+  job_title TEXT NOT NULL DEFAULT '',
+  peer_name TEXT NOT NULL DEFAULT '',
+  company_name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  session_version INTEGER NOT NULL DEFAULT 0,
+  latest_message_id TEXT,
+  latest_inbound_message_id TEXT,
+  last_message_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE SET NULL,
+  UNIQUE (platform, account_uid, peer_uid, encrypt_job_id),
+  CHECK (platform IN ('boss')),
+  CHECK (status IN ('active', 'human_takeover', 'paused', 'unsupported'))
+);
+
+CREATE TABLE IF NOT EXISTS fj_chat_leaders (
+  account_uid TEXT PRIMARY KEY,
+  executor_id TEXT NOT NULL,
+  tab_id TEXT NOT NULL,
+  leader_epoch INTEGER NOT NULL,
+  lease_expires_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (executor_id) REFERENCES fj_boss_executor_instances(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_chat_sessions_updated_at
+  ON fj_chat_sessions(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_chat_messages (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  platform_message_id TEXT NOT NULL,
+  direction TEXT NOT NULL,
+  message_type TEXT NOT NULL DEFAULT 'text',
+  content TEXT NOT NULL DEFAULT '',
+  sender_uid TEXT NOT NULL DEFAULT '',
+  receiver_uid TEXT NOT NULL DEFAULT '',
+  client_mid TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL,
+  sent_at TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  raw_meta_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (session_id) REFERENCES fj_chat_sessions(id) ON DELETE CASCADE,
+  UNIQUE (session_id, platform_message_id),
+  CHECK (direction IN ('inbound', 'outbound')),
+  CHECK (message_type IN ('text', 'image', 'system', 'unknown')),
+  CHECK (source IN ('websocket', 'manual', 'assistant'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_chat_messages_session_sent_at
+  ON fj_chat_messages(session_id, sent_at ASC, id ASC);
+
+CREATE TABLE IF NOT EXISTS fj_chat_reply_tasks (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  trigger_source TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending_generation',
+  based_on_message_id TEXT NOT NULL,
+  based_on_session_version INTEGER NOT NULL,
+  context_json TEXT NOT NULL DEFAULT '{}',
+  draft_text TEXT NOT NULL DEFAULT '',
+  final_text TEXT NOT NULL DEFAULT '',
+  generation_model TEXT NOT NULL DEFAULT '',
+  generation_error TEXT,
+  generated_at TEXT,
+  confirmed_at TEXT,
+  cancelled_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (session_id) REFERENCES fj_chat_sessions(id) ON DELETE CASCADE,
+  FOREIGN KEY (based_on_message_id) REFERENCES fj_chat_messages(id) ON DELETE CASCADE,
+  CHECK (trigger_source IN ('realtime', 'interval', 'manual')),
+  CHECK (status IN ('pending_generation', 'generating', 'awaiting_review', 'confirmed', 'cancelled', 'stale', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_chat_reply_tasks_status_created_at
+  ON fj_chat_reply_tasks(status, created_at ASC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_chat_reply_tasks_one_active
+  ON fj_chat_reply_tasks(session_id)
+  WHERE status IN ('pending_generation', 'generating', 'awaiting_review', 'confirmed');
+
+CREATE TABLE IF NOT EXISTS fj_chat_send_actions (
+  id TEXT PRIMARY KEY,
+  reply_task_id TEXT NOT NULL UNIQUE,
+  session_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  text TEXT NOT NULL,
+  execution_epoch INTEGER NOT NULL DEFAULT 0,
+  lease_owner TEXT,
+  lease_expires_at TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  outcome TEXT,
+  status_code TEXT NOT NULL DEFAULT '',
+  error_message TEXT NOT NULL DEFAULT '',
+  evidence_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  dispatched_at TEXT,
+  completed_at TEXT,
+  FOREIGN KEY (reply_task_id) REFERENCES fj_chat_reply_tasks(id) ON DELETE CASCADE,
+  FOREIGN KEY (session_id) REFERENCES fj_chat_sessions(id) ON DELETE CASCADE,
+  CHECK (status IN ('queued', 'leased', 'dispatching', 'accepted', 'failed', 'unknown', 'cancelled')),
+  CHECK (outcome IS NULL OR outcome IN ('accepted', 'failed', 'unknown'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_chat_send_actions_status_created_at
+  ON fj_chat_send_actions(status, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS fj_chat_events (
+  id TEXT PRIMARY KEY,
+  executor_id TEXT NOT NULL,
+  event_id TEXT NOT NULL UNIQUE,
+  event_type TEXT NOT NULL,
+  account_uid TEXT NOT NULL DEFAULT '',
+  leader_epoch INTEGER NOT NULL DEFAULT 0,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (executor_id) REFERENCES fj_boss_executor_instances(id) ON DELETE CASCADE,
+  CHECK (event_type IN ('message', 'socket_state', 'manual_takeover'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_chat_events_created_at
+  ON fj_chat_events(created_at DESC);
 """
 
 
@@ -786,9 +943,8 @@ class Database:
         connection = sqlite3.connect(self.sqlite_path)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON;")
-        # `DELETE` journal mode fails in this workspace sandbox because SQLite
-        # cannot remove the rollback journal file reliably. `TRUNCATE` keeps
-        # file-backed rollback semantics while avoiding that unlink step.
+        # 在当前工作区沙箱中，`DELETE` 日志模式无法可靠移除回滚日志文件。
+        # `TRUNCATE` 保留文件回滚语义，同时避免执行该删除步骤。
         connection.execute("PRAGMA journal_mode = TRUNCATE;")
         try:
             yield connection

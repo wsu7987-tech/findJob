@@ -14,7 +14,7 @@ from collections import Counter
 try:
     # FineJob 内置态优先走包内相对导入，避免依赖外部 scripts 包或工作目录。
     from . import boss_cdp_raw as boss
-except ImportError:  # pragma: no cover - 保留上游脚本直接运行兼容性
+except ImportError:  # pragma: no cover - 保留脚本直接运行兼容性
     try:
         from scripts import boss_cdp_raw as boss
     except ImportError:

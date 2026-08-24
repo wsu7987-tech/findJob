@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-# 来源：https://github.com/eatmoreduck/boss-zhipin-scraper
-# 内置基线：2bc40f56a3ca3249ce3b98cdda0187e0bd612aa5（MIT）
-# FineJob 仅做包路径适配；CDP 旁听与抓取行为保留上游实现，便于后续对照更新。
 """
 BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
 
@@ -183,7 +180,7 @@ def require_runtime_dependencies(*names):
 
 # ============================================================
 # 筛选参数映射
-# Source snapshots:
+# 接口快照：
 # - 城市: https://www.zhipin.com/wapi/zpgeek/search/job/hot/city.json + cityGroup.json
 # - 筛选项: https://www.zhipin.com/wapi/zpgeek/search/job/condition.json
 # ============================================================
@@ -201,11 +198,11 @@ def _city_data_path():
     module_data = os.path.join(os.path.dirname(__file__), "data", CITY_DATA_FILENAME)
     if os.path.isfile(module_data):
         return os.path.normpath(module_data)
-    # 2. 上游仓库开发态：脚本在 scripts/，数据在 ../data/
+    # 2. 开发态：脚本在 scripts/，数据在 ../data/
     repo_data = os.path.join(os.path.dirname(__file__), "..", "data", CITY_DATA_FILENAME)
     if os.path.isfile(repo_data):
         return os.path.normpath(repo_data)
-    # 3. 打包态：wheel force-include 到包根 data/，用 importlib.resources 兜底
+    # 3. 打包态：通过打包配置将数据放入包根 data/，再用 importlib.resources 兜底
     try:
         from importlib.resources import files  # py3.9+
         pkg_data = files(__package__ or "__main__").joinpath("..", "data", CITY_DATA_FILENAME) \
@@ -2010,7 +2007,7 @@ def analyze(list_data, details=None, search_keyword=""):
     loc_count = Counter()
     for j in jobs:
         loc = j.get("location", "")
-        # Extract district
+        # 提取区域
         parts = loc.split("·")
         if len(parts) >= 2:
             loc_count[parts[1]] += 1
@@ -2068,7 +2065,7 @@ def analyze(list_data, details=None, search_keyword=""):
         top_body = [t for t, _ in body_freq.most_common(8)] if body_freq else []
         print(f"  技能关键词: {', '.join(top_skills)}")
         print(f"  正文高频词: {', '.join(top_body)}")
-        # Experience requirement
+        # 经验要求
         if exp_count:
             top_exp = exp_count.most_common(1)[0][0]
             print(f"  经验要求主流: {top_exp}")
@@ -2094,7 +2091,7 @@ def has_usable_smoke_jobs(jobs):
 
 
 def run_smoke_test(cdp_port=DEFAULT_CDP_PORT):
-    """Run a real browser/API smoke test without writing result files."""
+    """使用真实浏览器/API 执行 smoke test，不写入结果文件。"""
     if not require_runtime_dependencies("requests", "websocket"):
         return 1
 
@@ -2561,7 +2558,7 @@ def main():
   # 环境检查
   %(prog)s --check
 
-  # 浏览器/API smoke test
+  # 浏览器/API 冒烟测试
   %(prog)s --smoke-test
 
   # 启动 Chrome CDP

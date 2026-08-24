@@ -28,10 +28,9 @@ from backend.app.errors import AppError
 
 router = APIRouter(prefix="/config", tags=["config"])
 
-# FineJob-retained API surface.
-# These endpoints are required by FineJob V1 for local LLM/Embedding setup,
-# provider connectivity checks, and persisted runtime configuration. Do not
-# remove them when cleaning legacy KnowledgeCurator routers.
+# FineJob 保留的 API 接口。
+# FineJob V1 使用这些接口配置本地 LLM/Embedding、检查服务商连通性，
+# 并持久化运行时配置；当前桌面端配置流程仍需要保留这些接口。
 
 
 @router.get("", response_model=AppConfigResponse)
