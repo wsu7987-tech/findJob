@@ -914,6 +914,20 @@ CREATE TABLE IF NOT EXISTS fj_chat_events (
 
 CREATE INDEX IF NOT EXISTS idx_fj_chat_events_created_at
   ON fj_chat_events(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_codex_sessions (
+  id TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'stopped',
+  started_at TEXT,
+  exited_at TEXT,
+  exit_reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (status IN ('stopped', 'starting', 'running', 'interrupting', 'exited', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_codex_sessions_updated_at
+  ON fj_codex_sessions(updated_at DESC);
 """
 
 
@@ -937,6 +951,7 @@ class Database:
             self._ensure_fj_boss_job_columns(connection)
             self._ensure_fj_delivery_strategy_columns(connection)
             self._ensure_fj_boss_executor_schema(connection)
+            self._ensure_codex_integration_schema(connection)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -1325,3 +1340,49 @@ class Database:
                     "UPDATE fj_boss_jobs SET delivery_evaluation_json = ? WHERE id = ?",
                     (json.dumps(evaluation, ensure_ascii=False), row["id"]),
                 )
+
+    def _ensure_codex_integration_schema(self, connection: sqlite3.Connection) -> None:
+        """补齐 Codex 聚合上下文、授权和失效判断使用的业务版本字段。"""
+        migrations = {
+            "fj_resumes": {
+                "facts_version": "ALTER TABLE fj_resumes ADD COLUMN facts_version INTEGER NOT NULL DEFAULT 1",
+            },
+            "fj_boss_jobs": {
+                "detail_version": "ALTER TABLE fj_boss_jobs ADD COLUMN detail_version INTEGER NOT NULL DEFAULT 1",
+            },
+            "fj_job_evaluations": {
+                "job_detail_version": "ALTER TABLE fj_job_evaluations ADD COLUMN job_detail_version INTEGER NOT NULL DEFAULT 1",
+                "resume_facts_version": "ALTER TABLE fj_job_evaluations ADD COLUMN resume_facts_version INTEGER NOT NULL DEFAULT 1",
+                "structure_version": "ALTER TABLE fj_job_evaluations ADD COLUMN structure_version INTEGER NOT NULL DEFAULT 1",
+            },
+            "fj_review_items": {
+                "version": "ALTER TABLE fj_review_items ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
+                "content_categories_json": "ALTER TABLE fj_review_items ADD COLUMN content_categories_json TEXT NOT NULL DEFAULT '[]'",
+                "classification_version": "ALTER TABLE fj_review_items ADD COLUMN classification_version INTEGER NOT NULL DEFAULT 1",
+                "authorization_mode": "ALTER TABLE fj_review_items ADD COLUMN authorization_mode TEXT NOT NULL DEFAULT 'manual_confirmation'",
+            },
+            "fj_automation_actions": {
+                "authorization_mode": "ALTER TABLE fj_automation_actions ADD COLUMN authorization_mode TEXT NOT NULL DEFAULT 'manual_confirmation'",
+                "authorization_source": "ALTER TABLE fj_automation_actions ADD COLUMN authorization_source TEXT NOT NULL DEFAULT 'confirmation'",
+                "content_categories_json": "ALTER TABLE fj_automation_actions ADD COLUMN content_categories_json TEXT NOT NULL DEFAULT '[]'",
+                "classification_version": "ALTER TABLE fj_automation_actions ADD COLUMN classification_version INTEGER NOT NULL DEFAULT 1",
+            },
+            "fj_chat_reply_tasks": {
+                "text_version": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN text_version INTEGER NOT NULL DEFAULT 1",
+                "content_categories_json": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN content_categories_json TEXT NOT NULL DEFAULT '[]'",
+                "classification_version": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN classification_version INTEGER NOT NULL DEFAULT 1",
+            },
+            "fj_chat_send_actions": {
+                "authorization_mode": "ALTER TABLE fj_chat_send_actions ADD COLUMN authorization_mode TEXT NOT NULL DEFAULT 'manual_confirmation'",
+                "authorization_source": "ALTER TABLE fj_chat_send_actions ADD COLUMN authorization_source TEXT NOT NULL DEFAULT 'confirmation'",
+                "content_categories_json": "ALTER TABLE fj_chat_send_actions ADD COLUMN content_categories_json TEXT NOT NULL DEFAULT '[]'",
+                "classification_version": "ALTER TABLE fj_chat_send_actions ADD COLUMN classification_version INTEGER NOT NULL DEFAULT 1",
+            },
+        }
+        for table, table_migrations in migrations.items():
+            columns = {
+                row["name"] for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            for column, ddl in table_migrations.items():
+                if column not in columns:
+                    connection.execute(ddl)

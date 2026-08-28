@@ -19,7 +19,7 @@ const shared = {
   platform: "node",
   target: "node22",
   sourcemap: true,
-  external: ["electron", "electron/main", "electron/renderer"],
+  external: ["electron", "electron/main", "electron/renderer", "node-pty"],
   tsconfig: path.resolve(projectRoot, "tsconfig.json")
 };
 

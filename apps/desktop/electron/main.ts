@@ -3,6 +3,9 @@ import { appendFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import type { Event as ElectronEvent, OpenDialogOptions } from "electron";
 
+import { createBackendProcessController } from "./backend-process";
+import { registerCodexIpc } from "./codex-ipc";
+import { createCodexSessionController } from "./codex-session";
 import { registerQuickCaptureIpc } from "./quick-capture-ipc";
 import { createQuitState } from "./quit-state";
 import { loadShellConfig } from "./shell-config";
@@ -36,6 +39,19 @@ const getRendererUrl = () =>
   pathToFileURL(path.resolve(getAppRoot(), "dist/index.html")).href;
 
 const getPreloadPath = () => path.resolve(getAppRoot(), "dist-electron/preload.cjs");
+const workspaceRoot =
+  process.env.FINE_JOB_WORKSPACE_ROOT ?? path.resolve(getAppRoot(), "../..");
+const backendOrigin =
+  process.env.KNOWLEDGE_CURATOR_API_ORIGIN ?? "http://127.0.0.1:8000";
+const appDataDir =
+  process.env.KNOWLEDGE_CURATOR_APP_DATA_DIR ?? app.getPath("userData");
+const pythonPath =
+  process.env.FINE_JOB_PYTHON_PATH ??
+  path.resolve(
+    workspaceRoot,
+    ".venv",
+    process.platform === "win32" ? "Scripts/python.exe" : "bin/python"
+  );
 
 let shellConfig = loadShellConfig();
 
@@ -74,6 +90,28 @@ const trayController = createTrayController({
   debugLog
 });
 
+const backendController = createBackendProcessController({
+  debugLog,
+  workspaceRoot,
+  backendOrigin
+});
+
+const codexSessionController = createCodexSessionController({
+  appDataDir,
+  workspaceRoot,
+  backendOrigin,
+  pythonPath,
+  getCodexPath: () => backendController.getCodexPath(),
+  createRuntime: () => backendController.createCodexRuntime(),
+  completeRuntime: (runId, token, status, reason) =>
+    backendController.completeCodexRuntime(runId, token, status, reason),
+  emit: (channel, payload) => {
+    const contents = windowManager.getMainWindow()?.webContents;
+    if (contents && !contents.isDestroyed()) contents.send(channel, payload);
+  },
+  debugLog
+});
+
 const reloadShellConfig = () => {
   shellConfig = loadShellConfig();
   return shortcutController.register(shellConfig);
@@ -94,7 +132,7 @@ const updateShellConfig = (
   return shortcutController.register(shellConfig);
 };
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   debugLog("app.whenReady resolved");
   clearInterval(bootstrapKeepAlive);
 
@@ -115,6 +153,17 @@ app.whenReady().then(() => {
     reloadShellConfig,
     updateShellConfig
   });
+  registerCodexIpc(
+    ipcMain,
+    codexSessionController,
+    () => windowManager.getMainWindow()?.webContents ?? null
+  );
+
+  try {
+    await backendController.start();
+  } catch (error) {
+    debugLog(`backend start failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 
   ipcMain.handle("dialog:pick-file", async (_event: ElectronEvent, dialogOptions?: OpenDialogOptions) => {
     const resolvedOptions: OpenDialogOptions = {
@@ -200,7 +249,7 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("app:get-meta", () => ({
-    backendOrigin: process.env.KNOWLEDGE_CURATOR_API_ORIGIN ?? "http://127.0.0.1:8000",
+    backendOrigin,
     isElectron: true,
     version: app.getVersion()
   }));
@@ -234,4 +283,5 @@ app.on("quit", () => {
   debugLog("app quit");
   shortcutController.unregisterAll();
   trayController.destroyTray();
+  codexSessionController.stop();
 });

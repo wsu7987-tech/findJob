@@ -219,15 +219,22 @@ def _html_to_text(html: str) -> tuple[str | None, str]:
     return title, text
 
 
-def _markdown_to_text(markdown_source: str) -> str:
+def _markdown_to_text(
+    markdown_source: str,
+    *,
+    max_chars: int | None = _MAX_EXTRACTED_CHARS,
+) -> str:
     text = _MARKDOWN_FRONT_MATTER_RE.sub("", markdown_source)
     text = _MARKDOWN_CODE_FENCE_RE.sub(" ", text)
     text = _MARKDOWN_IMAGE_RE.sub(r"\1", text)
     text = _MARKDOWN_LINK_RE.sub(r"\1", text)
     text = _MARKDOWN_INLINE_CODE_RE.sub(r"\1", text)
     text = _MARKDOWN_HEADER_RE.sub("", text)
-    text = re.sub(r"[*_>#-]{1,3}", " ", text)
-    return _normalize_text(text)
+    # 保留列表语义，单独移除 Markdown 分隔线，避免把项目经历中的短横线内容抹掉。
+    text = re.sub(r"(?m)^\s*[-*+]\s+", "• ", text)
+    text = re.sub(r"(?m)^\s*[-*_]{3,}\s*$", " ", text)
+    text = re.sub(r"[*_>#]{1,3}", " ", text)
+    return _normalize_text(text, max_chars=max_chars)
 
 
 def _extract_markdown_title(markdown_source: str) -> str | None:
@@ -276,12 +283,16 @@ def _first_line(text: str) -> str | None:
     return None
 
 
-def _normalize_text(text: str) -> str:
+def _normalize_text(
+    text: str,
+    *,
+    max_chars: int | None = _MAX_EXTRACTED_CHARS,
+) -> str:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     normalized = _WHITESPACE_RE.sub(" ", normalized)
     normalized = _BLANK_LINES_RE.sub("\n\n", normalized)
     normalized = normalized.strip()
-    return normalized[:_MAX_EXTRACTED_CHARS]
+    return normalized if max_chars is None else normalized[:max_chars]
 
 
 def _ensure_meaningful_text(text: str, source_name: str) -> None:

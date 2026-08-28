@@ -9,6 +9,7 @@ export const useFineJobResumesStore = defineStore("fineJobResumes", () => {
   const selectedResume = ref<FineJobResume | null>(null);
   const loading = ref(false);
   const parsing = ref(false);
+  const deleting = ref(false);
   const facts = ref<Record<string, FineJobResumeFact[]>>({});
   const factsLoading = ref(false);
   const factsSaving = ref(false);
@@ -72,6 +73,24 @@ export const useFineJobResumesStore = defineStore("fineJobResumes", () => {
     }
   };
 
+  const deleteResume = async (resumeId: string) => {
+    deleting.value = true;
+    error.value = null;
+    try {
+      await api.deleteFineJobResume(resumeId);
+      resumes.value = resumes.value.filter((resume) => resume.id !== resumeId);
+      delete facts.value[resumeId];
+      if (selectedResume.value?.id === resumeId) {
+        selectedResume.value = resumes.value[0] ?? null;
+      }
+    } catch (errorValue) {
+      error.value = mapError(errorValue);
+      throw errorValue;
+    } finally {
+      deleting.value = false;
+    }
+  };
+
   const loadFacts = async (resumeId: string) => {
     factsLoading.value = true;
     error.value = null;
@@ -124,6 +143,7 @@ export const useFineJobResumesStore = defineStore("fineJobResumes", () => {
     selectedResume,
     loading,
     parsing,
+    deleting,
     facts,
     factsLoading,
     factsSaving,
@@ -132,6 +152,7 @@ export const useFineJobResumesStore = defineStore("fineJobResumes", () => {
     load,
     selectResume,
     createFromFile,
+    deleteResume,
     loadFacts,
     extractFacts,
     saveFacts

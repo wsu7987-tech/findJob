@@ -4,6 +4,18 @@ from pathlib import Path
 import numpy as np
 
 
+def test_clean_resume_text_removes_common_pdf_artifacts() -> None:
+    from backend.app.services.fine_job.resume_text import clean_resume_text
+
+    result = clean_resume_text(
+        "\ufeff张  三\n\n第 1 页\n----------------\n"
+        "手机号：138 0013 8000\n邮箱：name @ example . com\n"
+        "front-\nend\n项目\n项目"
+    )
+
+    assert result == "张三\n\n手机号:13800138000\n邮箱:name@example.com\nfrontend\n项目"
+
+
 def test_pymupdf_markdown_parser_normalizes_markdown(monkeypatch) -> None:
     from backend.app.services.pdf_parse.parsers.pymupdf_markdown import (
         PymupdfMarkdownParser,

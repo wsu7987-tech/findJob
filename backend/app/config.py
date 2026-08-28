@@ -32,6 +32,8 @@ PERSISTED_CONFIG_KEYS = {
     "codex_model",
     "codex_reasoning_effort",
     "codex_timeout_seconds",
+    "codex_sensitive_auto_authorization_enabled",
+    "codex_sensitive_operation_permissions",
     "embedding_timeout_seconds",
     "fetch_user_agent",
     "quick_capture_hotkey",
@@ -81,6 +83,8 @@ class AppConfig:
     codex_model: str | None = None
     codex_reasoning_effort: str | None = None
     codex_timeout_seconds: int = 300
+    codex_sensitive_auto_authorization_enabled: bool = False
+    codex_sensitive_operation_permissions: dict[str, bool] | None = None
 
     def missing_runtime_fields(self) -> list[str]:
         missing: list[str] = []
@@ -316,6 +320,19 @@ def load_config() -> AppConfig:
             )
             or "300"
         ),
+        codex_sensitive_auto_authorization_enabled=_resolve_bool(
+            local_overrides,
+            "codex_sensitive_auto_authorization_enabled",
+            _env("FINE_JOB_CODEX_SENSITIVE_AUTO_AUTHORIZATION_ENABLED"),
+            default=False,
+        ),
+        codex_sensitive_operation_permissions=_resolve_permission_map(
+            _resolve_value(
+                local_overrides,
+                "codex_sensitive_operation_permissions",
+                _env("FINE_JOB_CODEX_SENSITIVE_OPERATION_PERMISSIONS"),
+            )
+        ),
     )
 
 
@@ -366,3 +383,26 @@ def _resolve_bool(
         if normalized in {"0", "false", "no", "off"}:
             return False
     return default
+
+
+def _resolve_permission_map(value: Any) -> dict[str, bool]:
+    """只保留已登记的敏感操作开关，未知字段不会进入授权判断。"""
+    allowed = {
+        "send_greeting",
+        "send_chat_reply",
+        "send_contact_info",
+        "send_commitment_reply",
+        "send_interview_decision",
+        "start_greeting_batch",
+        "resume_external_executor",
+        "submit_application",
+        "change_automation_policy",
+    }
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = {}
+    if not isinstance(value, dict):
+        value = {}
+    return {key: bool(value.get(key, False)) for key in sorted(allowed)}

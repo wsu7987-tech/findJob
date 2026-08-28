@@ -53,6 +53,8 @@
   FineJobChatSessionListEnvelope,
   FineJobChatReplyEnvelope,
   FineJobChatSendActionEnvelope,
+  FineJobCodexPendingWork,
+  FineJobCodexPermissions,
   PoolCreateRequest,
   PoolCreateResponse,
   PoolCommitMetadataRequest,
@@ -780,6 +782,11 @@ export const api = {
   async getFineJobResume(resumeId: string) {
     return request<FineJobResumeEnvelope>(`/api/fine-job/resumes/${resumeId}`);
   },
+  async deleteFineJobResume(resumeId: string) {
+    return request<void>(`/api/fine-job/resumes/${resumeId}`, {
+      method: "DELETE"
+    });
+  },
   async createFineJobResumeFromFile(payload: FineJobResumeCreateFromFileRequest) {
     return request<FineJobResumeEnvelope>("/api/fine-job/resumes/from-file", {
       method: "POST",
@@ -800,6 +807,29 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(payload)
     });
+  },
+  async getFineJobCodexPermissions() {
+    return request<FineJobCodexPermissions>("/api/fine-job/codex/permissions");
+  },
+  async updateFineJobCodexPermissions(payload: Pick<FineJobCodexPermissions, "enabled" | "permissions">) {
+    return request<FineJobCodexPermissions>("/api/fine-job/codex/permissions", {
+      method: "PATCH",
+      body: JSON.stringify(payload)
+    });
+  },
+  async getFineJobCodexPendingWork() {
+    return request<FineJobCodexPendingWork>("/api/fine-job/codex/pending");
+  },
+  async decideFineJobCodexPending(
+    resourceType: "greeting_preview" | "chat_reply",
+    resourceId: string,
+    operation: "approve" | "reject",
+    payload: { expected_version: number; final_text?: string; allow_override?: boolean; note?: string }
+  ) {
+    return request<Record<string, unknown>>(
+      `/api/fine-job/codex/pending/${resourceType}/${encodeURIComponent(resourceId)}/${operation}`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
   },
   async runQuickCaptureOcr(imageBase64: string) {
     return request<{ raw_text: string; captured_at: string; warnings: string[] }>(

@@ -40,6 +40,8 @@ class AppConfigResponse(BaseModel):
     codex_model: str | None
     codex_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None
     codex_timeout_seconds: int
+    codex_sensitive_auto_authorization_enabled: bool
+    codex_sensitive_operation_permissions: dict[str, bool]
 
 
 class AppConfigPatchRequest(BaseModel):
@@ -77,6 +79,8 @@ class AppConfigPatchRequest(BaseModel):
     codex_model: str | None = None
     codex_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
     codex_timeout_seconds: int | None = Field(default=None, ge=1, le=3600)
+    codex_sensitive_auto_authorization_enabled: bool | None = None
+    codex_sensitive_operation_permissions: dict[str, bool] | None = None
 
 
 class ProviderConnectivityCheckResponse(BaseModel):

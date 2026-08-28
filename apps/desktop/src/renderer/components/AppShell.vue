@@ -5,6 +5,7 @@ import {
   ArrowRight,
   ChatDotRound,
   Clock,
+  Cpu,
   Document,
   Link,
   List,
@@ -38,6 +39,7 @@ const navigation = [
   { label: "运行状态", routeName: "fine-job-runs", icon: List },
   { label: "待确认", routeName: "fine-job-review", icon: User },
   { label: "自动代聊", routeName: "fine-job-chat", icon: ChatDotRound },
+  { label: "Codex 工作台", routeName: "fine-job-codex", icon: Cpu },
   { label: "动作日志", routeName: "fine-job-logs", icon: User }
 ];
 

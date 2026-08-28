@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { ElMessage } from "element-plus";
+import { ElMessage, ElMessageBox } from "element-plus";
 
 import { chooseFile, hasFilePicker } from "@/services/desktop-bridge";
 import { formatDateTime } from "@/services/format";
@@ -33,6 +33,29 @@ const uploadResume = async () => {
     ElMessage.success("简历解析完成");
   } catch {
     ElMessage.error(resumesStore.error ?? "简历解析失败");
+  }
+};
+
+const removeResume = async (resume: FineJobResume) => {
+  try {
+    await ElMessageBox.confirm(
+      `确定删除简历“${resume.name}”吗？已确认的信息也会一并删除。`,
+      "删除简历",
+      {
+        type: "warning",
+        confirmButtonText: "删除",
+        cancelButtonText: "取消"
+      }
+    );
+    await resumesStore.deleteResume(resume.id);
+    parseDialogOpen.value = false;
+    confirmDialogOpen.value = false;
+    ElMessage.success("简历已删除");
+  } catch (value) {
+    if (value === "cancel" || value === "close") {
+      return;
+    }
+    ElMessage.error(resumesStore.error ?? "简历删除失败");
   }
 };
 
@@ -185,7 +208,13 @@ const factTypeOptions = [
               <el-button size="small" type="primary" plain @click="openConfirmDialog(row)">
                 信息确认
               </el-button>
-              <el-button size="small" type="danger" plain disabled>删除</el-button>
+              <el-button
+                size="small"
+                type="danger"
+                plain
+                :loading="resumesStore.deleting"
+                @click="removeResume(row)"
+              >删除</el-button>
             </div>
           </template>
         </el-table-column>

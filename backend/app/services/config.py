@@ -43,6 +43,12 @@ def serialize_config(config: AppConfig) -> dict[str, object]:
         "codex_model": config.codex_model,
         "codex_reasoning_effort": config.codex_reasoning_effort,
         "codex_timeout_seconds": config.codex_timeout_seconds,
+        "codex_sensitive_auto_authorization_enabled": (
+            config.codex_sensitive_auto_authorization_enabled
+        ),
+        "codex_sensitive_operation_permissions": (
+            config.codex_sensitive_operation_permissions or {}
+        ),
     }
 
 
@@ -133,6 +139,15 @@ def update_config(config: AppConfig, payload: AppConfigPatchRequest) -> AppConfi
         )
     if "codex_timeout_seconds" in updates:
         config.codex_timeout_seconds = int(updates["codex_timeout_seconds"])
+    if "codex_sensitive_auto_authorization_enabled" in updates:
+        config.codex_sensitive_auto_authorization_enabled = bool(
+            updates["codex_sensitive_auto_authorization_enabled"]
+        )
+    if "codex_sensitive_operation_permissions" in updates:
+        config.codex_sensitive_operation_permissions = {
+            str(key): bool(value)
+            for key, value in (updates["codex_sensitive_operation_permissions"] or {}).items()
+        }
 
     config.app_data_dir.mkdir(parents=True, exist_ok=True)
     config.sqlite_path.parent.mkdir(parents=True, exist_ok=True)

@@ -755,7 +755,11 @@ def edit_reply(db: Database, task_id: str, final_text: str) -> dict[str, Any]:
         if task["status"] != "awaiting_review":
             raise AppError(status_code=409, error_category="CHAT_REPLY_NOT_EDITABLE", error_message="当前回复任务不可编辑。")
         connection.execute(
-            "UPDATE fj_chat_reply_tasks SET final_text = ?, updated_at = ? WHERE id = ?",
+            """
+            UPDATE fj_chat_reply_tasks
+            SET final_text = ?, text_version = text_version + 1, updated_at = ?
+            WHERE id = ?
+            """,
             (final_text.strip(), _now(), task_id),
         )
         return _row(connection.execute("SELECT * FROM fj_chat_reply_tasks WHERE id = ?", (task_id,)).fetchone()) or {}

@@ -10,6 +10,7 @@ import PlatformLoginPage from "@/pages/fine-job/PlatformLogin.vue";
 import ResumeProfilePage from "@/pages/fine-job/ResumeProfile.vue";
 import ReviewQueuePage from "@/pages/fine-job/ReviewQueue.vue";
 import BossChatPage from "@/pages/fine-job/BossChat.vue";
+import CodexWorkspacePage from "@/pages/fine-job/CodexWorkspace.vue";
 
 export const router = createRouter({
   history: createWebHashHistory(),
@@ -75,6 +76,12 @@ export const router = createRouter({
       name: "fine-job-chat",
       component: BossChatPage,
       meta: { title: "自动代聊" }
+    },
+    {
+      path: "/fine-job/codex",
+      name: "fine-job-codex",
+      component: CodexWorkspacePage,
+      meta: { title: "Codex 工作台" }
     },
     {
       path: "/fine-job/logs",

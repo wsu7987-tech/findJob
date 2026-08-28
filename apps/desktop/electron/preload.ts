@@ -73,7 +73,28 @@ const desktopBridge = {
       backendOrigin: string;
       isElectron: boolean;
       version: string;
-    }>
+    }>,
+  startCodex: (size?: { cols?: number; rows?: number }) =>
+    ipcRenderer.invoke("codex:start", size) as Promise<{ status: string; runId: string | null }>,
+  resumeCodex: (size?: { cols?: number; rows?: number }) =>
+    ipcRenderer.invoke("codex:resume", size) as Promise<{ status: string; runId: string | null }>,
+  getCodexState: () =>
+    ipcRenderer.invoke("codex:state") as Promise<{ status: string; runId: string | null }>,
+  writeCodex: (data: string) => ipcRenderer.send("codex:input", data),
+  resizeCodex: (cols: number, rows: number) =>
+    ipcRenderer.send("codex:resize", { cols, rows }),
+  interruptCodex: () => ipcRenderer.send("codex:interrupt"),
+  stopCodex: () => ipcRenderer.send("codex:stop"),
+  onCodexOutput: (callback: (payload: { runId: string | null; data: string }) => void) => {
+    const listener = (_event: unknown, payload: { runId: string | null; data: string }) => callback(payload);
+    ipcRenderer.on("codex:output", listener);
+    return () => ipcRenderer.removeListener("codex:output", listener);
+  },
+  onCodexStatus: (callback: (payload: { status: string; runId: string | null; message: string }) => void) => {
+    const listener = (_event: unknown, payload: { status: string; runId: string | null; message: string }) => callback(payload);
+    ipcRenderer.on("codex:status", listener);
+    return () => ipcRenderer.removeListener("codex:status", listener);
+  }
 };
 
 contextBridge.exposeInMainWorld("desktopBridge", desktopBridge);

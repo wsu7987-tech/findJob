@@ -49,6 +49,7 @@ const mainWatchProcess = spawnProcess(
     "--external:electron",
     "--external:electron/main",
     "--external:electron/renderer",
+    "--external:node-pty",
     "--tsconfig=tsconfig.json",
     "--watch=forever"
   ],

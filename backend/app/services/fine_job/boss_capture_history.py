@@ -287,7 +287,7 @@ def update_capture_job_detail(
                 f"""
                 UPDATE fj_boss_jobs
                 SET detail_json = ?, detail_status = 'completed', detail_error = NULL,
-                    detail_collected_at = ?,
+                    detail_collected_at = ?, detail_version = detail_version + 1,
                     boss_active_status = CASE
                       WHEN ? <> '' THEN ? ELSE boss_active_status
                     END

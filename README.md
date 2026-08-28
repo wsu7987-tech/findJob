@@ -4,6 +4,12 @@ FineJob 是一个本地化的 AI 求职驾驶舱，目标是帮助用户管理�
 
 当前项目提供可复用的 OCR、PDF 解析、Playwright、FastAPI、LangGraph、SQLite、LLM Provider 等能力，前端产品层聚焦求职场景。
 
+## Codex 工作台
+
+桌面端“Codex 工作台”嵌入本机已登录的 Codex TUI。Electron 自动启动或复用 FineJob 后端，并管理本实例的单一 Codex PTY 会话，支持新建、恢复最近会话、中断和结束；Electron 退出后本地后端可由下次启动继续复用。专用工作区加载 FineJob Skill 与 MCP 配置，Codex 可使用 14 个 `finejob.*` 工具查询岗位和简历、保存岗位评估、创建打招呼预览、生成代聊草稿并请求受控发送。
+
+敏感操作在工作台中配置总开关和分项预授权。未获预授权的请求显示在待确认卡片中；真实动作仍由 FineJob 的业务版本、登录态、执行器和队列状态共同校验。
+
 ## 产品方向
 
 - 简历中心：上传简历、解析内容、形成结构化事实库。
@@ -17,8 +23,8 @@ FineJob 是一个本地化的 AI 求职驾驶舱，目标是帮助用户管理�
 
 | 层 | 技术 |
 | --- | --- |
-| 桌面端 | Electron, Vue 3, Pinia, Element Plus, Vite |
-| 后端 | FastAPI, Pydantic, LangGraph |
+| 桌面端 | Electron, Vue 3, Pinia, Element Plus, Vite, node-pty, xterm |
+| 后端 | FastAPI, Pydantic, LangGraph, Python MCP |
 | 存储 | SQLite, SQLite FTS5 |
 | AI | OpenAI-compatible LLM / Codex CLI / Embedding provider / stub provider |
 | 文档解析 | PyMuPDF, pymupdf4llm, RapidOCR |

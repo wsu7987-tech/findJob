@@ -65,6 +65,7 @@ docs-old/
 AGENTS.md
 
 # 编辑器与操作系统本地文件
+.pytest-temp/
 .vscode/
 .idea/
 *.swp

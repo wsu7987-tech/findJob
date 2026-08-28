@@ -77,3 +77,68 @@ def test_extract_and_save_resume_facts(configured_client, sqlite_connection) -> 
             "updated_at": saved[0]["updated_at"],
         }
     ]
+
+
+def test_delete_resume_removes_resume_and_facts(configured_client, sqlite_connection) -> None:
+    now = utc_now()
+    sqlite_connection.execute(
+        """
+        INSERT INTO fj_resumes (
+          id, name, file_path, file_hash, parser_name, raw_text,
+          markdown_text, preview_text, page_count, char_count,
+          quality_score, is_ocr, warnings_json, status, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "resume-delete",
+            "待删除简历",
+            "D:/resume-delete.pdf",
+            "delete-test-file",
+            "auto",
+            "简历内容",
+            None,
+            "简历内容",
+            1,
+            4,
+            0.8,
+            0,
+            json.dumps([]),
+            "parsed",
+            now,
+            now,
+        ),
+    )
+    sqlite_connection.execute(
+        """
+        INSERT INTO fj_resume_facts (
+          id, resume_id, fact_type, fact_key, fact_value,
+          confidence, source_text, user_confirmed, sensitive, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "fact-delete",
+            "resume-delete",
+            "basic",
+            "姓名",
+            "张三",
+            1,
+            None,
+            1,
+            0,
+            now,
+            now,
+        ),
+    )
+    sqlite_connection.commit()
+
+    response = configured_client.delete("/api/fine-job/resumes/resume-delete")
+
+    assert response.status_code == 204
+    assert configured_client.get("/api/fine-job/resumes/resume-delete").status_code == 404
+    remaining_facts = sqlite_connection.execute(
+        "SELECT id FROM fj_resume_facts WHERE resume_id = ?",
+        ("resume-delete",),
+    ).fetchall()
+    assert remaining_facts == []

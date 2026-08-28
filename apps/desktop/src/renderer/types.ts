@@ -3,6 +3,32 @@ export type RunTaskType = "summary" | "report";
 export type RunStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
 export type FeedbackValue = "useful" | "useless";
 
+export type FineJobCodexSessionStatus = "idle" | "starting" | "running" | "exited" | "failed";
+
+export interface FineJobCodexPermissions {
+  enabled: boolean;
+  permissions: Record<string, boolean>;
+  supported: Record<string, boolean>;
+}
+
+export interface FineJobCodexPendingItem {
+  id: string;
+  version?: number;
+  text_version?: number;
+  draft_message?: string;
+  final_message?: string;
+  final_text?: string;
+  status: string;
+  created_at: string;
+}
+
+export interface FineJobCodexPendingWork {
+  greetings: FineJobCodexPendingItem[];
+  chat_replies: FineJobCodexPendingItem[];
+  automation_actions: Array<Record<string, unknown>>;
+  chat_actions: Array<Record<string, unknown>>;
+}
+
 export interface ApiPoolItem {
   id: string;
   knowledge_item_id?: string;

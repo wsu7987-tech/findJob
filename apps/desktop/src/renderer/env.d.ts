@@ -57,6 +57,25 @@ declare global {
         isElectron: boolean;
         version: string;
       }>;
+      startCodex: (size?: { cols?: number; rows?: number }) => Promise<{
+        status: string;
+        runId: string | null;
+      }>;
+      resumeCodex: (size?: { cols?: number; rows?: number }) => Promise<{
+        status: string;
+        runId: string | null;
+      }>;
+      getCodexState: () => Promise<{ status: string; runId: string | null }>;
+      writeCodex: (data: string) => void;
+      resizeCodex: (cols: number, rows: number) => void;
+      interruptCodex: () => void;
+      stopCodex: () => void;
+      onCodexOutput: (
+        callback: (payload: { runId: string | null; data: string }) => void
+      ) => () => void;
+      onCodexStatus: (
+        callback: (payload: { status: string; runId: string | null; message: string }) => void
+      ) => () => void;
     };
   }
 }

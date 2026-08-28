@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Response, status
 
 from backend.app.config import AppConfig
 from backend.app.db import Database
@@ -14,6 +14,7 @@ from backend.app.schemas.fine_job.resumes import (
 )
 from backend.app.services.fine_job.resumes import (
     create_resume_from_file,
+    delete_resume,
     extract_resume_facts,
     get_resume,
     list_resume_facts,
@@ -36,6 +37,15 @@ def get_fine_job_resume(
     db: Database = Depends(get_database),
 ) -> FineJobResumeEnvelope:
     return FineJobResumeEnvelope(resume=get_resume(db, resume_id))
+
+
+@router.delete("/{resume_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_fine_job_resume(
+    resume_id: str,
+    db: Database = Depends(get_database),
+) -> Response:
+    delete_resume(db, resume_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post(

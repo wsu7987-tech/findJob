@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from backend.app.errors import AppError
+from backend.app.services.fine_job.resume_text import clean_resume_text
 from backend.app.services.pdf_parse.types import PdfParsePage, PdfParseResult
 
 try:
@@ -128,12 +129,12 @@ class RapidOcrParser:
             if callable(on_page):
                 on_page(page, total_pages)
 
-        raw_text = "\n".join(lines)
+        raw_text = clean_resume_text("\n".join(lines))
         return PdfParseResult(
             parser_name=self.parser_name,
             raw_text=raw_text,
             markdown_text=None,
-            preview_text=raw_text[:4000],
+            preview_text=raw_text,
             page_count=len(page_images),
             char_count=len(raw_text),
             quality_score=0.0,
@@ -174,7 +175,63 @@ class RapidOcrParser:
         txts = getattr(result, "txts", None)
         if not isinstance(txts, (list, tuple)):
             return []
-        return [text.strip() for text in txts if isinstance(text, str) and text.strip()]
+        texts = [text.strip() for text in txts if isinstance(text, str) and text.strip()]
+        boxes = getattr(result, "boxes", None)
+        if not isinstance(boxes, (list, tuple)) and not hasattr(boxes, "__len__"):
+            return texts
+        if len(boxes) != len(txts):
+            return texts
+
+        positioned: list[tuple[str, float, float, float]] = []
+        for text, box in zip(txts, boxes):
+            if not isinstance(text, str) or not text.strip():
+                continue
+            geometry = RapidOcrParser._box_geometry(box)
+            if geometry is None:
+                return texts
+            left, top, height = geometry
+            positioned.append((text.strip(), left, top, height))
+        if not positioned:
+            return texts
+
+        median_height = sorted(item[3] for item in positioned)[len(positioned) // 2]
+        row_tolerance = max(6.0, median_height * 0.6)
+        rows: list[dict[str, object]] = []
+        for item in sorted(positioned, key=lambda value: (value[2], value[1])):
+            row = next(
+                (candidate for candidate in rows if abs(item[2] - float(candidate["top"])) <= row_tolerance),
+                None,
+            )
+            if row is None:
+                rows.append({"top": item[2], "items": [item]})
+            else:
+                row["items"].append(item)
+
+        ordered: list[str] = []
+        for row in sorted(rows, key=lambda candidate: float(candidate["top"])):
+            items = sorted(row["items"], key=lambda value: value[1])
+            # 同一文字行的多个识别框合并，避免姓名、公司名和职位被拆成多行。
+            ordered.append(" ".join(item[0] for item in items))
+        return ordered
+
+    @staticmethod
+    def _box_geometry(box: object) -> tuple[float, float, float] | None:
+        points = box.tolist() if hasattr(box, "tolist") else box
+        if not isinstance(points, (list, tuple)) or len(points) < 2:
+            return None
+        coordinates: list[tuple[float, float]] = []
+        for point in points:
+            values = point.tolist() if hasattr(point, "tolist") else point
+            if not isinstance(values, (list, tuple)) or len(values) < 2:
+                return None
+            try:
+                coordinates.append((float(values[0]), float(values[1])))
+            except (TypeError, ValueError):
+                return None
+        left = min(point[0] for point in coordinates)
+        top = min(point[1] for point in coordinates)
+        bottom = max(point[1] for point in coordinates)
+        return left, top, max(1.0, bottom - top)
 
     @staticmethod
     def _raise_if_cancelled(cancel_check) -> None:
@@ -185,12 +242,3 @@ class RapidOcrParser:
                 error_message="PDF reparse was cancelled.",
             )
 
-    @staticmethod
-    def _looks_like_ocr_line(candidate: object) -> bool:
-        return (
-            isinstance(candidate, (list, tuple))
-            and len(candidate) == 2
-            and isinstance(candidate[1], (list, tuple))
-            and len(candidate[1]) == 2
-            and isinstance(candidate[1][0], str)
-        )

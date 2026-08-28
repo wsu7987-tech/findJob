@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from backend.app.errors import AppError
 from backend.app.services.ingest import _markdown_to_text
+from backend.app.services.fine_job.resume_text import clean_resume_text
 from backend.app.services.pdf_parse.types import PdfParsePage, PdfParseResult
 
 try:
@@ -32,43 +33,48 @@ class PymupdfMarkdownParser:
             )
 
         document = pymupdf.open(file_path)
-        page_count = int(getattr(document, "page_count", 0) or 0)
-        preview_pages: list[PdfParsePage] = []
-        on_page = getattr(request, "on_page", None)
-        cancel_check = getattr(request, "cancel_check", None)
-        if hasattr(document, "__iter__"):
-            for index, page in enumerate(document, start=1):
-                if callable(cancel_check) and cancel_check():
-                    raise AppError(
-                        status_code=409,
-                        error_category="CANCELLED",
-                        error_message="PDF reparse was cancelled.",
+        try:
+            page_count = int(getattr(document, "page_count", 0) or 0)
+            preview_pages: list[PdfParsePage] = []
+            on_page = getattr(request, "on_page", None)
+            cancel_check = getattr(request, "cancel_check", None)
+            if hasattr(document, "__iter__"):
+                for index, page in enumerate(document, start=1):
+                    if callable(cancel_check) and cancel_check():
+                        raise AppError(
+                            status_code=409,
+                            error_category="CANCELLED",
+                            error_message="PDF reparse was cancelled.",
+                        )
+                    page_markdown = page.get_text("markdown").strip()
+                    preview_page = PdfParsePage(
+                        page_number=index,
+                        content_type="markdown",
+                        content=page_markdown,
                     )
-                page_markdown = page.get_text("markdown").strip()
-                preview_page = PdfParsePage(
-                    page_number=index,
-                    content_type="markdown",
-                    content=page_markdown,
-                )
-                preview_pages.append(preview_page)
-                if callable(on_page):
-                    on_page(preview_page, page_count)
+                    preview_pages.append(preview_page)
+                    if callable(on_page):
+                        on_page(preview_page, page_count)
 
-        document = pymupdf.open(file_path)
-        markdown_text = pymupdf4llm.to_markdown(
-            document,
-            header=False,
-            footer=False,
-            page_separators=True,
-            ignore_images=True,
-            write_images=False,
-        )
-        raw_text = _markdown_to_text(markdown_text)
+            markdown_text = pymupdf4llm.to_markdown(
+                document,
+                header=False,
+                footer=False,
+                page_separators=True,
+                ignore_images=True,
+                write_images=False,
+            )
+        finally:
+            close = getattr(document, "close", None)
+            if callable(close):
+                close()
+
+        raw_text = clean_resume_text(_markdown_to_text(markdown_text, max_chars=None))
         return PdfParseResult(
             parser_name=self.parser_name,
             raw_text=raw_text,
             markdown_text=markdown_text,
-            preview_text=markdown_text[:4000],
+            preview_text=raw_text,
             page_count=page_count,
             char_count=len(raw_text),
             quality_score=0.0,
