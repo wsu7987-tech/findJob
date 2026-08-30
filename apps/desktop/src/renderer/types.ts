@@ -709,10 +709,20 @@ export interface FineJobActionLog {
   message: string;
   detail: Record<string, unknown>;
   created_at: string;
+  source?: "legacy_run" | "main_workflow";
+  category?: string;
+  outcome?: string;
+  job_id?: string | null;
+  job_title?: string | null;
+  company_name?: string | null;
 }
 
 export interface FineJobActionLogListEnvelope {
   logs: FineJobActionLog[];
+  total?: number;
+  page?: number;
+  page_size?: number;
+  action_types?: string[];
 }
 
 export type FineJobReviewStatus = "pending" | "approved" | "rejected" | "dismissed";
@@ -769,11 +779,34 @@ export interface FineJobReviewItem {
   created_at: string;
   updated_at: string;
   resolved_at?: string | null;
+  action_id?: string | null;
+  action_status?: FineJobAutomationActionStatus | null;
+  execution_state?: FineJobBossExecutionState | null;
+  action_last_error?: string | null;
 }
 
 export interface FineJobReviewItemListEnvelope {
   items: FineJobReviewItem[];
   total: number;
+  page?: number;
+  page_size?: number;
+}
+
+export interface FineJobReviewQuery {
+  status?: FineJobReviewStatus;
+  decision?: FineJobReviewItem["ai_decision"] | "";
+  query?: string;
+  execution_state?: FineJobBossExecutionState | "";
+  created_from?: string;
+  created_to?: string;
+  page?: number;
+  page_size?: number;
+}
+
+export interface FineJobReviewBatchResponse {
+  results: Array<{ review_item_id: string; success: boolean; error_message: string }>;
+  succeeded: number;
+  failed: number;
 }
 
 export interface FineJobAutomationAction {
@@ -871,6 +904,20 @@ export interface FineJobBossExecutorDashboard {
   executor: FineJobBossExecutorInstance | null;
   queue: { actions: FineJobBossExecutorQueueAction[]; total: number };
   protocol_version: string;
+}
+
+export interface FineJobOperationsDashboard {
+  generated_at: string;
+  metrics: Record<string, number>;
+  review_counts: Record<string, number>;
+  action_counts: Record<string, number>;
+  execution_counts: Record<string, number>;
+  capture_counts: Record<string, number>;
+  executor: FineJobBossExecutorInstance | null;
+  queue: { actions: FineJobBossExecutorQueueAction[]; total: number };
+  current_action?: FineJobBossExecutorQueueAction | null;
+  recent_issues: FineJobActionLog[];
+  legacy_runs: FineJobDeliveryRun[];
 }
 
 export interface FineJobBossNavigationTask {

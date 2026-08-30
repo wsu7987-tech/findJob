@@ -67,4 +67,18 @@ describe("fineJobBossExecutor store", () => {
     expect(verifySpy).toHaveBeenCalledWith("action-1", true);
     expect(store.dashboard?.queue.total).toBe(0);
   });
+
+  it("从运行状态页暂停执行器", async () => {
+    const controlSpy = vi.spyOn(api, "controlFineJobBossExecutor").mockResolvedValue({
+      executor: null,
+      queue: { actions: [], total: 0 },
+      protocol_version: "1.1"
+    });
+    const store = useFineJobBossExecutorStore();
+
+    await store.control("pause");
+
+    expect(controlSpy).toHaveBeenCalledWith("pause");
+    expect(store.dashboard?.queue.total).toBe(0);
+  });
 });

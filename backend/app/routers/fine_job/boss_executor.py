@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Header
 
 from backend.app.db import Database
 from backend.app.dependencies import get_database
+from backend.app.errors import AppError
 from backend.app.schemas.fine_job.boss_executor import (
     BossActionCompleteRequest,
     BossDispatchStartedRequest,
@@ -139,6 +140,18 @@ def status(db: Database = Depends(get_database)):
         boss_executor.sweep_page_timeout(db, str(executor["id"]))
         snapshot = boss_executor.executor_snapshot(db, str(executor["id"]))
     return snapshot
+
+
+@router.post("/boss-executor/desktop-control")
+def desktop_control(
+    payload: BossExecutorControlRequest,
+    db: Database = Depends(get_database),
+):
+    snapshot = boss_executor.executor_snapshot(db)
+    executor = snapshot.get("executor")
+    if not isinstance(executor, dict):
+        raise AppError(409, "EXECUTOR_NOT_PAIRED", "尚未配对BOSS执行器。")
+    return boss_executor.set_control(db, str(executor["id"]), payload.command)
 
 
 @router.post("/boss-navigation/open")

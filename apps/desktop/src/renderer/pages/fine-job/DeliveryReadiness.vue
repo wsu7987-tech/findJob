@@ -42,6 +42,7 @@ onMounted(() => {
   void intentStore.load();
   void platformStore.load();
   void resumesStore.load();
+  void runsStore.loadDashboard().catch(() => undefined);
 });
 
 const requiredItems = computed(() => [
@@ -128,6 +129,17 @@ const optionalItems = computed(() => [
 const missingItems = computed(() => requiredItems.value.filter((item) => item.state === "missing"));
 const readyCount = computed(() => requiredItems.value.length - missingItems.value.length);
 const canStart = computed(() => missingItems.value.length === 0);
+const runtimeStatus = computed(() => {
+  const executor = runsStore.dashboard?.executor;
+  if (!runsStore.dashboard) return "加载中";
+  if (!executor) return "未配对";
+  if (!executor.browser_connected) return "浏览器未连接";
+  if (executor.risk_state !== "none") return "风险暂停";
+  return executor.queue_state === "running" ? "运行中" : "已暂停";
+});
+const pendingReviewCount = computed(() => runsStore.dashboard?.metrics.pending_reviews ?? 0);
+const successfulActionCount = computed(() => runsStore.dashboard?.metrics.successful_actions ?? 0);
+const queueCount = computed(() => runsStore.dashboard?.queue.total ?? 0);
 
 const statusCopy = computed(() => {
   if (canStart.value) {
@@ -196,18 +208,18 @@ const startDryRun = async () => {
       </article>
       <article class="metric-card">
         <span>运行状态</span>
-        <strong>未启动</strong>
-        <p>补齐准备项后可启动</p>
+        <strong>{{ runtimeStatus }}</strong>
+        <p>当前执行队列 {{ queueCount }} 项</p>
       </article>
       <article class="metric-card">
         <span>待确认</span>
-        <strong>0</strong>
+        <strong>{{ pendingReviewCount }}</strong>
         <p>发送、投递、联系方式等动作会进入这里</p>
       </article>
       <article class="metric-card">
-        <span>今日投递</span>
-        <strong>0</strong>
-        <p>等待启动首个任务</p>
+        <span>已确认沟通</span>
+        <strong>{{ successfulActionCount }}</strong>
+        <p>主流程累计成功完成的动作</p>
       </article>
     </div>
 

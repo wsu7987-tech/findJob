@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 
 ReviewStatus = Literal["pending", "approved", "rejected", "dismissed"]
+ReviewDecision = Literal["recommend", "review", "reject"]
 ActionStatus = Literal[
     "queued", "leased", "succeeded", "failed", "blocked", "unknown", "cancelled"
 ]
@@ -17,7 +18,7 @@ class FineJobReviewItemResponse(BaseModel):
     evaluation_id: str
     action_type: Literal["start_conversation"]
     status: ReviewStatus
-    ai_decision: Literal["recommend", "review", "reject"]
+    ai_decision: ReviewDecision
     draft_message: str
     final_message: str
     resolution_note: str
@@ -29,11 +30,17 @@ class FineJobReviewItemResponse(BaseModel):
     created_at: str
     updated_at: str
     resolved_at: str | None = None
+    action_id: str | None = None
+    action_status: ActionStatus | None = None
+    execution_state: str | None = None
+    action_last_error: str | None = None
 
 
 class FineJobReviewItemListEnvelope(BaseModel):
     items: list[FineJobReviewItemResponse]
     total: int
+    page: int = 1
+    page_size: int = 50
 
 
 class FineJobReviewApproveRequest(BaseModel):
@@ -43,6 +50,29 @@ class FineJobReviewApproveRequest(BaseModel):
 
 class FineJobReviewRejectRequest(BaseModel):
     note: str = ""
+
+
+class FineJobReviewArchiveRequest(BaseModel):
+    note: str = ""
+
+
+class FineJobReviewBatchRequest(BaseModel):
+    review_item_ids: list[str] = Field(min_length=1, max_length=100)
+    operation: Literal["approve", "reject", "archive"]
+    note: str = ""
+    allow_override: bool = False
+
+
+class FineJobReviewBatchResult(BaseModel):
+    review_item_id: str
+    success: bool
+    error_message: str = ""
+
+
+class FineJobReviewBatchResponse(BaseModel):
+    results: list[FineJobReviewBatchResult]
+    succeeded: int
+    failed: int
 
 
 class FineJobAutomationActionResponse(BaseModel):

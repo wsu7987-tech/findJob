@@ -325,25 +325,228 @@ def list_action_logs(
     run_id: str | None = None,
     limit: int = 100,
 ) -> list[dict[str, object]]:
-    params: tuple[object, ...]
-    where = ""
+    return query_action_logs(db, run_id=run_id, page_size=limit)["logs"]
+
+
+def query_action_logs(
+    db: Database,
+    *,
+    run_id: str | None = None,
+    query: str = "",
+    level: str | None = None,
+    action_type: str | None = None,
+    category: str | None = None,
+    outcome: str | None = None,
+    source: str | None = None,
+    created_from: str | None = None,
+    created_to: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+) -> dict[str, object]:
+    # 旧日志与主工作流日志共用一张表，在查询层统一补充业务分类和执行结果。
+    category_sql = """
+      CASE
+        WHEN l.action_type LIKE 'review_%' THEN 'review'
+        WHEN l.action_type = 'executor_control' OR l.action_type LIKE 'boss_%'
+          OR l.action_type LIKE 'action_%' THEN 'execution'
+        WHEN l.action_type LIKE 'run_%' OR l.action_type LIKE 'search_%'
+          OR l.action_type LIKE 'candidates_%' OR l.action_type LIKE 'dry_run_%'
+          OR l.action_type LIKE 'waiting_%' THEN 'capture'
+        WHEN l.action_type LIKE '%chat%' THEN 'chat'
+        ELSE 'system'
+      END
+    """
+    outcome_sql = """
+      CASE
+        WHEN l.level = 'error' THEN 'failed'
+        WHEN l.action_type LIKE '%succeeded%' OR l.action_type LIKE '%accepted%'
+          OR l.action_type LIKE '%opened%' OR l.action_type LIKE '%approved%'
+          OR l.action_type LIKE '%restored%' THEN 'succeeded'
+        WHEN l.level = 'warning' THEN 'warning'
+        ELSE 'info'
+      END
+    """
+    conditions: list[str] = []
+    values: list[object] = []
     if run_id:
-        where = "WHERE run_id = ?"
-        params = (run_id, limit)
-    else:
-        params = (limit,)
+        conditions.append("l.run_id = ?")
+        values.append(run_id)
+    search = query.strip()
+    if search:
+        wildcard = f"%{search}%"
+        conditions.append(
+            "(l.message LIKE ? OR l.action_type LIKE ? OR l.detail_json LIKE ? "
+            "OR j.title LIKE ? OR j.company_name LIKE ?)"
+        )
+        values.extend([wildcard, wildcard, wildcard, wildcard, wildcard])
+    if level == "issue":
+        conditions.append("l.level IN ('warning', 'error')")
+    elif level:
+        conditions.append("l.level = ?")
+        values.append(level)
+    if action_type:
+        conditions.append("l.action_type = ?")
+        values.append(action_type)
+    if category:
+        conditions.append(f"({category_sql}) = ?")
+        values.append(category)
+    if outcome:
+        conditions.append(f"({outcome_sql}) = ?")
+        values.append(outcome)
+    if source == "legacy_run":
+        conditions.append("l.run_id IS NOT NULL")
+    elif source == "main_workflow":
+        conditions.append("l.run_id IS NULL")
+    if created_from:
+        conditions.append("l.created_at >= ?")
+        values.append(created_from)
+    if created_to:
+        conditions.append("l.created_at <= ?")
+        values.append(created_to)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    joins = """
+      LEFT JOIN fj_automation_actions a
+        ON a.id = json_extract(l.detail_json, '$.action_id')
+      LEFT JOIN fj_boss_jobs j
+        ON j.id = COALESCE(json_extract(l.detail_json, '$.job_id'), a.job_id)
+    """
+    offset = (page - 1) * page_size
     with db.connect() as connection:
+        total = int(connection.execute(
+            f"SELECT COUNT(DISTINCT l.id) FROM fj_action_logs l {joins} {where}",
+            values,
+        ).fetchone()[0])
         rows = connection.execute(
             f"""
-            SELECT id, run_id, level, action_type, message, detail_json, created_at
-            FROM fj_action_logs
+            SELECT l.id, l.run_id, l.level, l.action_type, l.message,
+                   l.detail_json, l.created_at,
+                   CASE WHEN l.run_id IS NULL THEN 'main_workflow' ELSE 'legacy_run' END AS source,
+                   {category_sql} AS category,
+                   {outcome_sql} AS outcome,
+                   j.id AS job_id, j.title AS job_title, j.company_name
+            FROM fj_action_logs l
+            {joins}
             {where}
-            ORDER BY created_at DESC, id DESC
-            LIMIT ?
+            ORDER BY l.created_at DESC, l.id DESC
+            LIMIT ? OFFSET ?
             """,
-            params,
+            [*values, page_size, offset],
         ).fetchall()
-    return [_serialize_log(row) for row in rows]
+        action_types = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT DISTINCT action_type FROM fj_action_logs ORDER BY action_type"
+            ).fetchall()
+        ]
+    return {
+        "logs": [_serialize_log(row) for row in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "action_types": action_types,
+    }
+
+
+def cleanup_action_logs(db: Database, *, before: str, source: str = "all") -> int:
+    conditions = ["created_at < ?"]
+    values: list[object] = [before]
+    if source == "legacy_run":
+        conditions.append("run_id IS NOT NULL")
+    elif source == "main_workflow":
+        conditions.append("run_id IS NULL")
+    with db.connect() as connection:
+        cursor = connection.execute(
+            f"DELETE FROM fj_action_logs WHERE {' AND '.join(conditions)}",
+            values,
+        )
+    return max(0, int(cursor.rowcount))
+
+
+def delete_delivery_run(db: Database, run_id: str) -> dict[str, object]:
+    run = get_delivery_run(db, run_id)
+    if run["status"] in {"pending", "running"}:
+        raise AppError(
+            status_code=409,
+            error_category="RUN_ACTIVE",
+            error_message="运行中的旧任务需要先结束后再删除。",
+        )
+    with db.connect() as connection:
+        candidates_deleted = int(connection.execute(
+            "SELECT COUNT(*) FROM fj_delivery_candidates WHERE run_id = ?", (run_id,)
+        ).fetchone()[0])
+        logs_deleted = int(connection.execute(
+            "SELECT COUNT(*) FROM fj_action_logs WHERE run_id = ?", (run_id,)
+        ).fetchone()[0])
+        # 旧任务删除时同步清理候选岗位和绑定日志，避免留下失去归属的数据。
+        connection.execute("DELETE FROM fj_action_logs WHERE run_id = ?", (run_id,))
+        connection.execute("DELETE FROM fj_delivery_candidates WHERE run_id = ?", (run_id,))
+        connection.execute("DELETE FROM fj_delivery_runs WHERE id = ?", (run_id,))
+    return {
+        "deleted": True,
+        "id": run_id,
+        "candidates_deleted": candidates_deleted,
+        "logs_deleted": logs_deleted,
+    }
+
+
+def get_operations_dashboard(db: Database) -> dict[str, object]:
+    from backend.app.services.fine_job.boss_executor import executor_snapshot
+
+    # 看板只读取当前岗位、评估、确认和动作表，旧 dry-run 单独作为历史数据展示。
+    with db.connect() as connection:
+        review_counts = _group_counts(connection, "fj_review_items", "status")
+        action_counts = _group_counts(connection, "fj_automation_actions", "status")
+        execution_counts = _group_counts(connection, "fj_automation_actions", "execution_state")
+        capture_counts = _group_counts(connection, "fj_boss_capture_batches", "status")
+        metrics = {
+            "jobs": int(connection.execute("SELECT COUNT(*) FROM fj_boss_jobs").fetchone()[0]),
+            "detailed_jobs": int(connection.execute(
+                "SELECT COUNT(*) FROM fj_boss_jobs WHERE detail_status = 'completed'"
+            ).fetchone()[0]),
+            "evaluated_jobs": int(connection.execute(
+                "SELECT COUNT(DISTINCT job_id) FROM fj_job_evaluations"
+            ).fetchone()[0]),
+            "pending_reviews": review_counts.get("pending", 0),
+            "queued_actions": action_counts.get("queued", 0),
+            "active_actions": sum(
+                execution_counts.get(state, 0)
+                for state in (
+                    "opening_page", "waiting_page_ready", "page_verified",
+                    "ready_to_dispatch", "dispatch_started", "request_accepted",
+                )
+            ),
+            "successful_actions": action_counts.get("succeeded", 0),
+            "issue_actions": sum(action_counts.get(state, 0) for state in ("failed", "blocked", "unknown")),
+        }
+    snapshot = executor_snapshot(db)
+    queue = snapshot.get("queue") if isinstance(snapshot.get("queue"), dict) else {"actions": [], "total": 0}
+    actions = queue.get("actions") if isinstance(queue, dict) else []
+    current_action = actions[0] if isinstance(actions, list) and actions else None
+    warnings = query_action_logs(db, level="warning", page_size=8)["logs"]
+    errors = query_action_logs(db, level="error", page_size=8)["logs"]
+    recent_issues = sorted(
+        [*warnings, *errors], key=lambda item: str(item["created_at"]), reverse=True
+    )[:8]
+    return {
+        "generated_at": utc_now(),
+        "metrics": metrics,
+        "review_counts": review_counts,
+        "action_counts": action_counts,
+        "execution_counts": execution_counts,
+        "capture_counts": capture_counts,
+        "executor": snapshot.get("executor"),
+        "queue": queue,
+        "current_action": current_action,
+        "recent_issues": recent_issues,
+        "legacy_runs": list_delivery_runs(db, limit=20),
+    }
+
+
+def _group_counts(connection, table: str, column: str) -> dict[str, int]:
+    rows = connection.execute(
+        f"SELECT {column}, COUNT(*) AS total FROM {table} GROUP BY {column}"
+    ).fetchall()
+    return {str(row[0]): int(row[1]) for row in rows}
 
 
 def _create_run_record(
@@ -701,4 +904,10 @@ def _serialize_log(row) -> dict[str, object]:
         "message": row["message"],
         "detail": detail if isinstance(detail, dict) else {},
         "created_at": row["created_at"],
+        "source": row["source"] if "source" in row.keys() else ("legacy_run" if row["run_id"] else "main_workflow"),
+        "category": row["category"] if "category" in row.keys() else "system",
+        "outcome": row["outcome"] if "outcome" in row.keys() else row["level"],
+        "job_id": row["job_id"] if "job_id" in row.keys() else None,
+        "job_title": row["job_title"] if "job_title" in row.keys() else None,
+        "company_name": row["company_name"] if "company_name" in row.keys() else None,
     }

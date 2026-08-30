@@ -46,13 +46,15 @@
   FineJobBossHistoryResponse,
   FineJobBossSearchPageRequest,
   FineJobBossSearchPageResponse,
+  FineJobReviewBatchResponse,
   FineJobReviewItemListEnvelope,
-  FineJobReviewStatus,
+  FineJobReviewQuery,
   FineJobAutomationActionEnvelope,
   FineJobAutomationActionListEnvelope,
   FineJobAutomationActionStatus,
   FineJobBossExecutorDashboard,
   FineJobBossNavigationTask,
+  FineJobOperationsDashboard,
   FineJobChatRuntime,
   FineJobChatRuntimeEnvelope,
   FineJobChatSessionDetail,
@@ -586,6 +588,12 @@ export const api = {
   async getFineJobDeliveryRun(runId: string) {
     return request<FineJobDeliveryRunEnvelope>(`/api/fine-job/delivery-runs/${runId}`);
   },
+  async deleteFineJobDeliveryRun(runId: string) {
+    return request<{ deleted: boolean; id: string; candidates_deleted: number; logs_deleted: number }>(
+      `/api/fine-job/delivery-runs/${runId}`,
+      { method: "DELETE" }
+    );
+  },
   async listFineJobDeliveryCandidates(runId: string) {
     return request<FineJobDeliveryCandidateListEnvelope>(
       `/api/fine-job/delivery-runs/${runId}/candidates`
@@ -594,8 +602,39 @@ export const api = {
   async listFineJobDeliveryRunLogs(runId: string) {
     return request<FineJobActionLogListEnvelope>(`/api/fine-job/delivery-runs/${runId}/logs`);
   },
-  async listFineJobRecentActionLogs() {
-    return request<FineJobActionLogListEnvelope>("/api/fine-job/delivery-runs/logs/recent");
+  async listFineJobRecentActionLogs(query: {
+    query?: string;
+    level?: string;
+    action_type?: string;
+    category?: string;
+    outcome?: string;
+    source?: string;
+    created_from?: string;
+    created_to?: string;
+    page?: number;
+    page_size?: number;
+  } = {}) {
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined && value !== null && value !== "") search.set(key, String(value));
+    }
+    return request<FineJobActionLogListEnvelope>(
+      `/api/fine-job/delivery-runs/logs/recent${search.size ? `?${search.toString()}` : ""}`
+    );
+  },
+  async cleanupFineJobActionLogs(payload: {
+    before: string;
+    source: "all" | "legacy_run" | "main_workflow";
+  }) {
+    return request<{ deleted: number; before: string }>(
+      "/api/fine-job/delivery-runs/logs/cleanup",
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
+  async getFineJobOperationsDashboard() {
+    return request<FineJobOperationsDashboard>(
+      "/api/fine-job/delivery-runs/operations/dashboard"
+    );
   },
   async listFineJobPlatformSessions() {
     return request<FineJobPlatformSessionListEnvelope>("/api/fine-job/platform-sessions");
@@ -755,9 +794,14 @@ export const api = {
       }
     );
   },
-  async listFineJobReviewItems(status?: FineJobReviewStatus) {
-    const suffix = status ? `?status=${encodeURIComponent(status)}` : "";
-    return request<FineJobReviewItemListEnvelope>(`/api/fine-job/review-items${suffix}`);
+  async listFineJobReviewItems(query: FineJobReviewQuery = {}) {
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined && value !== null && value !== "") search.set(key, String(value));
+    }
+    return request<FineJobReviewItemListEnvelope>(
+      `/api/fine-job/review-items${search.size ? `?${search.toString()}` : ""}`
+    );
   },
   async approveFineJobReviewItem(
     reviewItemId: string,
@@ -805,6 +849,28 @@ export const api = {
       body: JSON.stringify(payload)
     });
   },
+  async archiveFineJobReviewItem(reviewItemId: string, note = "") {
+    return request(`/api/fine-job/review-items/${reviewItemId}/archive`, {
+      method: "POST",
+      body: JSON.stringify({ note })
+    });
+  },
+  async restoreFineJobReviewItem(reviewItemId: string) {
+    return request(`/api/fine-job/review-items/${reviewItemId}/restore`, {
+      method: "POST"
+    });
+  },
+  async batchFineJobReviewItems(payload: {
+    review_item_ids: string[];
+    operation: "approve" | "reject" | "archive";
+    note?: string;
+    allow_override?: boolean;
+  }) {
+    return request<FineJobReviewBatchResponse>("/api/fine-job/review-items/batch", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  },
   async updateFineJobCompany(
     companyId: string,
     payload: { canonical_name?: string; company_type?: FineJobCompanyType; notes?: string }
@@ -840,6 +906,12 @@ export const api = {
   },
   async getFineJobBossExecutorStatus() {
     return request<FineJobBossExecutorDashboard>("/api/fine-job/boss-executor/status");
+  },
+  async controlFineJobBossExecutor(command: "allow" | "pause" | "resume" | "emergency_stop") {
+    return request<FineJobBossExecutorDashboard>("/api/fine-job/boss-executor/desktop-control", {
+      method: "POST",
+      body: JSON.stringify({ command })
+    });
   },
   async createFineJobBossPairingCode() {
     return request<{ code: string; expires_at: string }>(

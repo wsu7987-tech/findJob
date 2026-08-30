@@ -42,6 +42,17 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
     }
   };
 
+  const control = async (command: "allow" | "pause" | "resume" | "emergency_stop") => {
+    error.value = null;
+    try {
+      dashboard.value = await api.controlFineJobBossExecutor(command);
+      return dashboard.value;
+    } catch (value) {
+      error.value = mapError(value);
+      throw value;
+    }
+  };
+
   const openJob = async (
     jobId: string,
     sourceContext: "capture" | "history" | "review"
@@ -91,6 +102,7 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
     error,
     load,
     createPairingCode,
+    control,
     openJob,
     returnToReview,
     manualVerifyUnknown

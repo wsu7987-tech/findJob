@@ -49,6 +49,12 @@ def test_pair_auth_control_and_manual_navigation(configured_client, monkeypatch)
     assert allowed.status_code == 200
     assert allowed.json()["executor"]["permission_state"] == "allowed"
 
+    paused_from_desktop = configured_client.post(
+        "/api/fine-job/boss-executor/desktop-control", json={"command": "pause"}
+    )
+    assert paused_from_desktop.status_code == 200
+    assert paused_from_desktop.json()["executor"]["queue_state"] == "paused"
+
     opened = configured_client.post(
         "/api/fine-job/boss-navigation/open",
         json={"job_id": job["id"], "source_context": "history"},

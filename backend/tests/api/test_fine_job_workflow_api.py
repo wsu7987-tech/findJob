@@ -146,6 +146,65 @@ def test_rejected_evaluation_requires_explicit_override(configured_client) -> No
     assert approved.json()["action"]["status"] == "queued"
 
 
+def test_review_filters_batch_archive_and_restore(configured_client) -> None:
+    strategy = configured_client.post(
+        "/api/fine-job/strategies/recommendations",
+        json={"name": "批量审批测试", "evaluation_method": "rules", "required_skills": ["Python"]},
+    ).json()["strategy"]
+    job = _create_history_job(
+        configured_client,
+        job_id="workflow-batch",
+        title="Python 批量处理",
+        jd="负责 Python 服务开发",
+    )
+    configured_client.post(
+        f"/api/fine-job/boss-capture/history/{job['id']}/delivery-evaluations",
+        json={"recommendation_strategy_id": strategy["id"]},
+    )
+
+    filtered = configured_client.get(
+        "/api/fine-job/review-items",
+        params={
+            "status": "pending",
+            "decision": "recommend",
+            "query": "批量处理",
+            "page": 1,
+            "page_size": 10,
+        },
+    )
+    assert filtered.status_code == 200
+    assert filtered.json()["total"] == 1
+    assert filtered.json()["page"] == 1
+    review_id = filtered.json()["items"][0]["id"]
+
+    archived = configured_client.post(
+        "/api/fine-job/review-items/batch",
+        json={"review_item_ids": [review_id], "operation": "archive"},
+    )
+    assert archived.status_code == 200
+    assert archived.json()["succeeded"] == 1
+    dismissed = configured_client.get(
+        "/api/fine-job/review-items", params={"status": "dismissed"}
+    ).json()["items"]
+    assert dismissed[0]["resolution_note"] == "用户归档"
+
+    restored = configured_client.post(f"/api/fine-job/review-items/{review_id}/restore")
+    assert restored.status_code == 200
+    assert restored.json()["status"] == "pending"
+
+    approved = configured_client.post(
+        "/api/fine-job/review-items/batch",
+        json={"review_item_ids": [review_id], "operation": "approve"},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["succeeded"] == 1
+    approved_item = configured_client.get(
+        "/api/fine-job/review-items",
+        params={"status": "approved", "execution_state": "queued"},
+    ).json()["items"][0]
+    assert approved_item["action_status"] == "queued"
+
+
 def test_recommended_job_is_auto_queued_only_with_confirmed_auto_policy(
     configured_client,
 ) -> None:

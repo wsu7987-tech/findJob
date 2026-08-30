@@ -182,31 +182,74 @@ def list_review_items(
     db: Database,
     *,
     status: ReviewStatus | None = None,
-    limit: int = 200,
+    decision: str | None = None,
+    query: str = "",
+    execution_state: str | None = None,
+    created_from: str | None = None,
+    created_to: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
 ) -> dict[str, object]:
-    condition = "WHERE r.status = ?" if status else ""
-    values: list[object] = [status] if status else []
+    conditions: list[str] = []
+    values: list[object] = []
+    if status:
+        conditions.append("r.status = ?")
+        values.append(status)
+    if decision:
+        conditions.append("r.ai_decision = ?")
+        values.append(decision)
+    search = query.strip()
+    if search:
+        conditions.append("(j.title LIKE ? OR j.company_name LIKE ? OR r.resolution_note LIKE ?)")
+        wildcard = f"%{search}%"
+        values.extend([wildcard, wildcard, wildcard])
+    if execution_state:
+        conditions.append("a.execution_state = ?")
+        values.append(execution_state)
+    if created_from:
+        conditions.append("r.created_at >= ?")
+        values.append(created_from)
+    if created_to:
+        conditions.append("r.created_at <= ?")
+        values.append(created_to)
+    condition = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    offset = (page - 1) * page_size
     with db.connect() as connection:
         total = int(
             connection.execute(
-                f"SELECT COUNT(*) FROM fj_review_items r {condition}", values
+                f"""
+                SELECT COUNT(*)
+                FROM fj_review_items r
+                JOIN fj_boss_jobs j ON j.id = r.job_id
+                LEFT JOIN fj_automation_actions a ON a.review_item_id = r.id
+                {condition}
+                """,
+                values,
             ).fetchone()[0]
         )
         rows = connection.execute(
             f"""
             SELECT r.*, j.title AS job_title, j.company_name, j.job_link,
                    j.source_job_id, j.encrypt_job_id,
-                   e.evaluation_json
+                   e.evaluation_json,
+                   a.id AS action_id, a.status AS action_status,
+                   a.execution_state, a.last_error AS action_last_error
             FROM fj_review_items r
             JOIN fj_boss_jobs j ON j.id = r.job_id
             JOIN fj_job_evaluations e ON e.id = r.evaluation_id
+            LEFT JOIN fj_automation_actions a ON a.review_item_id = r.id
             {condition}
             ORDER BY r.created_at DESC, r.id DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            [*values, limit],
+            [*values, page_size, offset],
         ).fetchall()
-    return {"items": [_serialize_review(row) for row in rows], "total": total}
+    return {
+        "items": [_serialize_review(row) for row in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 def approve_review_item(
@@ -266,7 +309,12 @@ def approve_review_item(
         review_item_id=review_item_id,
         message=final_message,
     )
-    _log(db, "review_approved", f"已批准岗位“{row['job_title']}”的打招呼动作。")
+    _log(
+        db,
+        "review_approved",
+        f"已批准岗位“{row['job_title']}”的打招呼动作。",
+        detail={"job_id": row["job_id"], "review_item_id": review_item_id, "action_id": action["id"]},
+    )
     return _serialize_review(_get_review_row(db, review_item_id)), action
 
 
@@ -293,8 +341,115 @@ def reject_review_item(
             """,
             (note.strip(), now, now, review_item_id),
         )
-    _log(db, "review_rejected", f"已拒绝岗位“{row['job_title']}”的打招呼动作。")
+    _log(
+        db,
+        "review_rejected",
+        f"已拒绝岗位“{row['job_title']}”的打招呼动作。",
+        detail={"job_id": row["job_id"], "review_item_id": review_item_id},
+    )
     return _serialize_review(_get_review_row(db, review_item_id))
+
+
+def archive_review_item(
+    db: Database,
+    review_item_id: str,
+    *,
+    note: str = "",
+) -> dict[str, object]:
+    row = _get_review_row(db, review_item_id)
+    if row["status"] not in {"pending", "rejected"}:
+        raise AppError(
+            status_code=409,
+            error_category="INVALID_STATE",
+            error_message="只有待确认或已拒绝事项可以归档。",
+        )
+    now = utc_now()
+    resolution_note = "用户归档" + (f"：{note.strip()}" if note.strip() else "")
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_review_items
+            SET status = 'dismissed', resolution_note = ?, updated_at = ?, resolved_at = ?
+            WHERE id = ?
+            """,
+            (resolution_note, now, now, review_item_id),
+        )
+    _log(
+        db,
+        "review_archived",
+        f"已归档岗位“{row['job_title']}”的待确认事项。",
+        detail={"job_id": row["job_id"], "review_item_id": review_item_id},
+    )
+    return _serialize_review(_get_review_row(db, review_item_id))
+
+
+def restore_review_item(db: Database, review_item_id: str) -> dict[str, object]:
+    row = _get_review_row(db, review_item_id)
+    # 只恢复用户主动归档的事项，保留“新评估替代旧事项”的业务终态。
+    if row["status"] != "dismissed" or not str(row["resolution_note"] or "").startswith("用户归档"):
+        raise AppError(
+            status_code=409,
+            error_category="INVALID_STATE",
+            error_message="该事项由新评估替代或当前未归档，不能恢复。",
+        )
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_review_items
+            SET status = 'pending', resolution_note = '由归档恢复',
+                updated_at = ?, resolved_at = NULL
+            WHERE id = ?
+            """,
+            (now, review_item_id),
+        )
+    _log(
+        db,
+        "review_restored",
+        f"已恢复岗位“{row['job_title']}”的待确认事项。",
+        detail={"job_id": row["job_id"], "review_item_id": review_item_id},
+    )
+    return _serialize_review(_get_review_row(db, review_item_id))
+
+
+def batch_review_items(
+    db: Database,
+    *,
+    review_item_ids: list[str],
+    operation: str,
+    note: str = "",
+    allow_override: bool = False,
+) -> dict[str, object]:
+    results: list[dict[str, object]] = []
+    # 保留用户勾选顺序，同时避免同一事项重复执行。
+    unique_ids = list(dict.fromkeys(item.strip() for item in review_item_ids if item.strip()))
+    for review_item_id in unique_ids:
+        try:
+            # 单项失败不阻断其余事项，前端可据此展示部分成功结果。
+            if operation == "approve":
+                approve_review_item(
+                    db,
+                    review_item_id,
+                    message="",
+                    allow_override=allow_override,
+                )
+            elif operation == "reject":
+                reject_review_item(db, review_item_id, note=note)
+            elif operation == "archive":
+                archive_review_item(db, review_item_id, note=note)
+            else:
+                raise AppError(400, "VALIDATION_FAILED", "不支持的批量操作。")
+            results.append({"review_item_id": review_item_id, "success": True, "error_message": ""})
+        except AppError as exc:
+            results.append(
+                {
+                    "review_item_id": review_item_id,
+                    "success": False,
+                    "error_message": exc.error_message,
+                }
+            )
+    succeeded = sum(1 for item in results if item["success"])
+    return {"results": results, "succeeded": succeeded, "failed": len(results) - succeeded}
 
 
 def list_automation_actions(
@@ -398,7 +553,13 @@ def complete_action(
             ),
         )
     level = "info" if status == "succeeded" else "warning"
-    _log(db, f"action_{status}", message.strip() or f"动作状态更新为 {status}。", level=level)
+    _log(
+        db,
+        f"action_{status}",
+        message.strip() or f"动作状态更新为 {status}。",
+        level=level,
+        detail={"job_id": action["job_id"], "action_id": action_id},
+    )
     return _get_action(db, action_id)
 
 
@@ -538,10 +699,13 @@ def _get_review_row(db: Database, review_item_id: str):
         row = connection.execute(
             """
             SELECT r.*, j.title AS job_title, j.company_name, j.job_link,
-                   e.evaluation_json, e.filter_strategy_id
+                   e.evaluation_json, e.filter_strategy_id,
+                   a.id AS action_id, a.status AS action_status,
+                   a.execution_state, a.last_error AS action_last_error
             FROM fj_review_items r
             JOIN fj_boss_jobs j ON j.id = r.job_id
             JOIN fj_job_evaluations e ON e.id = r.evaluation_id
+            LEFT JOIN fj_automation_actions a ON a.review_item_id = r.id
             WHERE r.id = ?
             """,
             (review_item_id,),
@@ -594,6 +758,10 @@ def _serialize_review(row) -> dict[str, object]:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "resolved_at": row["resolved_at"],
+        "action_id": row["action_id"] if "action_id" in row.keys() else None,
+        "action_status": row["action_status"] if "action_status" in row.keys() else None,
+        "execution_state": row["execution_state"] if "execution_state" in row.keys() else None,
+        "action_last_error": row["action_last_error"] if "action_last_error" in row.keys() else None,
     }
 
 
@@ -655,14 +823,21 @@ def _resolve_encrypt_job_id(job) -> str:
     return matched.group(1) if matched else ""
 
 
-def _log(db: Database, action_type: str, message: str, *, level: str = "info") -> None:
+def _log(
+    db: Database,
+    action_type: str,
+    message: str,
+    *,
+    level: str = "info",
+    detail: dict[str, object] | None = None,
+) -> None:
     with db.connect() as connection:
         connection.execute(
             """
             INSERT INTO fj_action_logs (id, run_id, level, action_type, message, detail_json, created_at)
-            VALUES (?, NULL, ?, ?, ?, '{}', ?)
+            VALUES (?, NULL, ?, ?, ?, ?, ?)
             """,
-            (new_id(), level, action_type, message, utc_now()),
+            (new_id(), level, action_type, message, _json(detail or {}), utc_now()),
         )
 
 

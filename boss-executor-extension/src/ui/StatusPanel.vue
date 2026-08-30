@@ -100,24 +100,7 @@ onBeforeUnmount(() => {
 <template>
   <section class="finejob-panel" aria-label="FineJob BOSS 执行器状态">
     <header>FineJob BOSS 执行器</header>
-    <p class="success">框架已加载</p>
     <dl>
-      <div>
-        <dt>Background</dt>
-        <dd :data-state="status.background">{{ label(status.background) }}</dd>
-      </div>
-      <div>
-        <dt>Content</dt>
-        <dd :data-state="status.content">{{ label(status.content) }}</dd>
-      </div>
-      <div>
-        <dt>Main World</dt>
-        <dd :data-state="status.mainWorld">{{ label(status.mainWorld) }}</dd>
-      </div>
-      <div>
-        <dt>模式</dt>
-        <dd>串行默认招呼</dd>
-      </div>
       <div>
         <dt>FineJob</dt>
         <dd :data-state="status.executor.connected ? 'ready' : 'error'">
@@ -127,8 +110,16 @@ onBeforeUnmount(() => {
       <div>
         <dt>自动打招呼</dt>
         <dd :data-state="status.executor.executor?.permission_state === 'allowed' ? 'ready' : 'checking'">
-          {{ status.executor.executor?.permission_state || "未授权" }}
+          {{ status.executor.executor?.permission_state === "allowed" ? "已允许" : "已暂停" }}
         </dd>
+      </div>
+      <div>
+        <dt>队列</dt>
+        <dd>{{ status.executor.queue.length }} 项</dd>
+      </div>
+      <div>
+        <dt>当前页面</dt>
+        <dd>{{ pageLabel(status.bossSnapshot?.pageKind) }}</dd>
       </div>
     </dl>
     <section v-if="!status.executor.paired" class="probe">
@@ -145,60 +136,29 @@ onBeforeUnmount(() => {
         <button :disabled="busy" @click="run(() => controller.control('pause'))">暂停</button>
         <button class="danger" :disabled="busy" @click="run(() => controller.control('emergency_stop'))">紧急停止</button>
       </div>
-      <p class="detail">队列：{{ status.executor.executor?.queue_state || "等待连接" }}；风险：{{ status.executor.executor?.risk_state || "none" }}</p>
-      <ol v-if="status.executor.queue.length" class="queue">
-        <li v-for="item in status.executor.queue" :key="item.id">
-          {{ item.job_title }} · {{ actionLabel(item) }}
-          <button
-            v-if="!['dispatch_started', 'request_accepted', 'succeeded', 'failed_after_dispatch', 'unknown_after_dispatch'].includes(item.execution_state)"
-            :disabled="busy"
-            @click="run(() => controller.returnToReview(item.id))"
-          >退回</button>
-        </li>
-      </ol>
-      <p v-else class="detail">当前打招呼队列为空</p>
+      <p class="detail">
+        {{ status.executor.queue[0]
+          ? `当前：${status.executor.queue[0].job_title} · ${actionLabel(status.executor.queue[0])}`
+          : "当前打招呼队列为空" }}
+      </p>
       <p v-if="status.executor.lastResult" class="detail">上次结果：{{ status.executor.lastResult }}</p>
     </section>
-    <section class="probe">
-      <p class="probe-title">岗位只读识别</p>
+    <details class="probe">
+      <summary class="probe-title">诊断详情</summary>
       <dl>
-        <div>
-          <dt>岗位识别</dt>
-          <dd :data-state="status.bossProbe">{{ probeLabel(status.bossProbe) }}</dd>
-        </div>
-        <div>
-          <dt>页面类型</dt>
-          <dd>{{ pageLabel(status.bossSnapshot?.pageKind) }}</dd>
-        </div>
-        <div>
-          <dt>登录状态</dt>
-          <dd>{{ status.bossSnapshot?.loggedIn ? "正常" : "未识别" }}</dd>
-        </div>
-        <div>
-          <dt>岗位</dt>
-          <dd>{{ status.bossSnapshot?.job?.jobName || "未识别" }}</dd>
-        </div>
-        <div>
-          <dt>身份来源</dt>
-          <dd>{{ identitySourceLabel(status.bossSnapshot?.job) }}</dd>
-        </div>
-        <div>
-          <dt>HR</dt>
-          <dd>{{ hrLabel(status.bossSnapshot?.job) }}</dd>
-        </div>
-        <div>
-          <dt>岗位 ID</dt>
-          <dd>{{ status.bossSnapshot?.job?.encryptJobId }}</dd>
-        </div>
-        <div>
-          <dt>已沟通</dt>
-          <dd>{{ contactedLabel(status.bossSnapshot?.job?.contacted) }}</dd>
-        </div>
+        <div><dt>Background</dt><dd :data-state="status.background">{{ label(status.background) }}</dd></div>
+        <div><dt>Content</dt><dd :data-state="status.content">{{ label(status.content) }}</dd></div>
+        <div><dt>Main World</dt><dd :data-state="status.mainWorld">{{ label(status.mainWorld) }}</dd></div>
+        <div><dt>岗位识别</dt><dd :data-state="status.bossProbe">{{ probeLabel(status.bossProbe) }}</dd></div>
+        <div><dt>登录状态</dt><dd>{{ status.bossSnapshot?.loggedIn ? "正常" : "未识别" }}</dd></div>
+        <div><dt>岗位</dt><dd>{{ status.bossSnapshot?.job?.jobName || "未识别" }}</dd></div>
+        <div><dt>身份来源</dt><dd>{{ identitySourceLabel(status.bossSnapshot?.job) }}</dd></div>
+        <div><dt>HR</dt><dd>{{ hrLabel(status.bossSnapshot?.job) }}</dd></div>
+        <div><dt>岗位 ID</dt><dd>{{ status.bossSnapshot?.job?.encryptJobId || "未识别" }}</dd></div>
+        <div><dt>已沟通</dt><dd>{{ contactedLabel(status.bossSnapshot?.job?.contacted) }}</dd></div>
       </dl>
-      <p class="detail">{{ status.bossSnapshot?.reason || "等待岗位页面数据" }}</p>
-    </section>
-    <p class="page">页面：{{ status.page || "等待识别" }}</p>
-    <p v-if="status.detail" class="detail">{{ status.detail }}</p>
+      <p class="detail">{{ status.bossSnapshot?.reason || status.detail || "等待岗位页面数据" }}</p>
+    </details>
     <p v-if="uiError" class="detail">{{ uiError }}</p>
   </section>
 </template>

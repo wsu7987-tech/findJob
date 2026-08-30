@@ -64,7 +64,16 @@ describe("fineJobWorkflow store", () => {
 
     await store.load("pending");
 
-    expect(api.listFineJobReviewItems).toHaveBeenCalledWith("pending");
+    expect(api.listFineJobReviewItems).toHaveBeenCalledWith({
+      status: "pending",
+      decision: "",
+      query: "",
+      execution_state: "",
+      created_from: undefined,
+      created_to: undefined,
+      page: 1,
+      page_size: 20
+    });
     expect(api.listFineJobAutomationActions).toHaveBeenCalledWith("queued");
     expect(store.items[0].evaluation.evaluation_version).toBe("2.0");
   });
@@ -109,5 +118,31 @@ describe("fineJobWorkflow store", () => {
       allow_override: false
     });
     expect(action.status).toBe("queued");
+  });
+
+  it("携带筛选条件执行批量归档并刷新列表", async () => {
+    vi.spyOn(api, "batchFineJobReviewItems").mockResolvedValue({
+      results: [{ review_item_id: "review-1", success: true, error_message: "" }],
+      succeeded: 1,
+      failed: 0
+    });
+    vi.spyOn(api, "listFineJobReviewItems").mockResolvedValue({ items: [], total: 0 });
+    vi.spyOn(api, "listFineJobAutomationActions").mockResolvedValue({ actions: [], total: 0 });
+    const store = useFineJobWorkflowStore();
+    store.query = "Python";
+    store.decision = "recommend";
+
+    const result = await store.batch(["review-1"], "archive");
+
+    expect(result.succeeded).toBe(1);
+    expect(api.batchFineJobReviewItems).toHaveBeenCalledWith({
+      review_item_ids: ["review-1"],
+      operation: "archive",
+      allow_override: false
+    });
+    expect(api.listFineJobReviewItems).toHaveBeenLastCalledWith(expect.objectContaining({
+      query: "Python",
+      decision: "recommend"
+    }));
   });
 });

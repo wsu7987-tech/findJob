@@ -91,3 +91,53 @@ def test_real_collect_pauses_when_boss_login_is_not_ready(configured_client) -> 
     assert run["stage"] == "waiting_for_login"
     assert run["error_count"] == 1
     assert "BOSS" in run["error_message"]
+
+
+def test_log_filters_cleanup_dashboard_and_legacy_run_delete(configured_client) -> None:
+    _prepare_ready_delivery_inputs(configured_client)
+    run = configured_client.post(
+        "/api/fine-job/delivery-runs",
+        json={"mode": "dry_run", "real_collect": False},
+    ).json()["run"]
+
+    filtered = configured_client.get(
+        "/api/fine-job/delivery-runs/logs/recent",
+        params={
+            "source": "legacy_run",
+            "category": "capture",
+            "query": "dry-run",
+            "page": 1,
+            "page_size": 10,
+        },
+    )
+    assert filtered.status_code == 200
+    assert filtered.json()["total"] >= 2
+    assert all(item["source"] == "legacy_run" for item in filtered.json()["logs"])
+    assert "run_created" in filtered.json()["action_types"]
+
+    issues = configured_client.get(
+        "/api/fine-job/delivery-runs/logs/recent",
+        params={"level": "issue", "page_size": 10},
+    )
+    assert issues.status_code == 200
+    assert issues.json()["total"] >= 1
+    assert all(item["level"] in {"warning", "error"} for item in issues.json()["logs"])
+
+    dashboard = configured_client.get(
+        "/api/fine-job/delivery-runs/operations/dashboard"
+    )
+    assert dashboard.status_code == 200
+    assert dashboard.json()["legacy_runs"][0]["id"] == run["id"]
+    assert "pending_reviews" in dashboard.json()["metrics"]
+
+    deleted = configured_client.delete(f"/api/fine-job/delivery-runs/{run['id']}")
+    assert deleted.status_code == 200
+    assert deleted.json()["candidates_deleted"] == 2
+    assert deleted.json()["logs_deleted"] == 4
+
+    cleanup = configured_client.post(
+        "/api/fine-job/delivery-runs/logs/cleanup",
+        json={"before": "2099-01-01T00:00:00Z", "source": "legacy_run"},
+    )
+    assert cleanup.status_code == 200
+    assert cleanup.json()["deleted"] == 0
