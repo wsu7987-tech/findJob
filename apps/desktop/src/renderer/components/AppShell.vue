@@ -31,10 +31,11 @@ const configStore = useConfigStore();
 
 const navigation = [
   { label: "投递准备", routeName: "fine-job-dashboard", icon: TrendCharts },
-  { label: "简历资料", routeName: "fine-job-resumes", icon: Document },
+  { label: "求职资料", routeName: "fine-job-resumes", icon: Document },
   { label: "平台登录", routeName: "fine-job-platform", icon: Monitor },
   { label: "岗位采集", routeName: "fine-job-capture", icon: Search },
   { label: "历史采集", routeName: "fine-job-capture-history", icon: Clock },
+  { label: "公司管理", routeName: "fine-job-companies", icon: User },
   { label: "策略管理", routeName: "fine-job-strategy", icon: Wallet },
   { label: "运行状态", routeName: "fine-job-runs", icon: List },
   { label: "待确认", routeName: "fine-job-review", icon: User },

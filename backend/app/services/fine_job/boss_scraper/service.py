@@ -27,6 +27,7 @@ class BossCaptureRequest:
     cdp_port: int = engine.DEFAULT_CDP_PORT
     output_format: str = "json"
     prefer_current_page: bool = False
+    filter_strategy_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +38,7 @@ class BossCaptureResult:
     details_path: Path | None
     source_url: str | None = None
     used_current_page: bool = False
+    capture_target_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +254,7 @@ class BossScraperService:
         request: BossCaptureRequest,
         *,
         progress_callback: Callable[[dict[str, object]], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> BossCaptureResult:
         if not request.keyword.strip():
             raise ValueError("keyword must not be empty")
@@ -304,6 +307,8 @@ class BossScraperService:
                 )
             if progress_callback:
                 scrape_kwargs["progress_callback"] = progress_callback
+            if should_stop:
+                scrape_kwargs["should_stop"] = should_stop
 
             list_keyword, list_city = self._capture_metadata(
                 source_url,
@@ -322,7 +327,11 @@ class BossScraperService:
             except engine.LoginGateError as exc:
                 raise RuntimeError(str(exc)) from exc
             details = None
-            if request.include_details and list_data.get("jobs"):
+            if (
+                request.include_details
+                and list_data.get("jobs")
+                and not list_data.get("stopped")
+            ):
                 if progress_callback:
                     progress_callback({
                         "stage": "list_completed",
@@ -364,6 +373,85 @@ class BossScraperService:
             details_path=details_path,
             source_url=source_url,
             used_current_page=used_current_page,
+            capture_target_id=(
+                str(capture_target.get("targetId") or "") or None
+                if capture_target
+                else None
+            ),
+        )
+
+    def capture_more_jobs(
+        self,
+        request: BossCaptureRequest,
+        *,
+        list_data: dict[str, object],
+        jobs_path: Path,
+        expected_target_id: str,
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> BossCaptureResult:
+        """在首次采集保留的搜索页面中继续下滑并追加岗位。"""
+        if request.pages < 1 or request.pages > engine.MAX_PAGES:
+            raise ValueError(f"pages must be between 1 and {engine.MAX_PAGES}")
+        with _CAPTURE_LOCK:
+            capture_target = self._find_interactive_target(request.cdp_port)
+            target_id = str((capture_target or {}).get("targetId") or "")
+            current_url = str((capture_target or {}).get("url") or "")
+            if not capture_target or target_id != expected_target_id:
+                raise RuntimeError("原 BOSS 搜索页面已经关闭或被替换，无法继续下滑采集。")
+            if not self._is_search_url(current_url):
+                raise RuntimeError("原 BOSS 搜索页面已离开搜索结果，无法继续下滑采集。")
+            keyword, city = self._capture_metadata(
+                current_url,
+                fallback_keyword=request.keyword.strip(),
+                fallback_city=request.city.strip(),
+            )
+            scrape_kwargs: dict[str, object] = {
+                "cdp_port": request.cdp_port,
+                "fmt": request.output_format,
+                "allow_dom_fallback": False,
+                "target_id": target_id,
+                "start_url": current_url,
+                "close_target": False,
+                "existing_jobs": list(list_data.get("jobs") or []),
+                "continue_current_page": True,
+            }
+            if progress_callback:
+                scrape_kwargs["progress_callback"] = progress_callback
+            if should_stop:
+                scrape_kwargs["should_stop"] = should_stop
+            continued_list = engine.scrape_list(
+                keyword,
+                city,
+                request.pages,
+                dict(request.filters),
+                str(jobs_path),
+                **scrape_kwargs,
+            )
+            if progress_callback:
+                jobs = list(continued_list.get("jobs") or [])
+                progress_callback(
+                    {
+                        "stage": "list_completed",
+                        "current": len(jobs),
+                        "total": len(jobs),
+                        "jobs": jobs,
+                        "jobs_path": str(jobs_path),
+                        "details_path": None,
+                        "message": (
+                            f"继续下滑采集完成，新增 {continued_list.get('new_jobs_count', 0)} 个岗位，"
+                            f"累计 {len(jobs)} 个岗位。"
+                        ),
+                    }
+                )
+        return BossCaptureResult(
+            list_data=continued_list,
+            details=None,
+            jobs_path=jobs_path,
+            details_path=None,
+            source_url=current_url,
+            used_current_page=True,
+            capture_target_id=target_id,
         )
 
     def capture_selected_details(
@@ -430,7 +518,8 @@ class BossScraperService:
         parsed = urlparse(url)
         return (
             parsed.hostname in {"www.zhipin.com", "zhipin.com"}
-            and parsed.path.rstrip("/") == "/web/geek/job"
+            # 兼容旧单数路径和 BOSS 当前重定向后的复数搜索路径。
+            and parsed.path.rstrip("/") in {"/web/geek/job", "/web/geek/jobs"}
         )
 
     @staticmethod

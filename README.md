@@ -6,17 +6,17 @@ FineJob 是一个本地化的 AI 求职驾驶舱，目标是帮助用户管理�
 
 ## Codex 工作台
 
-桌面端“Codex 工作台”嵌入本机已登录的 Codex TUI。Electron 自动启动或复用 FineJob 后端，并管理本实例的单一 Codex PTY 会话，支持新建、恢复最近会话、中断和结束；Electron 退出后本地后端可由下次启动继续复用。专用工作区加载 FineJob Skill 与 MCP 配置，Codex 可使用 14 个 `finejob.*` 工具查询岗位和简历、保存岗位评估、创建打招呼预览、生成代聊草稿并请求受控发送。
+桌面端“Codex 工作台”嵌入本机已登录的 Codex TUI。Electron 自动启动或复用 FineJob 后端，并管理本实例的单一 Codex PTY 会话，支持新建、恢复最近会话、中断和结束；Electron 退出后本地后端可由下次启动继续复用。FineJob Skill 与 FineJob Profile Skill 的正式资源保存在 `apps/desktop/resources/codex/skills/`，启动时同步到专用工作区并加载 MCP 配置。Codex 可使用 37 个 `finejob.*` 工具读取正式策略和统一岗位评估上下文、驱动现有岗位采集与筛选、在原搜索页动态继续下滑或停止当前采集、获取当前 JD、分析求职资料、保存岗位评估、创建打招呼预览、生成代聊草稿并请求受控发送。
 
 敏感操作在工作台中配置总开关和分项预授权。未获预授权的请求显示在待确认卡片中；真实动作仍由 FineJob 的业务版本、登录态、执行器和队列状态共同校验。
 
 ## 产品方向
 
-- 简历中心：上传简历、解析内容、形成结构化事实库。
+- 求职资料中心：管理 PDF 简历、Markdown、手动文本和项目资料，通过 OCR/识别与 AI 生成可确认的事实、QA、策略和上下文。
 - 求职目标：维护多个岗位方向、城市、薪资、关键词和排除词。
 - 岗位池：采集岗位、去重、评分、解释推荐或跳过原因。
 - 待处理：集中处理投递、打招呼、HR 回复、面试时间等需要确认的事项。
-- 对话辅助：基于简历事实和岗位信息生成回复草稿。
+- 对话辅助：基于已确认且允许对外使用的候选人上下文和岗位信息生成回复草稿。
 - 受控自动化：通过可见浏览器完成用户确认后的页面操作。
 
 ## 技术栈
@@ -38,6 +38,7 @@ FineJob 是一个本地化的 AI 求职驾驶舱，目标是帮助用户管理�
 ```text
 apps/desktop/
   electron/                 Electron main/preload/tray/shortcut modules
+  resources/codex/skills/   FineJob Codex Skill 正式资源
   src/renderer/             Vue pages, stores, components
   scripts/                  desktop dev/build helpers
 
@@ -139,7 +140,7 @@ uv run python -m backend.app.services.fine_job.boss_scraper.boss_cdp_raw --keywo
 实时、定时或手动三种触发方式生成回复草稿。草稿可以重新生成和人工编辑；只有用户点击“确认发送”
 且草稿依据的最后入站消息与会话版本仍一致时，才会创建一次发送动作。
 
-首版明确不读取 BOSS 历史聊天、不提供回复置信率、不使用 QA 集、不自动发送简历或联系方式，也不会
+首版明确不读取 BOSS 历史聊天、不提供回复置信率；回复可读取用户已确认且允许对外使用的 QA 与回答版本，不自动发送简历或联系方式，也不会
 自动确认 AI 草稿。发送使用 BOSS 的 `chat` MQTT/Protobuf 通道；`publish` 未抛错只展示为“已提交发送”，
 不表示平台已经送达。多个 BOSS 沟通页通过账号级租约选出一个领导标签页，领导失效后递增 epoch 切换，
 未知发送结果不会自动重试。
@@ -149,12 +150,13 @@ uv run python -m backend.app.services.fine_job.boss_scraper.boss_cdp_raw --keywo
 
 ## 当前状态
 
-当前阶段是项目框架清理和 FineJob 产品骨架搭建：
+当前已完成求职资料 V2 主链路：
 
-- 前端旧知识库页面会被移除。
-- 可复用底层能力会保留。
-- 后端旧业务 API 暂时保留，后续按模块确认后再删。
-- FineJob 的数据库表、API、Agent 和自动化执行器会逐步新增。
+- 简历作为资料源之一，PDF、Markdown、手动文本和项目资料进入统一资料中心；DOCX 延后接入。
+- 资料解析强制经过 OCR/文本识别与 AI 结构化输出，AI 草稿逐项确认后进入正式档案。
+- 原子事实、证据、动态 QA、回答版本、简历版本、求职活动与搜索词均支持动态维护。
+- `ProfileContextService` 为搜索、岗位评估和 HR 代聊统一生成经过确认与披露过滤的 Markdown 上下文。
+- 旧简历接口保留迁移期兼容，本地旧数据通过预览和用户明确确认后迁移。
 
 ## 文档
 
@@ -163,4 +165,6 @@ uv run python -m backend.app.services.fine_job.boss_scraper.boss_cdp_raw --keywo
 - `docs/安全策略.md`
 - `docs/Codex执行器适配计划.md`
 - `docs/遗留代码参考.md`
+- `求职资料功能重构方案.md`
+- `Codex与FineJob业务能力集成执行方案.md`
 - `自动代聊功能具体执行方案.md`

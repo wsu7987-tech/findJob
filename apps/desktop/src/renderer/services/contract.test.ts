@@ -33,6 +33,7 @@ describe("display label helpers", () => {
   it("maps error categories to readable labels", () => {
     expect(mapErrorCategoryLabel("CONFIG_INVALID")).toBe("配置无效");
     expect(mapErrorCategoryLabel("LLM_FAILED")).toBe("LLM 调用失败");
+    expect(mapErrorCategoryLabel("CODEX_OUTPUT_SCHEMA_INVALID")).toBe("Codex 输出 Schema 不兼容");
     expect(mapErrorCategoryLabel(null)).toBe("无");
   });
 });

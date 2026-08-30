@@ -20,6 +20,7 @@ export const useFineJobBossCaptureStore = defineStore("fineJobBossCapture", () =
   const stopping = ref(false);
   const locating = ref(false);
   const capturing = ref(false);
+  const stoppingCapture = ref(false);
   const suggesting = ref(false);
   const error = ref<string | null>(null);
   let pollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -111,6 +112,38 @@ export const useFineJobBossCaptureStore = defineStore("fineJobBossCapture", () =
     }
   };
 
+  const continueCapture = async (pages: number) => {
+    if (!task.value) return null;
+    capturing.value = true;
+    error.value = null;
+    try {
+      task.value = await api.continueFineJobBossCapture(task.value.id, pages);
+      startPolling(task.value.id);
+      return task.value;
+    } catch (errorValue) {
+      error.value = mapError(errorValue);
+      throw errorValue;
+    } finally {
+      capturing.value = false;
+    }
+  };
+
+  const stopCaptureTask = async () => {
+    if (!task.value) return null;
+    stoppingCapture.value = true;
+    error.value = null;
+    try {
+      task.value = await api.stopFineJobBossCaptureTask(task.value.id);
+      startPolling(task.value.id);
+      return task.value;
+    } catch (errorValue) {
+      error.value = mapError(errorValue);
+      throw errorValue;
+    } finally {
+      stoppingCapture.value = false;
+    }
+  };
+
   const captureDetails = async (jobIds: string[], force = false) => {
     if (!task.value) return null;
     capturing.value = true;
@@ -133,6 +166,7 @@ export const useFineJobBossCaptureStore = defineStore("fineJobBossCapture", () =
     options: {
       filterStrategyId?: string | null;
       recommendationStrategyId?: string | null;
+      contextStaleAction?: "regenerate" | "use_current" | "cancel";
     } = {}
   ) => {
     if (!task.value) return [];
@@ -144,7 +178,8 @@ export const useFineJobBossCaptureStore = defineStore("fineJobBossCapture", () =
         command,
         filter_strategy_id: options.filterStrategyId,
         recommendation_strategy_id: options.recommendationStrategyId,
-        extra_requirement: command
+        extra_requirement: command,
+        context_stale_action: options.contextStaleAction
       });
       task.value = response.task;
       return response.selected_job_ids;
@@ -176,7 +211,8 @@ export const useFineJobBossCaptureStore = defineStore("fineJobBossCapture", () =
     recommendationStrategyId: string,
     filterStrategyId?: string | null,
     extraRequirement = "",
-    jobIds?: string[]
+    jobIds?: string[],
+    contextStaleAction?: "regenerate" | "use_current" | "cancel"
   ) => {
     if (!task.value) return [];
     suggesting.value = true;
@@ -186,7 +222,8 @@ export const useFineJobBossCaptureStore = defineStore("fineJobBossCapture", () =
         recommendation_strategy_id: recommendationStrategyId,
         filter_strategy_id: filterStrategyId,
         extra_requirement: extraRequirement,
-        job_ids: jobIds
+        job_ids: jobIds,
+        context_stale_action: contextStaleAction
       });
       task.value = response.task;
       return response.evaluations;
@@ -247,6 +284,7 @@ export const useFineJobBossCaptureStore = defineStore("fineJobBossCapture", () =
     stopping,
     locating,
     capturing,
+    stoppingCapture,
     suggesting,
     error,
     loadStatus,
@@ -255,6 +293,8 @@ export const useFineJobBossCaptureStore = defineStore("fineJobBossCapture", () =
     stopBrowser,
     locate,
     capture,
+    continueCapture,
+    stopCaptureTask,
     captureDetails,
     suggest,
     applyFilter,

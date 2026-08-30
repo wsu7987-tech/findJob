@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
-import { ElMessage } from "element-plus";
+import { ElMessage, ElMessageBox } from "element-plus";
 
 import { useFineJobBossCaptureStore } from "@/stores/fineJobBossCapture";
 import { useFineJobBossExecutorStore } from "@/stores/fineJobBossExecutor";
 import { useFineJobPlatformSessionsStore } from "@/stores/fineJobPlatformSessions";
 import { useFineJobStrategiesStore } from "@/stores/fineJobStrategies";
 import type { FineJobBossCapturedJob } from "@/types";
+import { ApiError } from "@/services/api";
 
 const captureStore = useFineJobBossCaptureStore();
 const executorStore = useFineJobBossExecutorStore();
@@ -67,6 +68,18 @@ const browserStateType = computed(() => {
 const taskRunning = computed(
   () => captureStore.task?.status === "queued" || captureStore.task?.status === "running"
 );
+const listCaptureRunning = computed(
+  () => taskRunning.value && Boolean(
+    captureStore.task?.stage === "queued" || captureStore.task?.stage.startsWith("list")
+  )
+);
+const canContinueCapture = computed(
+  () => Boolean(
+    captureStore.status?.running
+    && captureStore.task?.status === "completed"
+    && captureStore.task.continuation_available
+  )
+);
 const progressPercentage = computed(() => {
   const task = captureStore.task;
   if (!task?.progress_total) return task?.status === "completed" ? 100 : 0;
@@ -89,6 +102,7 @@ const filterStatusRank = (status?: FineJobBossCapturedJob["filter_status"]) => {
   if (status === "pass") return 0;
   if (status === "review") return 1;
   if (status === "reject") return 2;
+  if (status === "exclude") return 2;
   return 3;
 };
 const firstNumber = (value?: string | null) => {
@@ -154,7 +168,7 @@ const detailStatusSummary = computed(() => {
     selected: selectedJobIds.value.length,
     recommended: jobs.filter((job) => job.recommended).length,
     passed: jobs.filter((job) => job.filter_status === "pass").length,
-    rejected: jobs.filter((job) => job.filter_status === "reject").length,
+    rejected: jobs.filter((job) => job.filter_status === "reject" || job.filter_status === "exclude").length,
     review: jobs.filter((job) => job.filter_status === "review").length,
     completed: jobs.filter((job) => job.detail_status === "completed").length,
     failed: jobs.filter((job) => job.detail_status === "failed").length
@@ -165,7 +179,7 @@ const selectedJobs = computed(() =>
 );
 const selectedDetailJobIds = computed(() =>
   selectedJobs.value
-    .filter((job) => job.job_id && job.detail_status !== "completed" && job.detail_status !== "collecting")
+    .filter((job) => job.job_id && !job.cooldown_excluded && job.detail_status !== "completed" && job.detail_status !== "collecting")
     .map((job) => job.job_id as string)
 );
 const selectedDeliveryJobIds = computed(() =>
@@ -249,7 +263,8 @@ const captureJobs = async () => {
       city: form.city.trim(),
       pages: form.pages,
       include_details: form.includeDetails,
-      prefer_current_page: form.preferCurrentPage
+      prefer_current_page: form.preferCurrentPage,
+      filter_strategy_id: filterStrategyId.value
     });
     ElMessage.success("采集任务已启动，可在本页查看实时进度");
   } catch {
@@ -261,7 +276,10 @@ const handleSelectionChange = (rows: FineJobBossCapturedJob[]) => {
   selectedJobIds.value = rows.map((row) => row.job_id || "").filter(Boolean);
 };
 
-const applySuggestedSelection = async (mode: "strategy" | "ai") => {
+const applySuggestedSelection = async (
+  mode: "strategy" | "ai",
+  contextStaleAction?: "regenerate" | "use_current" | "cancel"
+) => {
   if (mode === "strategy" && !filterStrategyId.value) {
     ElMessage.warning("请先选择岗位筛选策略");
     return;
@@ -275,7 +293,8 @@ const applySuggestedSelection = async (mode: "strategy" | "ai") => {
       ? await captureStore.applyFilter(filterStrategyId.value!)
       : await captureStore.suggest("ai", aiCommand.value, {
           filterStrategyId: filterStrategyId.value,
-          recommendationStrategyId: recommendationStrategyId.value
+          recommendationStrategyId: recommendationStrategyId.value,
+          contextStaleAction
         });
     selectedJobIds.value = ids;
     await nextTick();
@@ -288,12 +307,33 @@ const applySuggestedSelection = async (mode: "strategy" | "ai") => {
       }
     }
     ElMessage.success(`${mode === "ai" ? "AI 初筛" : "筛选策略"}选择 ${ids.length} 个岗位`);
-  } catch {
+  } catch (errorValue) {
+    if (errorValue instanceof ApiError && errorValue.errorCategory === "CONTEXT_STALE_CONFIRMATION_REQUIRED") {
+      try {
+        await ElMessageBox.confirm(
+          "当前岗位评估上下文已过期。请选择 AI 初筛使用的版本。",
+          "上下文已过期",
+          {
+            type: "warning",
+            confirmButtonText: "重新生成并继续",
+            cancelButtonText: "使用当前版本",
+            distinguishCancelAndClose: true
+          }
+        );
+        await applySuggestedSelection(mode, "regenerate");
+      } catch (action) {
+        if (action === "cancel") await applySuggestedSelection(mode, "use_current");
+      }
+      return;
+    }
     ElMessage.error(captureStore.error ?? "生成详情采集建议失败");
   }
 };
 
-const evaluateDeliveries = async (jobIds: string[]) => {
+const evaluateDeliveries = async (
+  jobIds: string[],
+  contextStaleAction?: "regenerate" | "use_current" | "cancel"
+) => {
   if (!recommendationStrategyId.value) {
     ElMessage.warning("请先选择岗位建议投递策略");
     return;
@@ -307,12 +347,31 @@ const evaluateDeliveries = async (jobIds: string[]) => {
       recommendationStrategyId.value,
       filterStrategyId.value,
       aiCommand.value,
-      jobIds
+      jobIds,
+      contextStaleAction
     );
     const recommended = evaluations.filter((item) => item.decision === "recommend").length;
     const review = evaluations.filter((item) => item.decision === "review").length;
     ElMessage.success(`投递评估完成：建议 ${recommended}，待判断 ${review}`);
-  } catch {
+  } catch (errorValue) {
+    if (errorValue instanceof ApiError && errorValue.errorCategory === "CONTEXT_STALE_CONFIRMATION_REQUIRED") {
+      try {
+        await ElMessageBox.confirm(
+          "当前岗位评估上下文已过期。请选择本次任务使用的版本。",
+          "上下文已过期",
+          {
+            type: "warning",
+            confirmButtonText: "重新生成并继续",
+            cancelButtonText: "使用当前版本",
+            distinguishCancelAndClose: true
+          }
+        );
+        await evaluateDeliveries(jobIds, "regenerate");
+      } catch (action) {
+        if (action === "cancel") await evaluateDeliveries(jobIds, "use_current");
+      }
+      return;
+    }
     ElMessage.error(captureStore.error ?? "生成投递建议失败");
   }
 };
@@ -370,8 +429,26 @@ const openInDedicatedBrowser = async (job: FineJobBossCapturedJob) => {
   }
 };
 
+const continueCapture = async () => {
+  try {
+    await captureStore.continueCapture(form.pages);
+    ElMessage.success(`正在原搜索页继续下滑采集 ${form.pages} 页`);
+  } catch {
+    ElMessage.error(captureStore.error ?? "继续下滑采集失败");
+  }
+};
+
+const stopCapture = async () => {
+  try {
+    await captureStore.stopCaptureTask();
+    ElMessage.success("正在停止采集；已获得岗位和原搜索页会保留");
+  } catch {
+    ElMessage.error(captureStore.error ?? "停止采集失败");
+  }
+};
+
 const canSelectJob = (job: FineJobBossCapturedJob) =>
-  job.detail_status !== "queued" && job.detail_status !== "collecting";
+  job.detail_status !== "queued" && job.detail_status !== "collecting" && !job.cooldown_excluded;
 
 const detailStatusLabel = (status?: string) =>
   ({
@@ -389,8 +466,8 @@ const detailStatusType = (status?: string) => {
   return "info";
 };
 
-const filterStatusLabel = (status?: string) => ({ pass: "通过", reject: "排除", review: "待判断" }[status || ""] || "未筛选");
-const filterStatusType = (status?: string) => status === "pass" ? "success" : status === "reject" ? "danger" : status === "review" ? "warning" : "info";
+const filterStatusLabel = (status?: string) => ({ pass: "通过", reject: "排除", exclude: "冷却排除", review: "待判断" }[status || ""] || "未筛选");
+const filterStatusType = (status?: string) => status === "pass" ? "success" : status === "reject" || status === "exclude" ? "danger" : status === "review" ? "warning" : "info";
 const deliveryDecisionLabel = (decision?: string) => ({ recommend: "建议投递", reject: "不建议", review: "待判断" }[decision || ""] || "未评估");
 const deliveryDecisionType = (decision?: string) => decision === "recommend" ? "success" : decision === "reject" ? "danger" : decision === "review" ? "warning" : "info";
 const deliveryEvaluationReasons = (job: FineJobBossCapturedJob) =>
@@ -493,6 +570,7 @@ function formatDuration(seconds: number) {
           <el-switch v-model="form.includeDetails" />
           <span>采集列表后，自动获取全部岗位详情（不建议）</span>
         </div>
+        <p class="secondary-text">当前会使用已选岗位筛选策略，在详情采集前统一排除黑名单、外包公司及冷却中的公司/岗位。</p>
         <el-alert
           v-if="form.includeDetails"
           type="warning"
@@ -503,10 +581,46 @@ function formatDuration(seconds: number) {
         />
       </el-form>
       <div class="platform-actions capture-submit">
-        <el-button type="primary" size="large" :disabled="!captureStore.status?.running || taskRunning" :loading="captureStore.capturing" @click="captureJobs">
+        <el-button
+          v-if="!listCaptureRunning"
+          type="primary"
+          size="large"
+          :disabled="!captureStore.status?.running || taskRunning"
+          :loading="captureStore.capturing"
+          @click="captureJobs"
+        >
           开始采集
         </el-button>
+        <el-button
+          v-else
+          type="danger"
+          size="large"
+          :loading="captureStore.stoppingCapture"
+          :disabled="Boolean(captureStore.task?.stop_requested)"
+          @click="stopCapture"
+        >
+          {{ captureStore.task?.stop_requested ? "正在停止" : "停止采集" }}
+        </el-button>
+        <el-button
+          v-if="captureStore.task?.status === 'completed'"
+          type="success"
+          size="large"
+          :disabled="!canContinueCapture"
+          :loading="captureStore.capturing"
+          @click="continueCapture"
+        >
+          继续下滑采集 {{ form.pages }} 页
+        </el-button>
       </div>
+      <el-alert
+        v-if="captureStore.task?.status === 'completed'"
+        class="capture-result-alert"
+        :type="captureStore.task.stage === 'list_stopped' ? 'warning' : 'success'"
+        :title="captureStore.task.message"
+        :description="`累计下滑 ${captureStore.task.total_pages_loaded ?? 0} 页；最近一次新增 ${captureStore.task.last_added_jobs ?? 0} 个岗位。`"
+        :closable="false"
+        show-icon
+      />
     </section>
 
     <section v-if="captureStore.task && captureStore.task.status !== 'completed'" class="page-panel capture-progress-panel">
@@ -608,7 +722,14 @@ function formatDuration(seconds: number) {
           </template>
         </el-table-column>
         <el-table-column prop="title" label="岗位" min-width="180" sortable="custom" />
-        <el-table-column prop="boss_name" label="公司" min-width="150" />
+        <el-table-column prop="boss_name" label="公司" min-width="190">
+          <template #default="scope">
+            <span>{{ scope.row.boss_name }}</span>
+            <el-tag v-if="scope.row.is_outsourcing_company" type="warning" size="small">外包</el-tag>
+            <el-tag v-if="scope.row.is_blacklisted" type="danger" size="small">黑名单</el-tag>
+            <el-tag v-if="scope.row.application_status === 'applied'" type="info" size="small">已投递</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column prop="salary" label="薪资" width="110" sortable="custom" />
         <el-table-column prop="company_scale" label="公司规模" width="120" sortable="custom" />
         <el-table-column prop="company_industry" label="行业" width="120" show-overflow-tooltip />
@@ -644,7 +765,7 @@ function formatDuration(seconds: number) {
               v-if="scope.row.detail_status === 'completed' && !scope.row.delivery_evaluation"
               link
               type="warning"
-              :disabled="taskRunning || !scope.row.job_id || !recommendationStrategyId"
+              :disabled="taskRunning || !scope.row.job_id || !recommendationStrategyId || scope.row.cooldown_excluded"
               :loading="captureStore.suggesting"
               @click.stop="evaluateSingleDelivery(scope.row)"
             >
@@ -654,7 +775,7 @@ function formatDuration(seconds: number) {
               v-else-if="scope.row.detail_status !== 'completed'"
               link
               type="success"
-              :disabled="taskRunning || !scope.row.job_id"
+              :disabled="taskRunning || !scope.row.job_id || scope.row.cooldown_excluded"
               @click.stop="captureSingleDetail(scope.row)"
             >
               {{ detailActionLabel(scope.row) }}
@@ -684,6 +805,9 @@ function formatDuration(seconds: number) {
             <el-tag :type="currentDetailJob.boss_active_status ? 'success' : 'info'">招聘者：{{ currentDetailJob.boss_active_status || "未获取" }}</el-tag>
             <el-tag :type="detailStatusType(currentDetailJob.detail_status)">{{ detailStatusLabel(currentDetailJob.detail_status) }}</el-tag>
             <el-tag v-if="currentDetailJob.is_previously_collected" type="warning">历史岗位</el-tag>
+            <el-tag v-if="currentDetailJob.is_outsourcing_company" type="warning">外包公司</el-tag>
+            <el-tag v-if="currentDetailJob.is_blacklisted" type="danger">公司黑名单</el-tag>
+            <el-tag v-if="currentDetailJob.application_status === 'applied'" type="info">已投递</el-tag>
           </div>
         </div>
 

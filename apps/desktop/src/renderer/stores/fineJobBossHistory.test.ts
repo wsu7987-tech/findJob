@@ -51,6 +51,7 @@ describe("fineJobBossHistory store", () => {
           job_id: "job-1",
           title: "Python 开发",
           boss_name: "示例科技",
+          search_keyword: "Python 后端",
           first_collected_at: "2026-08-18T10:00:00Z",
           last_collected_at: "2026-08-19T10:00:00Z",
           collect_count: 2,
@@ -65,12 +66,18 @@ describe("fineJobBossHistory store", () => {
     store.page = 2;
     store.pageSize = 10;
 
-    await store.load({ query: "Python", sort_by: "collect_count", sort_order: "desc" });
+    await store.load({
+      query: "Python",
+      search_keyword: "Python 后端",
+      sort_by: "collect_count",
+      sort_order: "desc"
+    });
 
     expect(listSpy).toHaveBeenCalledWith({
       page: 2,
       page_size: 10,
       query: "Python",
+      search_keyword: "Python 后端",
       sort_by: "collect_count",
       sort_order: "desc"
     });

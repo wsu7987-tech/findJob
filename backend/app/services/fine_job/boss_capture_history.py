@@ -8,6 +8,7 @@ from urllib.parse import urlsplit, urlunsplit
 from backend.app.db import Database
 from backend.app.errors import AppError
 from backend.app.utils import new_id, utc_now
+from backend.app.services.fine_job.companies import resolve_company
 
 
 HistorySortField = Literal[
@@ -86,6 +87,7 @@ def record_capture_jobs(
     db: Database,
     *,
     capture_id: str,
+    search_keyword: str = "",
     jobs: list[dict[str, object]],
     collected_at: str | None = None,
 ) -> list[dict[str, object]]:
@@ -94,6 +96,8 @@ def record_capture_jobs(
     with db.connect() as connection:
         for raw_job in jobs:
             job = dict(raw_job)
+            company = resolve_company(connection, _company(job), source="capture")
+            company_id = str(company["id"]) if company is not None else None
             dedupe_key = build_job_dedupe_key(job)
             existing = connection.execute(
                 "SELECT * FROM fj_boss_jobs WHERE dedupe_key = ?",
@@ -121,14 +125,14 @@ def record_capture_jobs(
                     """
                     INSERT INTO fj_boss_jobs (
                       id, dedupe_key, source_job_id, encrypt_job_id, title,
-                      company_name, company_scale, company_stage, company_industry,
+                      company_name, company_id, company_scale, company_stage, company_industry,
                       welfare, salary, location, experience, degree,
                       boss_active_status, job_link, tags, skills,
-                      job_labels, payload_json, detail_json, detail_status,
+                      job_labels, search_keyword, payload_json, detail_json, detail_status,
                       detail_error, delivery_evaluation_json, detail_collected_at, first_collected_at,
                       last_collected_at, collect_count, latest_batch_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         history_job_id,
@@ -137,6 +141,7 @@ def record_capture_jobs(
                         _text(job.get("encrypt_job_id")),
                         _text(job.get("title")),
                         _company(job),
+                        company_id,
                         _text(job.get("company_scale")),
                         _text(job.get("company_stage")),
                         _text(job.get("company_industry")),
@@ -150,6 +155,7 @@ def record_capture_jobs(
                         _text(job.get("tags")),
                         _text(job.get("skills")),
                         _text(job.get("job_labels")),
+                        _text(search_keyword),
                         _json(job),
                         detail_json,
                         detail_status,
@@ -182,14 +188,26 @@ def record_capture_jobs(
                     if incoming_status != "not_collected" or not existing["detail_json"]
                     else str(existing["detail_status"])
                 )
+                existing_payload = _load_json(existing["payload_json"])
+                if isinstance(existing_payload, dict):
+                    # 重复采集后继续保留上一次正式筛选结果，新的筛选完成时再覆盖。
+                    for key in (
+                        "filter_status",
+                        "filter_reasons",
+                        "filter_missing_fields",
+                        "filter_strategy_id",
+                    ):
+                        if key not in job and key in existing_payload:
+                            job[key] = existing_payload[key]
                 connection.execute(
                     """
                     UPDATE fj_boss_jobs
                     SET source_job_id = ?, encrypt_job_id = ?, title = ?,
-                        company_name = ?, company_scale = ?, company_stage = ?,
+                        company_name = ?, company_id = COALESCE(?, company_id),
+                        company_scale = ?, company_stage = ?,
                         company_industry = ?, welfare = ?, salary = ?, location = ?,
                         experience = ?, degree = ?, boss_active_status = ?, job_link = ?,
-                        tags = ?, skills = ?, job_labels = ?, payload_json = ?,
+                        tags = ?, skills = ?, job_labels = ?, search_keyword = ?, payload_json = ?,
                         detail_json = ?, detail_status = ?, detail_error = ?,
                         delivery_evaluation_json = ?,
                         detail_collected_at = COALESCE(?, detail_collected_at),
@@ -201,6 +219,7 @@ def record_capture_jobs(
                         _prefer(job.get("encrypt_job_id"), existing["encrypt_job_id"]),
                         _prefer(job.get("title"), existing["title"]),
                         _prefer(_company(job), existing["company_name"]),
+                        company_id,
                         _prefer(job.get("company_scale"), existing["company_scale"]),
                         _prefer(job.get("company_stage"), existing["company_stage"]),
                         _prefer(job.get("company_industry"), existing["company_industry"]),
@@ -214,6 +233,7 @@ def record_capture_jobs(
                         _prefer(job.get("tags"), existing["tags"]),
                         _prefer(job.get("skills"), existing["skills"]),
                         _prefer(job.get("job_labels"), existing["job_labels"]),
+                        _text(search_keyword),
                         _json(job),
                         detail_json,
                         detail_status,
@@ -252,6 +272,12 @@ def record_capture_jobs(
                         if existing is not None
                         else _json_or_none(job.get("delivery_evaluation"))
                     ),
+                    "history_record_id": history_job_id,
+                    "company_id": company_id or (existing["company_id"] if existing is not None else None),
+                    "company_type": company["company_type"] if company is not None else "unknown",
+                    "is_outsourcing_company": bool(company is not None and company["company_type"] == "outsourcing"),
+                    "is_blacklisted": bool(company is not None and company["is_blacklisted"]),
+                    "search_keyword": _text(search_keyword),
                     "is_previously_collected": was_previously_collected,
                     "first_collected_at": first_collected_at,
                     "last_collected_at": now,
@@ -259,6 +285,42 @@ def record_capture_jobs(
                 }
             )
     return enriched
+
+
+def update_capture_job_filter_result(
+    db: Database,
+    *,
+    job: dict[str, object],
+    result: dict[str, object],
+) -> None:
+    """把当前筛选结论同步到历史岗位的最新数据。"""
+    history_record_id = _text(job.get("history_record_id") or job.get("id"))
+    identity_column = "id" if history_record_id else "dedupe_key"
+    identity_value = history_record_id or build_job_dedupe_key(job)
+    with db.connect() as connection:
+        row = connection.execute(
+            f"SELECT payload_json FROM fj_boss_jobs WHERE {identity_column} = ?",
+            (identity_value,),
+        ).fetchone()
+        if row is None:
+            return
+        payload = _load_json(row["payload_json"])
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.update(
+            {
+                "filter_status": result.get("status"),
+                "filter_reasons": list(result.get("reasons") or []),
+                "filter_missing_fields": list(result.get("missing_fields") or []),
+                "filter_strategy_id": result.get("strategy_id"),
+                "cooldown_excluded": bool(result.get("cooldown_excluded")),
+                "cooldown_reasons": list(result.get("cooldown_reasons") or []),
+            }
+        )
+        connection.execute(
+            f"UPDATE fj_boss_jobs SET payload_json = ? WHERE {identity_column} = ?",
+            (_json(payload), identity_value),
+        )
 
 
 def update_capture_job_detail(
@@ -276,7 +338,7 @@ def update_capture_job_detail(
     now = collected_at or utc_now()
     with db.connect() as connection:
         existing = connection.execute(
-            f"SELECT detail_json FROM fj_boss_jobs WHERE {identity_column} = ?",
+            f"SELECT id, detail_json FROM fj_boss_jobs WHERE {identity_column} = ?",
             (identity_value,),
         ).fetchone()
         if existing is None:
@@ -310,6 +372,10 @@ def update_capture_job_detail(
                 """,
                 (status, error, identity_value),
             )
+    if status == "completed":
+        from backend.app.services.fine_job.filter_exclusions import record_job_event
+
+        record_job_event(db, "detail", str(existing["id"]), now)
 
 
 def update_capture_job_delivery_evaluation(
@@ -326,7 +392,7 @@ def update_capture_job_delivery_evaluation(
     identity_value = history_record_id or build_job_dedupe_key(job)
     with db.connect() as connection:
         row = connection.execute(
-            f"SELECT payload_json FROM fj_boss_jobs WHERE {identity_column} = ?",
+            f"SELECT id, payload_json FROM fj_boss_jobs WHERE {identity_column} = ?",
             (identity_value,),
         ).fetchone()
         if row is None:
@@ -353,17 +419,24 @@ def update_capture_job_delivery_evaluation(
             """,
             (_json(evaluation), _json(payload), identity_value),
         )
+    from backend.app.services.fine_job.filter_exclusions import record_job_event
+
+    record_job_event(db, "evaluation", str(row["id"]), utc_now())
 
 
 def get_capture_history_job(db: Database, history_job_id: str) -> dict[str, object]:
     with db.connect() as connection:
         row = connection.execute(
             """
-            SELECT id, source_job_id, encrypt_job_id, title, company_name,
+            SELECT id, source_job_id, encrypt_job_id, title, company_name, company_id,
+                   (SELECT company_type FROM fj_companies c WHERE c.id = fj_boss_jobs.company_id) AS company_type,
+                   (SELECT is_blacklisted FROM fj_companies c WHERE c.id = fj_boss_jobs.company_id) AS is_blacklisted,
+                   (SELECT status FROM fj_job_applications a WHERE a.job_id = fj_boss_jobs.id) AS application_status,
+                   (SELECT applied_at FROM fj_job_applications a WHERE a.job_id = fj_boss_jobs.id) AS applied_at,
                    company_scale, company_stage, company_industry, welfare,
                    salary, location, experience, degree,
-                   boss_active_status, job_link, tags, skills, job_labels,
-                   detail_json, detail_status, detail_error, delivery_evaluation_json, detail_collected_at,
+                   boss_active_status, job_link, tags, skills, job_labels, search_keyword, payload_json,
+                   detail_json, detail_status, detail_error, detail_version, delivery_evaluation_json, detail_collected_at,
                    first_collected_at, last_collected_at, collect_count,
                    latest_batch_id
             FROM fj_boss_jobs
@@ -384,6 +457,7 @@ def list_capture_history(
     db: Database,
     *,
     query: str = "",
+    search_keyword: str = "",
     city: str = "",
     company_scale: str = "",
     company_industry: str = "",
@@ -397,12 +471,18 @@ def list_capture_history(
     page: int = 1,
     page_size: int = 20,
 ) -> dict[str, object]:
+    from backend.app.services.fine_job.job_applications import sync_succeeded_applications
+
+    sync_succeeded_applications(db)
     conditions: list[str] = []
     values: list[object] = []
     if query.strip():
         like = f"%{query.strip()}%"
         conditions.append("(title LIKE ? OR company_name LIKE ? OR skills LIKE ?)")
         values.extend([like, like, like])
+    if search_keyword.strip():
+        conditions.append("search_keyword = ?")
+        values.append(search_keyword.strip())
     if city.strip():
         conditions.append("location LIKE ?")
         values.append(f"%{city.strip()}%")
@@ -441,11 +521,16 @@ def list_capture_history(
         )
         rows = connection.execute(
             f"""
-            SELECT id, source_job_id, encrypt_job_id, title, company_name, company_scale, salary,
+            SELECT id, source_job_id, encrypt_job_id, title, company_name, company_id,
+                   (SELECT company_type FROM fj_companies c WHERE c.id = fj_boss_jobs.company_id) AS company_type,
+                   (SELECT is_blacklisted FROM fj_companies c WHERE c.id = fj_boss_jobs.company_id) AS is_blacklisted,
+                   (SELECT status FROM fj_job_applications a WHERE a.job_id = fj_boss_jobs.id) AS application_status,
+                   (SELECT applied_at FROM fj_job_applications a WHERE a.job_id = fj_boss_jobs.id) AS applied_at,
+                   company_scale, salary,
                    company_stage, company_industry, welfare, location, experience,
                    degree, boss_active_status, job_link,
-                   tags, skills, job_labels, detail_json, detail_status,
-                   detail_error, delivery_evaluation_json, detail_collected_at, first_collected_at,
+                   tags, skills, job_labels, search_keyword, payload_json, detail_json, detail_status,
+                   detail_error, detail_version, delivery_evaluation_json, detail_collected_at, first_collected_at,
                    last_collected_at, collect_count, latest_batch_id
             FROM fj_boss_jobs
             {where_sql}
@@ -491,12 +576,21 @@ def _serialize_history_row(row) -> dict[str, object]:
             detail = json.loads(row["detail_json"])
         except json.JSONDecodeError:
             detail = None
+    payload = _load_json(row["payload_json"])
+    if not isinstance(payload, dict):
+        payload = {}
     return {
         "id": row["id"],
         "job_id": row["source_job_id"],
         "encrypt_job_id": row["encrypt_job_id"],
         "title": row["title"],
         "boss_name": row["company_name"],
+        "company_id": row["company_id"],
+        "company_type": row["company_type"] or "unknown",
+        "is_outsourcing_company": row["company_type"] == "outsourcing",
+        "is_blacklisted": bool(row["is_blacklisted"]),
+        "application_status": row["application_status"],
+        "applied_at": row["applied_at"],
         "company_scale": row["company_scale"],
         "company_stage": row["company_stage"],
         "company_industry": row["company_industry"],
@@ -510,6 +604,13 @@ def _serialize_history_row(row) -> dict[str, object]:
         "tags": row["tags"],
         "skills": row["skills"],
         "job_labels": row["job_labels"],
+        "search_keyword": row["search_keyword"],
+        "filter_status": payload.get("filter_status"),
+        "filter_reasons": list(payload.get("filter_reasons") or []),
+        "filter_missing_fields": list(payload.get("filter_missing_fields") or []),
+        "filter_strategy_id": payload.get("filter_strategy_id"),
+        "cooldown_excluded": bool(payload.get("cooldown_excluded")),
+        "cooldown_reasons": list(payload.get("cooldown_reasons") or []),
         "detail": detail,
         "delivery_evaluation": _load_json(row["delivery_evaluation_json"]),
         "recommended": (
@@ -524,6 +625,7 @@ def _serialize_history_row(row) -> dict[str, object]:
         ) or None,
         "detail_status": row["detail_status"],
         "detail_error": row["detail_error"],
+        "detail_version": row["detail_version"],
         "detail_collected_at": row["detail_collected_at"],
         "first_collected_at": row["first_collected_at"],
         "last_collected_at": row["last_collected_at"],

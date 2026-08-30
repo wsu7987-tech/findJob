@@ -19,7 +19,7 @@ class ImmediateThread:
 
 
 class FakeScraper:
-    def capture_jobs(self, request, *, progress_callback):
+    def capture_jobs(self, request, *, progress_callback, should_stop=None):
         jobs = [{"job_id": "job-1", "title": "Python 开发", "boss_name": "测试公司"}]
         progress_callback(
             {
@@ -43,10 +43,51 @@ class FakeScraper:
                 }
             )
         return BossCaptureResult(
-            list_data={"keyword": "Python", "city": "上海", "jobs": jobs},
+            list_data={
+                "keyword": "Python",
+                "city": "上海",
+                "jobs": jobs,
+                "new_jobs_count": 1,
+                "pages_loaded": 1,
+                "has_more": True,
+                "stopped": False,
+            },
             details=[{"job_id": "job-1", "jd": "岗位描述"}] if request.include_details else None,
             jobs_path=Path("boss_jobs.json"),
             details_path=Path("boss_details.json") if request.include_details else None,
+            capture_target_id="target-1",
+        )
+
+    def capture_more_jobs(
+        self,
+        request,
+        *,
+        list_data,
+        jobs_path,
+        expected_target_id,
+        progress_callback,
+        should_stop=None,
+    ):
+        jobs = [
+            *list_data["jobs"],
+            {"job_id": "job-2", "title": "AI Agent 开发", "boss_name": "续采公司"},
+        ]
+        progress_callback({"stage": "list_completed", "jobs": jobs, "jobs_path": str(jobs_path)})
+        return BossCaptureResult(
+            list_data={
+                **list_data,
+                "jobs": jobs,
+                "new_jobs_count": 1,
+                "pages_loaded": request.pages,
+                "has_more": True,
+                "stopped": False,
+            },
+            details=None,
+            jobs_path=jobs_path,
+            details_path=None,
+            source_url="https://www.zhipin.com/web/geek/job?query=Python",
+            used_current_page=True,
+            capture_target_id=expected_target_id,
         )
 
     def capture_selected_details(
@@ -125,6 +166,44 @@ def test_task_marks_job_seen_in_an_earlier_capture(monkeypatch, tmp_path: Path, 
     assert second["jobs"][0]["is_previously_collected"] is True
     assert second["jobs"][0]["collect_count"] == 2
     assert second["duplicate_jobs_count"] == 1
+
+
+def test_filter_result_is_written_to_existing_history_job(monkeypatch, tmp_path: Path, test_db) -> None:
+    from backend.app.services.fine_job.boss_capture_history import list_capture_history
+
+    monkeypatch.setattr(
+        "backend.app.services.fine_job.boss_capture_tasks.Thread",
+        ImmediateThread,
+    )
+    manager = BossCaptureTaskManager(scraper=FakeScraper())
+    task = manager.start_capture(
+        BossCaptureRequest(
+            keyword="Python",
+            city="上海",
+            pages=1,
+            include_details=False,
+            output_dir=tmp_path,
+        ),
+        output_dir=tmp_path,
+        db=test_db,
+    )
+
+    manager.apply_filter_results(
+        task["id"],
+        [{
+            "job_id": "job-1",
+            "status": "pass",
+            "reasons": ["岗位标题符合"],
+            "missing_fields": [],
+            "strategy_id": "filter-1",
+        }],
+    )
+
+    history = list_capture_history(test_db)["items"][0]
+    assert history["search_keyword"] == "Python"
+    assert history["filter_status"] == "pass"
+    assert history["filter_reasons"] == ["岗位标题符合"]
+    assert history["filter_strategy_id"] == "filter-1"
 
 
 def test_force_recaptures_a_completed_job_detail(monkeypatch, tmp_path: Path) -> None:
@@ -219,3 +298,49 @@ def test_history_detail_task_updates_detail_without_incrementing_count(
     assert task["status"] == "completed"
     assert refreshed["detail"]["jd"] == "重新采集的岗位描述"
     assert refreshed["collect_count"] == 1
+
+
+def test_continue_capture_appends_to_same_task_and_history(
+    monkeypatch,
+    tmp_path: Path,
+    test_db,
+) -> None:
+    from backend.app.services.fine_job.boss_capture_history import list_capture_history
+
+    monkeypatch.setattr(
+        "backend.app.services.fine_job.boss_capture_tasks.Thread",
+        ImmediateThread,
+    )
+    manager = BossCaptureTaskManager(scraper=FakeScraper())
+    initial = manager.start_capture(
+        BossCaptureRequest(
+            keyword="Python",
+            city="上海",
+            pages=1,
+            include_details=False,
+            output_dir=tmp_path,
+        ),
+        output_dir=tmp_path,
+        db=test_db,
+    )
+    manager.apply_filter_results(
+        initial["id"],
+        [{
+            "job_id": "job-1",
+            "status": "reject",
+            "reasons": ["不符合当前方向"],
+            "missing_fields": [],
+            "strategy_id": "filter-1",
+        }],
+    )
+
+    continued = manager.continue_capture(initial["id"], pages=2)
+
+    assert continued["id"] == initial["id"]
+    assert continued["status"] == "completed"
+    assert continued["last_added_jobs"] == 1
+    assert continued["total_pages_loaded"] == 3
+    assert [job["job_id"] for job in continued["jobs"]] == ["job-1", "job-2"]
+    assert continued["jobs"][0]["filter_status"] == "reject"
+    assert all(job.get("history_record_id") for job in continued["jobs"])
+    assert list_capture_history(test_db)["total"] == 2

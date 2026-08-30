@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from threading import RLock, Thread
@@ -10,6 +11,7 @@ from backend.app.errors import AppError
 from backend.app.services.fine_job.boss_capture_history import (
     create_capture_batch,
     record_capture_jobs,
+    update_capture_job_filter_result,
     update_capture_batch,
     update_capture_job_detail,
     update_capture_job_delivery_evaluation,
@@ -19,6 +21,12 @@ from backend.app.services.fine_job.boss_scraper.service import (
     BossScraperService,
     boss_scraper_service,
 )
+from backend.app.services.fine_job.filter_exclusions import (
+    apply_filter_exclusions,
+    assert_job_action_allowed,
+)
+from backend.app.services.fine_job.job_evaluation import evaluate_filter_strategy
+from backend.app.services.fine_job.strategies import get_filter_strategy
 from backend.app.utils import new_id, utc_now
 
 
@@ -75,11 +83,18 @@ class BossCaptureTaskManager:
             "updated_at": now,
             "finished_at": None,
             "error_message": None,
+            "continuation_available": False,
+            "has_more": True,
+            "last_added_jobs": 0,
+            "total_pages_loaded": 0,
+            "stop_requested": False,
             "_request": request,
             "_output_dir": output_dir,
             "_list_data": None,
             "_db": db,
             "_history_recorded": False,
+            "_filter_strategy_id": request.filter_strategy_id,
+            "_capture_target_id": None,
         }
         if db is not None:
             create_capture_batch(
@@ -94,6 +109,63 @@ class BossCaptureTaskManager:
         with self._lock:
             self._tasks[task_id] = task
         Thread(target=self._run_capture, args=(task_id,), daemon=True).start()
+        return self.get_task(task_id)
+
+    def continue_capture(self, task_id: str, *, pages: int) -> dict[str, object]:
+        """在原搜索页面继续下滑，不创建新的采集任务。"""
+        with self._lock:
+            task = self._require_task(task_id)
+            if task["status"] in {"queued", "running"}:
+                raise AppError(409, "TASK_RUNNING", "当前采集任务仍在运行。")
+            if not isinstance(task.get("_list_data"), dict):
+                raise AppError(409, "CAPTURE_NOT_READY", "首次岗位列表尚未采集完成。")
+            if not task.get("jobs_path"):
+                raise AppError(409, "CAPTURE_NOT_READY", "首次采集结果文件尚未准备完成。")
+            if not task.get("_capture_target_id"):
+                raise AppError(409, "CAPTURE_PAGE_NOT_REUSABLE", "首次采集没有保留搜索页面，无法继续下滑。")
+            if task.get("has_more") is False:
+                raise AppError(409, "CAPTURE_REACHED_END", "当前搜索结果已经没有更多岗位。")
+            if pages < 1 or pages > 10:
+                raise AppError(422, "VALIDATION_FAILED", "继续下滑采集页数必须在 1 到 10 之间。")
+            request = task.get("_request")
+            if not isinstance(request, BossCaptureRequest):
+                raise AppError(409, "CAPTURE_NOT_READY", "采集任务缺少原搜索条件。")
+            task["_continue_request"] = replace(
+                request,
+                pages=pages,
+                include_details=False,
+                max_details=None,
+                prefer_current_page=True,
+            )
+            task.update(
+                status="queued",
+                stage="list_continue_queued",
+                message=f"准备在原搜索页面继续下滑采集 {pages} 页。",
+                pages=pages,
+                progress_current=0,
+                progress_total=pages,
+                estimated_seconds_min=max(8, pages * 12),
+                estimated_seconds_max=max(20, pages * 22),
+                finished_at=None,
+                error_message=None,
+                stop_requested=False,
+                last_added_jobs=0,
+                updated_at=utc_now(),
+            )
+            self._sync_capture_batch(task, status="running")
+        Thread(target=self._run_continue_capture, args=(task_id,), daemon=True).start()
+        return self.get_task(task_id)
+
+    def stop_capture(self, task_id: str) -> dict[str, object]:
+        """请求停止列表采集，保留浏览器和已经采集的岗位。"""
+        with self._lock:
+            task = self._require_task(task_id)
+            list_stage = str(task["stage"]) == "queued" or str(task["stage"]).startswith("list")
+            if task["status"] not in {"queued", "running"} or not list_stage:
+                raise AppError(409, "CAPTURE_NOT_RUNNING", "当前没有正在执行的列表采集。")
+            task["stop_requested"] = True
+            task["message"] = "正在停止采集；已获得的岗位会继续保留。"
+            task["updated_at"] = utc_now()
         return self.get_task(task_id)
 
     def start_details(
@@ -119,6 +191,19 @@ class BossCaptureTaskManager:
                     error_message="岗位列表尚未完成，不能启动详情采集。",
                 )
             existing = {str(job["job_id"]): job for job in task["jobs"]}
+            db = task.get("_db")
+            if isinstance(db, Database):
+                for job_id in job_ids:
+                    job = existing.get(job_id)
+                    if not job:
+                        continue
+                    strategy_id = str(job.get("filter_strategy_id") or "")
+                    strategy = get_filter_strategy(db, strategy_id) if strategy_id else None
+                    history_id = str(job.get("history_record_id") or "")
+                    if history_id:
+                        assert_job_action_allowed(
+                            db, history_id, strategy=strategy, action="detail"
+                        )
             selected_ids = [
                 job_id
                 for job_id in dict.fromkeys(job_ids)
@@ -266,6 +351,21 @@ class BossCaptureTaskManager:
                 job["filter_reasons"] = list(result.get("reasons") or [])
                 job["filter_missing_fields"] = list(result.get("missing_fields") or [])
                 job["filter_strategy_id"] = result.get("strategy_id")
+                for field in (
+                    "company_id",
+                    "company_type",
+                    "is_outsourcing_company",
+                    "is_blacklisted",
+                    "application_status",
+                    "applied_at",
+                    "cooldown_excluded",
+                    "cooldown_reasons",
+                ):
+                    if field in result:
+                        job[field] = result[field]
+                db = task.get("_db")
+                if isinstance(db, Database):
+                    update_capture_job_filter_result(db, job=job, result=result)
             task["updated_at"] = utc_now()
         return self.get_task(task_id)
 
@@ -316,6 +416,7 @@ class BossCaptureTaskManager:
             result = self._scraper.capture_jobs(
                 request,
                 progress_callback=lambda event: self._handle_progress(task_id, event),
+                should_stop=lambda: self._capture_stop_requested(task_id),
             )
             with self._lock:
                 task = self._require_task(task_id)
@@ -324,15 +425,27 @@ class BossCaptureTaskManager:
                 task["details_path"] = str(result.details_path) if result.details_path else None
                 task["source_url"] = result.source_url
                 task["used_current_page"] = result.used_current_page
+                task["_capture_target_id"] = result.capture_target_id
                 if not task["jobs"]:
                     self._set_list_jobs(task, result.list_data.get("jobs") or [])
                     self._persist_list_jobs(task)
+                stopped = bool(result.list_data.get("stopped") or task.get("stop_requested"))
+                has_more = bool(result.list_data.get("has_more", True))
+                continuation_available = bool(result.capture_target_id and has_more)
                 task.update(
                     status="completed",
-                    stage="details_completed" if request.include_details else "list_completed",
+                    stage=(
+                        "list_stopped"
+                        if stopped
+                        else "details_completed" if request.include_details else "list_completed"
+                    ),
                     message=(
-                        f"采集完成：{len(task['jobs'])} 个岗位，"
-                        f"{task['details_completed']} 个详情。"
+                        f"已停止采集，保留 {len(task['jobs'])} 个岗位。"
+                        if stopped
+                        else (
+                            f"采集完成：{len(task['jobs'])} 个岗位，"
+                            f"{task['details_completed']} 个详情。"
+                        )
                     ),
                     progress_current=(
                         int(task["details_completed"]) + int(task["details_failed"])
@@ -343,6 +456,74 @@ class BossCaptureTaskManager:
                     estimated_seconds_min=0,
                     estimated_seconds_max=0,
                     current_job=None,
+                    has_more=has_more,
+                    continuation_available=continuation_available,
+                    last_added_jobs=int(
+                        result.list_data.get("new_jobs_count") or len(task["jobs"])
+                    ),
+                    total_pages_loaded=int(result.list_data.get("pages_loaded") or request.pages),
+                    stop_requested=False,
+                    updated_at=utc_now(),
+                    finished_at=utc_now(),
+                )
+                self._sync_capture_batch(task, status="completed", finished=True)
+        except Exception as exc:  # noqa: BLE001 - 后台任务边界
+            self._mark_failed(task_id, exc)
+
+    def _run_continue_capture(self, task_id: str) -> None:
+        with self._lock:
+            task = self._require_task(task_id)
+            request = task["_continue_request"]
+            # 详情门禁会收窄内部列表；续采去重必须使用任务中保存的完整岗位集合。
+            list_data = {
+                **task["_list_data"],
+                "jobs": [dict(job) for job in task["jobs"]],
+            }
+            jobs_path = Path(str(task["jobs_path"]))
+            target_id = str(task["_capture_target_id"])
+            task.update(
+                status="running",
+                stage="list_continuing",
+                message=f"正在原搜索页面继续下滑采集 {request.pages} 页。",
+                updated_at=utc_now(),
+            )
+        try:
+            result = self._scraper.capture_more_jobs(
+                request,
+                list_data=list_data,
+                jobs_path=jobs_path,
+                expected_target_id=target_id,
+                progress_callback=lambda event: self._handle_progress(task_id, event),
+                should_stop=lambda: self._capture_stop_requested(task_id),
+            )
+            with self._lock:
+                task = self._require_task(task_id)
+                task["_list_data"] = result.list_data
+                task["source_url"] = result.source_url
+                task["used_current_page"] = True
+                stopped = bool(result.list_data.get("stopped") or task.get("stop_requested"))
+                added = int(result.list_data.get("new_jobs_count") or 0)
+                loaded = int(result.list_data.get("pages_loaded") or 0)
+                has_more = bool(result.list_data.get("has_more", True))
+                task.update(
+                    status="completed",
+                    stage="list_stopped" if stopped else "list_completed",
+                    message=(
+                        f"已停止继续采集，本次新增 {added} 个，累计 {len(task['jobs'])} 个岗位。"
+                        if stopped
+                        else f"继续下滑采集完成，本次新增 {added} 个，累计 {len(task['jobs'])} 个岗位。"
+                    ),
+                    progress_current=loaded,
+                    progress_total=int(request.pages),
+                    jobs_collected=len(task["jobs"]),
+                    estimated_seconds_min=0,
+                    estimated_seconds_max=0,
+                    current_job=None,
+                    continuation_available=has_more,
+                    has_more=has_more,
+                    last_added_jobs=added,
+                    total_pages_loaded=int(task.get("total_pages_loaded") or 0) + loaded,
+                    stop_requested=False,
                     updated_at=utc_now(),
                     finished_at=utc_now(),
                 )
@@ -424,6 +605,7 @@ class BossCaptureTaskManager:
                 task["details_path"] = event.get("details_path") or task.get("details_path")
                 task["jobs_collected"] = len(task["jobs"])
                 self._persist_list_jobs(task)
+                self._apply_capture_gate(task, jobs)
                 task["progress_current"] = 0 if task["auto_details"] else len(task["jobs"])
                 task["progress_total"] = len(task["jobs"])
                 if task["auto_details"]:
@@ -481,17 +663,83 @@ class BossCaptureTaskManager:
 
     def _persist_list_jobs(self, task: dict[str, object]) -> None:
         db = task.get("_db")
-        if not isinstance(db, Database) or task.get("_history_recorded"):
+        if not isinstance(db, Database):
             return
-        task["jobs"] = record_capture_jobs(
+        jobs = list(task["jobs"])
+        pending_indices = [
+            index for index, job in enumerate(jobs)
+            if not job.get("history_record_id")
+        ]
+        if not pending_indices:
+            return
+        # 续采只落库本次新增岗位，既保持同一采集任务，也避免重复累计采集次数。
+        persisted = record_capture_jobs(
             db,
             capture_id=str(task["id"]),
-            jobs=list(task["jobs"]),
+            search_keyword=str(task.get("keyword") or ""),
+            jobs=[jobs[index] for index in pending_indices],
         )
+        for index, job in zip(pending_indices, persisted, strict=True):
+            jobs[index] = job
+        task["jobs"] = jobs
         task["duplicate_jobs_count"] = sum(
             1 for job in task["jobs"] if job.get("is_previously_collected")
         )
         task["_history_recorded"] = True
+
+    def _apply_capture_gate(
+        self,
+        task: dict[str, object],
+        raw_jobs: list[dict[str, object]],
+    ) -> None:
+        """列表采集完成后一次性应用冷却清单，再把允许岗位交给详情采集。"""
+        strategy_id = str(task.get("_filter_strategy_id") or "")
+        db = task.get("_db")
+        if not isinstance(db, Database):
+            return
+        if not strategy_id:
+            blocked_ids: set[str] = set()
+            for job in task["jobs"]:
+                if not job.get("is_blacklisted"):
+                    continue
+                job["filter_status"] = "exclude"
+                job["filter_reasons"] = ["公司黑名单"]
+                job["cooldown_excluded"] = True
+                job["cooldown_reasons"] = ["公司黑名单"]
+                blocked_ids.add(str(job.get("job_id") or ""))
+            raw_jobs[:] = [
+                job for job in raw_jobs
+                if str(job.get("job_id") or "") not in blocked_ids
+            ]
+            return
+        strategy = get_filter_strategy(db, strategy_id)
+        results = evaluate_filter_strategy(task["jobs"], strategy)
+        _enriched, results = apply_filter_exclusions(db, strategy, task["jobs"], results)
+        by_id = {str(result.get("job_id") or ""): result for result in results}
+        for job in task["jobs"]:
+            result = by_id.get(str(job.get("job_id") or ""))
+            if not result:
+                continue
+            job["filter_status"] = result.get("status")
+            job["filter_reasons"] = list(result.get("reasons") or [])
+            job["filter_missing_fields"] = list(result.get("missing_fields") or [])
+            job["filter_strategy_id"] = strategy_id
+            for field in (
+                "company_id", "company_type", "is_outsourcing_company",
+                "is_blacklisted", "application_status", "applied_at",
+                "cooldown_excluded", "cooldown_reasons",
+            ):
+                if field in result:
+                    job[field] = result[field]
+            update_capture_job_filter_result(db, job=job, result=result)
+        allowed_ids = {
+            str(result.get("job_id") or "")
+            for result in results
+            if result.get("status") in {"pass", "review"}
+        }
+        raw_jobs[:] = [
+            job for job in raw_jobs if str(job.get("job_id") or "") in allowed_ids
+        ]
 
     @staticmethod
     def _sync_capture_batch(
@@ -523,6 +771,7 @@ class BossCaptureTaskManager:
             previous = existing.get(job_id, {})
             normalized.append(
                 {
+                    **previous,
                     **raw,
                     "detail_status": previous.get(
                         "detail_status",
@@ -543,6 +792,11 @@ class BossCaptureTaskManager:
                 }
             )
         task["jobs"] = normalized
+
+    def _capture_stop_requested(self, task_id: str) -> bool:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            return bool(task and task.get("stop_requested"))
 
     @staticmethod
     def _find_job(task: dict[str, object], job_id: str) -> dict[str, object] | None:

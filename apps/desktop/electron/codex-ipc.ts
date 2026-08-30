@@ -4,6 +4,7 @@ interface CodexController {
   start: (cols?: number, rows?: number) => Promise<unknown>;
   resume: (cols?: number, rows?: number) => Promise<unknown>;
   write: (data: string) => void;
+  submitPrompt?: (prompt: string) => Promise<boolean>;
   resize: (cols: number, rows: number) => void;
   interrupt: () => void;
   stop: () => void;
@@ -24,6 +25,10 @@ export const registerCodexIpc = (
   ipcMain.handle("codex:state", () => controller.state());
   ipcMain.on("codex:input", (_event, data: string) => {
     if (typeof data === "string") controller.write(data);
+  });
+  ipcMain.handle("codex:submit-prompt", (_event, prompt: string) => {
+    if (typeof prompt !== "string" || !controller.submitPrompt) return false;
+    return controller.submitPrompt(prompt);
   });
   ipcMain.on("codex:resize", (_event, size: { cols: number; rows: number }) => {
     if (Number.isInteger(size?.cols) && Number.isInteger(size?.rows)) {

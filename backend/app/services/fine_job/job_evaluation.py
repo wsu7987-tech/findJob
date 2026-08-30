@@ -23,6 +23,7 @@ def evaluate_delivery_jobs(
     resume_facts: list[dict[str, object]],
     extra_requirement: str,
     config: AppConfig,
+    candidate_context: str = "",
 ) -> list[dict[str, object]]:
     method = str(recommendation_strategy.get("evaluation_method") or "hybrid")
     rule_results = {
@@ -54,6 +55,7 @@ def evaluate_delivery_jobs(
         resume_facts=resume_facts,
         extra_requirement=extra_requirement,
         config=config,
+        candidate_context=candidate_context,
     )
     llm_by_id = {str(result["job_id"]): result for result in llm_results}
     merged = []
@@ -266,6 +268,7 @@ def _evaluate_delivery_by_llm(
     resume_facts: list[dict[str, object]],
     extra_requirement: str,
     config: AppConfig,
+    candidate_context: str,
 ) -> list[dict[str, object]]:
     if not jobs:
         return []
@@ -343,6 +346,7 @@ def _evaluate_delivery_by_llm(
                 f"\n岗位 ID：{job_id}"
                 f"\n投递策略：{json.dumps(strategy_context, ensure_ascii=False)}"
                 f"\n简历事实：{json.dumps(resume_context, ensure_ascii=False)}"
+                f"\n岗位评估上下文：{candidate_context.strip() or '无'}"
                 f"\n本次额外要求：{extra_requirement.strip() or '无'}"
                 "\n所有判断必须能从岗位证据或简历事实中找到依据。"
             ),

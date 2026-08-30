@@ -97,4 +97,32 @@ describe("fineJobBossCapture store", () => {
     expect(captureSpy).toHaveBeenCalledWith("task-1", ["job-1"], true);
     store.stopPolling();
   });
+
+  it("continues and stops the same list capture task", async () => {
+    const continueSpy = vi
+      .spyOn(api, "continueFineJobBossCapture")
+      .mockResolvedValue(task({ status: "queued", stage: "list_continue_queued", pages: 3 }));
+    const stopSpy = vi
+      .spyOn(api, "stopFineJobBossCaptureTask")
+      .mockResolvedValue(task({
+        status: "running",
+        stage: "list_continuing",
+        pages: 3,
+        stop_requested: true
+      }));
+    const store = useFineJobBossCaptureStore();
+    store.task = task({
+      status: "completed",
+      stage: "list_completed",
+      continuation_available: true
+    });
+
+    await store.continueCapture(3);
+    await store.stopCaptureTask();
+
+    expect(continueSpy).toHaveBeenCalledWith("task-1", 3);
+    expect(stopSpy).toHaveBeenCalledWith("task-1");
+    expect(store.task?.stop_requested).toBe(true);
+    store.stopPolling();
+  });
 });

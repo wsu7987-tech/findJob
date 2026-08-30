@@ -11,6 +11,13 @@ from backend.app.services.fine_job.boss_scraper.service import (
 )
 
 
+def test_network_capture_stop_interrupts_before_waiting() -> None:
+    capture = engine.NetworkJoblistCapture(None, "session-1")
+
+    with pytest.raises(engine.CaptureStopRequested):
+        capture.wait_next_response(timeout=20, should_stop=lambda: True)
+
+
 def test_capture_jobs_calls_embedded_engine_and_resets_request_budget(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -174,3 +181,65 @@ def test_capture_jobs_exposes_login_gate_as_runtime_error(
                 output_dir=tmp_path,
             )
         )
+
+
+def test_capture_more_jobs_reuses_original_search_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    current_url = "https://www.zhipin.com/web/geek/jobs?query=Python&city=101020100"
+    service = BossScraperService()
+    monkeypatch.setattr(
+        service,
+        "_find_interactive_target",
+        lambda _port: {"targetId": "target-1", "url": current_url, "type": "page"},
+    )
+    captured: dict[str, object] = {}
+
+    def fake_scrape_list(keyword, city, pages, filters, output_path, **kwargs):
+        captured.update(
+            keyword=keyword,
+            city=city,
+            pages=pages,
+            filters=filters,
+            output_path=output_path,
+            kwargs=kwargs,
+        )
+        return {
+            "keyword": keyword,
+            "city": city,
+            "jobs": [{"job_id": "job-1"}, {"job_id": "job-2"}],
+            "new_jobs_count": 1,
+        }
+
+    monkeypatch.setattr(engine, "scrape_list", fake_scrape_list)
+    should_stop = lambda: False
+    result = service.capture_more_jobs(
+        BossCaptureRequest(keyword="Python", city="上海", pages=2, include_details=False),
+        list_data={"keyword": "Python", "city": "上海", "jobs": [{"job_id": "job-1"}]},
+        jobs_path=tmp_path / "boss_jobs.json",
+        expected_target_id="target-1",
+        should_stop=should_stop,
+    )
+
+    assert captured["pages"] == 2
+    assert captured["kwargs"] == {
+        "cdp_port": 9222,
+        "fmt": "json",
+        "allow_dom_fallback": False,
+        "target_id": "target-1",
+        "start_url": current_url,
+        "close_target": False,
+        "existing_jobs": [{"job_id": "job-1"}],
+        "continue_current_page": True,
+        "should_stop": should_stop,
+    }
+    assert result.capture_target_id == "target-1"
+    assert result.list_data["new_jobs_count"] == 1
+
+
+@pytest.mark.parametrize("path", ["/web/geek/job", "/web/geek/jobs"])
+def test_search_page_recognizes_current_and_legacy_paths(path: str) -> None:
+    assert BossScraperService._is_search_url(
+        f"https://www.zhipin.com{path}?query=Python&city=101020100"
+    )

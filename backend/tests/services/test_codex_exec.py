@@ -118,6 +118,85 @@ def test_run_codex_exec_rejects_invalid_jsonl(monkeypatch: pytest.MonkeyPatch) -
     assert error.value.error_category == "CODEX_EVENT_INVALID"
 
 
+def test_run_codex_exec_returns_jsonl_schema_failure_instead_of_generic_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout = json.dumps(
+        {
+            "type": "turn.failed",
+            "error": {
+                "message": "Invalid output schema: every property must be required",
+            },
+        }
+    )
+
+    class FakeProcess:
+        returncode = 1
+        pid = 123
+
+        def __init__(self, _command, **_kwargs) -> None:
+            pass
+
+        def communicate(self, *, input=None, timeout=None):
+            return stdout, "Codex execution failed."
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(codex_exec, "resolve_codex_executable", lambda _path: "codex.exe")
+    monkeypatch.setattr(codex_exec.subprocess, "Popen", FakeProcess)
+
+    with pytest.raises(AppError) as error:
+        codex_exec.run_codex_exec(
+            cli_path="codex",
+            prompt="prompt",
+            output_schema={"type": "object"},
+            model=None,
+            reasoning_effort=None,
+            timeout_seconds=90,
+        )
+
+    assert error.value.error_category == "CODEX_OUTPUT_SCHEMA_INVALID"
+    assert "every property must be required" in error.value.error_message
+
+
+def test_run_codex_exec_returns_failure_event_even_when_process_exit_code_is_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout = json.dumps(
+        {"type": "error", "message": "model unavailable for this account"}
+    )
+
+    class FakeProcess:
+        returncode = 0
+        pid = 123
+
+        def __init__(self, _command, **_kwargs) -> None:
+            pass
+
+        def communicate(self, *, input=None, timeout=None):
+            return stdout, ""
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(codex_exec, "resolve_codex_executable", lambda _path: "codex.exe")
+    monkeypatch.setattr(codex_exec.subprocess, "Popen", FakeProcess)
+
+    with pytest.raises(AppError) as error:
+        codex_exec.run_codex_exec(
+            cli_path="codex",
+            prompt="prompt",
+            output_schema={"type": "object"},
+            model=None,
+            reasoning_effort=None,
+            timeout_seconds=90,
+        )
+
+    assert error.value.error_category == "CODEX_MODEL_UNAVAILABLE"
+    assert error.value.error_message == "model unavailable for this account"
+
+
 def test_check_codex_cli_requires_supported_exec_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     responses = iter(
         [

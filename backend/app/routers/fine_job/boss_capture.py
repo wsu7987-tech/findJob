@@ -13,6 +13,7 @@ from backend.app.schemas.fine_job.boss_capture import (
     BossCapturePayload,
     BossCaptureHistoryResponse,
     BossCaptureTaskResponse,
+    BossContinueCaptureRequest,
     BossCityListResponse,
     BossDetailCaptureRequest,
     BossDeliveryEvaluationRequest,
@@ -48,14 +49,65 @@ from backend.app.services.fine_job.job_evaluation import (
     evaluate_filter_strategy,
 )
 from backend.app.services.fine_job.resumes import list_resume_facts
+from backend.app.services.fine_job import profile_store, profile_v3
 from backend.app.services.fine_job.strategies import (
     get_filter_strategy,
     get_recommendation_strategy,
 )
 from backend.app.services.fine_job.workflow import record_evaluation_and_route
+from backend.app.services.fine_job.filter_exclusions import (
+    apply_filter_exclusions,
+    assert_job_action_allowed,
+)
 
 
 router = APIRouter(prefix="/fine-job/boss-capture", tags=["fine-job-boss-capture"])
+
+
+def _candidate_evaluation_context(
+    db: Database,
+    legacy_resume_id: str,
+    recommendation_strategy: dict[str, object],
+    stale_action: str | None,
+) -> tuple[
+    list[dict[str, object]],
+    dict[str, object] | None,
+    str | None,
+    dict[str, object] | None,
+]:
+    resume_version_id = str(recommendation_strategy.get("resume_version_id") or "")
+    if resume_version_id:
+        resume_version = profile_store.get_resume_version(db, resume_version_id)
+        profile_id = str(resume_version["profile_id"])
+        profile = profile_store.get_profile(db, profile_id)
+        resolution = profile_v3.resolve_task_context(
+            db, profile_id, resume_version_id, "evaluation", stale_action
+        )
+        if resolution["status"] == "confirmation_required":
+            raise AppError(
+                status_code=409,
+                error_category="CONTEXT_STALE_CONFIRMATION_REQUIRED",
+                error_message="岗位评估上下文已过期，请选择重新生成、继续使用当前版本或取消。",
+            )
+        if resolution["status"] == "cancelled":
+            raise AppError(
+                status_code=409,
+                error_category="CONTEXT_TASK_CANCELLED",
+                error_message="已取消本次岗位评估。",
+            )
+        context = dict(resolution["context"] or {})
+        return (
+            profile_store.evaluation_facts(db, profile_id, resume_version_id),
+            profile,
+            resume_version_id,
+            context,
+        )
+    profile = profile_store.ensure_default_profile(db)
+    facts = profile_store.evaluation_facts(db, str(profile["id"]))
+    if facts:
+        return facts, profile, None, None
+    legacy_facts = list_resume_facts(db, legacy_resume_id) if legacy_resume_id else []
+    return legacy_facts, None, None, None
 
 
 @router.get("/status", response_model=BossBrowserStatusResponse)
@@ -139,6 +191,7 @@ def start_boss_capture(
             max_details=None,
             output_dir=config.output_root / "fine-job" / "boss-capture",
             prefer_current_page=payload.prefer_current_page,
+            filter_strategy_id=payload.filter_strategy_id,
         ),
         output_dir=config.output_root / "fine-job" / "boss-capture",
         db=db,
@@ -149,6 +202,7 @@ def start_boss_capture(
 @router.get("/history", response_model=BossCaptureHistoryResponse)
 def get_boss_capture_history(
     query: str = "",
+    search_keyword: str = "",
     city: str = "",
     company_scale: str = "",
     company_industry: str = "",
@@ -167,6 +221,7 @@ def get_boss_capture_history(
         **list_capture_history(
             db,
             query=query,
+            search_keyword=search_keyword,
             city=city,
             company_scale=company_scale,
             company_industry=company_industry,
@@ -194,6 +249,11 @@ def capture_history_job_details(
     db: Database = Depends(get_database),
 ) -> BossCaptureTaskResponse:
     job = get_capture_history_job(db, history_job_id)
+    filter_strategy_id = str(job.get("filter_strategy_id") or "")
+    filter_strategy = get_filter_strategy(db, filter_strategy_id) if filter_strategy_id else None
+    assert_job_action_allowed(
+        db, history_job_id, strategy=filter_strategy, action="detail"
+    )
     if not boss_scraper_service.get_browser_status().running:
         raise AppError(
             status_code=409,
@@ -212,6 +272,34 @@ def capture_history_job_details(
 @router.get("/tasks/{task_id}", response_model=BossCaptureTaskResponse)
 def get_boss_capture_task(task_id: str) -> BossCaptureTaskResponse:
     return BossCaptureTaskResponse(**boss_capture_task_manager.get_task(task_id))
+
+
+@router.post(
+    "/tasks/{task_id}/continue",
+    response_model=BossCaptureTaskResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def continue_boss_capture(
+    task_id: str,
+    payload: BossContinueCaptureRequest,
+) -> BossCaptureTaskResponse:
+    if not boss_scraper_service.get_browser_status().running:
+        raise AppError(
+            status_code=409,
+            error_category="BROWSER_NOT_RUNNING",
+            error_message="FineJob 专用 Chrome 未启动，原搜索页面无法继续下滑。",
+        )
+    return BossCaptureTaskResponse(
+        **boss_capture_task_manager.continue_capture(task_id, pages=payload.pages)
+    )
+
+
+@router.post(
+    "/tasks/{task_id}/stop",
+    response_model=BossCaptureTaskResponse,
+)
+def stop_boss_capture(task_id: str) -> BossCaptureTaskResponse:
+    return BossCaptureTaskResponse(**boss_capture_task_manager.stop_capture(task_id))
 
 
 @router.post(
@@ -244,6 +332,7 @@ def apply_boss_filter_strategy(
     task = boss_capture_task_manager.get_task(task_id)
     strategy = get_filter_strategy(db, payload.strategy_id)
     results = evaluate_filter_strategy(task["jobs"], strategy)
+    _enriched_jobs, results = apply_filter_exclusions(db, strategy, task["jobs"], results)
     selected_ids = [
         str(result["job_id"])
         for result in results
@@ -268,10 +357,13 @@ def suggest_boss_details(
     config: AppConfig = Depends(get_config),
 ) -> BossDetailSuggestionResponse:
     task = boss_capture_task_manager.get_task(task_id)
-    jobs = task["jobs"]
+    jobs = [job for job in task["jobs"] if not job.get("is_blacklisted")]
     if payload.filter_strategy_id:
         filter_strategy = get_filter_strategy(db, payload.filter_strategy_id)
         filter_results = evaluate_filter_strategy(jobs, filter_strategy)
+        _enriched_jobs, filter_results = apply_filter_exclusions(
+            db, filter_strategy, jobs, filter_results
+        )
         boss_capture_task_manager.apply_filter_results(task_id, filter_results)
     else:
         filter_strategy = None
@@ -280,7 +372,14 @@ def suggest_boss_details(
             db, payload.recommendation_strategy_id
         )
         resume_id = str(recommendation_strategy.get("resume_id") or "")
-        facts = list_resume_facts(db, resume_id) if resume_id else []
+        facts, _candidate_profile, _resume_version_id, evaluation_context = (
+            _candidate_evaluation_context(
+                db,
+                resume_id,
+                recommendation_strategy,
+                stale_action=payload.context_stale_action,
+            )
+        )
         evaluations = evaluate_delivery_jobs(
             jobs,
             filter_strategy=filter_strategy,
@@ -288,6 +387,7 @@ def suggest_boss_details(
             resume_facts=facts,
             extra_requirement=payload.extra_requirement or payload.command,
             config=config,
+            candidate_context=_context_content(evaluation_context),
         )
         selected_ids = [
             str(item["job_id"])
@@ -350,10 +450,18 @@ def evaluate_boss_deliveries(
         job
         for job in task["jobs"]
         if job.get("detail_status") == "completed"
+        and not job.get("is_blacklisted")
         and (requested_job_ids is None or str(job.get("job_id") or "") in requested_job_ids)
     ]
     resume_id = str(recommendation_strategy.get("resume_id") or "")
-    facts = list_resume_facts(db, resume_id) if resume_id else []
+    facts, candidate_profile, resume_version_id, evaluation_context = (
+        _candidate_evaluation_context(
+            db,
+            resume_id,
+            recommendation_strategy,
+            stale_action=payload.context_stale_action,
+        )
+    )
     evaluations = evaluate_delivery_jobs(
         completed_jobs,
         filter_strategy=filter_strategy,
@@ -361,6 +469,7 @@ def evaluate_boss_deliveries(
         resume_facts=facts,
         extra_requirement=payload.extra_requirement,
         config=config,
+        candidate_context=_context_content(evaluation_context),
     )
     updated = boss_capture_task_manager.apply_delivery_evaluations(
         task_id, evaluations
@@ -380,6 +489,10 @@ def evaluate_boss_deliveries(
                 filter_strategy=filter_strategy,
                 resume_id=resume_id or None,
                 delivery_strategy=delivery_strategy,
+                candidate_profile=candidate_profile,
+                resume_version_id=resume_version_id,
+                context_revision_id=_context_revision_id(evaluation_context),
+                context_dependency_versions=_context_dependencies(evaluation_context),
             )
     return BossDeliveryEvaluationResponse(
         evaluations=evaluations,
@@ -413,8 +526,18 @@ def evaluate_history_job_delivery(
     filter_strategy = (
         get_filter_strategy(db, str(filter_strategy_id)) if filter_strategy_id else None
     )
+    assert_job_action_allowed(
+        db, history_job_id, strategy=filter_strategy, action="evaluation"
+    )
     resume_id = str(recommendation_strategy.get("resume_id") or "")
-    facts = list_resume_facts(db, resume_id) if resume_id else []
+    facts, candidate_profile, resume_version_id, evaluation_context = (
+        _candidate_evaluation_context(
+            db,
+            resume_id,
+            recommendation_strategy,
+            stale_action=payload.context_stale_action,
+        )
+    )
     evaluation = evaluate_delivery_jobs(
         [job],
         filter_strategy=filter_strategy,
@@ -422,6 +545,7 @@ def evaluate_history_job_delivery(
         resume_facts=facts,
         extra_requirement=payload.extra_requirement,
         config=config,
+        candidate_context=_context_content(evaluation_context),
     )[0]
     update_capture_job_delivery_evaluation(db, job=job, evaluation=evaluation)
     record_evaluation_and_route(
@@ -432,8 +556,27 @@ def evaluate_history_job_delivery(
         filter_strategy=filter_strategy,
         resume_id=resume_id or None,
         delivery_strategy=get_delivery_strategy(db),
+        candidate_profile=candidate_profile,
+        resume_version_id=resume_version_id,
+        context_revision_id=_context_revision_id(evaluation_context),
+        context_dependency_versions=_context_dependencies(evaluation_context),
     )
     return BossHistoryDeliveryEvaluationResponse(
         evaluation=evaluation,
         job=get_capture_history_job(db, history_job_id),
     )
+
+
+def _context_content(context: dict[str, object] | None) -> str:
+    current = (context or {}).get("current_revision")
+    return str(current.get("content") or "") if isinstance(current, dict) else ""
+
+
+def _context_revision_id(context: dict[str, object] | None) -> str | None:
+    current = (context or {}).get("current_revision")
+    return str(current.get("id")) if isinstance(current, dict) and current.get("id") else None
+
+
+def _context_dependencies(context: dict[str, object] | None) -> dict[str, object] | None:
+    dependencies = (context or {}).get("dependency_versions")
+    return dict(dependencies) if isinstance(dependencies, dict) else None

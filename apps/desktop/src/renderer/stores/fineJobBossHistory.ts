@@ -63,6 +63,7 @@ export const useFineJobBossHistoryStore = defineStore("fineJobBossHistory", () =
       recommendation_strategy_id: string;
       filter_strategy_id?: string | null;
       extra_requirement?: string;
+      context_stale_action?: "regenerate" | "use_current" | "cancel";
     }
   ) => {
     error.value = null;

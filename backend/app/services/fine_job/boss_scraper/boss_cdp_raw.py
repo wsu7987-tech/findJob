@@ -454,6 +454,10 @@ def attach_page_session(cdp, target_id):
 # 识别为异常环境（code 37）。改为导航真实搜索页 + 滚动加载，仅旁听页面
 # 自己发出的 /wapi/zpgeek/search/joblist.json 响应，全程零注入请求。
 # ============================================================
+class CaptureStopRequested(Exception):
+    """用户请求停止当前列表采集。"""
+
+
 class NetworkJoblistCapture:
     """监听并捕获页面自身发出的 joblist API 响应。
 
@@ -490,7 +494,7 @@ class NetworkJoblistCapture:
     def _is_joblist_url(url):
         return API_JOB_LIST_PATH in url
 
-    def wait_next_response(self, timeout, trigger=None, poll=0.5):
+    def wait_next_response(self, timeout, trigger=None, poll=0.5, should_stop=None):
         """等待下一个未消费的 joblist 响应并解析 JSON。
 
         Args:
@@ -501,10 +505,14 @@ class NetworkJoblistCapture:
         Returns:
             dict: 解析后的响应 JSON；超时未捕获返回 None
         """
+        if should_stop and should_stop():
+            raise CaptureStopRequested()
         if trigger is not None:
             trigger()
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if should_stop and should_stop():
+                raise CaptureStopRequested()
             request_id = self._next_completed()
             if request_id is None:
                 self.cdp.drain_events(min(poll, deadline - time.time()))
@@ -1387,7 +1395,8 @@ def build_search_url(keyword, city_code, page, filters):
     for key, code in filters.items():
         if code:
             params[key] = code
-    return f"https://www.zhipin.com/web/geek/job?{urlencode(params)}"
+    # BOSS 当前搜索页使用复数路径，直接生成实际地址以避免导航后重定向。
+    return f"https://www.zhipin.com/web/geek/jobs?{urlencode(params)}"
 
 
 def build_detail_url(job):
@@ -1460,11 +1469,20 @@ def load_existing_details(input_path=None, detail_output=None, result_dir=DEFAUL
 def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
                 target_id=None, start_url=None, close_target=True,
-                progress_callback=None):
+                progress_callback=None, existing_jobs=None,
+                continue_current_page=False, should_stop=None):
     city_name, city_code = resolve_city(city_input)
     cdp = CDPSession(cdp_port)
-    all_jobs = []
-    seen = set()
+    all_jobs = [dict(job) for job in existing_jobs or [] if isinstance(job, dict)]
+    seen = {
+        job.get("job_link") or job.get("title")
+        for job in all_jobs
+        if job.get("job_link") or job.get("title")
+    }
+    initial_job_count = len(all_jobs)
+    pages_loaded = 0
+    reached_end = False
+    stopped = False
     if not output_path:
         output_path = default_output_path("jobs")
 
@@ -1511,6 +1529,16 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     capture = NetworkJoblistCapture(cdp, sid)
     capture.enable()
 
+    def stop_if_requested():
+        if should_stop and should_stop():
+            raise CaptureStopRequested()
+
+    def interruptible_wait(seconds):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            stop_if_requested()
+            time.sleep(min(0.25, max(0, deadline - time.time())))
+
     def human_scroll(cdp, sid, to_bottom=False):
         """模拟人类滚动: 随机次数、随机距离、随机停顿，偶尔回滚一点。
 
@@ -1518,6 +1546,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
         """
         total_scrolls = random.randint(3, 6)
         for i in range(total_scrolls):
+            stop_if_requested()
             # 大部分往下滚，偶尔往上回滚一点（模拟阅读回看）
             if random.random() < 0.15:
                 delta = -random.randint(50, 150)
@@ -1526,9 +1555,9 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             cdp.eval_js(f"window.scrollBy(0,{delta})", sid)
             # 滚动间隔随机：有时快速连续滚，有时停下来"看"
             if random.random() < 0.3:
-                time.sleep(random.uniform(2.0, 4.0))
+                interruptible_wait(random.uniform(2.0, 4.0))
             else:
-                time.sleep(random.uniform(0.5, 1.5))
+                interruptible_wait(random.uniform(0.5, 1.5))
         if to_bottom:
             cdp.eval_js("window.scrollTo(0, document.body.scrollHeight); void 0;", sid)
 
@@ -1566,18 +1595,21 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
 
     try:
         for pg in range(1, max_pages + 1):
+            stop_if_requested()
             print(f"--- [{pg}/{max_pages} 页, {len(all_jobs)} 条已抓] ---")
 
-            if pg == 1:
+            if pg == 1 and not continue_current_page:
                 # 导航真实搜索页，被动等待页面自己发出首个 joblist 请求
                 url = start_url or build_search_url(keyword, city_code, pg, filters)
 
                 def trigger_navigate():
                     cdp.send("Page.navigate", {"url": url}, sid)
-                    time.sleep(random.uniform(2, 4))
+                    interruptible_wait(random.uniform(2, 4))
 
                 data = capture.wait_next_response(
-                    timeout=PROBE_CAPTURE_TIMEOUT, trigger=trigger_navigate
+                    timeout=PROBE_CAPTURE_TIMEOUT,
+                    trigger=trigger_navigate,
+                    should_stop=should_stop,
                 )
                 incr_request()
                 if data is None:
@@ -1587,9 +1619,16 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     gate_first_response(data)
             else:
                 # 翻页：滚动到底触发无限滚动加载，继续旁听页面自身请求
-                human_scroll(cdp, sid, to_bottom=True)
-                data = capture.wait_next_response(timeout=20)
+                data = capture.wait_next_response(
+                    timeout=20,
+                    trigger=lambda: human_scroll(cdp, sid, to_bottom=True),
+                    should_stop=should_stop,
+                )
                 incr_request()
+                if pg == 1 and data is not None:
+                    gate_first_response(data)
+
+            pages_loaded = pg
 
             reached_end = (
                 isinstance(data, dict)
@@ -1602,7 +1641,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             if not jobs and allow_dom_fallback:
                 log.warning("⚠️ 未捕获到 API 职位数据，回退到 DOM 提取（此方式已弃用，数据可能不完整）")
                 if data is None:
-                    time.sleep(random.uniform(2, 4))
+                    interruptible_wait(random.uniform(2, 4))
                     human_scroll(cdp, sid)
                 val = cdp.eval_js(EXTRACT_LIST_JS, sid)
                 if val:
@@ -1619,6 +1658,9 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
 
             if not jobs:
                 print("  ⚠️ 无数据")
+                if reached_end:
+                    print("  已到最后一页（hasMore=false），提前结束\n")
+                    break
                 continue
 
             new = 0
@@ -1666,10 +1708,13 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             if pg < max_pages:
                 d = random.uniform(12, 22)
                 print(f"  翻页等待 {d:.0f}s...\n")
-                time.sleep(d)
+                interruptible_wait(d)
 
     except KeyboardInterrupt:
         print("\n中断")
+    except CaptureStopRequested:
+        stopped = True
+        print("\n已按用户请求停止列表采集")
     except RuntimeError as e:
         print(f"\n⚠️ {e}")
     finally:
@@ -1698,7 +1743,16 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     else:
         print("无数据")
 
-    return {"keyword": keyword, "city": city_name, "total": len(all_jobs), "jobs": all_jobs}
+    return {
+        "keyword": keyword,
+        "city": city_name,
+        "total": len(all_jobs),
+        "jobs": all_jobs,
+        "new_jobs_count": len(all_jobs) - initial_job_count,
+        "pages_loaded": pages_loaded,
+        "has_more": not reached_end,
+        "stopped": stopped,
+    }
 
 
 # ============================================================

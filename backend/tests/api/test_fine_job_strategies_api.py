@@ -57,6 +57,45 @@ def test_filter_strategy_crud(configured_client) -> None:
     assert deleted_response.status_code == 204
 
 
+def test_filter_search_keywords_are_ordered_editable_records(configured_client) -> None:
+    strategy = configured_client.post(
+        "/api/fine-job/strategies/filters", json=_filter_payload(search_keywords=[])
+    ).json()["strategy"]
+    first = configured_client.post(
+        f"/api/fine-job/strategies/filters/{strategy['id']}/search-keywords",
+        json={"keyword": "AI Agent", "reason": "目标岗位", "enabled": True, "sort_order": 0},
+    ).json()["keyword"]
+    second = configured_client.post(
+        f"/api/fine-job/strategies/filters/{strategy['id']}/search-keywords",
+        json={"keyword": "LangGraph", "reason": "技能词", "enabled": True, "sort_order": 1},
+    ).json()["keyword"]
+
+    reordered = configured_client.put(
+        f"/api/fine-job/strategies/filters/{strategy['id']}/search-keywords/order",
+        json={"keyword_ids": [second["id"], first["id"]]},
+    ).json()["keywords"]
+    assert [item["keyword"] for item in reordered] == ["LangGraph", "AI Agent"]
+
+    updated = configured_client.patch(
+        f"/api/fine-job/strategies/filters/{strategy['id']}/search-keywords/{second['id']}",
+        json={
+            "keyword": second["keyword"],
+            "reason": second["reason"],
+            "enabled": False,
+            "sort_order": 0,
+        },
+    )
+    assert updated.status_code == 200
+    refreshed = configured_client.get(
+        f"/api/fine-job/strategies/filters/{strategy['id']}/search-keywords"
+    ).json()["keywords"]
+    assert next(item for item in refreshed if item["id"] == second["id"])["enabled"] is False
+    projection = configured_client.get(
+        "/api/fine-job/strategies/filters"
+    ).json()["strategies"][0]["search_keywords"]
+    assert projection == ["AI Agent"]
+
+
 def test_legacy_job_intent_migrates_to_filter_strategy(configured_client) -> None:
     configured_client.put(
         "/api/fine-job/job-intent",

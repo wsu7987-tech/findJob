@@ -5,6 +5,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+from uuid import uuid4
 
 
 DDL = """
@@ -336,6 +337,471 @@ CREATE TABLE IF NOT EXISTS fj_resume_facts (
 CREATE INDEX IF NOT EXISTS idx_fj_resume_facts_resume_id
   ON fj_resume_facts(resume_id);
 
+CREATE TABLE IF NOT EXISTS fj_candidate_profiles (
+  id TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL DEFAULT '默认候选人',
+  status TEXT NOT NULL DEFAULT 'draft',
+  sources_version INTEGER NOT NULL DEFAULT 1,
+  facts_version INTEGER NOT NULL DEFAULT 1,
+  questions_version INTEGER NOT NULL DEFAULT 1,
+  answers_version INTEGER NOT NULL DEFAULT 1,
+  strategy_version INTEGER NOT NULL DEFAULT 1,
+  context_version INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (status IN ('draft', 'ready', 'stale', 'archived'))
+);
+
+CREATE TABLE IF NOT EXISTS fj_profile_sources (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  resume_family_id TEXT,
+  source_type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  file_path TEXT,
+  raw_text TEXT NOT NULL DEFAULT '',
+  recognized_text TEXT NOT NULL DEFAULT '',
+  editable_text TEXT NOT NULL DEFAULT '',
+  recognizer_name TEXT,
+  status TEXT NOT NULL DEFAULT 'uploaded',
+  active_analysis_run_id TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  source_version INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+  CHECK (source_type IN ('pdf', 'markdown', 'text', 'project')),
+  CHECK (status IN ('uploaded', 'recognizing', 'analyzing', 'ready', 'review_required', 'failed', 'archived')),
+  CHECK (enabled IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_profile_sources_profile
+  ON fj_profile_sources(profile_id, enabled, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_resume_families (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  root_source_id TEXT,
+  target_role_family TEXT NOT NULL DEFAULT '',
+  base_version_id TEXT,
+  default_version_id TEXT,
+  content_version INTEGER NOT NULL DEFAULT 1,
+  analysis_version INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+  FOREIGN KEY (root_source_id) REFERENCES fj_profile_sources(id) ON DELETE SET NULL,
+  CHECK (status IN ('active', 'stale', 'archived'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_resume_families_profile
+  ON fj_resume_families(profile_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_profile_analysis_runs (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  source_ids_json TEXT NOT NULL DEFAULT '[]',
+  input_versions_json TEXT NOT NULL DEFAULT '{}',
+  ai_model TEXT,
+  prompt_version TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  quality_json TEXT NOT NULL DEFAULT '{}',
+  output_json TEXT,
+  error_category TEXT,
+  error_message TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+  CHECK (status IN ('pending', 'running', 'needs_confirmation', 'applied', 'failed', 'cancelled', 'stale'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_profile_analysis_runs_profile
+  ON fj_profile_analysis_runs(profile_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_profile_artifacts (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  context_scope_id TEXT,
+  source_id TEXT,
+  analysis_run_id TEXT,
+  artifact_type TEXT NOT NULL,
+  content TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'draft',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+  FOREIGN KEY (source_id) REFERENCES fj_profile_sources(id) ON DELETE CASCADE,
+  FOREIGN KEY (analysis_run_id) REFERENCES fj_profile_analysis_runs(id) ON DELETE SET NULL,
+  CHECK (artifact_type IN ('normalized_resume_markdown', 'candidate_context_full', 'candidate_context_search', 'candidate_context_evaluation', 'candidate_context_chat')),
+  CHECK (status IN ('draft', 'official', 'stale'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_profile_artifacts_profile
+  ON fj_profile_artifacts(profile_id, artifact_type, version DESC);
+
+CREATE TABLE IF NOT EXISTS fj_resume_versions (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  resume_family_id TEXT,
+  parent_version_id TEXT,
+  name TEXT NOT NULL,
+  role_family TEXT NOT NULL DEFAULT '',
+  version_type TEXT NOT NULL DEFAULT 'base',
+  target_job_id TEXT,
+  derived_reason TEXT NOT NULL DEFAULT '',
+  based_on_content_version INTEGER NOT NULL DEFAULT 1,
+  campaign_id TEXT,
+  source_id TEXT,
+  content TEXT NOT NULL DEFAULT '',
+  fact_ids_json TEXT NOT NULL DEFAULT '[]',
+  is_default INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'draft',
+  content_version INTEGER NOT NULL DEFAULT 1,
+  confirmed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+  FOREIGN KEY (resume_family_id) REFERENCES fj_resume_families(id) ON DELETE CASCADE,
+  FOREIGN KEY (parent_version_id) REFERENCES fj_resume_versions(id) ON DELETE SET NULL,
+  FOREIGN KEY (source_id) REFERENCES fj_profile_sources(id) ON DELETE SET NULL,
+  CHECK (is_default IN (0, 1)),
+  CHECK (version_type IN ('base', 'jd_tailored', 'manual_variant', 'language_variant')),
+  CHECK (status IN ('draft', 'confirmed', 'stale', 'archived'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_resume_versions_profile
+  ON fj_resume_versions(profile_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_profile_facts (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  scope_type TEXT NOT NULL DEFAULT 'general',
+  scope_id TEXT,
+  domain TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  field_key TEXT NOT NULL,
+  value_json TEXT NOT NULL,
+  source_type TEXT NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  valid_from TEXT,
+  valid_to TEXT,
+  date_precision TEXT NOT NULL DEFAULT 'unknown',
+  is_current INTEGER NOT NULL DEFAULT 0,
+  confidence REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'proposed',
+  conflict_group_id TEXT,
+  sensitivity TEXT NOT NULL DEFAULT 'normal',
+  external_use TEXT NOT NULL DEFAULT 'prohibited',
+  disclosure_policy_json TEXT NOT NULL DEFAULT '{}',
+  valid_until TEXT,
+  confirmed_by TEXT,
+  analysis_operation_run_id TEXT,
+  source_content_version INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+  CHECK (source_type IN ('document', 'user_answer', 'manual', 'ai_inference')),
+  CHECK (scope_type IN ('general', 'resume_family')),
+  CHECK (confirmed_by IS NULL OR confirmed_by IN ('ai_extraction', 'user')),
+  CHECK (date_precision IN ('year', 'month', 'day', 'unknown')),
+  CHECK (is_current IN (0, 1)),
+  CHECK (confidence >= 0 AND confidence <= 1),
+  CHECK (status IN ('proposed', 'confirmed', 'rejected', 'conflicted', 'stale')),
+  CHECK (sensitivity IN ('normal', 'private', 'sensitive')),
+  CHECK (external_use IN ('prohibited', 'summary_only', 'allowed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_profile_facts_profile
+  ON fj_profile_facts(profile_id, domain, entity_id, sort_order);
+
+CREATE TABLE IF NOT EXISTS fj_profile_fact_evidence (
+  id TEXT PRIMARY KEY,
+  fact_id TEXT NOT NULL,
+  source_type TEXT NOT NULL,
+  source_id TEXT,
+  source_excerpt TEXT NOT NULL DEFAULT '',
+  extraction_method TEXT NOT NULL DEFAULT 'ai',
+  confidence REAL NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (fact_id) REFERENCES fj_profile_facts(id) ON DELETE CASCADE,
+  CHECK (source_type IN ('document', 'question_answer', 'manual')),
+  CHECK (confidence >= 0 AND confidence <= 1)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_profile_fact_evidence_fact
+  ON fj_profile_fact_evidence(fact_id, created_at);
+
+CREATE TABLE IF NOT EXISTS fj_profile_questions (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  scope_type TEXT NOT NULL DEFAULT 'general',
+  scope_id TEXT,
+  scope_key TEXT NOT NULL DEFAULT 'general',
+  question_key TEXT NOT NULL,
+  question_text TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  origin TEXT NOT NULL DEFAULT 'user',
+  answer_type TEXT NOT NULL DEFAULT 'text',
+  required_stage TEXT NOT NULL DEFAULT 'chat',
+  priority TEXT NOT NULL DEFAULT 'medium',
+  proposed_answer_json TEXT,
+  final_answer_json TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  external_use TEXT NOT NULL DEFAULT 'prohibited',
+  valid_until TEXT,
+  source_id TEXT,
+  job_id TEXT,
+  writes_to_field TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  confirmed_by TEXT,
+  analysis_operation_run_id TEXT,
+  source_content_version INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+  FOREIGN KEY (source_id) REFERENCES fj_profile_sources(id) ON DELETE SET NULL,
+  UNIQUE (profile_id, scope_key, question_key),
+  CHECK (scope_type IN ('general', 'resume_family')),
+  CHECK (origin IN ('default', 'resume_analysis', 'jd_analysis', 'user')),
+  CHECK (answer_type IN ('text', 'number', 'date', 'range', 'select', 'multi_select', 'boolean')),
+  CHECK (required_stage IN ('search', 'greeting', 'application', 'chat', 'interview')),
+  CHECK (priority IN ('high', 'medium', 'low')),
+  CHECK (status IN ('pending', 'proposed_answer', 'answered', 'confirmed', 'declined', 'conflicted', 'stale')),
+  CHECK (external_use IN ('prohibited', 'summary_only', 'allowed')),
+  CHECK (enabled IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_profile_questions_profile
+  ON fj_profile_questions(profile_id, enabled, priority, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_profile_answer_variants (
+  id TEXT PRIMARY KEY,
+  question_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  scope_type TEXT NOT NULL DEFAULT 'general',
+  scope_id TEXT,
+  answer_text TEXT NOT NULL,
+  internal_note TEXT NOT NULL DEFAULT '',
+  usage_condition TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'draft',
+  generated_by TEXT NOT NULL DEFAULT 'user',
+  based_on_job_version INTEGER,
+  external_use TEXT NOT NULL DEFAULT 'prohibited',
+  disclosure_policy_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (question_id) REFERENCES fj_profile_questions(id) ON DELETE CASCADE,
+  CHECK (scope_type IN ('general', 'role_family', 'job')),
+  CHECK (status IN ('draft', 'confirmed', 'rejected', 'stale')),
+  CHECK (generated_by IN ('system', 'ai', 'user')),
+  CHECK (external_use IN ('prohibited', 'summary_only', 'allowed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_profile_answer_variants_question
+  ON fj_profile_answer_variants(question_id, scope_type, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_profile_analysis_items (
+  id TEXT PRIMARY KEY,
+  analysis_run_id TEXT NOT NULL,
+  item_type TEXT NOT NULL,
+  source_refs_json TEXT NOT NULL DEFAULT '[]',
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  result_resource_type TEXT,
+  result_resource_id TEXT,
+  decision_note TEXT,
+  decided_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (analysis_run_id) REFERENCES fj_profile_analysis_runs(id) ON DELETE CASCADE,
+  CHECK (item_type IN ('fact', 'question', 'answer_variant', 'strategy', 'search_query', 'resume_version_suggestion')),
+  CHECK (status IN ('pending', 'accepted', 'edited_and_accepted', 'rejected', 'deferred', 'apply_failed', 'applied'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_profile_analysis_items_run
+  ON fj_profile_analysis_items(analysis_run_id, status, item_type);
+
+CREATE TABLE IF NOT EXISTS fj_resume_analysis_runs (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  resume_family_id TEXT NOT NULL,
+  source_ids_json TEXT NOT NULL DEFAULT '[]',
+  operation_ids_json TEXT NOT NULL DEFAULT '[]',
+  input_versions_json TEXT NOT NULL DEFAULT '{}',
+  pipeline_mode TEXT NOT NULL DEFAULT 'chained',
+  execution_path TEXT NOT NULL DEFAULT 'structured',
+  ai_model TEXT,
+  status TEXT NOT NULL DEFAULT 'queued',
+  error_category TEXT,
+  error_message TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+  FOREIGN KEY (resume_family_id) REFERENCES fj_resume_families(id) ON DELETE CASCADE,
+  CHECK (pipeline_mode IN ('single', 'chained')),
+  CHECK (execution_path IN ('structured', 'codex_workspace')),
+  CHECK (status IN ('queued', 'running', 'completed', 'partial_failed', 'failed', 'cancelled'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_resume_analysis_runs_family
+  ON fj_resume_analysis_runs(resume_family_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_resume_analysis_operations (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  sequence_no INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  input_versions_json TEXT NOT NULL DEFAULT '{}',
+  output_summary_json TEXT NOT NULL DEFAULT '{}',
+  error_category TEXT,
+  error_message TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES fj_resume_analysis_runs(id) ON DELETE CASCADE,
+  UNIQUE (run_id, operation_id),
+  CHECK (operation_id IN ('clean_content', 'extract_facts', 'extract_qa', 'generate_filter_strategy', 'generate_recommendation_strategy', 'generate_search_keywords')),
+  CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'blocked', 'cancelled', 'stale'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_resume_analysis_operations_run
+  ON fj_resume_analysis_operations(run_id, sequence_no);
+
+CREATE TABLE IF NOT EXISTS fj_resume_analysis_issues (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  resume_family_id TEXT NOT NULL,
+  source_id TEXT,
+  operation_run_id TEXT,
+  issue_type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  source_excerpt TEXT NOT NULL DEFAULT '',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  resolved_at TEXT,
+  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+  FOREIGN KEY (resume_family_id) REFERENCES fj_resume_families(id) ON DELETE CASCADE,
+  FOREIGN KEY (source_id) REFERENCES fj_profile_sources(id) ON DELETE SET NULL,
+  FOREIGN KEY (operation_run_id) REFERENCES fj_resume_analysis_operations(id) ON DELETE SET NULL,
+  CHECK (issue_type IN ('uncertain_fact', 'conflict', 'missing_information', 'suggested_question')),
+  CHECK (status IN ('pending', 'resolved', 'dismissed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_resume_analysis_issues_family
+  ON fj_resume_analysis_issues(resume_family_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_resume_strategies (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  resume_family_id TEXT NOT NULL,
+  strategy_type TEXT NOT NULL,
+  name TEXT NOT NULL,
+  content_json TEXT NOT NULL DEFAULT '{}',
+  version INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'current',
+  generated_by TEXT NOT NULL DEFAULT 'ai',
+  operation_run_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+  FOREIGN KEY (resume_family_id) REFERENCES fj_resume_families(id) ON DELETE CASCADE,
+  FOREIGN KEY (operation_run_id) REFERENCES fj_resume_analysis_operations(id) ON DELETE SET NULL,
+  CHECK (strategy_type IN ('filter', 'recommendation')),
+  CHECK (status IN ('current', 'stale', 'archived')),
+  CHECK (generated_by IN ('ai', 'user'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_resume_strategies_family
+  ON fj_resume_strategies(resume_family_id, strategy_type, status, version DESC);
+
+CREATE TABLE IF NOT EXISTS fj_resume_search_keywords (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  resume_family_id TEXT NOT NULL,
+  keyword TEXT NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  version INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'current',
+  operation_run_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+  FOREIGN KEY (resume_family_id) REFERENCES fj_resume_families(id) ON DELETE CASCADE,
+  FOREIGN KEY (operation_run_id) REFERENCES fj_resume_analysis_operations(id) ON DELETE SET NULL,
+  CHECK (enabled IN (0, 1)),
+  CHECK (status IN ('current', 'stale', 'archived'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_resume_search_keywords_family
+  ON fj_resume_search_keywords(resume_family_id, enabled, sort_order, created_at);
+
+CREATE TABLE IF NOT EXISTS fj_search_campaigns (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  target_titles_json TEXT NOT NULL DEFAULT '[]',
+  role_families_json TEXT NOT NULL DEFAULT '[]',
+  cities_json TEXT NOT NULL DEFAULT '[]',
+  districts_json TEXT NOT NULL DEFAULT '[]',
+  work_modes_json TEXT NOT NULL DEFAULT '[]',
+  salary_json TEXT NOT NULL DEFAULT '{}',
+  industries_json TEXT NOT NULL DEFAULT '[]',
+  company_scales_json TEXT NOT NULL DEFAULT '[]',
+  resume_version_id TEXT,
+  filter_strategy_id TEXT,
+  recommendation_strategy_id TEXT,
+  delivery_strategy_id TEXT,
+  excluded_terms_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'active',
+  campaign_version INTEGER NOT NULL DEFAULT 1,
+  confirmed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+  FOREIGN KEY (resume_version_id) REFERENCES fj_resume_versions(id) ON DELETE SET NULL,
+  CHECK (status IN ('active', 'paused', 'archived'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_search_campaigns_profile
+  ON fj_search_campaigns(profile_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_search_queries (
+  id TEXT PRIMARY KEY,
+  campaign_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  role_family TEXT NOT NULL DEFAULT '',
+  platform TEXT NOT NULL DEFAULT 'boss',
+  keyword TEXT NOT NULL,
+  cities_json TEXT NOT NULL DEFAULT '[]',
+  work_modes_json TEXT NOT NULL DEFAULT '[]',
+  positive_terms_json TEXT NOT NULL DEFAULT '[]',
+  excluded_terms_json TEXT NOT NULL DEFAULT '[]',
+  priority INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (campaign_id) REFERENCES fj_search_campaigns(id) ON DELETE CASCADE,
+  CHECK (enabled IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_search_queries_campaign
+  ON fj_search_queries(campaign_id, enabled, priority DESC, created_at);
+
 CREATE TABLE IF NOT EXISTS fj_job_intents (
   id TEXT PRIMARY KEY,
   target_title TEXT NOT NULL DEFAULT '',
@@ -422,6 +888,7 @@ CREATE TABLE IF NOT EXISTS fj_job_filter_strategies (
   skill_include_all_json TEXT NOT NULL DEFAULT '[]',
   skill_exclude_json TEXT NOT NULL DEFAULT '[]',
   boss_active_statuses_json TEXT NOT NULL DEFAULT '[]',
+  cooldown_rules_json TEXT NOT NULL DEFAULT '{}',
   unknown_value_policy TEXT NOT NULL DEFAULT 'review',
   notes TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
@@ -532,6 +999,40 @@ CREATE TABLE IF NOT EXISTS fj_boss_capture_batches (
 CREATE INDEX IF NOT EXISTS idx_fj_boss_capture_batches_created_at
   ON fj_boss_capture_batches(created_at DESC);
 
+CREATE TABLE IF NOT EXISTS fj_companies (
+  id TEXT PRIMARY KEY,
+  canonical_name TEXT NOT NULL,
+  normalized_name TEXT NOT NULL UNIQUE,
+  company_type TEXT NOT NULL DEFAULT 'unknown',
+  classification_source TEXT NOT NULL DEFAULT 'capture',
+  notes TEXT NOT NULL DEFAULT '',
+  is_blacklisted INTEGER NOT NULL DEFAULT 0,
+  blacklist_reason TEXT NOT NULL DEFAULT '',
+  blacklisted_at TEXT,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (company_type IN ('unknown', 'direct', 'outsourcing')),
+  CHECK (classification_source IN ('capture', 'manual', 'mcp', 'migration')),
+  CHECK (is_blacklisted IN (0, 1)),
+  CHECK (version > 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_companies_type_blacklisted
+  ON fj_companies(company_type, is_blacklisted, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_company_aliases (
+  id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL,
+  alias_name TEXT NOT NULL,
+  normalized_alias TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_company_aliases_company
+  ON fj_company_aliases(company_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS fj_boss_jobs (
   id TEXT PRIMARY KEY,
   dedupe_key TEXT NOT NULL UNIQUE,
@@ -539,6 +1040,7 @@ CREATE TABLE IF NOT EXISTS fj_boss_jobs (
   encrypt_job_id TEXT NOT NULL DEFAULT '',
   title TEXT NOT NULL DEFAULT '',
   company_name TEXT NOT NULL DEFAULT '',
+  company_id TEXT,
   company_scale TEXT NOT NULL DEFAULT '',
   company_stage TEXT NOT NULL DEFAULT '',
   company_industry TEXT NOT NULL DEFAULT '',
@@ -552,6 +1054,7 @@ CREATE TABLE IF NOT EXISTS fj_boss_jobs (
   tags TEXT NOT NULL DEFAULT '',
   skills TEXT NOT NULL DEFAULT '',
   job_labels TEXT NOT NULL DEFAULT '',
+  search_keyword TEXT NOT NULL DEFAULT '',
   payload_json TEXT NOT NULL DEFAULT '{}',
   detail_json TEXT,
   detail_status TEXT NOT NULL DEFAULT 'not_collected',
@@ -563,6 +1066,7 @@ CREATE TABLE IF NOT EXISTS fj_boss_jobs (
   collect_count INTEGER NOT NULL DEFAULT 1,
   latest_batch_id TEXT NOT NULL,
   FOREIGN KEY (latest_batch_id) REFERENCES fj_boss_capture_batches(id),
+  FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE SET NULL,
   CHECK (detail_status IN ('not_collected', 'queued', 'collecting', 'completed', 'failed')),
   CHECK (collect_count > 0)
 );
@@ -590,6 +1094,59 @@ CREATE TABLE IF NOT EXISTS fj_boss_capture_batch_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_fj_boss_capture_batch_jobs_job_id
   ON fj_boss_capture_batch_jobs(job_id, collected_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_job_applications (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL UNIQUE,
+  company_id TEXT,
+  status TEXT NOT NULL DEFAULT 'applied',
+  source TEXT NOT NULL DEFAULT 'manual',
+  source_action_id TEXT,
+  evidence_level TEXT NOT NULL DEFAULT 'confirmed',
+  applied_at TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+  FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE SET NULL,
+  CHECK (status IN ('applied', 'cleared')),
+  CHECK (source IN ('boss_action', 'manual', 'mcp', 'migration')),
+  CHECK (evidence_level IN ('confirmed', 'inferred'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_job_applications_status_time
+  ON fj_job_applications(status, applied_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fj_job_applications_company
+  ON fj_job_applications(company_id, status, applied_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_filter_exclusion_states (
+  strategy_id TEXT PRIMARY KEY,
+  strategy_version INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'stale',
+  last_full_refreshed_at TEXT,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (strategy_id) REFERENCES fj_job_filter_strategies(id) ON DELETE CASCADE,
+  CHECK (status IN ('ready', 'stale'))
+);
+
+CREATE TABLE IF NOT EXISTS fj_filter_exclusion_entries (
+  id TEXT PRIMARY KEY,
+  strategy_id TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  rule_type TEXT NOT NULL,
+  source_event_at TEXT,
+  excluded_until TEXT,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (strategy_id) REFERENCES fj_job_filter_strategies(id) ON DELETE CASCADE,
+  UNIQUE (strategy_id, entity_type, entity_id, rule_type),
+  CHECK (entity_type IN ('company', 'job'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_filter_exclusion_entries_active
+  ON fj_filter_exclusion_entries(strategy_id, entity_type, entity_id, excluded_until);
 
 CREATE TABLE IF NOT EXISTS fj_job_evaluations (
   id TEXT PRIMARY KEY,
@@ -928,6 +1485,221 @@ CREATE TABLE IF NOT EXISTS fj_codex_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_fj_codex_sessions_updated_at
   ON fj_codex_sessions(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_fact_resume_links (
+  fact_id TEXT NOT NULL,
+  resume_version_id TEXT NOT NULL,
+  linked_by TEXT NOT NULL DEFAULT 'user',
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (fact_id, resume_version_id),
+  FOREIGN KEY (fact_id) REFERENCES fj_profile_facts(id) ON DELETE CASCADE,
+  FOREIGN KEY (resume_version_id) REFERENCES fj_resume_versions(id) ON DELETE CASCADE,
+  CHECK (linked_by IN ('ai_extraction', 'user', 'derived', 'migration'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_fact_resume_links_resume
+  ON fj_fact_resume_links(resume_version_id, fact_id);
+
+CREATE TABLE IF NOT EXISTS fj_question_resume_links (
+  question_id TEXT NOT NULL,
+  resume_version_id TEXT NOT NULL,
+  linked_by TEXT NOT NULL DEFAULT 'user',
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (question_id, resume_version_id),
+  FOREIGN KEY (question_id) REFERENCES fj_profile_questions(id) ON DELETE CASCADE,
+  FOREIGN KEY (resume_version_id) REFERENCES fj_resume_versions(id) ON DELETE CASCADE,
+  CHECK (linked_by IN ('ai_extraction', 'user', 'derived', 'migration'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_question_resume_links_resume
+  ON fj_question_resume_links(resume_version_id, question_id);
+
+CREATE TABLE IF NOT EXISTS fj_profile_question_evidence (
+  id TEXT PRIMARY KEY,
+  question_id TEXT NOT NULL,
+  source_id TEXT,
+  resume_version_id TEXT,
+  source_excerpt TEXT NOT NULL,
+  extraction_method TEXT NOT NULL DEFAULT 'ai',
+  confidence REAL NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (question_id) REFERENCES fj_profile_questions(id) ON DELETE CASCADE,
+  FOREIGN KEY (source_id) REFERENCES fj_profile_sources(id) ON DELETE SET NULL,
+  FOREIGN KEY (resume_version_id) REFERENCES fj_resume_versions(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_profile_question_evidence_question
+  ON fj_profile_question_evidence(question_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_profile_qa_revisions (
+  id TEXT PRIMARY KEY,
+  question_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  answer_json TEXT NOT NULL,
+  source_type TEXT NOT NULL DEFAULT 'user',
+  status TEXT NOT NULL DEFAULT 'current',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (question_id) REFERENCES fj_profile_questions(id) ON DELETE CASCADE,
+  UNIQUE (question_id, revision),
+  CHECK (source_type IN ('user', 'ai_extraction', 'restored', 'migration')),
+  CHECK (status IN ('current', 'history'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_profile_qa_revisions_question
+  ON fj_profile_qa_revisions(question_id, revision DESC);
+
+CREATE TABLE IF NOT EXISTS fj_profile_qa_templates (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  question_key TEXT NOT NULL,
+  question_text TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  answer_type TEXT NOT NULL DEFAULT 'text',
+  required_stage TEXT NOT NULL DEFAULT 'chat',
+  priority TEXT NOT NULL DEFAULT 'medium',
+  writes_to_field TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  source_type TEXT NOT NULL DEFAULT 'system',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+  UNIQUE (profile_id, question_key),
+  CHECK (source_type IN ('system', 'user')),
+  CHECK (enabled IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_profile_qa_templates_profile
+  ON fj_profile_qa_templates(profile_id, enabled, sort_order, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_profile_issues_v3 (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  resume_version_id TEXT,
+  source_id TEXT,
+  operation_run_id TEXT,
+  issue_type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  source_excerpt TEXT NOT NULL DEFAULT '',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  resolved_at TEXT,
+  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+  FOREIGN KEY (resume_version_id) REFERENCES fj_resume_versions(id) ON DELETE SET NULL,
+  FOREIGN KEY (source_id) REFERENCES fj_profile_sources(id) ON DELETE SET NULL,
+  FOREIGN KEY (operation_run_id) REFERENCES fj_resume_analysis_operations(id) ON DELETE SET NULL,
+  CHECK (issue_type IN ('uncertain_fact', 'fact_conflict', 'missing_information', 'missing_qa', 'qa_conflict', 'orphaned_profile_data', 'analysis_choice')),
+  CHECK (status IN ('pending', 'organizing', 'awaiting_confirmation', 'resolved', 'dismissed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_profile_issues_v3_profile
+  ON fj_profile_issues_v3(profile_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_profile_issue_answers (
+  id TEXT PRIMARY KEY,
+  issue_id TEXT NOT NULL,
+  answer_text TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (issue_id) REFERENCES fj_profile_issues_v3(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_profile_issue_answers_issue
+  ON fj_profile_issue_answers(issue_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_profile_issue_change_sets (
+  id TEXT PRIMARY KEY,
+  issue_id TEXT NOT NULL,
+  answer_id TEXT NOT NULL,
+  changes_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'draft',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  applied_at TEXT,
+  FOREIGN KEY (issue_id) REFERENCES fj_profile_issues_v3(id) ON DELETE CASCADE,
+  FOREIGN KEY (answer_id) REFERENCES fj_profile_issue_answers(id) ON DELETE CASCADE,
+  CHECK (status IN ('draft', 'applied', 'discarded'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_profile_issue_change_sets_issue
+  ON fj_profile_issue_change_sets(issue_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_profile_context_heads (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  resume_version_id TEXT NOT NULL,
+  view_type TEXT NOT NULL,
+  current_revision_id TEXT,
+  dependency_versions_json TEXT NOT NULL DEFAULT '{}',
+  stale INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+  FOREIGN KEY (resume_version_id) REFERENCES fj_resume_versions(id) ON DELETE CASCADE,
+  UNIQUE (profile_id, resume_version_id, view_type),
+  CHECK (view_type IN ('full', 'search', 'evaluation', 'chat')),
+  CHECK (stale IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS fj_profile_context_revisions (
+  id TEXT PRIMARY KEY,
+  head_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  source_type TEXT NOT NULL DEFAULT 'generated',
+  status TEXT NOT NULL DEFAULT 'draft',
+  dependency_versions_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (head_id) REFERENCES fj_profile_context_heads(id) ON DELETE CASCADE,
+  UNIQUE (head_id, revision),
+  CHECK (source_type IN ('generated', 'user_edit', 'restored', 'migration')),
+  CHECK (status IN ('draft', 'current', 'history'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_profile_context_revisions_head
+  ON fj_profile_context_revisions(head_id, revision DESC);
+
+CREATE TABLE IF NOT EXISTS fj_filter_strategy_search_keywords (
+  id TEXT PRIMARY KEY,
+  filter_strategy_id TEXT NOT NULL,
+  keyword TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  source_type TEXT NOT NULL DEFAULT 'user',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (filter_strategy_id) REFERENCES fj_job_filter_strategies(id) ON DELETE CASCADE,
+  CHECK (enabled IN (0, 1)),
+  CHECK (source_type IN ('user', 'ai', 'migration'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_filter_strategy_keywords_strategy
+  ON fj_filter_strategy_search_keywords(filter_strategy_id, sort_order, created_at);
+
+CREATE TABLE IF NOT EXISTS fj_strategy_change_sets (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL,
+  resume_version_id TEXT NOT NULL,
+  strategy_type TEXT NOT NULL,
+  target_strategy_id TEXT,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'draft',
+  operation_run_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  applied_at TEXT,
+  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+  FOREIGN KEY (resume_version_id) REFERENCES fj_resume_versions(id) ON DELETE CASCADE,
+  CHECK (strategy_type IN ('filter', 'recommendation', 'search_keywords')),
+  CHECK (status IN ('draft', 'applied', 'discarded'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_strategy_change_sets_profile
+  ON fj_strategy_change_sets(profile_id, status, updated_at DESC);
 """
 
 
@@ -951,7 +1723,10 @@ class Database:
             self._ensure_fj_boss_job_columns(connection)
             self._ensure_fj_delivery_strategy_columns(connection)
             self._ensure_fj_boss_executor_schema(connection)
+            self._ensure_fj_company_governance_schema(connection)
             self._ensure_codex_integration_schema(connection)
+            self._ensure_resume_analysis_v2_schema(connection)
+            self._ensure_resume_analysis_v3_schema(connection)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -1151,6 +1926,10 @@ class Database:
             "delivery_evaluation_json": (
                 "ALTER TABLE fj_boss_jobs ADD COLUMN delivery_evaluation_json TEXT"
             ),
+            "search_keyword": (
+                "ALTER TABLE fj_boss_jobs ADD COLUMN search_keyword TEXT NOT NULL DEFAULT ''"
+            ),
+            "company_id": "ALTER TABLE fj_boss_jobs ADD COLUMN company_id TEXT",
         }
         for column, ddl in migrations.items():
             if column not in columns:
@@ -1180,6 +1959,111 @@ class Database:
                     row["company_industry"] or str(payload.get("company_industry") or ""),
                     row["welfare"] or str(payload.get("welfare") or ""),
                     row["id"],
+                ),
+            )
+
+    def _ensure_fj_company_governance_schema(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """补齐公司治理、投递事实和筛选冷却字段，并关联已有岗位。"""
+        strategy_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(fj_job_filter_strategies)")
+        }
+        if "cooldown_rules_json" not in strategy_columns:
+            connection.execute(
+                "ALTER TABLE fj_job_filter_strategies ADD COLUMN cooldown_rules_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fj_boss_jobs_company_id ON fj_boss_jobs(company_id)"
+        )
+
+        # 旧库执行 DDL 时不会替换已有表，这里保证新增治理表完整存在。
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS fj_companies (
+              id TEXT PRIMARY KEY, canonical_name TEXT NOT NULL,
+              normalized_name TEXT NOT NULL UNIQUE,
+              company_type TEXT NOT NULL DEFAULT 'unknown',
+              classification_source TEXT NOT NULL DEFAULT 'capture',
+              notes TEXT NOT NULL DEFAULT '', is_blacklisted INTEGER NOT NULL DEFAULT 0,
+              blacklist_reason TEXT NOT NULL DEFAULT '', blacklisted_at TEXT,
+              version INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_fj_companies_type_blacklisted
+              ON fj_companies(company_type, is_blacklisted, updated_at DESC);
+            CREATE TABLE IF NOT EXISTS fj_company_aliases (
+              id TEXT PRIMARY KEY, company_id TEXT NOT NULL,
+              alias_name TEXT NOT NULL, normalized_alias TEXT NOT NULL UNIQUE,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_fj_company_aliases_company
+              ON fj_company_aliases(company_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS fj_job_applications (
+              id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE, company_id TEXT,
+              status TEXT NOT NULL DEFAULT 'applied', source TEXT NOT NULL DEFAULT 'manual',
+              source_action_id TEXT, evidence_level TEXT NOT NULL DEFAULT 'confirmed',
+              applied_at TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+              FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_fj_job_applications_status_time
+              ON fj_job_applications(status, applied_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_fj_job_applications_company
+              ON fj_job_applications(company_id, status, applied_at DESC);
+            CREATE TABLE IF NOT EXISTS fj_filter_exclusion_states (
+              strategy_id TEXT PRIMARY KEY, strategy_version INTEGER NOT NULL,
+              status TEXT NOT NULL DEFAULT 'stale', last_full_refreshed_at TEXT,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (strategy_id) REFERENCES fj_job_filter_strategies(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS fj_filter_exclusion_entries (
+              id TEXT PRIMARY KEY, strategy_id TEXT NOT NULL,
+              entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
+              rule_type TEXT NOT NULL, source_event_at TEXT, excluded_until TEXT,
+              reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (strategy_id) REFERENCES fj_job_filter_strategies(id) ON DELETE CASCADE,
+              UNIQUE (strategy_id, entity_type, entity_id, rule_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_fj_filter_exclusion_entries_active
+              ON fj_filter_exclusion_entries(strategy_id, entity_type, entity_id, excluded_until);
+            """
+        )
+
+        # 每次初始化按最新包含规则校正旧岗位，已有外包配置升级后立即生效。
+        from backend.app.services.fine_job.companies import reconcile_job_companies
+
+        reconcile_job_companies(connection, source="migration")
+        now = connection.execute(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now') AS value"
+        ).fetchone()["value"]
+
+        # 已成功发送的打招呼动作迁移为已投递事实。
+        action_rows = connection.execute(
+            """
+            SELECT a.id, a.job_id, COALESCE(a.completed_at, a.updated_at) AS applied_at,
+                   j.company_id
+            FROM fj_automation_actions a
+            JOIN fj_boss_jobs j ON j.id = a.job_id
+            WHERE a.status = 'succeeded'
+            """
+        ).fetchall()
+        for row in action_rows:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO fj_job_applications (
+                  id, job_id, company_id, status, source, source_action_id,
+                  evidence_level, applied_at, note, created_at, updated_at
+                ) VALUES (?, ?, ?, 'applied', 'migration', ?, 'confirmed', ?, '', ?, ?)
+                """,
+                (
+                    str(uuid4()), row["job_id"], row["company_id"], row["id"],
+                    row["applied_at"] or now, now, now,
                 ),
             )
 
@@ -1344,6 +2228,9 @@ class Database:
     def _ensure_codex_integration_schema(self, connection: sqlite3.Connection) -> None:
         """补齐 Codex 聚合上下文、授权和失效判断使用的业务版本字段。"""
         migrations = {
+            "fj_profile_analysis_runs": {
+                "error_category": "ALTER TABLE fj_profile_analysis_runs ADD COLUMN error_category TEXT",
+            },
             "fj_resumes": {
                 "facts_version": "ALTER TABLE fj_resumes ADD COLUMN facts_version INTEGER NOT NULL DEFAULT 1",
             },
@@ -1354,12 +2241,18 @@ class Database:
                 "job_detail_version": "ALTER TABLE fj_job_evaluations ADD COLUMN job_detail_version INTEGER NOT NULL DEFAULT 1",
                 "resume_facts_version": "ALTER TABLE fj_job_evaluations ADD COLUMN resume_facts_version INTEGER NOT NULL DEFAULT 1",
                 "structure_version": "ALTER TABLE fj_job_evaluations ADD COLUMN structure_version INTEGER NOT NULL DEFAULT 1",
+                "candidate_profile_id": "ALTER TABLE fj_job_evaluations ADD COLUMN candidate_profile_id TEXT",
+                "profile_context_version": "ALTER TABLE fj_job_evaluations ADD COLUMN profile_context_version INTEGER",
+                "resume_version_id": "ALTER TABLE fj_job_evaluations ADD COLUMN resume_version_id TEXT",
             },
             "fj_review_items": {
                 "version": "ALTER TABLE fj_review_items ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
                 "content_categories_json": "ALTER TABLE fj_review_items ADD COLUMN content_categories_json TEXT NOT NULL DEFAULT '[]'",
                 "classification_version": "ALTER TABLE fj_review_items ADD COLUMN classification_version INTEGER NOT NULL DEFAULT 1",
                 "authorization_mode": "ALTER TABLE fj_review_items ADD COLUMN authorization_mode TEXT NOT NULL DEFAULT 'manual_confirmation'",
+                "candidate_profile_id": "ALTER TABLE fj_review_items ADD COLUMN candidate_profile_id TEXT",
+                "profile_context_version": "ALTER TABLE fj_review_items ADD COLUMN profile_context_version INTEGER",
+                "resume_version_id": "ALTER TABLE fj_review_items ADD COLUMN resume_version_id TEXT",
             },
             "fj_automation_actions": {
                 "authorization_mode": "ALTER TABLE fj_automation_actions ADD COLUMN authorization_mode TEXT NOT NULL DEFAULT 'manual_confirmation'",
@@ -1371,6 +2264,8 @@ class Database:
                 "text_version": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN text_version INTEGER NOT NULL DEFAULT 1",
                 "content_categories_json": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN content_categories_json TEXT NOT NULL DEFAULT '[]'",
                 "classification_version": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN classification_version INTEGER NOT NULL DEFAULT 1",
+                "candidate_profile_id": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN candidate_profile_id TEXT",
+                "profile_context_version": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN profile_context_version INTEGER",
             },
             "fj_chat_send_actions": {
                 "authorization_mode": "ALTER TABLE fj_chat_send_actions ADD COLUMN authorization_mode TEXT NOT NULL DEFAULT 'manual_confirmation'",
@@ -1386,3 +2281,628 @@ class Database:
             for column, ddl in table_migrations.items():
                 if column not in columns:
                     connection.execute(ddl)
+
+    def _ensure_resume_analysis_v2_schema(self, connection: sqlite3.Connection) -> None:
+        """补齐简历组、资料作用域和派生版本使用的 V2 字段。"""
+        migrations = {
+            "fj_profile_sources": {
+                "resume_family_id": "ALTER TABLE fj_profile_sources ADD COLUMN resume_family_id TEXT",
+                "editable_text": "ALTER TABLE fj_profile_sources ADD COLUMN editable_text TEXT NOT NULL DEFAULT ''",
+            },
+            "fj_resume_versions": {
+                "resume_family_id": "ALTER TABLE fj_resume_versions ADD COLUMN resume_family_id TEXT",
+                "parent_version_id": "ALTER TABLE fj_resume_versions ADD COLUMN parent_version_id TEXT",
+                "version_type": "ALTER TABLE fj_resume_versions ADD COLUMN version_type TEXT NOT NULL DEFAULT 'base'",
+                "target_job_id": "ALTER TABLE fj_resume_versions ADD COLUMN target_job_id TEXT",
+                "derived_reason": "ALTER TABLE fj_resume_versions ADD COLUMN derived_reason TEXT NOT NULL DEFAULT ''",
+                "based_on_content_version": "ALTER TABLE fj_resume_versions ADD COLUMN based_on_content_version INTEGER NOT NULL DEFAULT 1",
+            },
+            "fj_resume_families": {
+                "base_version_id": "ALTER TABLE fj_resume_families ADD COLUMN base_version_id TEXT",
+            },
+            "fj_profile_facts": {
+                "scope_type": "ALTER TABLE fj_profile_facts ADD COLUMN scope_type TEXT NOT NULL DEFAULT 'general'",
+                "scope_id": "ALTER TABLE fj_profile_facts ADD COLUMN scope_id TEXT",
+                "confirmed_by": "ALTER TABLE fj_profile_facts ADD COLUMN confirmed_by TEXT",
+                "analysis_operation_run_id": "ALTER TABLE fj_profile_facts ADD COLUMN analysis_operation_run_id TEXT",
+                "source_content_version": "ALTER TABLE fj_profile_facts ADD COLUMN source_content_version INTEGER",
+            },
+            "fj_profile_questions": {
+                "scope_type": "ALTER TABLE fj_profile_questions ADD COLUMN scope_type TEXT NOT NULL DEFAULT 'general'",
+                "scope_id": "ALTER TABLE fj_profile_questions ADD COLUMN scope_id TEXT",
+                "scope_key": "ALTER TABLE fj_profile_questions ADD COLUMN scope_key TEXT NOT NULL DEFAULT 'general'",
+                "confirmed_by": "ALTER TABLE fj_profile_questions ADD COLUMN confirmed_by TEXT",
+                "analysis_operation_run_id": "ALTER TABLE fj_profile_questions ADD COLUMN analysis_operation_run_id TEXT",
+                "source_content_version": "ALTER TABLE fj_profile_questions ADD COLUMN source_content_version INTEGER",
+            },
+            "fj_profile_artifacts": {
+                "context_scope_id": "ALTER TABLE fj_profile_artifacts ADD COLUMN context_scope_id TEXT",
+            },
+            "fj_resume_search_keywords": {
+                "version": "ALTER TABLE fj_resume_search_keywords ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
+                "status": "ALTER TABLE fj_resume_search_keywords ADD COLUMN status TEXT NOT NULL DEFAULT 'current'",
+            },
+        }
+        for table, table_migrations in migrations.items():
+            columns = {
+                row["name"] for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            for column, ddl in table_migrations.items():
+                if column not in columns:
+                    connection.execute(ddl)
+
+        # 旧数据优先沿用组内默认版本，其次采用最早的基础版本。
+        connection.execute(
+            """
+            UPDATE fj_resume_families
+            SET base_version_id = COALESCE(
+              base_version_id,
+              default_version_id,
+              (
+                SELECT v.id FROM fj_resume_versions v
+                WHERE v.resume_family_id = fj_resume_families.id
+                  AND v.version_type = 'base'
+                ORDER BY v.created_at, v.id
+                LIMIT 1
+              )
+            )
+            WHERE base_version_id IS NULL
+            """
+        )
+
+        # 识别稿默认采用当前识别正文，保证旧资料可以直接进入 V2 编辑流程。
+        connection.execute(
+            """
+            UPDATE fj_profile_sources
+            SET editable_text = CASE
+              WHEN editable_text <> '' THEN editable_text
+              WHEN recognized_text <> '' THEN recognized_text
+              ELSE raw_text
+            END
+            """
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO fj_resume_families (
+              id, profile_id, name, root_source_id, target_role_family,
+              content_version, analysis_version, status, created_at, updated_at
+            )
+            SELECT 'family_' || id, profile_id, title, id, '', source_version, 0,
+                   'active', created_at, updated_at
+            FROM fj_profile_sources
+            WHERE source_type = 'pdf'
+            """
+        )
+        connection.execute(
+            """
+            UPDATE fj_profile_sources
+            SET resume_family_id = 'family_' || id
+            WHERE source_type = 'pdf' AND resume_family_id IS NULL
+            """
+        )
+        connection.execute(
+            """
+            UPDATE fj_resume_versions
+            SET resume_family_id = (
+              SELECT resume_family_id FROM fj_profile_sources
+              WHERE fj_profile_sources.id = fj_resume_versions.source_id
+            )
+            WHERE resume_family_id IS NULL AND source_id IS NOT NULL
+            """
+        )
+        connection.execute(
+            """
+            UPDATE fj_profile_questions
+            SET scope_type = 'resume_family',
+                scope_id = (
+                  SELECT resume_family_id FROM fj_profile_sources
+                  WHERE fj_profile_sources.id = fj_profile_questions.source_id
+                ),
+                scope_key = (
+                  SELECT resume_family_id FROM fj_profile_sources
+                  WHERE fj_profile_sources.id = fj_profile_questions.source_id
+                )
+            WHERE source_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1 FROM fj_profile_sources
+                WHERE fj_profile_sources.id = fj_profile_questions.source_id
+                  AND resume_family_id IS NOT NULL
+              )
+            """
+        )
+        self._rebuild_profile_questions_scope_constraint(connection)
+
+    def _rebuild_profile_questions_scope_constraint(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """将旧版问题唯一键升级为“档案 + 作用域 + 问题键”。"""
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fj_profile_questions'"
+        ).fetchone()
+        table_sql = str(row["sql"] or "") if row else ""
+        if "UNIQUE (profile_id, question_key)" not in table_sql:
+            return
+
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            connection.execute(
+                """
+                CREATE TABLE fj_profile_questions_v2 (
+                  id TEXT PRIMARY KEY,
+                  profile_id TEXT NOT NULL,
+                  scope_type TEXT NOT NULL DEFAULT 'general',
+                  scope_id TEXT,
+                  scope_key TEXT NOT NULL DEFAULT 'general',
+                  question_key TEXT NOT NULL,
+                  question_text TEXT NOT NULL,
+                  reason TEXT NOT NULL DEFAULT '',
+                  origin TEXT NOT NULL DEFAULT 'user',
+                  answer_type TEXT NOT NULL DEFAULT 'text',
+                  required_stage TEXT NOT NULL DEFAULT 'chat',
+                  priority TEXT NOT NULL DEFAULT 'medium',
+                  proposed_answer_json TEXT,
+                  final_answer_json TEXT,
+                  status TEXT NOT NULL DEFAULT 'pending',
+                  external_use TEXT NOT NULL DEFAULT 'prohibited',
+                  valid_until TEXT,
+                  source_id TEXT,
+                  job_id TEXT,
+                  writes_to_field TEXT,
+                  enabled INTEGER NOT NULL DEFAULT 1,
+                  confirmed_by TEXT,
+                  analysis_operation_run_id TEXT,
+                  source_content_version INTEGER,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  FOREIGN KEY (profile_id) REFERENCES fj_candidate_profiles(id) ON DELETE CASCADE,
+                  FOREIGN KEY (source_id) REFERENCES fj_profile_sources(id) ON DELETE SET NULL,
+                  UNIQUE (profile_id, scope_key, question_key),
+                  CHECK (scope_type IN ('general', 'resume_family')),
+                  CHECK (origin IN ('default', 'resume_analysis', 'jd_analysis', 'user')),
+                  CHECK (answer_type IN ('text', 'number', 'date', 'range', 'select', 'multi_select', 'boolean')),
+                  CHECK (required_stage IN ('search', 'greeting', 'application', 'chat', 'interview')),
+                  CHECK (priority IN ('high', 'medium', 'low')),
+                  CHECK (status IN ('pending', 'proposed_answer', 'answered', 'confirmed', 'declined', 'conflicted', 'stale')),
+                  CHECK (external_use IN ('prohibited', 'summary_only', 'allowed')),
+                  CHECK (enabled IN (0, 1))
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO fj_profile_questions_v2 (
+                  id, profile_id, scope_type, scope_id, scope_key, question_key,
+                  question_text, reason, origin, answer_type, required_stage,
+                  priority, proposed_answer_json, final_answer_json, status,
+                  external_use, valid_until, source_id, job_id, writes_to_field,
+                  enabled, confirmed_by, analysis_operation_run_id,
+                  source_content_version, created_at, updated_at
+                )
+                SELECT id, profile_id, scope_type, scope_id,
+                       CASE WHEN scope_type = 'resume_family' AND scope_id IS NOT NULL
+                            THEN scope_id ELSE 'general' END,
+                       question_key, question_text, reason, origin, answer_type,
+                       required_stage, priority, proposed_answer_json,
+                       final_answer_json, status, external_use, valid_until,
+                       source_id, job_id, writes_to_field, enabled, confirmed_by,
+                       analysis_operation_run_id, source_content_version,
+                       created_at, updated_at
+                FROM fj_profile_questions
+                """
+            )
+            connection.execute("DROP TABLE fj_profile_questions")
+            connection.execute("ALTER TABLE fj_profile_questions_v2 RENAME TO fj_profile_questions")
+            connection.execute(
+                """
+                CREATE INDEX idx_fj_profile_questions_profile
+                ON fj_profile_questions(profile_id, enabled, priority, updated_at DESC)
+                """
+            )
+            connection.commit()
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
+
+    def _ensure_resume_analysis_v3_schema(self, connection: sqlite3.Connection) -> None:
+        """补齐 V3 的具体简历关联、上下文修订和下游快照字段。"""
+        migrations = {
+            "fj_profile_sources": {
+                "resume_version_id": "ALTER TABLE fj_profile_sources ADD COLUMN resume_version_id TEXT",
+            },
+            "fj_resume_families": {
+                "default_delivery_version_id": "ALTER TABLE fj_resume_families ADD COLUMN default_delivery_version_id TEXT",
+            },
+            "fj_resume_versions": {
+                "current_role": "ALTER TABLE fj_resume_versions ADD COLUMN current_role TEXT NOT NULL DEFAULT 'derived'",
+                "origin_type": "ALTER TABLE fj_resume_versions ADD COLUMN origin_type TEXT NOT NULL DEFAULT 'manual_copy'",
+                "derived_from_version_id": "ALTER TABLE fj_resume_versions ADD COLUMN derived_from_version_id TEXT",
+                "target_job_snapshot_json": "ALTER TABLE fj_resume_versions ADD COLUMN target_job_snapshot_json TEXT NOT NULL DEFAULT '{}'",
+                "deleted_at": "ALTER TABLE fj_resume_versions ADD COLUMN deleted_at TEXT",
+            },
+            "fj_profile_facts": {
+                "applies_to_all_resumes": "ALTER TABLE fj_profile_facts ADD COLUMN applies_to_all_resumes INTEGER NOT NULL DEFAULT 0",
+            },
+            "fj_profile_questions": {
+                "applies_to_all_resumes": "ALTER TABLE fj_profile_questions ADD COLUMN applies_to_all_resumes INTEGER NOT NULL DEFAULT 0",
+            },
+            "fj_resume_analysis_runs": {
+                "resume_version_id": "ALTER TABLE fj_resume_analysis_runs ADD COLUMN resume_version_id TEXT",
+            },
+            "fj_job_filter_strategies": {
+                "candidate_profile_id": "ALTER TABLE fj_job_filter_strategies ADD COLUMN candidate_profile_id TEXT",
+                "resume_version_id": "ALTER TABLE fj_job_filter_strategies ADD COLUMN resume_version_id TEXT",
+                "source_type": "ALTER TABLE fj_job_filter_strategies ADD COLUMN source_type TEXT NOT NULL DEFAULT 'user'",
+                "strategy_version": "ALTER TABLE fj_job_filter_strategies ADD COLUMN strategy_version INTEGER NOT NULL DEFAULT 1",
+                "based_on_analysis_run_id": "ALTER TABLE fj_job_filter_strategies ADD COLUMN based_on_analysis_run_id TEXT",
+                "based_on_resume_content_version": "ALTER TABLE fj_job_filter_strategies ADD COLUMN based_on_resume_content_version INTEGER",
+                "based_on_facts_version": "ALTER TABLE fj_job_filter_strategies ADD COLUMN based_on_facts_version INTEGER",
+                "based_on_qa_version": "ALTER TABLE fj_job_filter_strategies ADD COLUMN based_on_qa_version INTEGER",
+            },
+            "fj_job_recommendation_strategies": {
+                "candidate_profile_id": "ALTER TABLE fj_job_recommendation_strategies ADD COLUMN candidate_profile_id TEXT",
+                "resume_version_id": "ALTER TABLE fj_job_recommendation_strategies ADD COLUMN resume_version_id TEXT",
+                "source_type": "ALTER TABLE fj_job_recommendation_strategies ADD COLUMN source_type TEXT NOT NULL DEFAULT 'user'",
+                "strategy_version": "ALTER TABLE fj_job_recommendation_strategies ADD COLUMN strategy_version INTEGER NOT NULL DEFAULT 1",
+                "based_on_analysis_run_id": "ALTER TABLE fj_job_recommendation_strategies ADD COLUMN based_on_analysis_run_id TEXT",
+                "based_on_resume_content_version": "ALTER TABLE fj_job_recommendation_strategies ADD COLUMN based_on_resume_content_version INTEGER",
+                "based_on_facts_version": "ALTER TABLE fj_job_recommendation_strategies ADD COLUMN based_on_facts_version INTEGER",
+                "based_on_qa_version": "ALTER TABLE fj_job_recommendation_strategies ADD COLUMN based_on_qa_version INTEGER",
+            },
+            "fj_job_evaluations": {
+                "context_revision_id": "ALTER TABLE fj_job_evaluations ADD COLUMN context_revision_id TEXT",
+                "filter_strategy_version": "ALTER TABLE fj_job_evaluations ADD COLUMN filter_strategy_version INTEGER",
+                "recommendation_strategy_version": "ALTER TABLE fj_job_evaluations ADD COLUMN recommendation_strategy_version INTEGER",
+                "profile_facts_version": "ALTER TABLE fj_job_evaluations ADD COLUMN profile_facts_version INTEGER",
+                "profile_questions_version": "ALTER TABLE fj_job_evaluations ADD COLUMN profile_questions_version INTEGER",
+                "candidate_snapshot_json": "ALTER TABLE fj_job_evaluations ADD COLUMN candidate_snapshot_json TEXT NOT NULL DEFAULT '{}'",
+            },
+            "fj_review_items": {
+                "context_revision_id": "ALTER TABLE fj_review_items ADD COLUMN context_revision_id TEXT",
+            },
+            "fj_chat_sessions": {
+                "candidate_profile_id": "ALTER TABLE fj_chat_sessions ADD COLUMN candidate_profile_id TEXT",
+                "resume_version_id": "ALTER TABLE fj_chat_sessions ADD COLUMN resume_version_id TEXT",
+                "context_revision_id": "ALTER TABLE fj_chat_sessions ADD COLUMN context_revision_id TEXT",
+                "evaluation_id": "ALTER TABLE fj_chat_sessions ADD COLUMN evaluation_id TEXT",
+            },
+            "fj_chat_reply_tasks": {
+                "resume_version_id": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN resume_version_id TEXT",
+                "context_revision_id": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN context_revision_id TEXT",
+            },
+        }
+        for table, table_migrations in migrations.items():
+            columns = {
+                row["name"] for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            for column, ddl in table_migrations.items():
+                if column not in columns:
+                    connection.execute(ddl)
+
+        # 现有基础/派生角色与真实生成来源转换为独立字段。
+        connection.execute(
+            """
+            UPDATE fj_resume_versions
+            SET current_role = CASE
+                  WHEN id IN (
+                    SELECT base_version_id FROM fj_resume_families
+                    WHERE base_version_id IS NOT NULL
+                  ) THEN 'base'
+                  ELSE 'derived'
+                END,
+                origin_type = CASE
+                  WHEN version_type = 'base' THEN 'upload_base'
+                  WHEN source_id IS NOT NULL THEN 'upload_derived'
+                  WHEN version_type = 'jd_tailored' THEN 'ai_derived'
+                  ELSE 'manual_copy'
+                END,
+                derived_from_version_id = COALESCE(derived_from_version_id, parent_version_id)
+            """
+        )
+        connection.execute(
+            """
+            UPDATE fj_profile_sources
+            SET resume_version_id = (
+              SELECT v.id FROM fj_resume_versions v
+              WHERE v.source_id = fj_profile_sources.id
+              ORDER BY CASE v.current_role WHEN 'base' THEN 0 ELSE 1 END,
+                       v.created_at, v.id
+              LIMIT 1
+            )
+            WHERE resume_version_id IS NULL
+            """
+        )
+        connection.execute(
+            """
+            UPDATE fj_resume_analysis_runs
+            SET resume_version_id = (
+              SELECT base_version_id FROM fj_resume_families f
+              WHERE f.id = fj_resume_analysis_runs.resume_family_id
+            )
+            WHERE resume_version_id IS NULL
+            """
+        )
+        # 具体简历已经唯一归属候选人档案，补齐旧策略缺失的档案关联。
+        for strategy_table in (
+            "fj_job_filter_strategies",
+            "fj_job_recommendation_strategies",
+        ):
+            connection.execute(
+                f"""
+                UPDATE {strategy_table}
+                SET candidate_profile_id = (
+                  SELECT v.profile_id FROM fj_resume_versions v
+                  WHERE v.id = {strategy_table}.resume_version_id
+                )
+                WHERE resume_version_id IS NOT NULL
+                  AND COALESCE(candidate_profile_id, '') = ''
+                """
+            )
+
+        # 旧通用作用域迁移为用户可见的“适用全部简历”。
+        connection.execute(
+            "UPDATE fj_profile_facts SET applies_to_all_resumes = 1 WHERE scope_type = 'general'"
+        )
+        connection.execute(
+            "UPDATE fj_profile_questions SET applies_to_all_resumes = 1 WHERE scope_type = 'general' AND origin <> 'default'"
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO fj_fact_resume_links (
+              fact_id, resume_version_id, linked_by, created_at
+            )
+            SELECT f.id,
+                   COALESCE(
+                     (
+                       SELECT v.id
+                       FROM fj_profile_fact_evidence e
+                       JOIN fj_resume_versions v ON v.source_id = e.source_id
+                       WHERE e.fact_id = f.id
+                       ORDER BY v.created_at, v.id LIMIT 1
+                     ),
+                     (
+                       SELECT rf.base_version_id FROM fj_resume_families rf
+                       WHERE rf.id = f.scope_id
+                     )
+                   ),
+                   'migration', f.created_at
+            FROM fj_profile_facts f
+            WHERE f.scope_type = 'resume_family'
+              AND COALESCE(
+                    (
+                      SELECT v.id
+                      FROM fj_profile_fact_evidence e
+                      JOIN fj_resume_versions v ON v.source_id = e.source_id
+                      WHERE e.fact_id = f.id
+                      ORDER BY v.created_at, v.id LIMIT 1
+                    ),
+                    (
+                      SELECT rf.base_version_id FROM fj_resume_families rf
+                      WHERE rf.id = f.scope_id
+                    )
+                  ) IS NOT NULL
+            """
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO fj_question_resume_links (
+              question_id, resume_version_id, linked_by, created_at
+            )
+            SELECT q.id,
+                   COALESCE(
+                     (
+                       SELECT v.id FROM fj_resume_versions v
+                       WHERE v.source_id = q.source_id
+                       ORDER BY v.created_at, v.id LIMIT 1
+                     ),
+                     (
+                       SELECT rf.base_version_id FROM fj_resume_families rf
+                       WHERE rf.id = q.scope_id
+                     )
+                   ),
+                   'migration', q.created_at
+            FROM fj_profile_questions q
+            WHERE q.scope_type = 'resume_family'
+              AND COALESCE(
+                    (
+                      SELECT v.id FROM fj_resume_versions v
+                      WHERE v.source_id = q.source_id
+                      ORDER BY v.created_at, v.id LIMIT 1
+                    ),
+                    (
+                      SELECT rf.base_version_id FROM fj_resume_families rf
+                      WHERE rf.id = q.scope_id
+                    )
+                  ) IS NOT NULL
+            """
+        )
+
+        # 默认问题成为提取模板，避免在正式 QA 中产生通用空记录。
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO fj_profile_qa_templates (
+              id, profile_id, question_key, question_text, reason, answer_type,
+              required_stage, priority, writes_to_field, enabled, sort_order,
+              source_type, created_at, updated_at
+            )
+            SELECT 'template_' || q.profile_id || '_' || q.question_key,
+                   q.profile_id, q.question_key, q.question_text, q.reason,
+                   q.answer_type, q.required_stage, q.priority, q.writes_to_field,
+                   q.enabled, ROW_NUMBER() OVER (
+                     PARTITION BY q.profile_id ORDER BY q.created_at, q.question_key
+                   ), 'system', q.created_at, q.updated_at
+            FROM fj_profile_questions q
+            WHERE q.origin = 'default'
+            """
+        )
+        connection.execute(
+            """
+            DELETE FROM fj_profile_questions
+            WHERE origin = 'default' AND status = 'pending'
+              AND final_answer_json IS NULL AND proposed_answer_json IS NULL
+            """
+        )
+        self._merge_resume_analysis_v3_duplicates(connection)
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO fj_profile_qa_revisions (
+              id, question_id, revision, answer_json, source_type,
+              status, created_at
+            )
+            SELECT 'qa_revision_' || q.id, q.id, 1, q.final_answer_json,
+                   'migration', 'current', q.updated_at
+            FROM fj_profile_questions q
+            WHERE q.final_answer_json IS NOT NULL
+            """
+        )
+
+    def _merge_resume_analysis_v3_duplicates(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """合并旧通用/简历组作用域中内容完全相同的事实和 QA。"""
+        fact_groups = connection.execute(
+            """
+            SELECT GROUP_CONCAT(id) AS ids
+            FROM fj_profile_facts
+            GROUP BY profile_id, domain, entity_type, entity_id, field_key, value_json
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        for group in fact_groups:
+            fact_ids = [item for item in str(group["ids"] or "").split(",") if item]
+            if len(fact_ids) < 2:
+                continue
+            placeholders = ",".join("?" for _ in fact_ids)
+            rows = connection.execute(
+                f"""
+                SELECT id, applies_to_all_resumes FROM fj_profile_facts
+                WHERE id IN ({placeholders})
+                ORDER BY CASE status WHEN 'confirmed' THEN 0 ELSE 1 END,
+                         applies_to_all_resumes DESC, created_at, id
+                """,
+                fact_ids,
+            ).fetchall()
+            canonical_id = str(rows[0]["id"])
+            applies_to_all = any(bool(row["applies_to_all_resumes"]) for row in rows)
+            for row in rows[1:]:
+                duplicate_id = str(row["id"])
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO fj_fact_resume_links (
+                      fact_id, resume_version_id, linked_by, created_at
+                    )
+                    SELECT ?, resume_version_id, linked_by, created_at
+                    FROM fj_fact_resume_links WHERE fact_id = ?
+                    """,
+                    (canonical_id, duplicate_id),
+                )
+                connection.execute(
+                    "UPDATE fj_profile_fact_evidence SET fact_id = ? WHERE fact_id = ?",
+                    (canonical_id, duplicate_id),
+                )
+                connection.execute(
+                    "DELETE FROM fj_profile_facts WHERE id = ?", (duplicate_id,)
+                )
+            connection.execute(
+                "UPDATE fj_profile_facts SET applies_to_all_resumes = ? WHERE id = ?",
+                (1 if applies_to_all else 0, canonical_id),
+            )
+
+        question_groups = connection.execute(
+            """
+            SELECT GROUP_CONCAT(id) AS ids
+            FROM fj_profile_questions
+            WHERE final_answer_json IS NOT NULL
+            GROUP BY profile_id, question_key, final_answer_json
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        for group in question_groups:
+            question_ids = [item for item in str(group["ids"] or "").split(",") if item]
+            if len(question_ids) < 2:
+                continue
+            placeholders = ",".join("?" for _ in question_ids)
+            rows = connection.execute(
+                f"""
+                SELECT id, applies_to_all_resumes FROM fj_profile_questions
+                WHERE id IN ({placeholders})
+                ORDER BY CASE status WHEN 'confirmed' THEN 0 ELSE 1 END,
+                         applies_to_all_resumes DESC, created_at, id
+                """,
+                question_ids,
+            ).fetchall()
+            canonical_id = str(rows[0]["id"])
+            applies_to_all = any(bool(row["applies_to_all_resumes"]) for row in rows)
+            for row in rows[1:]:
+                duplicate_id = str(row["id"])
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO fj_question_resume_links (
+                      question_id, resume_version_id, linked_by, created_at
+                    )
+                    SELECT ?, resume_version_id, linked_by, created_at
+                    FROM fj_question_resume_links WHERE question_id = ?
+                    """,
+                    (canonical_id, duplicate_id),
+                )
+                connection.execute(
+                    "UPDATE fj_profile_question_evidence SET question_id = ? WHERE question_id = ?",
+                    (canonical_id, duplicate_id),
+                )
+                connection.execute(
+                    "UPDATE fj_profile_answer_variants SET question_id = ? WHERE question_id = ?",
+                    (canonical_id, duplicate_id),
+                )
+                connection.execute(
+                    "DELETE FROM fj_profile_qa_revisions WHERE question_id = ?",
+                    (duplicate_id,),
+                )
+                connection.execute(
+                    "DELETE FROM fj_profile_questions WHERE id = ?", (duplicate_id,)
+                )
+            connection.execute(
+                "UPDATE fj_profile_questions SET applies_to_all_resumes = ? WHERE id = ?",
+                (1 if applies_to_all else 0, canonical_id),
+            )
+
+        # 现有筛选策略的关键词数组转换为稳定、有序的词组记录。
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO fj_filter_strategy_search_keywords (
+              id, filter_strategy_id, keyword, reason, enabled, sort_order,
+              source_type, created_at, updated_at
+            )
+            SELECT 'keyword_' || s.id || '_' || j.key,
+                   s.id, CAST(j.value AS TEXT), '', 1, CAST(j.key AS INTEGER),
+                   'migration', s.created_at, s.updated_at
+            FROM fj_job_filter_strategies s, json_each(s.search_keywords_json) j
+            WHERE TRIM(CAST(j.value AS TEXT)) <> ''
+            """
+        )
+
+        # 旧 V2 待处理记录保留到新的回答闭环中。
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO fj_profile_issues_v3 (
+              id, profile_id, resume_version_id, source_id, operation_run_id,
+              issue_type, title, description, source_excerpt, payload_json,
+              status, created_at, updated_at, resolved_at
+            )
+            SELECT 'v3_' || i.id, i.profile_id, f.base_version_id, i.source_id,
+                   i.operation_run_id,
+                   CASE i.issue_type
+                     WHEN 'uncertain_fact' THEN 'uncertain_fact'
+                     WHEN 'conflict' THEN 'fact_conflict'
+                     WHEN 'suggested_question' THEN 'missing_qa'
+                     ELSE 'missing_information'
+                   END,
+                   i.title, i.description, i.source_excerpt, i.payload_json,
+                   CASE i.status WHEN 'resolved' THEN 'resolved'
+                                 WHEN 'dismissed' THEN 'dismissed'
+                                 ELSE 'pending' END,
+                   i.created_at, i.updated_at, i.resolved_at
+            FROM fj_resume_analysis_issues i
+            LEFT JOIN fj_resume_families f ON f.id = i.resume_family_id
+            """
+        )

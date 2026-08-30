@@ -48,6 +48,12 @@ class CodexExecResult:
     event_count: int
 
 
+@dataclass(slots=True)
+class CodexEventFailure:
+    error_category: str
+    error_message: str
+
+
 def resolve_codex_executable(cli_path: str) -> str:
     candidate = (cli_path or "codex").strip()
     if not candidate or any(character in candidate for character in ("\x00", "\r", "\n")):
@@ -93,6 +99,35 @@ def validate_codex_options(*, model: str | None, reasoning_effort: str | None) -
         )
 
 
+def build_codex_process_command(executable: str, arguments: list[str]) -> list[str]:
+    """根据 Codex 入口类型构造可执行的 Windows 启动命令。"""
+    if os.name != "nt":
+        return [executable, *arguments]
+
+    extension = Path(executable).suffix.lower()
+    if extension in {".cmd", ".bat"}:
+        # Windows 批处理入口需要交给 cmd.exe，避免 subprocess 直接启动失败。
+        return [os.environ.get("ComSpec", "cmd.exe"), "/d", "/s", "/c", executable, *arguments]
+    if extension == ".ps1":
+        system_root = os.environ.get("SystemRoot")
+        powershell = (
+            str(Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
+            if system_root
+            else "powershell.exe"
+        )
+        # PowerShell 脚本入口使用与桌面端一致的无配置启动参数。
+        return [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            executable,
+            *arguments,
+        ]
+    return [executable, *arguments]
+
+
 def build_codex_command(
     *,
     executable: str,
@@ -102,8 +137,7 @@ def build_codex_command(
     reasoning_effort: str | None,
 ) -> list[str]:
     validate_codex_options(model=model, reasoning_effort=reasoning_effort)
-    command = [
-        executable,
+    arguments = [
         "exec",
         "--json",
         "--color",
@@ -119,17 +153,20 @@ def build_codex_command(
         str(workdir),
     ]
     if model:
-        command.extend(["--model", model])
+        arguments.extend(["--model", model])
     if reasoning_effort:
-        command.extend(["--config", f'model_reasoning_effort="{reasoning_effort}"'])
-    command.append("-")
-    return command
+        arguments.extend(["--config", f'model_reasoning_effort="{reasoning_effort}"'])
+    arguments.append("-")
+    return build_codex_process_command(executable, arguments)
 
 
 def check_codex_cli(cli_path: str, *, timeout_seconds: int = 10) -> CodexCliStatus:
     try:
         executable = resolve_codex_executable(cli_path)
-        version_process = _run_probe([executable, "--version"], timeout_seconds=timeout_seconds)
+        version_process = _run_probe(
+            build_codex_process_command(executable, ["--version"]),
+            timeout_seconds=timeout_seconds,
+        )
     except AppError as exc:
         return CodexCliStatus(
             ok=False,
@@ -166,7 +203,7 @@ def check_codex_cli(cli_path: str, *, timeout_seconds: int = 10) -> CodexCliStat
         )
 
     help_process = _run_probe(
-        [executable, "exec", "--help"],
+        build_codex_process_command(executable, ["exec", "--help"]),
         timeout_seconds=timeout_seconds,
     )
     help_output = f"{help_process.stdout}\n{help_process.stderr}"
@@ -183,7 +220,7 @@ def check_codex_cli(cli_path: str, *, timeout_seconds: int = 10) -> CodexCliStat
         )
 
     login_process = _run_probe(
-        [executable, "login", "status"],
+        build_codex_process_command(executable, ["login", "status"]),
         timeout_seconds=timeout_seconds,
     )
     login_output = f"{login_process.stdout}\n{login_process.stderr}".strip()
@@ -276,15 +313,46 @@ def run_codex_exec(
                 error_message=f"Failed to start Codex CLI: {_redact(str(exc))}",
             ) from exc
 
+    event_parse_error: AppError | None = None
+    events: list[dict[str, Any]] = []
+    final_message: str | None = None
+    usage: dict[str, Any] | None = None
+    event_failure: CodexEventFailure | None = None
+    try:
+        events, final_message, usage, event_failure = _parse_jsonl_events(stdout)
+    except AppError as exc:
+        event_parse_error = exc
+
+    if event_failure is not None:
+        raise AppError(
+            status_code=502,
+            error_category=event_failure.error_category,
+            error_message=event_failure.error_message,
+        )
+
     if process.returncode != 0:
         category = _classify_process_failure(stderr)
         raise AppError(
             status_code=502,
             error_category=category,
-            error_message=_process_detail(stderr, fallback="Codex execution failed."),
+            error_message=_process_detail(
+                stderr,
+                fallback=(
+                    event_parse_error.error_message
+                    if event_parse_error is not None
+                    else "Codex execution failed."
+                ),
+            ),
         )
 
-    events, final_message, usage = _parse_jsonl_events(stdout)
+    if event_parse_error is not None:
+        raise event_parse_error
+    if final_message is None:
+        raise AppError(
+            status_code=502,
+            error_category="CODEX_EVENT_INVALID",
+            error_message="Codex JSONL stream did not contain a final agent message.",
+        )
     try:
         parsed_output = json.loads(final_message)
     except json.JSONDecodeError as exc:
@@ -359,7 +427,10 @@ def _run_probe(command: list[str], *, timeout_seconds: int) -> subprocess.Comple
 
 def _probe_version(executable: str) -> str:
     try:
-        process = _run_probe([executable, "--version"], timeout_seconds=5)
+        process = _run_probe(
+            build_codex_process_command(executable, ["--version"]),
+            timeout_seconds=5,
+        )
     except (OSError, subprocess.SubprocessError):
         return ""
     return f"{process.stdout}\n{process.stderr}"
@@ -367,10 +438,11 @@ def _probe_version(executable: str) -> str:
 
 def _parse_jsonl_events(
     stdout: str,
-) -> tuple[list[dict[str, Any]], str, dict[str, Any] | None]:
+) -> tuple[list[dict[str, Any]], str | None, dict[str, Any] | None, CodexEventFailure | None]:
     events: list[dict[str, Any]] = []
     final_message: str | None = None
     usage: dict[str, Any] | None = None
+    failure: CodexEventFailure | None = None
     for line_number, line in enumerate(stdout.splitlines(), start=1):
         stripped = line.strip()
         if not stripped:
@@ -392,6 +464,7 @@ def _parse_jsonl_events(
         events.append(event)
         event_type = str(event.get("type") or "")
         item = event.get("item")
+        failure = failure or _extract_event_failure(event)
         if (
             event_type == "item.completed"
             and isinstance(item, dict)
@@ -402,13 +475,50 @@ def _parse_jsonl_events(
         if event_type == "turn.completed" and isinstance(event.get("usage"), dict):
             usage = dict(event["usage"])
 
-    if final_message is None:
+    if final_message is None and failure is None:
         raise AppError(
             status_code=502,
             error_category="CODEX_EVENT_INVALID",
             error_message="Codex JSONL stream did not contain a final agent message.",
         )
-    return events, final_message, usage
+    return events, final_message, usage, failure
+
+
+def _extract_event_failure(event: dict[str, Any]) -> CodexEventFailure | None:
+    event_type = str(event.get("type") or "")
+    item = event.get("item")
+    is_failure_event = event_type in {"error", "turn.failed", "turn.error", "item.failed"}
+    if isinstance(item, dict) and str(item.get("type") or "") in {"error", "failure"}:
+        is_failure_event = True
+    if not is_failure_event:
+        return None
+
+    payload: Any = event.get("error") or event.get("message") or event.get("reason") or item or event
+    message = _extract_failure_message(payload)
+    category = _classify_process_failure(message)
+    if category == "CODEX_PROCESS_FAILED":
+        if event_type == "error":
+            category = "CODEX_EVENT_FAILED"
+        elif event_type in {"turn.failed", "turn.error"}:
+            category = "CODEX_TURN_FAILED"
+    return CodexEventFailure(
+        error_category=category,
+        error_message=_process_detail(message, fallback="Codex reported an execution failure."),
+    )
+
+
+def _extract_failure_message(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("message", "error_message", "detail", "reason", "code"):
+            candidate = value.get(key)
+            if candidate:
+                return _extract_failure_message(candidate)
+        return json.dumps(value, ensure_ascii=False)
+    if value is None:
+        return ""
+    return str(value)
 
 
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
@@ -430,6 +540,19 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
 
 def _classify_process_failure(stderr: str) -> str:
     normalized = stderr.lower()
+    if any(
+        token in normalized
+        for token in (
+            "output schema",
+            "output-schema",
+            "json schema",
+            "jsonschema",
+            "additionalproperties",
+            "required property",
+            "schema validation",
+        )
+    ):
+        return "CODEX_OUTPUT_SCHEMA_INVALID"
     if "not logged in" in normalized or "login" in normalized and "required" in normalized:
         return "CODEX_NOT_AUTHENTICATED"
     if "rate limit" in normalized or "too many requests" in normalized:

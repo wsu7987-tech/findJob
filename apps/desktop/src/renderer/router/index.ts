@@ -11,6 +11,7 @@ import ResumeProfilePage from "@/pages/fine-job/ResumeProfile.vue";
 import ReviewQueuePage from "@/pages/fine-job/ReviewQueue.vue";
 import BossChatPage from "@/pages/fine-job/BossChat.vue";
 import CodexWorkspacePage from "@/pages/fine-job/CodexWorkspace.vue";
+import CompanyManagementPage from "@/pages/fine-job/CompanyManagement.vue";
 
 export const router = createRouter({
   history: createWebHashHistory(),
@@ -29,7 +30,7 @@ export const router = createRouter({
       path: "/fine-job/resumes",
       name: "fine-job-resumes",
       component: ResumeProfilePage,
-      meta: { title: "简历资料" }
+      meta: { title: "求职资料" }
     },
     {
       path: "/fine-job/intent",
@@ -58,6 +59,12 @@ export const router = createRouter({
       name: "fine-job-strategy",
       component: StrategyManagementPage,
       meta: { title: "策略管理" }
+    },
+    {
+      path: "/fine-job/companies",
+      name: "fine-job-companies",
+      component: CompanyManagementPage,
+      meta: { title: "公司管理" }
     },
     {
       path: "/fine-job/runs",

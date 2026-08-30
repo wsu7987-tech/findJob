@@ -2,7 +2,12 @@ import { defineStore } from "pinia";
 import { ref } from "vue";
 
 import { ApiError, NetworkError, api } from "@/services/api";
-import type { FineJobFilterStrategy, FineJobRecommendationStrategy } from "@/types";
+import type {
+  FineJobFilterStrategy,
+  FineJobRecommendationStrategy,
+  FineJobStrategyChangeSet,
+  FineJobStrategySearchKeyword
+} from "@/types";
 
 export const emptyFilterStrategy = (): FineJobFilterStrategy => ({
   name: "",
@@ -27,6 +32,15 @@ export const emptyFilterStrategy = (): FineJobFilterStrategy => ({
   skill_include_all: [],
   skill_exclude: [],
   boss_active_statuses: [],
+  cooldown_rules: {
+    exclude_outsourcing_companies: true,
+    applied_company: { period: "permanent", exclude_outsourcing: true },
+    detailed_company: { period: "days_3", exclude_outsourcing: true },
+    evaluated_company: { period: "days_3", exclude_outsourcing: true },
+    applied_job: { period: "permanent", exclude_outsourcing: false },
+    detailed_job: { period: "days_3", exclude_outsourcing: false },
+    evaluated_job: { period: "days_7", exclude_outsourcing: false }
+  },
   unknown_value_policy: "review",
   notes: ""
 });
@@ -55,6 +69,9 @@ export const useFineJobStrategiesStore = defineStore("fineJobStrategies", () => 
   const loading = ref(false);
   const saving = ref(false);
   const error = ref<string | null>(null);
+  const filterKeywords = ref<FineJobStrategySearchKeyword[]>([]);
+  const filterChangeSets = ref<FineJobStrategyChangeSet[]>([]);
+  const recommendationChangeSets = ref<FineJobStrategyChangeSet[]>([]);
 
   const load = async () => {
     loading.value = true;
@@ -117,17 +134,101 @@ export const useFineJobStrategiesStore = defineStore("fineJobStrategies", () => 
     await load();
   };
 
+  const loadFilterResources = async (strategyId?: string) => {
+    if (!strategyId) {
+      filterKeywords.value = [];
+      filterChangeSets.value = [];
+      return;
+    }
+    const [keywordResponse, changeResponse] = await Promise.all([
+      api.listFineJobStrategySearchKeywords(strategyId),
+      api.listFineJobFilterStrategyChangeSets(strategyId)
+    ]);
+    filterKeywords.value = keywordResponse.keywords;
+    filterChangeSets.value = changeResponse.change_sets;
+  };
+
+  const loadRecommendationChangeSets = async (strategyId?: string) => {
+    recommendationChangeSets.value = strategyId
+      ? (await api.listFineJobRecommendationStrategyChangeSets(strategyId)).change_sets
+      : [];
+  };
+
+  const createFilterKeyword = async (
+    strategyId: string,
+    payload: Pick<FineJobStrategySearchKeyword, "keyword" | "reason" | "enabled" | "sort_order">
+  ) => {
+    await api.createFineJobStrategySearchKeyword(strategyId, payload);
+    await loadFilterResources(strategyId);
+  };
+
+  const updateFilterKeyword = async (strategyId: string, keyword: FineJobStrategySearchKeyword) => {
+    await api.updateFineJobStrategySearchKeyword(strategyId, keyword.id, {
+      keyword: keyword.keyword.trim(),
+      reason: keyword.reason.trim(),
+      enabled: keyword.enabled,
+      sort_order: keyword.sort_order
+    });
+    await loadFilterResources(strategyId);
+  };
+
+  const removeFilterKeyword = async (strategyId: string, keywordId: string) => {
+    await api.deleteFineJobStrategySearchKeyword(strategyId, keywordId);
+    await loadFilterResources(strategyId);
+  };
+
+  const moveFilterKeyword = async (strategyId: string, keywordId: string, offset: -1 | 1) => {
+    const ids = filterKeywords.value.map((item) => item.id);
+    const index = ids.indexOf(keywordId);
+    const target = index + offset;
+    if (index < 0 || target < 0 || target >= ids.length) return;
+    [ids[index], ids[target]] = [ids[target], ids[index]];
+    const response = await api.reorderFineJobStrategySearchKeywords(strategyId, ids);
+    filterKeywords.value = response.keywords;
+  };
+
+  const applyFilterChangeSet = async (
+    strategyId: string,
+    changeSetId: string,
+    mode: "update_current" | "save_as_new"
+  ) => {
+    await api.applyFineJobFilterStrategyChangeSet(strategyId, changeSetId, { mode });
+    await load();
+    await loadFilterResources(strategyId);
+  };
+
+  const applyRecommendationChangeSet = async (
+    strategyId: string,
+    changeSetId: string,
+    mode: "update_current" | "save_as_new"
+  ) => {
+    await api.applyFineJobRecommendationStrategyChangeSet(strategyId, changeSetId, { mode });
+    await load();
+    await loadRecommendationChangeSets(strategyId);
+  };
+
   return {
     filters,
     recommendations,
     loading,
     saving,
     error,
+    filterKeywords,
+    filterChangeSets,
+    recommendationChangeSets,
     load,
     saveFilter,
     removeFilter,
     saveRecommendation,
-    removeRecommendation
+    removeRecommendation,
+    loadFilterResources,
+    loadRecommendationChangeSets,
+    createFilterKeyword,
+    updateFilterKeyword,
+    removeFilterKeyword,
+    moveFilterKeyword,
+    applyFilterChangeSet,
+    applyRecommendationChangeSet
   };
 });
 

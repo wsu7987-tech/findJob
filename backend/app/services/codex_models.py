@@ -4,11 +4,13 @@ import json
 import os
 import subprocess
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 from backend.app.errors import AppError
-from backend.app.services.reasoning.codex_exec import resolve_codex_executable
+from backend.app.services.reasoning.codex_exec import (
+    build_codex_process_command,
+    resolve_codex_executable,
+)
 
 
 MODEL_LIST_TIMEOUT_SECONDS = 15
@@ -63,10 +65,7 @@ def list_codex_models(cli_path: str) -> dict[str, object]:
 
 
 def _build_command(executable: str) -> list[str]:
-    path = Path(executable)
-    if os.name == "nt" and path.suffix.lower() == ".ps1":
-        return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", executable, "debug", "models"]
-    return [executable, "debug", "models"]
+    return build_codex_process_command(executable, ["debug", "models"])
 
 
 def _parse_json_output(output: str) -> object:

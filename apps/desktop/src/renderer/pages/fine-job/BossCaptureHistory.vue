@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { ElMessage } from "element-plus";
+import { ElMessage, ElMessageBox } from "element-plus";
 
+import { ApiError, api } from "@/services/api";
 import { formatDateTime } from "@/services/format";
 import { useFineJobBossCaptureStore } from "@/stores/fineJobBossCapture";
 import { useFineJobBossExecutorStore } from "@/stores/fineJobBossExecutor";
@@ -19,6 +20,7 @@ const recommendationStrategyId = ref<string | null>(null);
 const dateRange = ref<string[]>([]);
 const filters = reactive({
   query: "",
+  searchKeyword: "",
   city: "",
   companyScale: "",
   companyIndustry: "",
@@ -42,6 +44,7 @@ const companyIndustryOptions = ["人工智能", "互联网", "计算机软件", 
 
 const queryPayload = computed(() => ({
   query: filters.query.trim(),
+  search_keyword: filters.searchKeyword.trim(),
   city: filters.city,
   company_scale: filters.companyScale,
   company_industry: filters.companyIndustry,
@@ -83,6 +86,7 @@ const search = async () => {
 const reset = async () => {
   Object.assign(filters, {
     query: "",
+    searchKeyword: "",
     city: "",
     companyScale: "",
     companyIndustry: "",
@@ -139,7 +143,10 @@ const captureHistoryDetails = async (job: FineJobBossHistoryJob) => {
   }
 };
 
-const evaluateHistoryDelivery = async (job: FineJobBossHistoryJob) => {
+const evaluateHistoryDelivery = async (
+  job: FineJobBossHistoryJob,
+  contextStaleAction?: "regenerate" | "use_current" | "cancel"
+) => {
   if (!recommendationStrategyId.value) {
     ElMessage.warning("请先选择岗位建议投递策略");
     return;
@@ -150,11 +157,30 @@ const evaluateHistoryDelivery = async (job: FineJobBossHistoryJob) => {
   }
   try {
     const updated = await historyStore.evaluateDelivery(job.id, {
-      recommendation_strategy_id: recommendationStrategyId.value
+      recommendation_strategy_id: recommendationStrategyId.value,
+      context_stale_action: contextStaleAction
     });
     selectedJob.value = updated;
     ElMessage.success("投递建议已获取");
-  } catch {
+  } catch (errorValue) {
+    if (errorValue instanceof ApiError && errorValue.errorCategory === "CONTEXT_STALE_CONFIRMATION_REQUIRED") {
+      try {
+        await ElMessageBox.confirm(
+          "当前岗位评估上下文已过期。请选择本次任务使用的版本。",
+          "上下文已过期",
+          {
+            type: "warning",
+            confirmButtonText: "重新生成并继续",
+            cancelButtonText: "使用当前版本",
+            distinguishCancelAndClose: true
+          }
+        );
+        await evaluateHistoryDelivery(job, "regenerate");
+      } catch (action) {
+        if (action === "cancel") await evaluateHistoryDelivery(job, "use_current");
+      }
+      return;
+    }
     ElMessage.error(historyStore.error ?? "获取投递建议失败");
   }
 };
@@ -189,6 +215,37 @@ const detailStatusType = (status?: string) => {
   if (status === "failed") return "danger";
   if (status === "queued" || status === "collecting") return "warning";
   return "info";
+};
+
+const filterStatusLabel = (status?: string | null) => ({
+  pass: "通过",
+  review: "待判断",
+  reject: "不通过",
+  exclude: "冷却排除"
+}[status || ""] || "未筛选");
+
+const filterStatusType = (status?: string | null) => {
+  if (status === "pass") return "success";
+  if (status === "review") return "warning";
+  if (status === "reject" || status === "exclude") return "danger";
+  return "info";
+};
+
+const filterStrategyName = (strategyId?: string | null) => {
+  if (!strategyId) return "未关联";
+  return strategiesStore.filters.find((item) => item.id === strategyId)?.name || strategyId;
+};
+
+const toggleApplication = async (job: FineJobBossHistoryJob) => {
+  const applied = job.application_status !== "applied";
+  try {
+    await api.setFineJobJobApplication(job.id, applied, applied ? "历史岗位页面人工标记" : "撤销人工标记");
+    await loadHistory();
+    selectedJob.value = historyStore.items.find((item) => item.id === job.id) ?? selectedJob.value;
+    ElMessage.success(applied ? "已标记为已投递" : "已取消已投递标记");
+  } catch (error) {
+    ElMessage.error((error as Error).message || "投递状态更新失败");
+  }
 };
 
 const deliveryDecisionLabel = (decision?: string) =>
@@ -258,6 +315,9 @@ watch(
         <div class="history-filter-grid">
           <el-form-item label="岗位 / 公司 / 技能">
             <el-input v-model="filters.query" clearable placeholder="输入关键词" @keyup.enter="search" />
+          </el-form-item>
+          <el-form-item label="搜索词">
+            <el-input v-model="filters.searchKeyword" clearable placeholder="最近采集使用的搜索词" @keyup.enter="search" />
           </el-form-item>
           <el-form-item label="城市">
             <el-select v-model="filters.city" filterable clearable placeholder="全部城市">
@@ -356,7 +416,15 @@ watch(
           </template>
         </el-table-column>
         <el-table-column prop="title" label="岗位" min-width="180" show-overflow-tooltip sortable="custom" />
-        <el-table-column prop="boss_name" label="公司" min-width="150" show-overflow-tooltip sortable="custom" />
+        <el-table-column prop="search_keyword" label="搜索词" min-width="130" show-overflow-tooltip />
+        <el-table-column prop="boss_name" label="公司" min-width="190" sortable="custom">
+          <template #default="{ row }">
+            <span>{{ row.boss_name }}</span>
+            <el-tag v-if="row.is_outsourcing_company" type="warning" size="small">外包</el-tag>
+            <el-tag v-if="row.is_blacklisted" type="danger" size="small">黑名单</el-tag>
+            <el-tag v-if="row.application_status === 'applied'" type="info" size="small">已投递</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column prop="company_scale" label="公司规模" width="120" />
         <el-table-column prop="company_industry" label="行业" width="120" show-overflow-tooltip />
         <el-table-column prop="company_stage" label="融资阶段" width="110" />
@@ -371,6 +439,13 @@ watch(
           <template #default="{ row }">{{ formatDateTime(row.last_collected_at) }}</template>
         </el-table-column>
         <el-table-column prop="collect_count" label="次数" width="100" align="center" sortable="custom" />
+        <el-table-column label="筛选" width="100">
+          <template #default="{ row }">
+            <el-tag :type="filterStatusType(row.filter_status)" size="small">
+              {{ filterStatusLabel(row.filter_status) }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="详情" width="110">
           <template #default="{ row }">
             <el-tag :type="detailStatusType(row.detail_status)" size="small">
@@ -378,9 +453,12 @@ watch(
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="285" fixed="right">
+        <el-table-column label="操作" width="355" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click.stop="openDetail(row)">查看详情</el-button>
+            <el-button link :type="row.application_status === 'applied' ? 'info' : 'success'" @click.stop="toggleApplication(row)">
+              {{ row.application_status === "applied" ? "取消已投递" : "标记已投递" }}
+            </el-button>
             <el-button
               link
               type="primary"
@@ -394,7 +472,7 @@ watch(
               link
               type="warning"
               :loading="historyStore.deliveryJobId === row.id"
-              :disabled="historyActionRunning || !recommendationStrategyId"
+              :disabled="historyActionRunning || !recommendationStrategyId || row.cooldown_excluded"
               @click.stop="evaluateHistoryDelivery(row)"
             >
               获取投递详情
@@ -404,7 +482,7 @@ watch(
               link
               type="success"
               :loading="historyStore.detailJobId === row.id"
-              :disabled="historyActionRunning && historyStore.detailJobId !== row.id"
+              :disabled="row.cooldown_excluded || (historyActionRunning && historyStore.detailJobId !== row.id)"
               @click.stop="captureHistoryDetails(row)"
             >
               {{ detailActionLabel(row) }}
@@ -436,13 +514,30 @@ watch(
             <el-tag>{{ selectedJob.salary || "薪资未知" }}</el-tag>
             <el-tag type="info">已采集 {{ selectedJob.collect_count }} 次</el-tag>
             <el-tag :type="detailStatusType(selectedJob.detail_status)">{{ detailStatusLabel(selectedJob.detail_status) }}</el-tag>
+            <el-tag v-if="selectedJob.is_outsourcing_company" type="warning">外包公司</el-tag>
+            <el-tag v-if="selectedJob.is_blacklisted" type="danger">公司黑名单</el-tag>
+            <el-tag v-if="selectedJob.application_status === 'applied'" type="info">已投递</el-tag>
           </div>
         </div>
         <el-divider />
         <h3>采集记录</h3>
+        <p>最近搜索词：{{ selectedJob.search_keyword || "未记录" }}</p>
         <p>首次采集：{{ formatDateTime(selectedJob.first_collected_at) }}</p>
         <p>最后采集：{{ formatDateTime(selectedJob.last_collected_at) }}</p>
         <p v-if="selectedJob.detail_collected_at">详情采集：{{ formatDateTime(selectedJob.detail_collected_at) }}</p>
+        <el-divider />
+        <h3>岗位筛选</h3>
+        <p>
+          结论：
+          <el-tag :type="filterStatusType(selectedJob.filter_status)" size="small">
+            {{ filterStatusLabel(selectedJob.filter_status) }}
+          </el-tag>
+        </p>
+        <p v-if="selectedJob.filter_strategy_id">关联策略：{{ filterStrategyName(selectedJob.filter_strategy_id) }}</p>
+        <p>原因：{{ selectedJob.filter_reasons?.join("；") || "暂无筛选原因" }}</p>
+        <p v-if="selectedJob.filter_missing_fields?.length">
+          缺失信息：{{ selectedJob.filter_missing_fields.join("、") }}
+        </p>
         <el-divider />
         <h3>技能与标签</h3>
         <p>{{ selectedJob.skills || selectedJob.job_labels || selectedJob.tags || "暂无标签" }}</p>
@@ -498,16 +593,19 @@ watch(
           v-if="selectedJob.detail_status === 'completed'"
           type="warning"
           :loading="historyStore.deliveryJobId === selectedJob.id"
-          :disabled="historyActionRunning && historyStore.deliveryJobId !== selectedJob.id || !recommendationStrategyId"
+          :disabled="selectedJob.cooldown_excluded || (historyActionRunning && historyStore.deliveryJobId !== selectedJob.id) || !recommendationStrategyId"
           @click="evaluateHistoryDelivery(selectedJob)"
         >
           {{ selectedJob.delivery_evaluation ? "重新获取投递建议" : "获取投递建议" }}
         </el-button>
         <el-divider />
+        <el-button :type="selectedJob.application_status === 'applied' ? 'info' : 'success'" @click="toggleApplication(selectedJob)">
+          {{ selectedJob.application_status === "applied" ? "取消已投递" : "标记已投递" }}
+        </el-button>
         <el-button
           type="primary"
           :loading="historyStore.detailJobId === selectedJob.id"
-          :disabled="historyActionRunning && historyStore.detailJobId !== selectedJob.id"
+          :disabled="selectedJob.cooldown_excluded || (historyActionRunning && historyStore.detailJobId !== selectedJob.id)"
           @click="captureHistoryDetails(selectedJob)"
         >
           {{ detailActionLabel(selectedJob) }}

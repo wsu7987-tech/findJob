@@ -27,6 +27,10 @@ def record_evaluation_and_route(
     filter_strategy: dict[str, object] | None,
     resume_id: str | None,
     delivery_strategy: dict[str, object] | None,
+    candidate_profile: dict[str, object] | None = None,
+    resume_version_id: str | None = None,
+    context_revision_id: str | None = None,
+    context_dependency_versions: dict[str, object] | None = None,
 ) -> dict[str, object] | None:
     """保存不可变评估，并按已确认的自动化策略路由到审批或执行队列。"""
     job_id = _resolve_history_job_id(db, job)
@@ -38,14 +42,34 @@ def record_evaluation_and_route(
     evaluation_id = new_id()
     decision = str(evaluation.get("decision") or "review")
     source = str(evaluation.get("source") or "rules")
+    candidate_snapshot = {
+        "candidate_profile_id": _optional_text((candidate_profile or {}).get("id")),
+        "profile_versions": (candidate_profile or {}).get("versions") or {},
+        "resume_version_id": _optional_text(resume_version_id),
+        "context_revision_id": _optional_text(context_revision_id),
+        "context_dependencies": context_dependency_versions or {},
+        "filter_strategy": {
+            "id": _optional_text((filter_strategy or {}).get("id")),
+            "version": (filter_strategy or {}).get("strategy_version"),
+        },
+        "recommendation_strategy": {
+            "id": _optional_text(recommendation_strategy.get("id")),
+            "version": recommendation_strategy.get("strategy_version"),
+        },
+    }
+    profile_versions = (candidate_profile or {}).get("versions") or {}
     with db.connect() as connection:
         connection.execute(
             """
             INSERT INTO fj_job_evaluations (
               id, job_id, evaluation_version, recommendation_strategy_id,
               filter_strategy_id, resume_id, source, decision, confidence,
-              evaluation_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              evaluation_json, created_at, candidate_profile_id,
+              profile_context_version, resume_version_id, structure_version,
+              context_revision_id, filter_strategy_version,
+              recommendation_strategy_version, profile_facts_version,
+              profile_questions_version, candidate_snapshot_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 evaluation_id,
@@ -59,6 +83,16 @@ def record_evaluation_and_route(
                 float(evaluation.get("confidence") or 0),
                 _json(evaluation),
                 now,
+                _optional_text((candidate_profile or {}).get("id")),
+                _profile_context_version(candidate_profile),
+                _optional_text(resume_version_id),
+                2 if candidate_profile else 1,
+                _optional_text(context_revision_id),
+                (filter_strategy or {}).get("strategy_version"),
+                recommendation_strategy.get("strategy_version"),
+                profile_versions.get("facts_version") if isinstance(profile_versions, dict) else None,
+                profile_versions.get("questions_version") if isinstance(profile_versions, dict) else None,
+                _json(candidate_snapshot),
             ),
         )
 
@@ -103,8 +137,9 @@ def record_evaluation_and_route(
             INSERT INTO fj_review_items (
               id, job_id, evaluation_id, action_type, status, ai_decision,
               draft_message, final_message, resolution_note, auto_approved,
-              created_at, updated_at, resolved_at
-            ) VALUES (?, ?, ?, 'start_conversation', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              created_at, updated_at, resolved_at, candidate_profile_id,
+              profile_context_version, resume_version_id, context_revision_id
+            ) VALUES (?, ?, ?, 'start_conversation', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 review_id,
@@ -119,6 +154,10 @@ def record_evaluation_and_route(
                 now,
                 now,
                 resolved_at,
+                _optional_text((candidate_profile or {}).get("id")),
+                _profile_context_version(candidate_profile),
+                _optional_text(resume_version_id),
+                _optional_text(context_revision_id),
             ),
         )
 
@@ -178,6 +217,14 @@ def approve_review_item(
     allow_override: bool,
 ) -> tuple[dict[str, object], dict[str, object]]:
     row = _get_review_row(db, review_item_id)
+    from backend.app.services.fine_job.filter_exclusions import assert_job_action_allowed
+    from backend.app.services.fine_job.strategies import get_filter_strategy
+
+    filter_strategy_id = str(row["filter_strategy_id"] or "")
+    filter_strategy = get_filter_strategy(db, filter_strategy_id) if filter_strategy_id else None
+    assert_job_action_allowed(
+        db, str(row["job_id"]), strategy=filter_strategy, action="application"
+    )
     if row["status"] == "rejected" and not allow_override:
         raise AppError(
             status_code=409,
@@ -491,7 +538,7 @@ def _get_review_row(db: Database, review_item_id: str):
         row = connection.execute(
             """
             SELECT r.*, j.title AS job_title, j.company_name, j.job_link,
-                   e.evaluation_json
+                   e.evaluation_json, e.filter_strategy_id
             FROM fj_review_items r
             JOIN fj_boss_jobs j ON j.id = r.job_id
             JOIN fj_job_evaluations e ON e.id = r.evaluation_id
@@ -622,6 +669,16 @@ def _log(db: Database, action_type: str, message: str, *, level: str = "info") -
 def _optional_text(value: object) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _profile_context_version(profile: dict[str, object] | None) -> int | None:
+    if not profile:
+        return None
+    versions = profile.get("versions")
+    if not isinstance(versions, dict):
+        return None
+    value = versions.get("context_version")
+    return int(value) if value is not None else None
 
 
 def _json(value: object) -> str:

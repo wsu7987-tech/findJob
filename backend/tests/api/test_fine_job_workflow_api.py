@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 
 def _create_history_job(configured_client, *, job_id: str, title: str, jd: str) -> dict:
     from backend.app.services.fine_job.boss_capture_history import (
@@ -190,3 +192,82 @@ def test_recommended_job_is_auto_queued_only_with_confirmed_auto_policy(
         "/api/fine-job/automation-actions", params={"status": "queued"}
     ).json()["actions"]
     assert len(queued) == 1
+
+
+def test_evaluation_uses_concrete_resume_context_and_saves_snapshot(
+    configured_client,
+    sqlite_connection,
+) -> None:
+    profile = configured_client.get("/api/fine-job/profiles").json()["profiles"][0]
+    resume = configured_client.post(
+        f"/api/fine-job/profiles/{profile['id']}/resume-versions",
+        json={
+            "name": "岗位评估简历",
+            "version_type": "base",
+            "current_role": "base",
+            "origin_type": "manual_copy",
+            "content": "具备 Python 服务开发经验。",
+            "based_on_content_version": 1,
+        },
+    ).json()["resume_version"]
+    strategy = configured_client.post(
+        "/api/fine-job/strategies/recommendations",
+        json={
+            "name": "资料版本评估",
+            "evaluation_method": "rules",
+            "required_skills": ["Python"],
+            "candidate_profile_id": profile["id"],
+            "resume_version_id": resume["id"],
+        },
+    ).json()["strategy"]
+    job = _create_history_job(
+        configured_client,
+        job_id="workflow-profile-v3",
+        title="Python 开发",
+        jd="负责 Python 服务开发",
+    )
+
+    evaluated = configured_client.post(
+        f"/api/fine-job/boss-capture/history/{job['id']}/delivery-evaluations",
+        json={"recommendation_strategy_id": strategy["id"]},
+    )
+    assert evaluated.status_code == 200
+    row = sqlite_connection.execute(
+        "SELECT * FROM fj_job_evaluations ORDER BY created_at DESC, id DESC LIMIT 1"
+    ).fetchone()
+    assert row["resume_version_id"] == resume["id"]
+    assert row["context_revision_id"]
+    assert row["recommendation_strategy_version"] == strategy["strategy_version"]
+    snapshot = json.loads(row["candidate_snapshot_json"])
+    assert snapshot["resume_version_id"] == resume["id"]
+    assert snapshot["context_revision_id"] == row["context_revision_id"]
+
+    configured_client.post(
+        f"/api/fine-job/profiles/{profile['id']}/facts",
+        json={
+            "domain": "skill",
+            "entity_type": "candidate",
+            "entity_id": "candidate",
+            "field_key": "python",
+            "value": "熟练",
+            "source_type": "manual",
+            "status": "confirmed",
+            "confidence": 1,
+            "confirmed_by": "user",
+            "resume_version_ids": [resume["id"]],
+        },
+    )
+    needs_choice = configured_client.post(
+        f"/api/fine-job/boss-capture/history/{job['id']}/delivery-evaluations",
+        json={"recommendation_strategy_id": strategy["id"]},
+    )
+    assert needs_choice.status_code == 409
+    assert needs_choice.json()["error_category"] == "CONTEXT_STALE_CONFIRMATION_REQUIRED"
+    continued = configured_client.post(
+        f"/api/fine-job/boss-capture/history/{job['id']}/delivery-evaluations",
+        json={
+            "recommendation_strategy_id": strategy["id"],
+            "context_stale_action": "use_current",
+        },
+    )
+    assert continued.status_code == 200

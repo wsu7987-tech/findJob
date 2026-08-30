@@ -86,6 +86,9 @@ const handleCustomKey = (event: KeyboardEvent) => {
     (event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "v";
   if (isPasteShortcut) {
     // 粘贴快捷键由页面读取剪贴板，避免 Electron 中隐藏输入框收不到 Ctrl/Cmd+V。
+    // 阻止浏览器继续派发原生粘贴，避免快捷键处理和 paste 监听各粘贴一次。
+    event.preventDefault();
+    event.stopPropagation();
     void pasteFromClipboard();
     return false;
   }
@@ -95,8 +98,10 @@ const handleCustomKey = (event: KeyboardEvent) => {
 
 // 对外提供终端聚焦能力，供新建会话完成后把输入焦点交给终端。
 const focus = () => terminal?.focus();
+// 只清空终端当前显示内容，不结束 Codex 进程或删除会话数据。
+const clear = () => terminal?.clear();
 
-defineExpose({ copyAll, copySelection, focus, paste: pasteFromClipboard });
+defineExpose({ clear, copyAll, copySelection, focus, paste: pasteFromClipboard });
 
 onMounted(() => {
   if (!host.value) return;

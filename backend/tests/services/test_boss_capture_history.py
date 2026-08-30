@@ -4,6 +4,7 @@ from backend.app.services.fine_job.boss_capture_history import (
     create_capture_batch,
     list_capture_history,
     record_capture_jobs,
+    update_capture_job_filter_result,
     update_capture_job_detail,
 )
 
@@ -129,3 +130,51 @@ def test_capture_history_filters_sorts_paginates_and_saves_detail(test_db) -> No
     completed = next(item for item in result["items"] if item["title"] == "Python 开发")
     assert completed["detail"]["jd"] == "负责 Python 服务开发"
     assert completed["detail_status"] == "completed"
+
+
+def test_capture_history_saves_latest_search_keyword_and_filter_result(test_db) -> None:
+    _create_batch(test_db, "capture-1", "2026-08-18T10:00:00Z")
+    _create_batch(test_db, "capture-2", "2026-08-19T10:00:00Z")
+    job = {
+        "job_id": "job-filter-1",
+        "title": "Python 后端开发",
+        "boss_name": "示例科技",
+        "location": "上海",
+        "detail_status": "not_collected",
+    }
+    recorded = record_capture_jobs(
+        test_db,
+        capture_id="capture-1",
+        search_keyword="Python",
+        jobs=[job],
+        collected_at="2026-08-18T10:01:00Z",
+    )
+    update_capture_job_filter_result(
+        test_db,
+        job=recorded[0],
+        result={
+            "status": "pass",
+            "reasons": ["标题命中 Python"],
+            "missing_fields": [],
+            "strategy_id": "strategy-1",
+        },
+    )
+
+    first = list_capture_history(test_db, search_keyword="Python")["items"][0]
+    assert first["search_keyword"] == "Python"
+    assert first["filter_status"] == "pass"
+    assert first["filter_reasons"] == ["标题命中 Python"]
+    assert first["filter_strategy_id"] == "strategy-1"
+
+    record_capture_jobs(
+        test_db,
+        capture_id="capture-2",
+        search_keyword="后端工程师",
+        jobs=[job],
+        collected_at="2026-08-19T10:01:00Z",
+    )
+    latest = list_capture_history(test_db, search_keyword="后端工程师")["items"][0]
+    assert latest["search_keyword"] == "后端工程师"
+    assert latest["filter_status"] == "pass"
+    assert latest["filter_reasons"] == ["标题命中 Python"]
+    assert list_capture_history(test_db, search_keyword="Python")["total"] == 0

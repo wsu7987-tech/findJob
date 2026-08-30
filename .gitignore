@@ -75,6 +75,10 @@ Thumbs.db
 Desktop.ini
 
 
+/.tmp/
+boss-executor-extension/.output/
+boss-executor-extension/.wxt/
+
 /run-logs/
 /聊天记录.md
 /任务交接.md

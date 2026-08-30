@@ -50,6 +50,7 @@ type DesktopBridgeShape = {
   resumeCodex?: (size?: { cols?: number; rows?: number }) => Promise<{ status: string; runId: string | null }>;
   getCodexState?: () => Promise<{ status: string; runId: string | null }>;
   writeCodex?: (data: string) => void;
+  submitCodexPrompt?: (prompt: string) => Promise<boolean>;
   resizeCodex?: (cols: number, rows: number) => void;
   interruptCodex?: () => void;
   stopCodex?: () => void;

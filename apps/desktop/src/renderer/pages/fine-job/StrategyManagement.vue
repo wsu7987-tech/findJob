@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
+import { api } from "@/services/api";
+import { formatDateTime } from "@/services/format";
 
 import {
   emptyDeliveryStrategy,
   useFineJobDeliveryStrategyStore
 } from "@/stores/fineJobDeliveryStrategy";
 import { useFineJobResumesStore } from "@/stores/fineJobResumes";
+import { useFineJobProfilesStore } from "@/stores/fineJobProfiles";
 import {
   emptyFilterStrategy,
   emptyRecommendationStrategy,
@@ -15,46 +18,89 @@ import {
 import type {
   FineJobDeliveryStrategy,
   FineJobFilterStrategy,
+  FineJobFilterExclusionState,
   FineJobRecommendationStrategy
 } from "@/types";
 
 const strategiesStore = useFineJobStrategiesStore();
 const deliveryStore = useFineJobDeliveryStrategyStore();
 const resumesStore = useFineJobResumesStore();
+const profilesStore = useFineJobProfilesStore();
 const activeTab = ref("filters");
 const filterForm = ref<FineJobFilterStrategy>(emptyFilterStrategy());
 const recommendationForm = ref<FineJobRecommendationStrategy>(emptyRecommendationStrategy());
 const deliveryForm = ref<FineJobDeliveryStrategy>(emptyDeliveryStrategy());
+const keywordDraft = ref({ keyword: "", reason: "" });
+const exclusionState = ref<FineJobFilterExclusionState | null>(null);
+const refreshingExclusions = ref(false);
 
 const companyScaleOptions = ["0-20人", "20-99人", "100-499人", "500-999人", "1000-9999人", "10000人以上"];
 const companyStageOptions = ["未融资", "不需要融资", "天使轮", "A轮", "B轮", "C轮", "D轮及以上", "已上市"];
 const degreeOptions = ["学历不限", "初中及以下", "中专/中技", "高中", "大专", "本科", "硕士", "博士"];
 const experienceOptions = ["经验不限", "在校/应届", "1年以内", "1-3年", "3-5年", "5-10年", "10年以上"];
 const activeOptions = ["刚刚活跃", "今日活跃", "3日内活跃", "本周活跃", "本月活跃"];
+const cooldownOptions = [
+  { label: "关闭", value: "disabled" },
+  { label: "3 天", value: "days_3" },
+  { label: "7 天", value: "days_7" },
+  { label: "30 天", value: "days_30" },
+  { label: "永久", value: "permanent" }
+];
 const deliveryReady = computed(() => Boolean(deliveryStore.strategy?.ready));
 
 onMounted(async () => {
-  await Promise.all([strategiesStore.load(), resumesStore.load(), deliveryStore.load()]);
+  await Promise.all([
+    strategiesStore.load(),
+    resumesStore.load(),
+    profilesStore.load(),
+    deliveryStore.load()
+  ]);
   // 策略加载完成后默认选中第一条岗位筛选策略。
-  if (strategiesStore.filters.length) editFilter(strategiesStore.filters[0]);
+  if (strategiesStore.filters.length) await editFilter(strategiesStore.filters[0]);
   // 策略加载完成后默认选中第一条岗位建议投递策略。
-  if (strategiesStore.recommendations.length) editRecommendation(strategiesStore.recommendations[0]);
+  if (strategiesStore.recommendations.length) await editRecommendation(strategiesStore.recommendations[0]);
   deliveryForm.value = cloneDelivery(deliveryStore.strategy ?? emptyDeliveryStrategy());
 });
 
-const editFilter = (strategy?: FineJobFilterStrategy) => {
+const editFilter = async (strategy?: FineJobFilterStrategy) => {
   filterForm.value = clone(strategy ?? emptyFilterStrategy());
+  await strategiesStore.loadFilterResources(strategy?.id);
+  exclusionState.value = strategy?.id
+    ? await api.getFineJobFilterExclusions(strategy.id)
+    : null;
 };
 
-const editRecommendation = (strategy?: FineJobRecommendationStrategy) => {
+const refreshExclusions = async () => {
+  if (!filterForm.value.id) return;
+  refreshingExclusions.value = true;
+  try {
+    exclusionState.value = await api.refreshFineJobFilterExclusions(filterForm.value.id);
+    ElMessage.success("排除清单已完整刷新");
+  } catch (error) {
+    ElMessage.error((error as Error).message || "排除清单刷新失败");
+  } finally {
+    refreshingExclusions.value = false;
+  }
+};
+
+const editRecommendation = async (strategy?: FineJobRecommendationStrategy) => {
   recommendationForm.value = clone(strategy ?? emptyRecommendationStrategy());
+  await strategiesStore.loadRecommendationChangeSets(strategy?.id);
 };
 
 const saveFilter = async () => {
   if (!filterForm.value.name.trim()) return ElMessage.warning("请填写策略名称");
   try {
-    const saved = await strategiesStore.saveFilter(normalizeFilter(filterForm.value));
+    const payload = normalizeFilter(filterForm.value);
+    if (payload.id) {
+      payload.search_keywords = strategiesStore.filterKeywords
+        .filter((item) => item.enabled)
+        .map((item) => item.keyword);
+    }
+    const saved = await strategiesStore.saveFilter(payload);
     filterForm.value = clone(saved);
+    await strategiesStore.loadFilterResources(saved.id);
+    exclusionState.value = saved.id ? await api.getFineJobFilterExclusions(saved.id) : null;
     ElMessage.success("岗位筛选策略已保存");
   } catch {
     ElMessage.error(strategiesStore.error ?? "岗位筛选策略保存失败");
@@ -66,6 +112,7 @@ const saveRecommendation = async () => {
   try {
     const saved = await strategiesStore.saveRecommendation(normalizeRecommendation(recommendationForm.value));
     recommendationForm.value = clone(saved);
+    await strategiesStore.loadRecommendationChangeSets(saved.id);
     ElMessage.success("岗位建议投递策略已保存");
   } catch {
     ElMessage.error(strategiesStore.error ?? "岗位建议投递策略保存失败");
@@ -103,6 +150,60 @@ const saveDelivery = async () => {
     ElMessage.error(deliveryStore.error ?? "投递执行策略保存失败");
   }
 };
+
+const addKeyword = async () => {
+  if (!filterForm.value.id) return ElMessage.warning("请先保存筛选策略");
+  if (!keywordDraft.value.keyword.trim()) return ElMessage.warning("请填写搜索词");
+  await strategiesStore.createFilterKeyword(filterForm.value.id, {
+    keyword: keywordDraft.value.keyword.trim(),
+    reason: keywordDraft.value.reason.trim(),
+    enabled: true,
+    sort_order: strategiesStore.filterKeywords.length
+  });
+  keywordDraft.value = { keyword: "", reason: "" };
+  ElMessage.success("搜索词已添加");
+};
+
+const saveKeyword = async (keywordId: string) => {
+  if (!filterForm.value.id) return;
+  const keyword = strategiesStore.filterKeywords.find((item) => item.id === keywordId);
+  if (!keyword?.keyword.trim()) return ElMessage.warning("搜索词不能为空");
+  await strategiesStore.updateFilterKeyword(filterForm.value.id, keyword);
+  ElMessage.success("搜索词已保存");
+};
+
+const removeKeyword = async (keywordId: string) => {
+  if (!filterForm.value.id) return;
+  await strategiesStore.removeFilterKeyword(filterForm.value.id, keywordId);
+  ElMessage.success("搜索词已删除");
+};
+
+const moveKeyword = async (keywordId: string, offset: -1 | 1) => {
+  if (!filterForm.value.id) return;
+  await strategiesStore.moveFilterKeyword(filterForm.value.id, keywordId, offset);
+};
+
+const applyFilterChange = async (changeSetId: string, mode: "update_current" | "save_as_new") => {
+  if (!filterForm.value.id) return;
+  await strategiesStore.applyFilterChangeSet(filterForm.value.id, changeSetId, mode);
+  if (mode === "update_current") {
+    const current = strategiesStore.filters.find((item) => item.id === filterForm.value.id);
+    if (current) await editFilter(current);
+  }
+  ElMessage.success(mode === "update_current" ? "AI 变更已更新到当前策略" : "已另存为新策略");
+};
+
+const applyRecommendationChange = async (changeSetId: string, mode: "update_current" | "save_as_new") => {
+  if (!recommendationForm.value.id) return;
+  await strategiesStore.applyRecommendationChangeSet(recommendationForm.value.id, changeSetId, mode);
+  if (mode === "update_current") {
+    const current = strategiesStore.recommendations.find((item) => item.id === recommendationForm.value.id);
+    if (current) await editRecommendation(current);
+  }
+  ElMessage.success(mode === "update_current" ? "AI 变更已更新到当前策略" : "已另存为新策略");
+};
+
+const prettyJson = (value: Record<string, unknown>) => JSON.stringify(value, null, 2);
 
 const normalizeFilter = (value: FineJobFilterStrategy) => ({
   ...value,
@@ -163,13 +264,45 @@ const cloneDelivery = (value: FineJobDeliveryStrategy): FineJobDeliveryStrategy 
 
               <h3>搜索范围</h3>
               <div class="form-grid">
-                <el-form-item label="搜索关键词"><el-select v-model="filterForm.search_keywords" multiple filterable allow-create default-first-option clearable placeholder="AI Agent" /></el-form-item>
                 <el-form-item label="城市"><el-select v-model="filterForm.cities" multiple filterable allow-create default-first-option clearable placeholder="广州" /></el-form-item>
                 <el-form-item label="工作性质">
                   <el-select v-model="filterForm.job_types" multiple clearable>
                     <el-option label="正职" value="full_time" /><el-option label="实习" value="internship" /><el-option label="兼职" value="part_time" />
                   </el-select>
                 </el-form-item>
+              </div>
+
+              <h3>搜索词组</h3>
+              <p class="secondary-text">按启用顺序执行搜索，第一条启用的搜索词是默认搜索词。</p>
+              <el-alert v-if="!filterForm.id" type="info" title="先保存筛选策略，再添加搜索词。" :closable="false" />
+              <div v-else class="keyword-manager">
+                <div class="keyword-create-row">
+                  <el-input v-model="keywordDraft.keyword" placeholder="搜索词" />
+                  <el-input v-model="keywordDraft.reason" placeholder="生成或使用理由" />
+                  <el-button type="primary" plain @click="addKeyword">添加</el-button>
+                </div>
+                <div v-for="(item, index) in strategiesStore.filterKeywords" :key="item.id" class="keyword-row">
+                  <el-switch v-model="item.enabled" @change="saveKeyword(item.id)" />
+                  <el-input v-model="item.keyword" aria-label="搜索词" />
+                  <el-input v-model="item.reason" aria-label="搜索词理由" placeholder="理由" />
+                  <el-button-group>
+                    <el-button :disabled="index === 0" @click="moveKeyword(item.id, -1)">上移</el-button>
+                    <el-button :disabled="index === strategiesStore.filterKeywords.length - 1" @click="moveKeyword(item.id, 1)">下移</el-button>
+                    <el-button @click="saveKeyword(item.id)">保存</el-button>
+                    <el-button type="danger" @click="removeKeyword(item.id)">删除</el-button>
+                  </el-button-group>
+                </div>
+                <el-empty v-if="!strategiesStore.filterKeywords.length" description="暂无搜索词" :image-size="64" />
+              </div>
+
+              <div v-if="strategiesStore.filterChangeSets.some((item) => item.status === 'draft')" class="change-set-list">
+                <h3>AI 生成变更待确认</h3>
+                <article v-for="item in strategiesStore.filterChangeSets.filter((entry) => entry.status === 'draft')" :key="item.id" class="change-set-card">
+                  <el-tag>{{ item.strategy_type === "search_keywords" ? "搜索词组" : "筛选策略" }}</el-tag>
+                  <pre>{{ prettyJson(item.payload) }}</pre>
+                  <el-button type="primary" plain @click="applyFilterChange(item.id, 'update_current')">更新当前策略</el-button>
+                  <el-button @click="applyFilterChange(item.id, 'save_as_new')">另存新策略</el-button>
+                </article>
               </div>
 
               <h3>岗位与公司</h3>
@@ -202,6 +335,38 @@ const cloneDelivery = (value: FineJobDeliveryStrategy): FineJobDeliveryStrategy 
                 <el-form-item label="月薪下限不低于（K）"><el-input-number v-model="filterForm.monthly_salary_min" :min="0" /></el-form-item>
                 <el-form-item label="月薪上限不低于（K）"><el-input-number v-model="filterForm.monthly_salary_max_at_least" :min="0" /></el-form-item>
                 <el-form-item label="日薪下限不低于（元）"><el-input-number v-model="filterForm.daily_salary_min" :min="0" /></el-form-item>
+              </div>
+
+              <h3>重复获取与投递冷却</h3>
+              <p class="secondary-text">列表采集完成后先刷新并应用排除清单，再决定是否获取详情或投递建议。清单完整刷新后 24 小时内复用，相关动作完成时立即增量更新。</p>
+              <div v-if="exclusionState" class="exclusion-state">
+                <el-tag :type="exclusionState.status === 'ready' ? 'success' : 'warning'">
+                  {{ exclusionState.status === "ready" ? "排除清单可用" : "等待完整刷新" }}
+                </el-tag>
+                <span>公司 {{ exclusionState.company_count }} · 岗位 {{ exclusionState.job_count }}</span>
+                <span>上次完整刷新：{{ exclusionState.last_full_refreshed_at ? formatDateTime(exclusionState.last_full_refreshed_at) : "尚未刷新" }}</span>
+                <el-button size="small" :loading="refreshingExclusions" @click="refreshExclusions">立即刷新</el-button>
+              </div>
+              <div class="cooldown-head">
+                <span>默认排除外包公司</span>
+                <el-switch v-model="filterForm.cooldown_rules.exclude_outsourcing_companies" />
+              </div>
+              <div class="cooldown-grid">
+                <el-form-item label="已投递公司">
+                  <el-select v-model="filterForm.cooldown_rules.applied_company.period"><el-option v-for="item in cooldownOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select>
+                  <el-checkbox v-model="filterForm.cooldown_rules.applied_company.exclude_outsourcing">外包公司不参与公司去重</el-checkbox>
+                </el-form-item>
+                <el-form-item label="已获取详情公司">
+                  <el-select v-model="filterForm.cooldown_rules.detailed_company.period"><el-option v-for="item in cooldownOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select>
+                  <el-checkbox v-model="filterForm.cooldown_rules.detailed_company.exclude_outsourcing">外包公司不参与公司去重</el-checkbox>
+                </el-form-item>
+                <el-form-item label="已获取投递建议公司">
+                  <el-select v-model="filterForm.cooldown_rules.evaluated_company.period"><el-option v-for="item in cooldownOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select>
+                  <el-checkbox v-model="filterForm.cooldown_rules.evaluated_company.exclude_outsourcing">外包公司不参与公司去重</el-checkbox>
+                </el-form-item>
+                <el-form-item label="已投递岗位"><el-select v-model="filterForm.cooldown_rules.applied_job.period"><el-option v-for="item in cooldownOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item>
+                <el-form-item label="已获取详情岗位"><el-select v-model="filterForm.cooldown_rules.detailed_job.period"><el-option v-for="item in cooldownOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item>
+                <el-form-item label="已获取投递建议岗位"><el-select v-model="filterForm.cooldown_rules.evaluated_job.period"><el-option v-for="item in cooldownOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item>
               </div>
 
               <h3>技能与内容</h3>
@@ -241,6 +406,11 @@ const cloneDelivery = (value: FineJobDeliveryStrategy): FineJobDeliveryStrategy 
                 <el-form-item label="关联简历">
                   <el-select v-model="recommendationForm.resume_id" clearable><el-option v-for="item in resumesStore.resumes" :key="item.id" :label="item.name" :value="item.id" /></el-select>
                 </el-form-item>
+                <el-form-item label="关联求职资料版本">
+                  <el-select v-model="recommendationForm.resume_version_id" clearable>
+                    <el-option v-for="item in profilesStore.resumeVersions" :key="item.id" :label="item.name" :value="item.id" />
+                  </el-select>
+                </el-form-item>
                 <el-form-item label="最低推荐置信度"><el-slider v-model="recommendationForm.minimum_confidence" :min="0" :max="1" :step="0.05" show-input /></el-form-item>
               </div>
               <div class="form-grid">
@@ -254,6 +424,14 @@ const cloneDelivery = (value: FineJobDeliveryStrategy): FineJobDeliveryStrategy 
               <el-form-item label="工作偏好"><el-input v-model="recommendationForm.work_preferences" type="textarea" :rows="2" placeholder="远程、通勤、团队阶段等软要求" /></el-form-item>
               <el-form-item label="风险偏好"><el-input v-model="recommendationForm.risk_notes" type="textarea" :rows="2" /></el-form-item>
               <el-form-item label="其他说明"><el-input v-model="recommendationForm.notes" type="textarea" :rows="2" /></el-form-item>
+              <div v-if="strategiesStore.recommendationChangeSets.some((item) => item.status === 'draft')" class="change-set-list">
+                <h3>AI 生成变更待确认</h3>
+                <article v-for="item in strategiesStore.recommendationChangeSets.filter((entry) => entry.status === 'draft')" :key="item.id" class="change-set-card">
+                  <pre>{{ prettyJson(item.payload) }}</pre>
+                  <el-button type="primary" plain @click="applyRecommendationChange(item.id, 'update_current')">更新当前策略</el-button>
+                  <el-button @click="applyRecommendationChange(item.id, 'save_as_new')">另存新策略</el-button>
+                </article>
+              </div>
             </el-form>
           </div>
         </el-tab-pane>
@@ -332,6 +510,15 @@ const cloneDelivery = (value: FineJobDeliveryStrategy): FineJobDeliveryStrategy 
 .strategy-item > div { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .strategy-form { min-width: 0; }
 .strategy-form h3 { margin: 18px 0 10px; }
+.keyword-manager, .change-set-list { display: grid; gap: 10px; margin-bottom: 18px; }
+.keyword-create-row, .keyword-row { display: grid; grid-template-columns: minmax(130px, 0.8fr) minmax(180px, 1.4fr) auto; gap: 8px; align-items: center; }
+.keyword-row { grid-template-columns: auto minmax(130px, 0.8fr) minmax(180px, 1.4fr) auto; }
+.change-set-card { padding: 12px; border: 1px solid var(--el-border-color); border-radius: 10px; }
+.change-set-card pre { max-height: 260px; overflow: auto; white-space: pre-wrap; font-size: 12px; }
 .verification-help { margin: 8px 0 0; line-height: 1.55; }
+.cooldown-head { display: flex; align-items: center; gap: 12px; margin: 12px 0; }
+.exclusion-state { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 12px 0; }
+.cooldown-grid { display: grid; grid-template-columns: repeat(3, minmax(190px, 1fr)); gap: 12px; }
+.cooldown-grid :deep(.el-form-item__content) { display: grid; gap: 8px; }
 @media (max-width: 900px) { .strategy-layout { grid-template-columns: 1fr; } }
 </style>

@@ -11,6 +11,8 @@ from backend.app.config import AppConfig
 from backend.app.db import Database
 from backend.app.errors import AppError
 from backend.app.services.ai import _post_json
+from backend.app.services.fine_job import profile_store
+from backend.app.services.fine_job.profile_context import get_profile_context
 
 
 RUNTIME_ID = "boss"
@@ -566,7 +568,7 @@ def get_session(db: Database, session_id: str) -> dict[str, Any]:
         }
 
 
-def _build_context(connection: sqlite3.Connection, session: sqlite3.Row) -> dict[str, Any]:
+def _build_context(db: Database, connection: sqlite3.Connection, session: sqlite3.Row) -> dict[str, Any]:
     messages = [dict(row) for row in connection.execute(
         """
         SELECT direction, message_type, content, sent_at
@@ -585,6 +587,20 @@ def _build_context(connection: sqlite3.Connection, session: sqlite3.Row) -> dict
     intent_row = connection.execute(
         "SELECT * FROM fj_job_intents ORDER BY updated_at DESC LIMIT 1"
     ).fetchone()
+    profile = profile_store.ensure_default_profile(db)
+    candidate_context = get_profile_context(
+        db,
+        str(profile["id"]),
+        view="chat",
+        job_id=str(session["job_id"] or "") or None,
+        persist_artifact=False,
+    )
+    confirmed_profile_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM fj_profile_facts WHERE profile_id = ? AND status = 'confirmed'",
+            (profile["id"],),
+        ).fetchone()[0]
+    )
     evaluation_row = None
     if session["job_id"]:
         evaluation_row = connection.execute(
@@ -606,7 +622,8 @@ def _build_context(connection: sqlite3.Connection, session: sqlite3.Row) -> dict
             "decision": evaluation_row["decision"],
             "detail": _loads(evaluation_row["evaluation_json"], {}),
         } if evaluation_row else None,
-        "resume_facts": resume_facts,
+        "candidate_profile_context": candidate_context,
+        "resume_facts": resume_facts if confirmed_profile_count == 0 else [],
         "job_intent": _row(intent_row) if intent_row else None,
     }
 
@@ -633,7 +650,7 @@ def _chat_completion(config: AppConfig, context: dict[str, Any], instruction: st
     if not config.llm_api_key:
         raise AppError(status_code=422, error_category="LLM_NOT_CONFIGURED", error_message="请先配置 LLM API Key。")
     system_prompt = (
-        "你是求职者的沟通助手。只根据给定的本地对话、岗位信息、已确认简历事实和求职意向，"
+        "你是求职者的沟通助手。只根据给定的本地对话、岗位信息、已确认候选人上下文和求职意向，"
         "生成一条简洁、自然、诚实的中文回复。不得虚构经历、薪资、到岗时间或联系方式；"
         "资料不足时应明确表示需要确认。只输出可直接发送的正文。"
     )
@@ -708,10 +725,20 @@ def generate_reply(
                 "UPDATE fj_chat_reply_tasks SET status = 'generating', generation_error = NULL, updated_at = ? WHERE id = ?",
                 (now, task_id),
             )
-        context = _build_context(connection, session)
+        context = _build_context(db, connection, session)
+        candidate_context = context["candidate_profile_context"]
         connection.execute(
-            "UPDATE fj_chat_reply_tasks SET context_json = ? WHERE id = ?",
-            (json.dumps(context, ensure_ascii=False), task_id),
+            """
+            UPDATE fj_chat_reply_tasks
+            SET context_json = ?, candidate_profile_id = ?, profile_context_version = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(context, ensure_ascii=False),
+                candidate_context["profile_id"],
+                candidate_context["artifact_version"],
+                task_id,
+            ),
         )
     try:
         text, model = _chat_completion(config, context, instruction)

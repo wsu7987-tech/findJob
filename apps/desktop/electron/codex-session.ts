@@ -44,15 +44,7 @@ export interface CodexSessionOptions {
   debugLog: (message: string) => void;
 }
 
-const SKILL_TEXT = `---
-name: finejob
-description: 使用 FineJob MCP 工具完成岗位检索、岗位评估、打招呼预览与代聊回复。
----
-
-# FineJob 业务协作
-
-先调用 \`finejob.get_capabilities\`。读取岗位或会话上下文后保留返回的版本号，写入评估、预览和发送请求时原样传回。敏感动作返回 \`awaiting_confirmation\` 时，提示用户在 FineJob 确认卡片处理。任务进入队列后用 \`finejob.get_operation_status\` 查询结果。
-`;
+const MANAGED_SKILLS = ["finejob", "finejob-profile"] as const;
 
 const quoteBatchValue = (value: string) => `"${value.replace(/"/g, '""')}"`;
 
@@ -86,12 +78,32 @@ const writeWindowsUtf8Launcher = (workspace: string, launch: ReturnType<typeof r
   return launcherPath;
 };
 
-const writeManagedWorkspace = (options: CodexSessionOptions) => {
+export const writeManagedWorkspace = (
+  options: Pick<CodexSessionOptions, "appDataDir" | "workspaceRoot" | "pythonPath">
+) => {
   const tuiWorkspace = path.resolve(options.appDataDir, "codex-workspace");
   const configDir = path.resolve(tuiWorkspace, ".codex");
-  const skillDir = path.resolve(tuiWorkspace, ".agents", "skills", "finejob");
+  const managedSkillsDir = path.resolve(tuiWorkspace, ".agents", "skills");
+  const skillResourcesDir = path.resolve(
+    options.workspaceRoot,
+    "apps",
+    "desktop",
+    "resources",
+    "codex",
+    "skills"
+  );
   fs.mkdirSync(configDir, { recursive: true });
-  fs.mkdirSync(skillDir, { recursive: true });
+  fs.mkdirSync(managedSkillsDir, { recursive: true });
+  for (const skillName of MANAGED_SKILLS) {
+    const sourceDir = path.resolve(skillResourcesDir, skillName);
+    const destinationDir = path.resolve(managedSkillsDir, skillName);
+    if (!fs.existsSync(sourceDir)) {
+      throw new Error(`缺少 FineJob Skill 资源：${sourceDir}`);
+    }
+    // 每次启动同步正式 Skill 资源，确保托管工作区使用仓库中的当前版本。
+    fs.rmSync(destinationDir, { recursive: true, force: true });
+    fs.cpSync(sourceDir, destinationDir, { recursive: true });
+  }
   const config = [
     "[mcp_servers.finejob]",
     `command = ${JSON.stringify(options.pythonPath)}`,
@@ -101,7 +113,6 @@ const writeManagedWorkspace = (options: CodexSessionOptions) => {
     ""
   ].join("\n");
   fs.writeFileSync(path.resolve(configDir, "config.toml"), config, "utf8");
-  fs.writeFileSync(path.resolve(skillDir, "SKILL.md"), SKILL_TEXT, "utf8");
   return tuiWorkspace;
 };
 
@@ -111,6 +122,8 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
   let runId: string | null = null;
   let runtimeToken: string | null = null;
   let recentOutput = "";
+  let firstOutputPromise: Promise<void> | null = null;
+  let resolveFirstOutput: (() => void) | null = null;
 
   const setStatus = (next: SessionStatus, message = "") => {
     status = next;
@@ -159,12 +172,22 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
         env: terminalEnv,
         useConpty: process.platform === "win32"
       });
+      // 等待 Codex 首屏出现后再提交自动任务，避免输入早于交互界面初始化。
+      firstOutputPromise = new Promise<void>((resolve) => {
+        resolveFirstOutput = resolve;
+      });
       terminal.onData((data) => {
         // 保存有限的最近输出，让快速退出时的首屏错误仍能显示在状态区。
         recentOutput = `${recentOutput}${data}`.slice(-RECENT_OUTPUT_LIMIT);
+        resolveFirstOutput?.();
+        resolveFirstOutput = null;
+        firstOutputPromise = null;
         options.emit("codex:output", { runId, data });
       });
       terminal.onExit(({ exitCode }) => {
+        resolveFirstOutput?.();
+        resolveFirstOutput = null;
+        firstOutputPromise = null;
         terminal = null;
         const completedRunId = runId;
         const completedToken = runtimeToken;
@@ -186,6 +209,9 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
       return { status, runId };
     } catch (error) {
       terminal = null;
+      resolveFirstOutput?.();
+      resolveFirstOutput = null;
+      firstOutputPromise = null;
       if (runId && runtimeToken) {
         void options.completeRuntime(
           runId,
@@ -207,6 +233,22 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
       if (terminal && data.length <= 16_384) {
         terminal.write(data);
       }
+    },
+    async submitPrompt(prompt: string) {
+      const currentTerminal = terminal;
+      const text = prompt.trim();
+      if (!currentTerminal || !text || text.length > 16_380) return false;
+      const pendingFirstOutput = firstOutputPromise;
+      if (pendingFirstOutput) {
+        // 没有首屏时最多等待两秒，避免任务入口被终端初始化卡住。
+        await Promise.race([
+          pendingFirstOutput,
+          new Promise<void>((resolve) => setTimeout(resolve, 2_000))
+        ]);
+      }
+      if (terminal !== currentTerminal) return false;
+      currentTerminal.write(`${text}\r`);
+      return true;
     },
     resize(cols: number, rows: number) {
       terminal?.resize(Math.max(20, Math.min(400, cols)), Math.max(8, Math.min(200, rows)));

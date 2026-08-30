@@ -9,12 +9,15 @@ from backend.app.errors import register_error_handlers
 from backend.app.routers.config import router as config_router
 from backend.app.routers.fine_job.boss_capture import router as fine_job_boss_capture_router
 from backend.app.routers.fine_job.codex import router as fine_job_codex_router
+from backend.app.routers.fine_job.companies import router as fine_job_companies_router
 from backend.app.routers.fine_job.boss_chat import router as fine_job_boss_chat_router
 from backend.app.routers.fine_job.boss_executor import router as fine_job_boss_executor_router
 from backend.app.routers.fine_job.delivery_runs import router as fine_job_delivery_runs_router
 from backend.app.routers.fine_job.delivery_strategies import router as fine_job_delivery_strategies_router
 from backend.app.routers.fine_job.job_intents import router as fine_job_intents_router
 from backend.app.routers.fine_job.platform_sessions import router as fine_job_platform_sessions_router
+from backend.app.routers.fine_job.profiles import router as fine_job_profiles_router
+from backend.app.routers.fine_job.profiles_v3 import router as fine_job_profiles_v3_router
 from backend.app.routers.fine_job.resumes import router as fine_job_resumes_router
 from backend.app.routers.fine_job.strategies import router as fine_job_strategies_router
 from backend.app.routers.fine_job.workflow import router as fine_job_workflow_router
@@ -40,6 +43,7 @@ from backend.app.services.web_reparse_job_store import WebReparseJobStore
 from backend.app.services.web_session_profiles import WebSessionProfileStore
 from backend.app.services.fine_job.boss_chat import BossChatScheduler
 from backend.app.services.fine_job.codex_runtime import CodexRuntimeRegistry
+from backend.app.services.fine_job.profile_store import ensure_default_profile
 
 
 def create_app() -> FastAPI:
@@ -52,6 +56,7 @@ def create_app() -> FastAPI:
 
     db = Database(config.sqlite_path)
     db.initialize()
+    ensure_default_profile(db)
 
     app = FastAPI(title="Knowledge Curator Backend")
     app.add_middleware(
@@ -83,12 +88,15 @@ def create_app() -> FastAPI:
     app.include_router(config_router, prefix="/api")
     app.include_router(fine_job_boss_capture_router, prefix="/api")
     app.include_router(fine_job_codex_router, prefix="/api")
+    app.include_router(fine_job_companies_router, prefix="/api")
     app.include_router(fine_job_boss_chat_router, prefix="/api")
     app.include_router(fine_job_boss_executor_router, prefix="/api")
     app.include_router(fine_job_delivery_runs_router, prefix="/api")
     app.include_router(fine_job_delivery_strategies_router, prefix="/api")
     app.include_router(fine_job_intents_router, prefix="/api")
     app.include_router(fine_job_platform_sessions_router, prefix="/api")
+    app.include_router(fine_job_profiles_router, prefix="/api")
+    app.include_router(fine_job_profiles_v3_router, prefix="/api")
     app.include_router(fine_job_resumes_router, prefix="/api")
     app.include_router(fine_job_strategies_router, prefix="/api")
     app.include_router(fine_job_workflow_router, prefix="/api")

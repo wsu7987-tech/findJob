@@ -228,6 +228,7 @@ export interface FineJobBossCaptureRequest extends FineJobBossSearchPageRequest 
   pages: number;
   include_details: boolean;
   prefer_current_page: boolean;
+  filter_strategy_id?: string | null;
 }
 
 export interface FineJobBossCapturedJob {
@@ -249,15 +250,24 @@ export interface FineJobBossCapturedJob {
   skills?: string;
   job_labels?: string;
   detail_status?: "not_collected" | "queued" | "collecting" | "completed" | "failed";
+  detail_version?: number;
   detail?: Record<string, unknown> | null;
   detail_error?: string | null;
   recommended?: boolean;
   recommendation_source?: "strategy" | "ai" | "rules" | "llm" | null;
   recommendation_reason?: string | null;
-  filter_status?: "pass" | "reject" | "review" | null;
+  filter_status?: "pass" | "reject" | "review" | "exclude" | null;
   filter_reasons?: string[];
   filter_missing_fields?: string[];
   filter_strategy_id?: string | null;
+  company_id?: string | null;
+  company_type?: FineJobCompanyType;
+  is_outsourcing_company?: boolean;
+  is_blacklisted?: boolean;
+  application_status?: "applied" | "cleared" | null;
+  applied_at?: string | null;
+  cooldown_excluded?: boolean;
+  cooldown_reasons?: string[];
   delivery_evaluation?: FineJobBossDeliveryEvaluation | null;
   list_collected_at?: string | null;
   detail_collected_at?: string | null;
@@ -287,6 +297,11 @@ export interface FineJobBossCaptureTask {
   details_completed: number;
   details_failed: number;
   duplicate_jobs_count: number;
+  continuation_available?: boolean;
+  has_more?: boolean;
+  last_added_jobs?: number;
+  total_pages_loaded?: number;
+  stop_requested?: boolean;
   current_job?: Record<string, unknown> | null;
   estimated_seconds_min: number;
   estimated_seconds_max: number;
@@ -306,10 +321,12 @@ export interface FineJobBossDetailSuggestionResponse {
 
 export interface FineJobBossFilterResult {
   job_id: string;
-  status: "pass" | "reject" | "review";
+  status: "pass" | "reject" | "review" | "exclude";
   reasons: string[];
   missing_fields: string[];
   strategy_id?: string | null;
+  cooldown_excluded?: boolean;
+  cooldown_reasons?: string[];
 }
 
 export interface FineJobBossFilterApplicationResponse {
@@ -373,6 +390,7 @@ export type FineJobBossHistorySortField =
 
 export interface FineJobBossHistoryQuery {
   query?: string;
+  search_keyword?: string;
   city?: string;
   company_scale?: string;
   company_industry?: string;
@@ -389,6 +407,7 @@ export interface FineJobBossHistoryQuery {
 
 export interface FineJobBossHistoryJob extends FineJobBossCapturedJob {
   id: string;
+  search_keyword: string;
   first_collected_at: string;
   last_collected_at: string;
   collect_count: number;
@@ -433,6 +452,22 @@ export interface FineJobDeliveryStrategyEnvelope {
 
 export type FineJobUnknownValuePolicy = "keep" | "review" | "exclude";
 export type FineJobJobType = "full_time" | "internship" | "part_time";
+export type FineJobCooldownPeriod = "disabled" | "days_3" | "days_7" | "days_30" | "permanent";
+
+export interface FineJobCooldownRule {
+  period: FineJobCooldownPeriod;
+  exclude_outsourcing: boolean;
+}
+
+export interface FineJobCooldownRules {
+  exclude_outsourcing_companies: boolean;
+  applied_company: FineJobCooldownRule;
+  detailed_company: FineJobCooldownRule;
+  evaluated_company: FineJobCooldownRule;
+  applied_job: FineJobCooldownRule;
+  detailed_job: FineJobCooldownRule;
+  evaluated_job: FineJobCooldownRule;
+}
 
 export interface FineJobFilterStrategy {
   id?: string;
@@ -458,8 +493,17 @@ export interface FineJobFilterStrategy {
   skill_include_all: string[];
   skill_exclude: string[];
   boss_active_statuses: string[];
+  cooldown_rules: FineJobCooldownRules;
   unknown_value_policy: FineJobUnknownValuePolicy;
   notes: string;
+  candidate_profile_id?: string | null;
+  resume_version_id?: string | null;
+  source_type?: "user" | "ai" | "migration";
+  based_on_analysis_run_id?: string | null;
+  based_on_resume_content_version?: number | null;
+  based_on_facts_version?: number | null;
+  based_on_qa_version?: number | null;
+  strategy_version?: number;
   created_at?: string;
   updated_at?: string;
 }
@@ -470,6 +514,16 @@ export interface FineJobFilterStrategyListEnvelope {
 
 export interface FineJobFilterStrategyEnvelope {
   strategy: FineJobFilterStrategy;
+}
+
+export interface FineJobFilterExclusionState {
+  strategy_id: string;
+  status: "ready" | "stale";
+  strategy_version: number;
+  last_full_refreshed_at?: string | null;
+  updated_at?: string | null;
+  company_count: number;
+  job_count: number;
 }
 
 export type FineJobEvaluationMethod = "rules" | "llm" | "hybrid";
@@ -491,6 +545,14 @@ export interface FineJobRecommendationStrategy {
   minimum_confidence: number;
   insufficient_info_action: "review" | "reject";
   notes: string;
+  candidate_profile_id?: string | null;
+  resume_version_id?: string | null;
+  source_type?: "user" | "ai" | "migration";
+  based_on_analysis_run_id?: string | null;
+  based_on_resume_content_version?: number | null;
+  based_on_facts_version?: number | null;
+  based_on_qa_version?: number | null;
+  strategy_version?: number;
   created_at?: string;
   updated_at?: string;
 }
@@ -501,6 +563,79 @@ export interface FineJobRecommendationStrategyListEnvelope {
 
 export interface FineJobRecommendationStrategyEnvelope {
   strategy: FineJobRecommendationStrategy;
+}
+
+export type FineJobCompanyType = "unknown" | "direct" | "outsourcing";
+
+export interface FineJobCompany {
+  id: string;
+  canonical_name: string;
+  normalized_name: string;
+  company_type: FineJobCompanyType;
+  classification_source: "capture" | "manual" | "mcp" | "migration";
+  notes: string;
+  is_blacklisted: boolean;
+  blacklist_reason: string;
+  blacklisted_at?: string | null;
+  version: number;
+  aliases: Array<{ id: string; alias_name: string }>;
+  job_count: number;
+  applied_job_count: number;
+  last_detail_at?: string | null;
+  last_evaluated_at?: string | null;
+  last_applied_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FineJobCompanyEnvelope { company: FineJobCompany; }
+export interface FineJobCompanyListEnvelope {
+  items: FineJobCompany[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface FineJobStrategySearchKeyword {
+  id: string;
+  filter_strategy_id: string;
+  keyword: string;
+  reason: string;
+  enabled: boolean;
+  sort_order: number;
+  source_type: "user" | "ai" | "migration";
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FineJobStrategySearchKeywordEnvelope {
+  keyword: FineJobStrategySearchKeyword;
+}
+
+export interface FineJobStrategySearchKeywordListEnvelope {
+  keywords: FineJobStrategySearchKeyword[];
+}
+
+export interface FineJobStrategyChangeSet {
+  id: string;
+  profile_id: string;
+  resume_version_id: string;
+  strategy_type: "filter" | "recommendation" | "search_keywords";
+  target_strategy_id?: string | null;
+  payload: Record<string, unknown>;
+  status: "draft" | "applied" | "discarded";
+  operation_run_id?: string | null;
+  created_at: string;
+  updated_at: string;
+  applied_at?: string | null;
+}
+
+export interface FineJobStrategyChangeSetListEnvelope {
+  change_sets: FineJobStrategyChangeSet[];
+}
+
+export interface FineJobStrategyChangeSetEnvelope {
+  change_set: FineJobStrategyChangeSet;
 }
 
 export type FineJobDeliveryRunMode = "dry_run" | "live";

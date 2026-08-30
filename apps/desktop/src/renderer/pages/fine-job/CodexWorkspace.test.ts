@@ -5,6 +5,7 @@ import { flushPromises, mount } from "@vue/test-utils";
 import { defineComponent, h } from "vue";
 
 const mocks = vi.hoisted(() => ({
+  clear: vi.fn(),
   focus: vi.fn(),
   load: vi.fn(),
   start: vi.fn()
@@ -45,13 +46,14 @@ const GenericStub = defineComponent({
 const CodexTerminalStub = defineComponent({
   emits: ["ready"],
   setup(_, { expose }) {
-    expose({ focus: mocks.focus });
+    expose({ clear: mocks.clear, focus: mocks.focus });
     return () => h("div", { "data-testid": "codex-terminal" });
   }
 });
 
 describe("CodexWorkspace", () => {
   beforeEach(() => {
+    mocks.clear.mockReset();
     mocks.focus.mockReset();
     mocks.load.mockReset();
     mocks.start.mockReset().mockResolvedValue(undefined);
@@ -76,5 +78,27 @@ describe("CodexWorkspace", () => {
 
     expect(mocks.start).toHaveBeenCalledWith(120, 36, false);
     expect(mocks.focus).toHaveBeenCalledTimes(1);
+  });
+
+  it("Clear 只清空终端显示", async () => {
+    const wrapper = mount(CodexWorkspace, {
+      global: {
+        stubs: {
+          CodexTerminal: CodexTerminalStub,
+          ElAlert: GenericStub,
+          ElButton: ElButtonStub,
+          ElEmpty: GenericStub,
+          ElTag: GenericStub,
+          ElSwitch: GenericStub
+        }
+      }
+    });
+
+    await flushPromises();
+    const clearButton = wrapper.findAll("button").find((button) => button.text() === "Clear");
+    expect(clearButton).toBeDefined();
+    await clearButton!.trigger("click");
+
+    expect(mocks.clear).toHaveBeenCalledTimes(1);
   });
 });

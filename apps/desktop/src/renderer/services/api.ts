@@ -16,9 +16,15 @@
   FineJobFilterStrategy,
   FineJobFilterStrategyEnvelope,
   FineJobFilterStrategyListEnvelope,
+  FineJobFilterExclusionState,
   FineJobRecommendationStrategy,
   FineJobRecommendationStrategyEnvelope,
   FineJobRecommendationStrategyListEnvelope,
+  FineJobStrategyChangeSetEnvelope,
+  FineJobStrategyChangeSetListEnvelope,
+  FineJobStrategySearchKeyword,
+  FineJobStrategySearchKeywordEnvelope,
+  FineJobStrategySearchKeywordListEnvelope,
   FineJobActionLogListEnvelope,
   FineJobDeliveryCandidateListEnvelope,
   FineJobDeliveryRunCreateRequest,
@@ -55,6 +61,9 @@
   FineJobChatSendActionEnvelope,
   FineJobCodexPendingWork,
   FineJobCodexPermissions,
+  FineJobCompanyEnvelope,
+  FineJobCompanyListEnvelope,
+  FineJobCompanyType,
   PoolCreateRequest,
   PoolCreateResponse,
   PoolCommitMetadataRequest,
@@ -182,7 +191,7 @@ const buildHeaders = (init?: RequestInit) => {
   return headers;
 };
 
-const request = async <T>(path: string, init?: RequestInit) => {
+export const request = async <T>(path: string, init?: RequestInit) => {
   const origin = await getBackendOrigin();
   const url = new URL(path, origin).toString();
 
@@ -463,6 +472,68 @@ export const api = {
       method: "DELETE"
     });
   },
+  async getFineJobFilterExclusions(strategyId: string) {
+    return request<FineJobFilterExclusionState>(
+      `/api/fine-job/strategies/filters/${strategyId}/exclusions`
+    );
+  },
+  async refreshFineJobFilterExclusions(strategyId: string) {
+    return request<FineJobFilterExclusionState>(
+      `/api/fine-job/strategies/filters/${strategyId}/exclusions/refresh`,
+      { method: "POST" }
+    );
+  },
+  async listFineJobStrategySearchKeywords(strategyId: string) {
+    return request<FineJobStrategySearchKeywordListEnvelope>(
+      `/api/fine-job/strategies/filters/${strategyId}/search-keywords`
+    );
+  },
+  async createFineJobStrategySearchKeyword(
+    strategyId: string,
+    payload: Pick<FineJobStrategySearchKeyword, "keyword" | "reason" | "enabled" | "sort_order">
+  ) {
+    return request<FineJobStrategySearchKeywordEnvelope>(
+      `/api/fine-job/strategies/filters/${strategyId}/search-keywords`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
+  async updateFineJobStrategySearchKeyword(
+    strategyId: string,
+    keywordId: string,
+    payload: Pick<FineJobStrategySearchKeyword, "keyword" | "reason" | "enabled" | "sort_order">
+  ) {
+    return request<FineJobStrategySearchKeywordEnvelope>(
+      `/api/fine-job/strategies/filters/${strategyId}/search-keywords/${keywordId}`,
+      { method: "PATCH", body: JSON.stringify(payload) }
+    );
+  },
+  async deleteFineJobStrategySearchKeyword(strategyId: string, keywordId: string) {
+    return request<void>(
+      `/api/fine-job/strategies/filters/${strategyId}/search-keywords/${keywordId}`,
+      { method: "DELETE" }
+    );
+  },
+  async reorderFineJobStrategySearchKeywords(strategyId: string, keywordIds: string[]) {
+    return request<FineJobStrategySearchKeywordListEnvelope>(
+      `/api/fine-job/strategies/filters/${strategyId}/search-keywords/order`,
+      { method: "PUT", body: JSON.stringify({ keyword_ids: keywordIds }) }
+    );
+  },
+  async listFineJobFilterStrategyChangeSets(strategyId: string) {
+    return request<FineJobStrategyChangeSetListEnvelope>(
+      `/api/fine-job/strategies/filters/${strategyId}/ai-change-sets`
+    );
+  },
+  async applyFineJobFilterStrategyChangeSet(
+    strategyId: string,
+    changeSetId: string,
+    payload: { mode: "update_current" | "save_as_new"; name?: string }
+  ) {
+    return request<FineJobStrategyChangeSetEnvelope>(
+      `/api/fine-job/strategies/filters/${strategyId}/ai-change-sets/${changeSetId}/apply`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
   async listFineJobRecommendationStrategies() {
     return request<FineJobRecommendationStrategyListEnvelope>(
       "/api/fine-job/strategies/recommendations"
@@ -487,6 +558,21 @@ export const api = {
     return request<void>(`/api/fine-job/strategies/recommendations/${strategyId}`, {
       method: "DELETE"
     });
+  },
+  async listFineJobRecommendationStrategyChangeSets(strategyId: string) {
+    return request<FineJobStrategyChangeSetListEnvelope>(
+      `/api/fine-job/strategies/recommendations/${strategyId}/ai-change-sets`
+    );
+  },
+  async applyFineJobRecommendationStrategyChangeSet(
+    strategyId: string,
+    changeSetId: string,
+    payload: { mode: "update_current" | "save_as_new"; name?: string }
+  ) {
+    return request<FineJobStrategyChangeSetEnvelope>(
+      `/api/fine-job/strategies/recommendations/${strategyId}/ai-change-sets/${changeSetId}/apply`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
   },
   async listFineJobDeliveryRuns() {
     return request<FineJobDeliveryRunListEnvelope>("/api/fine-job/delivery-runs");
@@ -566,6 +652,21 @@ export const api = {
   async getFineJobBossCaptureTask(taskId: string) {
     return request<FineJobBossCaptureTask>(`/api/fine-job/boss-capture/tasks/${taskId}`);
   },
+  async continueFineJobBossCapture(taskId: string, pages: number) {
+    return request<FineJobBossCaptureTask>(
+      `/api/fine-job/boss-capture/tasks/${taskId}/continue`,
+      {
+        method: "POST",
+        body: JSON.stringify({ pages })
+      }
+    );
+  },
+  async stopFineJobBossCaptureTask(taskId: string) {
+    return request<FineJobBossCaptureTask>(
+      `/api/fine-job/boss-capture/tasks/${taskId}/stop`,
+      { method: "POST" }
+    );
+  },
   async listFineJobBossCaptureHistory(query: FineJobBossHistoryQuery) {
     const search = new URLSearchParams();
     for (const [key, value] of Object.entries(query)) {
@@ -605,6 +706,7 @@ export const api = {
       filter_strategy_id?: string | null;
       recommendation_strategy_id?: string | null;
       extra_requirement?: string;
+      context_stale_action?: "regenerate" | "use_current" | "cancel";
     }
   ) {
     return request<FineJobBossDetailSuggestionResponse>(
@@ -628,6 +730,7 @@ export const api = {
       filter_strategy_id?: string | null;
       extra_requirement?: string;
       job_ids?: string[];
+      context_stale_action?: "regenerate" | "use_current" | "cancel";
     }
   ) {
     return request<FineJobBossDeliveryEvaluationResponse>(
@@ -641,6 +744,7 @@ export const api = {
       recommendation_strategy_id: string;
       filter_strategy_id?: string | null;
       extra_requirement?: string;
+      context_stale_action?: "regenerate" | "use_current" | "cancel";
     }
   ) {
     return request<FineJobBossHistoryDeliveryEvaluationResponse>(
@@ -675,6 +779,64 @@ export const api = {
     return request<FineJobAutomationActionListEnvelope>(
       `/api/fine-job/automation-actions${suffix}`
     );
+  },
+  async listFineJobCompanies(query: {
+    query?: string;
+    company_type?: FineJobCompanyType | "";
+    blacklist_status?: "all" | "blacklisted" | "normal";
+    page?: number;
+    page_size?: number;
+  } = {}) {
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined && value !== null && value !== "") search.set(key, String(value));
+    }
+    return request<FineJobCompanyListEnvelope>(
+      `/api/fine-job/companies${search.size ? `?${search.toString()}` : ""}`
+    );
+  },
+  async createFineJobCompany(payload: {
+    name: string;
+    company_type: FineJobCompanyType;
+    notes?: string;
+  }) {
+    return request<FineJobCompanyEnvelope>("/api/fine-job/companies", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  },
+  async updateFineJobCompany(
+    companyId: string,
+    payload: { canonical_name?: string; company_type?: FineJobCompanyType; notes?: string }
+  ) {
+    return request<FineJobCompanyEnvelope>(`/api/fine-job/companies/${companyId}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload)
+    });
+  },
+  async setFineJobCompanyBlacklist(companyId: string, blacklisted: boolean, reason = "") {
+    return request<FineJobCompanyEnvelope>(`/api/fine-job/companies/${companyId}/blacklist`, {
+      method: "PUT",
+      body: JSON.stringify({ blacklisted, reason })
+    });
+  },
+  async addFineJobCompanyAlias(companyId: string, aliasName: string) {
+    return request<FineJobCompanyEnvelope>(`/api/fine-job/companies/${companyId}/aliases`, {
+      method: "POST",
+      body: JSON.stringify({ alias_name: aliasName })
+    });
+  },
+  async deleteFineJobCompanyAlias(companyId: string, aliasId: string) {
+    return request<{ deleted: boolean; id: string }>(
+      `/api/fine-job/companies/${companyId}/aliases/${aliasId}`,
+      { method: "DELETE" }
+    );
+  },
+  async setFineJobJobApplication(jobId: string, applied: boolean, note = "") {
+    return request(`/api/fine-job/companies/jobs/${jobId}/application`, {
+      method: "PUT",
+      body: JSON.stringify({ applied, note })
+    });
   },
   async getFineJobBossExecutorStatus() {
     return request<FineJobBossExecutorDashboard>("/api/fine-job/boss-executor/status");

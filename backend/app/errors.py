@@ -7,7 +7,6 @@ from fastapi.responses import JSONResponse
 class AppError(Exception):
     def __init__(
         self,
-        *,
         status_code: int,
         error_category: str,
         error_message: str,

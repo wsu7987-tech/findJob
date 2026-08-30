@@ -32,6 +32,11 @@ class BossCapturePayload(BossSearchPageRequest):
     pages: int = Field(default=1, ge=1, le=10)
     include_details: bool = False
     prefer_current_page: bool = True
+    filter_strategy_id: str | None = None
+
+
+class BossContinueCaptureRequest(BaseModel):
+    pages: int = Field(default=1, ge=1, le=10)
 
 
 class BossSearchPageResponse(BaseModel):
@@ -56,6 +61,11 @@ class BossCaptureTaskResponse(BaseModel):
     details_completed: int = 0
     details_failed: int = 0
     duplicate_jobs_count: int = 0
+    continuation_available: bool = False
+    has_more: bool = True
+    last_added_jobs: int = 0
+    total_pages_loaded: int = 0
+    stop_requested: bool = False
     current_job: dict[str, Any] | None = None
     estimated_seconds_min: int = 0
     estimated_seconds_max: int = 0
@@ -89,15 +99,19 @@ class BossDeliveryEvaluationRequest(BaseModel):
     recommendation_strategy_id: str
     filter_strategy_id: str | None = None
     extra_requirement: str = ""
+    context_stale_action: Literal["regenerate", "use_current", "cancel"] | None = None
     job_ids: list[str] | None = None
+    context_stale_action: Literal["regenerate", "use_current", "cancel"] | None = None
 
 
 class BossJobFilterResult(BaseModel):
     job_id: str
-    status: Literal["pass", "reject", "review"]
+    status: Literal["pass", "reject", "review", "exclude"]
     reasons: list[str] = Field(default_factory=list)
     missing_fields: list[str] = Field(default_factory=list)
     strategy_id: str | None = None
+    cooldown_excluded: bool = False
+    cooldown_reasons: list[str] = Field(default_factory=list)
 
 
 class BossJobDeliveryEvaluation(BaseModel):

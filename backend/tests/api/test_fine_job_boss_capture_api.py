@@ -123,6 +123,56 @@ def test_start_capture_returns_pollable_task(configured_client, monkeypatch) -> 
     assert captured["request"].max_details is None
 
 
+def test_continue_capture_reuses_task(configured_client, monkeypatch) -> None:
+    captured = {}
+    monkeypatch.setattr(
+        "backend.app.routers.fine_job.boss_capture.boss_scraper_service.get_browser_status",
+        lambda: BossBrowserStatus(running=True, cdp_port=9222),
+    )
+
+    def fake_continue(task_id, *, pages):
+        captured.update(task_id=task_id, pages=pages)
+        return _task_payload(
+            id=task_id,
+            stage="list_continue_queued",
+            pages=pages,
+            continuation_available=True,
+        )
+
+    monkeypatch.setattr(
+        "backend.app.routers.fine_job.boss_capture.boss_capture_task_manager.continue_capture",
+        fake_continue,
+    )
+
+    response = configured_client.post(
+        "/api/fine-job/boss-capture/tasks/task-1/continue",
+        json={"pages": 3},
+    )
+
+    assert response.status_code == 202
+    assert captured == {"task_id": "task-1", "pages": 3}
+    assert response.json()["id"] == "task-1"
+
+
+def test_stop_capture_keeps_task_pollable(configured_client, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "backend.app.routers.fine_job.boss_capture.boss_capture_task_manager.stop_capture",
+        lambda task_id: _task_payload(
+            id=task_id,
+            status="running",
+            stage="list_continuing",
+            stop_requested=True,
+        ),
+    )
+
+    response = configured_client.post(
+        "/api/fine-job/boss-capture/tasks/task-1/stop"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["stop_requested"] is True
+
+
 def test_list_boss_capture_history_supports_filters_sort_and_pagination(
     configured_client,
 ) -> None:
