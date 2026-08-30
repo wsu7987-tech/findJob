@@ -2,6 +2,7 @@ import { browser } from "#imports";
 
 import { fineJobExecutorClient, type FineJobExecutorClient } from "./client";
 import type {
+  BossChatCoordinatorStatus,
   ChatObservedMessage,
   ChatSendCommand,
   ChatSendExecutionResult,
@@ -12,27 +13,53 @@ import type {
 
 const LEADER_STATE_KEY = "finejobBossChatLeaderV1";
 const EVENT_OUTBOX_KEY = "finejobBossChatEventOutboxV1";
+const RESULT_OUTBOX_KEY = "finejobBossChatResultOutboxV1";
+const RUNTIME_CACHE_KEY = "finejobBossChatRuntimeCacheV1";
 const TAB_STALE_MS = 15_000;
 const LEASE_MS = 20_000;
+const EVENT_OUTBOX_MAX_ITEMS = 200;
+const EVENT_OUTBOX_MAX_BYTES = 2 * 1024 * 1024;
 
 type Candidate = ChatTabHeartbeat & { receivedAt: number };
 type LeaderLease = { tabId: string; epoch: number; expiresAt: number };
 type ActiveAction = { action: FineJobChatSendAction; deadlineAt: number };
+type RuntimeCache = {
+  listenEnabled: boolean;
+  generationEnabled: boolean;
+  sendEnabled: boolean;
+  updatedAt: string;
+};
 
 export class BossChatCoordinator {
   private readonly candidates = new Map<string, Candidate>();
   private readonly leaders = new Map<string, LeaderLease>();
   private readonly activeActions = new Map<string, ActiveAction>();
   private eventOutbox: Record<string, ChatObservedMessage> = {};
+  private resultOutbox: Record<string, ChatSendExecutionResult> = {};
   private timer: number | null = null;
   private tickRunning = false;
   private listenEnabled = false;
+  private runtimeKnown = false;
+  private runtimeCache: RuntimeCache | null = null;
+  private eventOutboxBlocked = false;
+  private lastSuccessfulFlushAt = "";
+  private lastError = "";
 
   constructor(private readonly client: FineJobExecutorClient = fineJobExecutorClient) {}
 
   async start(): Promise<void> {
-    const local = await browser.storage.local.get(EVENT_OUTBOX_KEY);
+    const local = await browser.storage.local.get([
+      EVENT_OUTBOX_KEY,
+      RESULT_OUTBOX_KEY,
+      RUNTIME_CACHE_KEY
+    ]);
     this.eventOutbox = (local[EVENT_OUTBOX_KEY] as Record<string, ChatObservedMessage> | undefined) ?? {};
+    this.resultOutbox = (local[RESULT_OUTBOX_KEY] as Record<string, ChatSendExecutionResult> | undefined) ?? {};
+    const runtime = local[RUNTIME_CACHE_KEY] as RuntimeCache | undefined;
+    this.runtimeCache = runtime ?? null;
+    this.listenEnabled = runtime?.listenEnabled ?? false;
+    this.runtimeKnown = runtime !== undefined;
+    this.eventOutboxBlocked = this.isOutboxAtCapacity();
     const session = await browser.storage.session.get(LEADER_STATE_KEY);
     const stored = session[LEADER_STATE_KEY] as Record<string, LeaderLease> | undefined;
     for (const [accountUid, lease] of Object.entries(stored ?? {})) {
@@ -55,26 +82,35 @@ export class BossChatCoordinator {
   }
 
   async reportMessage(tabId: string, message: ChatObservedMessage): Promise<{ accepted: boolean }> {
-    const runtime = await this.client.getChatRuntime();
-    this.listenEnabled = runtime.listen_enabled;
+    // 监听开关使用最近一次成功同步的本地值，避免后端离线时消息在落盘前丢失。
     if (!this.listenEnabled) return { accepted: false };
     const leader = await this.elect(message.accountUid);
     // 入站消息只接受领导者标签页；人工发出的消息允许任意标签页上报并触发人工接管。
     if (message.direction === "inbound" && leader?.tabId !== tabId) {
       return { accepted: false };
     }
+    if (this.eventOutbox[message.eventId]) return { accepted: true };
+    if (!this.canAppendToOutbox(message)) {
+      this.eventOutboxBlocked = true;
+      this.lastError = "自动代聊消息待上传区已满，请恢复 FineJob 后端连接";
+      return { accepted: false };
+    }
     this.eventOutbox[message.eventId] = message;
-    const entries = Object.entries(this.eventOutbox);
-    if (entries.length > 200) this.eventOutbox = Object.fromEntries(entries.slice(-200));
+    // 收到消息后先持久化，后端上传失败时由后续 tick 继续处理。
     await this.persistOutbox();
     void this.tick();
     return { accepted: true };
   }
 
   async reportSendResult(result: ChatSendExecutionResult): Promise<void> {
-    await this.client.completeChatSend(result);
+    await this.persistSendResult(result);
     for (const [accountUid, active] of this.activeActions) {
       if (active.action.id === result.actionId) this.activeActions.delete(accountUid);
+    }
+    try {
+      await this.flushResultOutbox();
+    } catch (error) {
+      this.lastError = `自动代聊发送结果等待回传：${(error as Error).message}`;
     }
   }
 
@@ -85,6 +121,13 @@ export class BossChatCoordinator {
       this.pruneCandidates();
       const runtime = await this.client.getChatRuntime();
       this.listenEnabled = runtime.listen_enabled;
+      this.runtimeKnown = true;
+      await this.updateRuntimeCache(
+        runtime.listen_enabled,
+        runtime.generation_enabled,
+        runtime.send_enabled
+      );
+      await this.flushResultOutbox();
       const accounts = new Set<string>();
       for (const candidate of this.candidates.values()) accounts.add(candidate.accountUid);
       for (const accountUid of accounts) {
@@ -98,8 +141,10 @@ export class BossChatCoordinator {
         if (runtime.send_enabled) await this.claimAndDispatch(accountUid, leader);
       }
       await this.expireUnreportedActions();
-    } catch {
+      this.lastError = "";
+    } catch (error) {
       // 后端或页面暂时不可用时保留 outbox，下一个 tick 自动续传。
+      this.lastError = (error as Error).message || "自动代聊协调器暂时不可用";
     } finally {
       this.tickRunning = false;
     }
@@ -107,6 +152,19 @@ export class BossChatCoordinator {
 
   isListeningEnabled(): boolean {
     return this.listenEnabled;
+  }
+
+  getStatus(): BossChatCoordinatorStatus {
+    return {
+      listenEnabled: this.listenEnabled,
+      runtimeKnown: this.runtimeKnown,
+      eventOutboxCount: Object.keys(this.eventOutbox).length,
+      eventOutboxBytes: this.outboxBytes(),
+      eventOutboxBlocked: this.eventOutboxBlocked,
+      resultOutboxCount: Object.keys(this.resultOutbox).length,
+      lastSuccessfulFlushAt: this.lastSuccessfulFlushAt,
+      lastError: this.lastError
+    };
   }
 
   private pruneCandidates(): void {
@@ -154,6 +212,67 @@ export class BossChatCoordinator {
     await browser.storage.local.set({ [EVENT_OUTBOX_KEY]: this.eventOutbox });
   }
 
+  private resultKey(result: ChatSendExecutionResult): string {
+    return `${result.actionId}:${result.executionEpoch}`;
+  }
+
+  private async persistSendResult(result: ChatSendExecutionResult): Promise<void> {
+    const key = this.resultKey(result);
+    const existing = this.resultOutbox[key];
+    // 已取得明确平台结果时，不允许后续超时状态覆盖它。
+    if (existing && existing.outcome !== "unknown" && result.outcome === "unknown") return;
+    this.resultOutbox[key] = result;
+    await browser.storage.local.set({ [RESULT_OUTBOX_KEY]: this.resultOutbox });
+  }
+
+  private async flushResultOutbox(): Promise<void> {
+    for (const [key, result] of Object.entries(this.resultOutbox)) {
+      await this.client.completeChatSend(result);
+      delete this.resultOutbox[key];
+      await browser.storage.local.set({ [RESULT_OUTBOX_KEY]: this.resultOutbox });
+    }
+  }
+
+  private async updateRuntimeCache(
+    listenEnabled: boolean,
+    generationEnabled: boolean,
+    sendEnabled: boolean
+  ): Promise<void> {
+    if (
+      this.runtimeCache?.listenEnabled === listenEnabled
+      && this.runtimeCache.generationEnabled === generationEnabled
+      && this.runtimeCache.sendEnabled === sendEnabled
+    ) return;
+    this.runtimeCache = {
+      listenEnabled,
+      generationEnabled,
+      sendEnabled,
+      updatedAt: new Date().toISOString()
+    };
+    await browser.storage.local.set({ [RUNTIME_CACHE_KEY]: this.runtimeCache });
+  }
+
+  private messageBytes(message: ChatObservedMessage): number {
+    return new TextEncoder().encode(JSON.stringify(message)).byteLength;
+  }
+
+  private outboxBytes(): number {
+    return Object.values(this.eventOutbox).reduce(
+      (total, message) => total + this.messageBytes(message),
+      0
+    );
+  }
+
+  private isOutboxAtCapacity(): boolean {
+    return Object.keys(this.eventOutbox).length >= EVENT_OUTBOX_MAX_ITEMS
+      || this.outboxBytes() >= EVENT_OUTBOX_MAX_BYTES;
+  }
+
+  private canAppendToOutbox(message: ChatObservedMessage): boolean {
+    return Object.keys(this.eventOutbox).length < EVENT_OUTBOX_MAX_ITEMS
+      && this.outboxBytes() + this.messageBytes(message) <= EVENT_OUTBOX_MAX_BYTES;
+  }
+
   private async flushAccountOutbox(accountUid: string, leaderEpoch: number): Promise<void> {
     const messages = Object.values(this.eventOutbox)
       .filter((item) => item.accountUid === accountUid)
@@ -162,6 +281,8 @@ export class BossChatCoordinator {
     await this.client.reportChatMessages(messages, leaderEpoch);
     for (const message of messages) delete this.eventOutbox[message.eventId];
     await this.persistOutbox();
+    this.eventOutboxBlocked = false;
+    this.lastSuccessfulFlushAt = new Date().toISOString();
   }
 
   private async claimAndDispatch(accountUid: string, leader: LeaderLease): Promise<void> {
@@ -170,7 +291,12 @@ export class BossChatCoordinator {
     if (!action) return;
     await this.client.markChatDispatchStarted(action);
     this.activeActions.set(accountUid, { action, deadlineAt: Date.now() + 30_000 });
-    const command: ChatSendCommand = { type: "BOSS_CHAT_SEND", targetTabId: leader.tabId, action };
+    const command: ChatSendCommand = {
+      type: "BOSS_CHAT_SEND",
+      targetTabId: leader.tabId,
+      leaderEpoch: leader.epoch,
+      action
+    };
     const tabs = await browser.tabs.query({ url: ["*://zhipin.com/*", "*://*.zhipin.com/*"] });
     const results = await Promise.allSettled(
       tabs.flatMap((tab) => tab.id === undefined ? [] : [browser.tabs.sendMessage(tab.id, {

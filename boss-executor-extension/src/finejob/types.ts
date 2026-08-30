@@ -56,6 +56,18 @@ export type ExecutorRuntimeState = {
   queue: FineJobQueueAction[];
   currentAction: FineJobQueueAction | null;
   lastResult: string;
+  chat?: BossChatCoordinatorStatus;
+};
+
+export type BossChatCoordinatorStatus = {
+  listenEnabled: boolean;
+  runtimeKnown: boolean;
+  eventOutboxCount: number;
+  eventOutboxBytes: number;
+  eventOutboxBlocked: boolean;
+  resultOutboxCount: number;
+  lastSuccessfulFlushAt: string;
+  lastError: string;
 };
 
 export type DefaultGreetingCommand = {
@@ -116,6 +128,7 @@ export type FineJobChatSendAction = {
 export type ChatSendCommand = {
   type: "BOSS_CHAT_SEND";
   targetTabId: string;
+  leaderEpoch: number;
   action: FineJobChatSendAction;
 };
 

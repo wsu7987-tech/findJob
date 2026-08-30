@@ -141,3 +141,50 @@ def test_database_initializes_retrieval_index_versions_schema(
         "created_at",
         "activated_at",
     }
+
+
+def test_database_initializes_boss_chat_debounce_columns(
+    app_paths: dict[str, str],
+) -> None:
+    database = Database(app_paths["sqlite_path"])
+    database.initialize()
+
+    with database.connect() as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(fj_chat_reply_tasks)").fetchall()
+        }
+        indexes = {
+            row[1]
+            for row in connection.execute("PRAGMA index_list(fj_chat_reply_tasks)").fetchall()
+        }
+
+    assert {
+        "generation_due_at",
+        "input_message_ids_json",
+        "decision",
+        "facts_used_json",
+        "warnings_json",
+        "requires_user_input",
+        "decision_reason",
+    } <= columns
+    assert "idx_fj_chat_reply_tasks_due" in indexes
+
+    with database.connect() as connection:
+        send_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(fj_chat_send_actions)").fetchall()
+        }
+        send_indexes = {
+            row[1]
+            for row in connection.execute("PRAGMA index_list(fj_chat_send_actions)").fetchall()
+        }
+
+    assert {
+        "leader_tab_id",
+        "leader_epoch",
+        "dispatch_deadline_at",
+        "platform_message_id",
+        "client_mid",
+    } <= send_columns
+    assert "idx_fj_chat_send_actions_dispatch_deadline" in send_indexes

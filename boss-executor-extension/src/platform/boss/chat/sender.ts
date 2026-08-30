@@ -22,6 +22,10 @@ class BossChatSender {
   private async connect(): Promise<MqttClient> {
     if (this.client?.connected) return this.client;
     if (this.connecting) return this.connecting;
+    if (this.client) {
+      this.client.end(true);
+      this.client = null;
+    }
     this.connecting = (async () => {
       const identity = readPageIdentity();
       const response = await fetch("https://www.zhipin.com/wapi/zppassport/get/wt", {
@@ -40,11 +44,12 @@ class BossChatSender {
         password: wt,
         keepalive: 25,
         clean: true,
-        reconnectPeriod: 1000,
+        reconnectPeriod: 0,
         connectTimeout: 10_000,
         protocolVersion: 4,
         createWebsocket: (url: string) => new WebSocket(url, wt ? [wt] : ["mqtt"])
       });
+      this.client = client;
       await new Promise<void>((resolve, reject) => {
         const timeout = window.setTimeout(() => reject(new Error("BOSS 聊天连接超时")), 10_000);
         client.once("connect", () => {
@@ -56,9 +61,15 @@ class BossChatSender {
           reject(error);
         });
       });
-      this.client = client;
+      client.once("close", () => {
+        if (this.client === client) this.client = null;
+      });
       return client;
-    })().finally(() => {
+    })().catch((error) => {
+      this.client?.end(true);
+      this.client = null;
+      throw error;
+    }).finally(() => {
       this.connecting = null;
     });
     return this.connecting;
@@ -66,10 +77,14 @@ class BossChatSender {
 
   async send(action: FineJobChatSendAction): Promise<ChatSendExecutionResult> {
     const clientMid = String(Date.now());
+    let publishStarted = false;
     try {
       const identity = readPageIdentity();
       if (identity.uid !== action.account_uid) {
         throw new Error("当前 BOSS 账号与待发送动作不一致");
+      }
+      if (!action.peer_uid || !action.encrypt_peer_uid || !action.security_id || !action.encrypt_job_id) {
+        throw new Error("聊天对象身份不完整，已阻止发送");
       }
       const client = await this.connect();
       const bytes = bossChatProtocol.encodeText({
@@ -81,29 +96,38 @@ class BossChatSender {
         text: action.text
       });
       markAssistantClientMid(clientMid);
-      client.publish(
-        "chat",
-        bytes as unknown as Parameters<MqttClient["publish"]>[1],
-        { qos: 1, retain: true }
-      );
+      publishStarted = true;
+      await new Promise<void>((resolve, reject) => {
+        const timeout = window.setTimeout(() => reject(new Error("MQTT 发送回执超时")), 10_000);
+        client.publish(
+          "chat",
+          bytes as unknown as Parameters<MqttClient["publish"]>[1],
+          { qos: 1, retain: true },
+          (error) => {
+            window.clearTimeout(timeout);
+            if (error) reject(error);
+            else resolve();
+          }
+        );
+      });
       return {
         actionId: action.id,
         executionEpoch: action.execution_epoch,
         outcome: "accepted",
         platformMessageId: "",
         clientMid,
-        statusCode: "publish_no_throw",
-        message: "MQTT publish 已提交发送",
+        statusCode: "mqtt_puback",
+        message: "MQTT 已确认提交发送",
         evidence: { topic: "chat", qos: 1, retain: true }
       };
     } catch (error) {
       return {
         actionId: action.id,
         executionEpoch: action.execution_epoch,
-        outcome: "failed",
+        outcome: publishStarted ? "unknown" : "failed",
         platformMessageId: "",
         clientMid,
-        statusCode: "chat_send_failed",
+        statusCode: publishStarted ? "chat_send_result_unknown" : "chat_send_failed",
         message: (error as Error).message || "BOSS 聊天发送失败",
         evidence: {}
       };

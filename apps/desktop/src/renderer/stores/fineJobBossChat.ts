@@ -14,6 +14,10 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
   const runtime = ref<FineJobChatRuntime | null>(null);
   const sessions = ref<FineJobChatSession[]>([]);
   const selectedSessionId = ref<string | null>(null);
+  const searchQuery = ref("");
+  const statusFilter = ref("");
+  const accountFilter = ref("");
+  const nextOffset = ref<number | null>(null);
   const detail = ref<FineJobChatSessionDetail | null>(null);
   const loading = ref(false);
   const mutating = ref(false);
@@ -31,10 +35,11 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     try {
       const [runtimeResult, sessionResult] = await Promise.all([
         api.getFineJobChatRuntime(),
-        api.listFineJobChatSessions()
+        api.listFineJobChatSessions(listParams())
       ]);
       runtime.value = runtimeResult.runtime;
       sessions.value = sessionResult.sessions;
+      nextOffset.value = sessionResult.next_offset ?? null;
       if (!selectedSessionId.value || !sessions.value.some((item) => item.id === selectedSessionId.value)) {
         selectedSessionId.value = sessions.value[0]?.id ?? null;
       }
@@ -45,6 +50,52 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
       throw value;
     } finally {
       loading.value = false;
+    }
+  };
+
+  const listParams = (offset = 0) => ({
+    q: searchQuery.value.trim() || undefined,
+    status: statusFilter.value || undefined,
+    account_uid: accountFilter.value.trim() || undefined,
+    limit: 50,
+    offset
+  });
+
+  const loadList = async () => {
+    const result = await api.listFineJobChatSessions(listParams());
+    sessions.value = result.sessions;
+    nextOffset.value = result.next_offset ?? null;
+    if (selectedSessionId.value && !sessions.value.some((item) => item.id === selectedSessionId.value)) {
+      selectedSessionId.value = sessions.value[0]?.id ?? null;
+      detail.value = selectedSessionId.value
+        ? await api.getFineJobChatSession(selectedSessionId.value)
+        : null;
+    }
+  };
+
+  const loadMore = async () => {
+    if (nextOffset.value === null) return;
+    const result = await api.listFineJobChatSessions(listParams(nextOffset.value));
+    const known = new Set(sessions.value.map((item) => item.id));
+    sessions.value.push(...result.sessions.filter((item) => !known.has(item.id)));
+    nextOffset.value = result.next_offset ?? null;
+  };
+
+  const poll = async () => {
+    if (mutating.value) return;
+    const selectedId = selectedSessionId.value;
+    try {
+      const [runtimeResult, sessionResult, selectedDetail] = await Promise.all([
+        api.getFineJobChatRuntime(),
+        api.listFineJobChatSessions(listParams()),
+        selectedId ? api.getFineJobChatSession(selectedId) : Promise.resolve(null)
+      ]);
+      runtime.value = runtimeResult.runtime;
+      sessions.value = sessionResult.sessions;
+      nextOffset.value = sessionResult.next_offset ?? null;
+      if (selectedId && selectedSessionId.value === selectedId && selectedDetail) detail.value = selectedDetail;
+    } catch (value) {
+      error.value = mapError(value);
     }
   };
 
@@ -114,8 +165,9 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
 
   const refreshSelected = async () => {
     if (selectedSessionId.value) await loadDetail(selectedSessionId.value);
-    const sessionResult = await api.listFineJobChatSessions();
+    const sessionResult = await api.listFineJobChatSessions(listParams());
     sessions.value = sessionResult.sessions;
+    nextOffset.value = sessionResult.next_offset ?? null;
   };
 
   const mutate = async <T>(operation: () => Promise<T>): Promise<T> => {
@@ -135,6 +187,10 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     runtime,
     sessions,
     selectedSessionId,
+    searchQuery,
+    statusFilter,
+    accountFilter,
+    nextOffset,
     detail,
     currentTask,
     loading,
@@ -142,6 +198,9 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     error,
     load,
     loadDetail,
+    loadList,
+    loadMore,
+    poll,
     updateRuntime,
     checkNow,
     generate,

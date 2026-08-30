@@ -8,16 +8,29 @@ type ContactContext = {
   companyName: string;
 };
 
-const cache = new Map<string, ContactContext>();
+type CachedContactContext = { value: ContactContext; expiresAt: number };
+
+const cache = new Map<string, CachedContactContext>();
+const CACHE_TTL_MS = 5 * 60_000;
+const CACHE_MAX_ITEMS = 200;
 
 const record = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" ? value as Record<string, unknown> : {};
 
 const text = (value: unknown): string => value == null ? "" : String(value);
 
-export const resolveBossContactContext = async (peerUid: string): Promise<ContactContext> => {
-  const cached = cache.get(peerUid);
-  if (cached) return cached;
+export const resolveBossContactContext = async (
+  accountUid: string,
+  peerUid: string,
+  encryptJobId = ""
+): Promise<ContactContext> => {
+  const now = Date.now();
+  for (const [key, item] of cache) {
+    if (item.expiresAt <= now) cache.delete(key);
+  }
+  const cacheKey = `${accountUid}:${peerUid}:${encryptJobId}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return cached.value;
   try {
     // 只查询当前消息对端，不同步聊天历史。
     const response = await fetch(
@@ -36,7 +49,11 @@ export const resolveBossContactContext = async (peerUid: string): Promise<Contac
       peerName: text(first.name),
       companyName: text(first.brandName)
     };
-    cache.set(peerUid, result);
+    cache.set(cacheKey, { value: result, expiresAt: now + CACHE_TTL_MS });
+    if (cache.size > CACHE_MAX_ITEMS) {
+      const oldestKey = cache.keys().next().value as string | undefined;
+      if (oldestKey) cache.delete(oldestKey);
+    }
     return result;
   } catch {
     return {

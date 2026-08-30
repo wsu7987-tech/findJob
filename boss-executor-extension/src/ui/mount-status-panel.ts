@@ -20,10 +20,16 @@ export const mountStatusPanel = (
   style.textContent = `
     :host { all: initial; }
     .finejob-panel { position: fixed; right: 18px; bottom: 18px; z-index: 2147483647;
-      width: 328px; padding: 14px; border: 1px solid rgba(94,234,212,.35);
+      box-sizing: border-box; width: 340px; max-width: calc(100vw - 16px);
+      max-height: calc(100vh - 16px); padding: 14px; border: 1px solid rgba(94,234,212,.35);
       border-radius: 12px; color: #e5e7eb; background: rgba(17,24,39,.96);
-      box-shadow: 0 12px 36px rgba(0,0,0,.28); font: 12px/1.5 system-ui, sans-serif; }
-    header { color: #5eead4; font-size: 14px; font-weight: 700; }
+      box-shadow: 0 12px 36px rgba(0,0,0,.28); font: 12px/1.5 system-ui, sans-serif;
+      display: flex; flex-direction: column; overflow: hidden; }
+    .finejob-panel--collapsed { width: 268px; padding: 9px 10px; }
+    .panel-header { color: #5eead4; font-size: 14px; font-weight: 700;
+      display: flex; align-items: center; gap: 8px; cursor: move; user-select: none; touch-action: none; }
+    .compact-status { flex: 1; color: #d1d5db; font-size: 12px; font-weight: 500; }
+    .panel-body { min-height: 0; overflow-y: auto; padding-right: 2px; }
     p { margin: 6px 0 0; }
     .success { color: #86efac; }
     dl { margin: 10px 0 0; }
@@ -43,6 +49,8 @@ export const mountStatusPanel = (
     .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
     button { padding: 5px 8px; border: 1px solid #4b5563; border-radius: 6px;
       color: #e5e7eb; background: #1f2937; cursor: pointer; }
+    button.icon-button { margin-left: auto; padding: 3px 7px; color: #99f6e4;
+      border-color: rgba(94,234,212,.35); background: rgba(31,41,55,.72); }
     button.primary { color: #052e2b; background: #5eead4; border-color: #5eead4; }
     button.danger { color: #fecaca; border-color: #ef4444; }
     .queue { max-height: 150px; overflow: auto; margin: 6px 0 0; padding-left: 18px; }

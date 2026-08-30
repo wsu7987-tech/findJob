@@ -19,6 +19,7 @@ export const CONTENT_NAMESPACE = "fine-job:boss-executor:content:v1";
 export class ContentService {
   private readonly mainWorldWaiters = new Set<() => void>();
   private readonly mainCommands: MainWorldCommand[] = [];
+  private chatLeaderEpoch = 0;
   private readonly tabId = typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
     : `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -71,6 +72,7 @@ export class ContentService {
   async enqueueMainCommand(command: MainWorldCommand): Promise<{ accepted: boolean }> {
     if (command.type === "BOSS_CHAT_SEND") {
       if (command.targetTabId !== this.tabId) return { accepted: false };
+      if (command.leaderEpoch !== this.chatLeaderEpoch) return { accepted: false };
       if (!command.action?.id || command.action.execution_epoch < 1 || !command.action.text) {
         throw new Error("聊天发送命令载荷无效");
       }
@@ -90,7 +92,13 @@ export class ContentService {
   }
 
   async takeMainCommand(): Promise<MainWorldCommand | null> {
-    return this.mainCommands.shift() ?? null;
+    while (this.mainCommands.length > 0) {
+      const command = this.mainCommands.shift() as MainWorldCommand;
+      if (command.type !== "BOSS_CHAT_SEND" || command.leaderEpoch === this.chatLeaderEpoch) {
+        return command;
+      }
+    }
+    return null;
   }
 
   async reportExecutionResult(result: MainWorldExecutionResult): Promise<{ accepted: true }> {
@@ -100,11 +108,12 @@ export class ContentService {
 
   async reportChatIdentity(identity: ChatIdentity): Promise<{ accepted: true }> {
     if (!identity.accountUid || !identity.loggedIn) return { accepted: true };
-    await this.background.reportChatTabHeartbeat({
+    const leader = await this.background.reportChatTabHeartbeat({
       ...identity,
       tabId: this.tabId,
       visible: document.visibilityState === "visible"
     });
+    this.chatLeaderEpoch = leader.isLeader ? leader.leaderEpoch : 0;
     return { accepted: true };
   }
 

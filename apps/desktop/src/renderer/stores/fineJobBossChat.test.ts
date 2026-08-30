@@ -109,4 +109,36 @@ describe("fineJobBossChat store", () => {
     });
     expect(store.runtime?.send_enabled).toBe(false);
   });
+
+  it("会话搜索和状态筛选通过服务端参数加载", async () => {
+    const listSpy = vi.mocked(api.listFineJobChatSessions);
+    const store = useFineJobBossChatStore();
+    store.searchQuery = "王经理";
+    store.statusFilter = "active";
+    store.accountFilter = "100";
+
+    await store.loadList();
+
+    expect(listSpy).toHaveBeenLastCalledWith({
+      q: "王经理",
+      status: "active",
+      account_uid: "100",
+      limit: 50,
+      offset: 0
+    });
+  });
+
+  it("轻量轮询保持当前选中会话并刷新运行状态", async () => {
+    const store = useFineJobBossChatStore();
+    await store.load();
+    vi.mocked(api.getFineJobChatRuntime).mockResolvedValue({
+      runtime: { ...runtime, generation_enabled: true }
+    } as never);
+
+    await store.poll();
+
+    expect(store.selectedSessionId).toBe("session-1");
+    expect(store.runtime?.generation_enabled).toBe(true);
+    expect(store.detail?.session.id).toBe("session-1");
+  });
 });

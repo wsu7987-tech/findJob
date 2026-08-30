@@ -964,8 +964,21 @@ export const api = {
   async checkFineJobChatNow() {
     return request<{ generated: number }>("/api/fine-job/boss-chat/check", { method: "POST" });
   },
-  async listFineJobChatSessions() {
-    return request<FineJobChatSessionListEnvelope>("/api/fine-job/boss-chat/sessions");
+  async listFineJobChatSessions(params: {
+    status?: string;
+    account_uid?: string;
+    q?: string;
+    limit?: number;
+    offset?: number;
+  } = {}) {
+    const query = new URLSearchParams();
+    if (params.status) query.set("status", params.status);
+    if (params.account_uid) query.set("account_uid", params.account_uid);
+    if (params.q) query.set("q", params.q);
+    if (params.limit) query.set("limit", String(params.limit));
+    if (params.offset) query.set("offset", String(params.offset));
+    const suffix = query.size ? `?${query.toString()}` : "";
+    return request<FineJobChatSessionListEnvelope>(`/api/fine-job/boss-chat/sessions${suffix}`);
   },
   async getFineJobChatSession(sessionId: string) {
     return request<FineJobChatSessionDetail>(

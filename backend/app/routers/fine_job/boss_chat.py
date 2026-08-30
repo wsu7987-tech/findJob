@@ -57,7 +57,6 @@ def executor_events(
     payload: BossChatEventBatchRequest,
     authorization: str = Header(default=""),
     db: Database = Depends(get_database),
-    config: AppConfig = Depends(get_config),
 ):
     executor = _executor(db, authorization)
     result = boss_chat.ingest_events(
@@ -65,8 +64,9 @@ def executor_events(
         str(executor["id"]),
         [event.model_dump() for event in payload.events],
     )
-    # 立即模式沿用同一任务处理器；定时模式只在到期时生成。
-    result["generated"] = boss_chat.process_due_tasks(db, config)
+    # 事件接口只负责可靠入库，草稿由后台调度器在防抖时间到期后生成。
+    result["generated"] = 0
+    result["processing_deferred"] = bool(result["queued_task_ids"])
     return result
 
 
@@ -115,14 +115,33 @@ def complete_action(
 @router.get("/sessions")
 def sessions(
     status: str | None = Query(default=None),
+    account_uid: str | None = Query(default=None, max_length=80),
+    q: str | None = Query(default=None, max_length=120),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
     db: Database = Depends(get_database),
 ):
-    return {"sessions": boss_chat.list_sessions(db, status=status)}
+    items = boss_chat.list_sessions(
+        db,
+        status=status,
+        account_uid=account_uid,
+        query=q,
+        limit=limit,
+        offset=offset,
+    )
+    return {
+        "sessions": items,
+        "next_offset": offset + len(items) if len(items) == limit else None,
+    }
 
 
 @router.get("/sessions/{session_id}")
-def session(session_id: str, db: Database = Depends(get_database)):
-    return boss_chat.get_session(db, session_id)
+def session(
+    session_id: str,
+    message_limit: int = Query(default=200, ge=20, le=500),
+    db: Database = Depends(get_database),
+):
+    return boss_chat.get_session(db, session_id, message_limit=message_limit)
 
 
 @router.post("/sessions/{session_id}/generate")

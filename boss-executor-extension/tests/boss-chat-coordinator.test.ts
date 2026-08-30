@@ -1,6 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ChatObservedMessage } from "../src/finejob/types";
+import type { ChatObservedMessage, ChatSendExecutionResult } from "../src/finejob/types";
 
 
 const storage = {
@@ -25,10 +25,13 @@ const browserMock = {
 
 (globalThis as unknown as Record<string, unknown>).__fineJobTestBrowser = browserMock;
 
-const message = (direction: "inbound" | "outbound"): ChatObservedMessage => ({
-  eventId: `event-${direction}`,
+const message = (
+  direction: "inbound" | "outbound",
+  suffix: string = direction
+): ChatObservedMessage => ({
+  eventId: `event-${suffix}`,
   accountUid: "100",
-  platformMessageId: `message-${direction}`,
+  platformMessageId: `message-${suffix}`,
   direction,
   messageType: "text",
   content: "测试消息",
@@ -56,6 +59,11 @@ describe("多标签页聊天领导者", () => {
     vi.useFakeTimers();
   });
 
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
   it("同一账号只有领导者提交入站消息，人工出站允许任意标签页上报", async () => {
     const { BossChatCoordinator } = await import("../src/finejob/chat-coordinator");
     const client = {
@@ -65,6 +73,7 @@ describe("多标签页聊天领导者", () => {
       completeChatSend: vi.fn()
     };
     const coordinator = new BossChatCoordinator(client as never);
+    await coordinator.start();
     const base = { accountUid: "100", loggedIn: true, pathname: "/web/geek/chat", observedAt: Date.now(), visible: true };
 
     const first = await coordinator.reportTabHeartbeat({ ...base, tabId: "tab-a" });
@@ -96,5 +105,98 @@ describe("多标签页聊天领导者", () => {
     });
     expect(first.leaderEpoch).toBe(1);
     expect(replacement).toEqual({ isLeader: true, leaderEpoch: 2 });
+  });
+
+  it("后端不可用时仍按本地监听缓存先保存消息", async () => {
+    storage.local.finejobBossChatRuntimeCacheV1 = {
+      listenEnabled: true,
+      generationEnabled: true,
+      sendEnabled: false,
+      updatedAt: new Date().toISOString()
+    };
+    const { BossChatCoordinator } = await import("../src/finejob/chat-coordinator");
+    const client = {
+      getChatRuntime: vi.fn(async () => { throw new Error("后端离线"); }),
+      completeChatSend: vi.fn()
+    };
+    const coordinator = new BossChatCoordinator(client as never);
+    await coordinator.start();
+    await coordinator.reportTabHeartbeat({
+      accountUid: "100",
+      tabId: "tab-a",
+      loggedIn: true,
+      pathname: "/web/geek/chat",
+      observedAt: Date.now(),
+      visible: true
+    });
+
+    await expect(coordinator.reportMessage("tab-a", message("inbound"))).resolves.toEqual({ accepted: true });
+    const outbox = storage.local.finejobBossChatEventOutboxV1 as Record<string, ChatObservedMessage>;
+    expect(outbox["event-inbound"]).toBeTruthy();
+    expect(client.getChatRuntime).toHaveBeenCalled();
+  });
+
+  it("待上传区达到容量后保留旧消息并明确拒绝新消息", async () => {
+    storage.local.finejobBossChatEventOutboxV1 = Object.fromEntries(
+      Array.from({ length: 200 }, (_, index) => {
+        const item = message("inbound", String(index));
+        return [item.eventId, item];
+      })
+    );
+    const { BossChatCoordinator } = await import("../src/finejob/chat-coordinator");
+    const client = {
+      getChatRuntime: vi.fn(async () => ({ listen_enabled: true, generation_enabled: true, send_enabled: false })),
+      completeChatSend: vi.fn()
+    };
+    const coordinator = new BossChatCoordinator(client as never);
+    await coordinator.start();
+    await coordinator.reportTabHeartbeat({
+      accountUid: "100",
+      tabId: "tab-a",
+      loggedIn: true,
+      pathname: "/web/geek/chat",
+      observedAt: Date.now(),
+      visible: true
+    });
+
+    await expect(coordinator.reportMessage("tab-a", message("inbound", "overflow"))).resolves.toEqual({ accepted: false });
+    const outbox = storage.local.finejobBossChatEventOutboxV1 as Record<string, ChatObservedMessage>;
+    expect(Object.keys(outbox)).toHaveLength(200);
+    expect(outbox["event-0"]).toBeTruthy();
+    expect(outbox["event-overflow"]).toBeUndefined();
+    expect(coordinator.getStatus()).toMatchObject({
+      eventOutboxCount: 200,
+      eventOutboxBlocked: true
+    });
+  });
+
+  it("发送结果先持久化，后端恢复后只补传结果", async () => {
+    const { BossChatCoordinator } = await import("../src/finejob/chat-coordinator");
+    const completeChatSend = vi.fn().mockRejectedValueOnce(new Error("后端离线"));
+    const client = {
+      getChatRuntime: vi.fn(async () => ({ listen_enabled: false, generation_enabled: false, send_enabled: false })),
+      completeChatSend
+    };
+    const coordinator = new BossChatCoordinator(client as never);
+    await coordinator.start();
+    const result: ChatSendExecutionResult = {
+      actionId: "action-1",
+      executionEpoch: 2,
+      outcome: "accepted",
+      platformMessageId: "",
+      clientMid: "mid-1",
+      statusCode: "mqtt_puback",
+      message: "已提交",
+      evidence: {}
+    };
+
+    await coordinator.reportSendResult(result);
+    expect(storage.local.finejobBossChatResultOutboxV1).toEqual({ "action-1:2": result });
+    expect(coordinator.getStatus().resultOutboxCount).toBe(1);
+
+    completeChatSend.mockResolvedValueOnce(undefined);
+    await coordinator.reportSendResult(result);
+    expect(storage.local.finejobBossChatResultOutboxV1).toEqual({});
+    expect(completeChatSend).toHaveBeenCalledTimes(2);
   });
 });

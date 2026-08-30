@@ -946,6 +946,15 @@ export type FineJobChatReplyStatus =
   | "stale"
   | "failed";
 
+export interface FineJobChatLeader {
+  account_uid: string;
+  executor_id: string;
+  tab_id: string;
+  leader_epoch: number;
+  lease_expires_at: string;
+  updated_at: string;
+}
+
 export interface FineJobChatRuntime {
   id: "boss";
   listen_enabled: boolean;
@@ -958,6 +967,7 @@ export interface FineJobChatRuntime {
   leader_tab_id?: string | null;
   leader_epoch: number;
   leader_lease_expires_at?: string | null;
+  leaders?: FineJobChatLeader[];
   updated_at: string;
 }
 
@@ -974,6 +984,8 @@ export interface FineJobChatSession {
   peer_name: string;
   company_name: string;
   status: FineJobChatSessionStatus;
+  identity_state?: "ready" | "incomplete";
+  job_context_state?: "linked" | "unlinked";
   session_version: number;
   latest_message_id?: string | null;
   latest_inbound_message_id?: string | null;
@@ -1009,6 +1021,14 @@ export interface FineJobChatReplyTask {
   status: FineJobChatReplyStatus;
   based_on_message_id: string;
   based_on_session_version: number;
+  generation_due_at?: string | null;
+  input_message_ids?: string[];
+  decision?: "reply" | "manual" | "ignore";
+  facts_used?: string[];
+  warnings?: string[];
+  requires_user_input?: boolean;
+  decision_reason?: string;
+  content_categories?: string[];
   context: Record<string, unknown>;
   draft_text: string;
   final_text: string;
@@ -1026,12 +1046,17 @@ export interface FineJobChatSendAction {
   status: "queued" | "leased" | "dispatching" | "accepted" | "failed" | "unknown" | "cancelled";
   text: string;
   execution_epoch: number;
+  leader_tab_id?: string;
+  leader_epoch?: number;
+  dispatch_deadline_at?: string | null;
   outcome?: "accepted" | "failed" | "unknown" | null;
   status_code: string;
   error_message: string;
   evidence: Record<string, unknown>;
   created_at: string;
   updated_at: string;
+  platform_message_id?: string;
+  client_mid?: string;
 }
 
 export interface FineJobChatSessionDetail {
@@ -1039,10 +1064,15 @@ export interface FineJobChatSessionDetail {
   messages: FineJobChatMessage[];
   reply_tasks: FineJobChatReplyTask[];
   send_actions: FineJobChatSendAction[];
+  messages_truncated?: boolean;
+  message_count?: number;
 }
 
 export interface FineJobChatRuntimeEnvelope { runtime: FineJobChatRuntime }
-export interface FineJobChatSessionListEnvelope { sessions: FineJobChatSession[] }
+export interface FineJobChatSessionListEnvelope {
+  sessions: FineJobChatSession[];
+  next_offset?: number | null;
+}
 export interface FineJobChatReplyEnvelope { reply_task: FineJobChatReplyTask }
 export interface FineJobChatSendActionEnvelope { action: FineJobChatSendAction }
 

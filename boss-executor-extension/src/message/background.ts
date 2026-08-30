@@ -33,7 +33,10 @@ export class BackgroundService {
   }
 
   async getExecutorState(): Promise<ExecutorRuntimeState> {
-    return fineJobExecutorClient.getState();
+    return {
+      ...fineJobExecutorClient.getState(),
+      chat: bossChatCoordinator.getStatus()
+    };
   }
 
   async pair(code: string): Promise<{ accepted: true }> {

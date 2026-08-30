@@ -1407,6 +1407,13 @@ CREATE TABLE IF NOT EXISTS fj_chat_reply_tasks (
   status TEXT NOT NULL DEFAULT 'pending_generation',
   based_on_message_id TEXT NOT NULL,
   based_on_session_version INTEGER NOT NULL,
+  generation_due_at TEXT,
+  input_message_ids_json TEXT NOT NULL DEFAULT '[]',
+  decision TEXT NOT NULL DEFAULT 'reply',
+  facts_used_json TEXT NOT NULL DEFAULT '[]',
+  warnings_json TEXT NOT NULL DEFAULT '[]',
+  requires_user_input INTEGER NOT NULL DEFAULT 0,
+  decision_reason TEXT NOT NULL DEFAULT '',
   context_json TEXT NOT NULL DEFAULT '{}',
   draft_text TEXT NOT NULL DEFAULT '',
   final_text TEXT NOT NULL DEFAULT '',
@@ -1438,8 +1445,13 @@ CREATE TABLE IF NOT EXISTS fj_chat_send_actions (
   execution_epoch INTEGER NOT NULL DEFAULT 0,
   lease_owner TEXT,
   lease_expires_at TEXT,
+  leader_tab_id TEXT NOT NULL DEFAULT '',
+  leader_epoch INTEGER NOT NULL DEFAULT 0,
+  dispatch_deadline_at TEXT,
   attempt_count INTEGER NOT NULL DEFAULT 0,
   outcome TEXT,
+  platform_message_id TEXT NOT NULL DEFAULT '',
+  client_mid TEXT NOT NULL DEFAULT '',
   status_code TEXT NOT NULL DEFAULT '',
   error_message TEXT NOT NULL DEFAULT '',
   evidence_json TEXT NOT NULL DEFAULT '{}',
@@ -2266,12 +2278,24 @@ class Database:
                 "classification_version": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN classification_version INTEGER NOT NULL DEFAULT 1",
                 "candidate_profile_id": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN candidate_profile_id TEXT",
                 "profile_context_version": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN profile_context_version INTEGER",
+                "generation_due_at": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN generation_due_at TEXT",
+                "input_message_ids_json": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN input_message_ids_json TEXT NOT NULL DEFAULT '[]'",
+                "decision": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN decision TEXT NOT NULL DEFAULT 'reply'",
+                "facts_used_json": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN facts_used_json TEXT NOT NULL DEFAULT '[]'",
+                "warnings_json": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN warnings_json TEXT NOT NULL DEFAULT '[]'",
+                "requires_user_input": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN requires_user_input INTEGER NOT NULL DEFAULT 0",
+                "decision_reason": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN decision_reason TEXT NOT NULL DEFAULT ''",
             },
             "fj_chat_send_actions": {
                 "authorization_mode": "ALTER TABLE fj_chat_send_actions ADD COLUMN authorization_mode TEXT NOT NULL DEFAULT 'manual_confirmation'",
                 "authorization_source": "ALTER TABLE fj_chat_send_actions ADD COLUMN authorization_source TEXT NOT NULL DEFAULT 'confirmation'",
                 "content_categories_json": "ALTER TABLE fj_chat_send_actions ADD COLUMN content_categories_json TEXT NOT NULL DEFAULT '[]'",
                 "classification_version": "ALTER TABLE fj_chat_send_actions ADD COLUMN classification_version INTEGER NOT NULL DEFAULT 1",
+                "leader_tab_id": "ALTER TABLE fj_chat_send_actions ADD COLUMN leader_tab_id TEXT NOT NULL DEFAULT ''",
+                "leader_epoch": "ALTER TABLE fj_chat_send_actions ADD COLUMN leader_epoch INTEGER NOT NULL DEFAULT 0",
+                "dispatch_deadline_at": "ALTER TABLE fj_chat_send_actions ADD COLUMN dispatch_deadline_at TEXT",
+                "platform_message_id": "ALTER TABLE fj_chat_send_actions ADD COLUMN platform_message_id TEXT NOT NULL DEFAULT ''",
+                "client_mid": "ALTER TABLE fj_chat_send_actions ADD COLUMN client_mid TEXT NOT NULL DEFAULT ''",
             },
         }
         for table, table_migrations in migrations.items():
@@ -2281,6 +2305,14 @@ class Database:
             for column, ddl in table_migrations.items():
                 if column not in columns:
                     connection.execute(ddl)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fj_chat_reply_tasks_due "
+            "ON fj_chat_reply_tasks(status, generation_due_at, created_at)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fj_chat_send_actions_dispatch_deadline "
+            "ON fj_chat_send_actions(status, dispatch_deadline_at)"
+        )
 
     def _ensure_resume_analysis_v2_schema(self, connection: sqlite3.Connection) -> None:
         """补齐简历组、资料作用域和派生版本使用的 V2 字段。"""

@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
+import { browser } from "#imports";
 import type { ComponentState, FrameworkStatus } from "../executor/framework-mode";
 import type { ExecutorPanelController, FineJobQueueAction } from "../finejob/types";
 import type { BossJobIdentity, BossPageKind, BossProbeState } from "../platform/boss/types";
@@ -13,7 +14,71 @@ const pairingCode = ref("");
 const busy = ref(false);
 const uiError = ref("");
 const nowMs = ref(Date.now());
+const panel = ref<HTMLElement | null>(null);
+const collapsed = ref(false);
+const position = ref<{ left: number; top: number } | null>(null);
+const PANEL_UI_KEY = "finejobBossExecutorPanelUiV1";
 let countdownTimer: number | null = null;
+let dragging: { offsetX: number; offsetY: number } | null = null;
+
+const displayAction = computed(() => props.status.executor.currentAction ?? props.status.executor.queue[0] ?? null);
+const panelStyle = computed(() => position.value ? {
+  left: `${position.value.left}px`,
+  top: `${position.value.top}px`,
+  right: "auto",
+  bottom: "auto"
+} : {});
+
+const persistPanelUi = async () => {
+  await browser.storage.local.set({
+    [PANEL_UI_KEY]: {
+      collapsed: collapsed.value,
+      position: position.value
+    }
+  });
+};
+
+const clampPosition = () => {
+  if (!position.value || !panel.value) return;
+  const rect = panel.value.getBoundingClientRect();
+  position.value = {
+    left: Math.max(8, Math.min(position.value.left, window.innerWidth - rect.width - 8)),
+    top: Math.max(8, Math.min(position.value.top, window.innerHeight - rect.height - 8))
+  };
+};
+
+const toggleCollapsed = async () => {
+  collapsed.value = !collapsed.value;
+  await nextTick();
+  clampPosition();
+  await persistPanelUi();
+};
+
+const onPointerMove = (event: PointerEvent) => {
+  if (!dragging) return;
+  position.value = {
+    left: event.clientX - dragging.offsetX,
+    top: event.clientY - dragging.offsetY
+  };
+  clampPosition();
+};
+
+const stopDragging = () => {
+  if (!dragging) return;
+  dragging = null;
+  window.removeEventListener("pointermove", onPointerMove);
+  window.removeEventListener("pointerup", stopDragging);
+  void persistPanelUi();
+};
+
+const startDragging = (event: PointerEvent) => {
+  if ((event.target as HTMLElement).closest("button") || !panel.value) return;
+  const rect = panel.value.getBoundingClientRect();
+  position.value = { left: rect.left, top: rect.top };
+  dragging = { offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top };
+  window.addEventListener("pointermove", onPointerMove);
+  window.addEventListener("pointerup", stopDragging, { once: true });
+};
 
 const run = async (operation: () => Promise<void>) => {
   busy.value = true;
@@ -32,6 +97,11 @@ const pair = () => run(async () => {
   await props.controller.pair(pairingCode.value);
   pairingCode.value = "";
 });
+
+const returnCurrentToReview = () => {
+  const action = props.status.executor.currentAction;
+  if (action) void run(() => props.controller.returnToReview(action.id));
+};
 
 const label = (state: ComponentState) =>
   ({ checking: "检查中", ready: "正常", error: "异常" })[state];
@@ -91,15 +161,47 @@ const actionLabel = (action: FineJobQueueAction) => {
 
 onMounted(() => {
   countdownTimer = window.setInterval(() => { nowMs.value = Date.now(); }, 1000);
+  void browser.storage.local.get(PANEL_UI_KEY).then(async (stored) => {
+    const ui = stored[PANEL_UI_KEY] as {
+      collapsed?: boolean;
+      position?: { left: number; top: number } | null;
+    } | undefined;
+    collapsed.value = Boolean(ui?.collapsed);
+    position.value = ui?.position ?? null;
+    await nextTick();
+    clampPosition();
+  });
+  window.addEventListener("resize", clampPosition);
 });
 onBeforeUnmount(() => {
   if (countdownTimer !== null) window.clearInterval(countdownTimer);
+  stopDragging();
+  window.removeEventListener("resize", clampPosition);
 });
 </script>
 
 <template>
-  <section class="finejob-panel" aria-label="FineJob BOSS 执行器状态">
-    <header>FineJob BOSS 执行器</header>
+  <section
+    ref="panel"
+    class="finejob-panel"
+    :class="{ 'finejob-panel--collapsed': collapsed }"
+    :style="panelStyle"
+    aria-label="FineJob BOSS 执行器状态"
+  >
+    <header class="panel-header" @pointerdown="startDragging">
+      <span>FineJob</span>
+      <span v-if="collapsed" class="compact-status">
+        {{ status.executor.connected ? "● 已连接" : "○ 未连接" }} · 队列 {{ status.executor.queue.length }}
+      </span>
+      <button
+        class="icon-button"
+        type="button"
+        :aria-label="collapsed ? '展开 FineJob 面板' : '缩小 FineJob 面板'"
+        :title="collapsed ? '展开' : '缩小'"
+        @click.stop="toggleCollapsed"
+      >{{ collapsed ? "展开" : "缩小" }}</button>
+    </header>
+    <div v-if="!collapsed" class="panel-body">
     <dl>
       <div>
         <dt>FineJob</dt>
@@ -111,6 +213,12 @@ onBeforeUnmount(() => {
         <dt>自动打招呼</dt>
         <dd :data-state="status.executor.executor?.permission_state === 'allowed' ? 'ready' : 'checking'">
           {{ status.executor.executor?.permission_state === "allowed" ? "已允许" : "已暂停" }}
+        </dd>
+      </div>
+      <div>
+        <dt>自动代聊</dt>
+        <dd :data-state="status.executor.chat?.eventOutboxBlocked ? 'error' : status.executor.chat?.listenEnabled ? 'ready' : 'checking'">
+          {{ status.executor.chat?.listenEnabled ? `监听中 · 待上传 ${status.executor.chat.eventOutboxCount}` : "未监听" }}
         </dd>
       </div>
       <div>
@@ -134,11 +242,17 @@ onBeforeUnmount(() => {
       <div class="actions">
         <button class="primary" :disabled="busy" @click="run(() => controller.control('allow'))">允许自动打招呼</button>
         <button :disabled="busy" @click="run(() => controller.control('pause'))">暂停</button>
+        <button :disabled="busy" @click="run(() => controller.control('resume'))">恢复队列</button>
         <button class="danger" :disabled="busy" @click="run(() => controller.control('emergency_stop'))">紧急停止</button>
+        <button
+          v-if="status.executor.currentAction"
+          :disabled="busy"
+          @click="returnCurrentToReview"
+        >退回确认</button>
       </div>
       <p class="detail">
-        {{ status.executor.queue[0]
-          ? `当前：${status.executor.queue[0].job_title} · ${actionLabel(status.executor.queue[0])}`
+        {{ displayAction
+          ? `${status.executor.currentAction ? "当前" : "下一项"}：${displayAction.job_title} · ${actionLabel(displayAction)}`
           : "当前打招呼队列为空" }}
       </p>
       <p v-if="status.executor.lastResult" class="detail">上次结果：{{ status.executor.lastResult }}</p>
@@ -156,9 +270,13 @@ onBeforeUnmount(() => {
         <div><dt>HR</dt><dd>{{ hrLabel(status.bossSnapshot?.job) }}</dd></div>
         <div><dt>岗位 ID</dt><dd>{{ status.bossSnapshot?.job?.encryptJobId || "未识别" }}</dd></div>
         <div><dt>已沟通</dt><dd>{{ contactedLabel(status.bossSnapshot?.job?.contacted) }}</dd></div>
+        <div><dt>代聊待上传</dt><dd :data-state="status.executor.chat?.eventOutboxBlocked ? 'error' : 'ready'">{{ status.executor.chat?.eventOutboxCount ?? 0 }} 条</dd></div>
+        <div><dt>代聊结果待回传</dt><dd :data-state="status.executor.chat?.resultOutboxCount ? 'checking' : 'ready'">{{ status.executor.chat?.resultOutboxCount ?? 0 }} 条</dd></div>
       </dl>
       <p class="detail">{{ status.bossSnapshot?.reason || status.detail || "等待岗位页面数据" }}</p>
+      <p v-if="status.executor.chat?.lastError" class="detail">自动代聊：{{ status.executor.chat.lastError }}</p>
     </details>
     <p v-if="uiError" class="detail">{{ uiError }}</p>
+    </div>
   </section>
 </template>
