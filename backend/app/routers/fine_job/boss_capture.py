@@ -16,6 +16,7 @@ from backend.app.schemas.fine_job.boss_capture import (
     BossContinueCaptureRequest,
     BossCityListResponse,
     BossDetailCaptureRequest,
+    BossHistoryDetailCaptureRequest,
     BossDeliveryEvaluationRequest,
     BossDeliveryEvaluationResponse,
     BossHistoryDeliveryEvaluationResponse,
@@ -245,14 +246,20 @@ def get_boss_capture_history(
 )
 def capture_history_job_details(
     history_job_id: str,
+    payload: BossHistoryDetailCaptureRequest | None = None,
     config: AppConfig = Depends(get_config),
     db: Database = Depends(get_database),
 ) -> BossCaptureTaskResponse:
     job = get_capture_history_job(db, history_job_id)
     filter_strategy_id = str(job.get("filter_strategy_id") or "")
     filter_strategy = get_filter_strategy(db, filter_strategy_id) if filter_strategy_id else None
+    manual_override = bool(payload and payload.manual_override)
     assert_job_action_allowed(
-        db, history_job_id, strategy=filter_strategy, action="detail"
+        db,
+        history_job_id,
+        strategy=filter_strategy,
+        action="detail",
+        allow_manual_override=manual_override,
     )
     if not boss_scraper_service.get_browser_status().running:
         raise AppError(
@@ -260,12 +267,12 @@ def capture_history_job_details(
             error_category="BROWSER_NOT_RUNNING",
             error_message="FineJob 专用 Chrome 未启动，请先打开并完成 BOSS 登录。",
         )
+    start_kwargs = {
+        "output_dir": config.output_root / "fine-job" / "boss-capture",
+        "db": db,
+    }
     return BossCaptureTaskResponse(
-        **boss_capture_task_manager.start_history_detail(
-            job,
-            output_dir=config.output_root / "fine-job" / "boss-capture",
-            db=db,
-        )
+        **boss_capture_task_manager.start_history_detail(job, **start_kwargs)
     )
 
 
@@ -311,12 +318,11 @@ def capture_selected_boss_details(
     task_id: str,
     payload: BossDetailCaptureRequest,
 ) -> BossCaptureTaskResponse:
+    start_kwargs = {"force": payload.force}
+    if payload.manual_override:
+        start_kwargs["manual_override"] = True
     return BossCaptureTaskResponse(
-        **boss_capture_task_manager.start_details(
-            task_id,
-            payload.job_ids,
-            force=payload.force,
-        )
+        **boss_capture_task_manager.start_details(task_id, payload.job_ids, **start_kwargs)
     )
 
 
@@ -333,12 +339,17 @@ def apply_boss_filter_strategy(
     strategy = get_filter_strategy(db, payload.strategy_id)
     results = evaluate_filter_strategy(task["jobs"], strategy)
     _enriched_jobs, results = apply_filter_exclusions(db, strategy, task["jobs"], results)
+    updated = boss_capture_task_manager.apply_filter_results(task_id, results)
+    processing_states = {
+        str(job.get("job_id") or ""): job.get("processing_state")
+        for job in updated.get("jobs") or []
+    }
     selected_ids = [
         str(result["job_id"])
         for result in results
         if result["status"] in {"pass", "review"}
+        and processing_states.get(str(result["job_id"])) != "duplicate"
     ]
-    updated = boss_capture_task_manager.apply_filter_results(task_id, results)
     return BossFilterApplicationResponse(
         selected_job_ids=selected_ids,
         results=results,
@@ -358,19 +369,42 @@ def suggest_boss_details(
 ) -> BossDetailSuggestionResponse:
     task = boss_capture_task_manager.get_task(task_id)
     jobs = [job for job in task["jobs"] if not job.get("is_blacklisted")]
-    if payload.filter_strategy_id:
-        filter_strategy = get_filter_strategy(db, payload.filter_strategy_id)
+    recommendation_strategy = (
+        get_recommendation_strategy(db, payload.recommendation_strategy_id)
+        if payload.mode == "ai" and payload.recommendation_strategy_id
+        else None
+    )
+    filter_strategy_id = payload.filter_strategy_id or (
+        recommendation_strategy.get("filter_strategy_id")
+        if recommendation_strategy is not None
+        else None
+    )
+    if filter_strategy_id:
+        filter_strategy = get_filter_strategy(db, str(filter_strategy_id))
         filter_results = evaluate_filter_strategy(jobs, filter_strategy)
-        _enriched_jobs, filter_results = apply_filter_exclusions(
+        jobs, filter_results = apply_filter_exclusions(
             db, filter_strategy, jobs, filter_results
         )
-        boss_capture_task_manager.apply_filter_results(task_id, filter_results)
+        updated_task = boss_capture_task_manager.apply_filter_results(task_id, filter_results)
+        processing_states = {
+            str(job.get("job_id") or ""): job.get("processing_state")
+            for job in updated_task.get("jobs") or []
+        }
+        # 自动推荐任务只评估本轮筛选产生的候选岗位，手动详情入口不受该选择影响。
+        candidate_ids = {
+            str(item.get("job_id") or "")
+            for item in filter_results
+            if item.get("status") in {"pass", "review"}
+            and processing_states.get(str(item.get("job_id") or "")) != "duplicate"
+        }
+        jobs = [
+            job
+            for job in jobs
+            if str(job.get("job_id") or job.get("id") or "") in candidate_ids
+        ]
     else:
         filter_strategy = None
-    if payload.mode == "ai" and payload.recommendation_strategy_id:
-        recommendation_strategy = get_recommendation_strategy(
-            db, payload.recommendation_strategy_id
-        )
+    if recommendation_strategy is not None:
         resume_id = str(recommendation_strategy.get("resume_id") or "")
         facts, _candidate_profile, _resume_version_id, evaluation_context = (
             _candidate_evaluation_context(
@@ -446,12 +480,32 @@ def evaluate_boss_deliveries(
     )
     # 投递建议只处理前端明确选中的已完成详情岗位；其他岗位保持原状态。
     requested_job_ids = set(payload.job_ids) if payload.job_ids is not None else None
+    manual_override = payload.manual_override or requested_job_ids is not None
+    candidate_job_ids: set[str] | None = None
+    if requested_job_ids is None and filter_strategy is not None:
+        filter_results = evaluate_filter_strategy(task["jobs"], filter_strategy)
+        _enriched_jobs, filter_results = apply_filter_exclusions(
+            db, filter_strategy, task["jobs"], filter_results
+        )
+        task = boss_capture_task_manager.apply_filter_results(task_id, filter_results)
+        # 未显式选岗时沿用关联筛选策略确定本轮自动评估候选。
+        processing_states = {
+            str(job.get("job_id") or ""): job.get("processing_state")
+            for job in task.get("jobs") or []
+        }
+        candidate_job_ids = {
+            str(item.get("job_id") or "")
+            for item in filter_results
+            if item.get("status") in {"pass", "review"}
+            and processing_states.get(str(item.get("job_id") or "")) != "duplicate"
+        }
     completed_jobs = [
         job
         for job in task["jobs"]
         if job.get("detail_status") == "completed"
-        and not job.get("is_blacklisted")
+        and (manual_override or not job.get("is_blacklisted"))
         and (requested_job_ids is None or str(job.get("job_id") or "") in requested_job_ids)
+        and (candidate_job_ids is None or str(job.get("job_id") or "") in candidate_job_ids)
     ]
     resume_id = str(recommendation_strategy.get("resume_id") or "")
     facts, candidate_profile, resume_version_id, evaluation_context = (
@@ -527,7 +581,11 @@ def evaluate_history_job_delivery(
         get_filter_strategy(db, str(filter_strategy_id)) if filter_strategy_id else None
     )
     assert_job_action_allowed(
-        db, history_job_id, strategy=filter_strategy, action="evaluation"
+        db,
+        history_job_id,
+        strategy=filter_strategy,
+        action="evaluation",
+        allow_manual_override=payload.manual_override,
     )
     resume_id = str(recommendation_strategy.get("resume_id") or "")
     facts, candidate_profile, resume_version_id, evaluation_context = (

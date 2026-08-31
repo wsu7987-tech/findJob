@@ -587,6 +587,8 @@ class CodexToolService:
             if result.get("status") not in {"pass", "review"}:
                 continue
             job = jobs_by_id.get(str(result.get("job_id") or ""), {})
+            if job.get("processing_state") == "duplicate":
+                continue
             selected.append(
                 {
                     "job_id": result.get("job_id"),
@@ -594,17 +596,36 @@ class CodexToolService:
                     "status": result.get("status"),
                 }
             )
+        continuation = {
+            "available": bool(updated.get("continuation_available")),
+            "has_more": bool(updated.get("has_more", True)),
+            "capture_task_id": task_id,
+            "next_tool": "finejob.continue_job_capture",
+        }
+        message = "岗位筛选已完成，最新结果已写入历史岗位。"
+        if not selected and continuation["available"] and continuation["has_more"]:
+            message = (
+                "本页岗位均未进入候选集合，筛选结果已写入历史岗位；"
+                "原搜索页仍可继续下滑。上层目标需要候选岗位且尚未达标时，"
+                "请调用 finejob.continue_job_capture。"
+            )
         return _result(
             result_type="data",
             status="succeeded",
-            data={"results": results, "selected_jobs": selected, "task": updated},
+            data={
+                "results": results,
+                "selected_jobs": selected,
+                "continuation": continuation,
+                "task": updated,
+            },
             resource=_resource("capture_task", task_id),
-            message="岗位筛选已完成，最新结果已写入历史岗位。",
+            message=message,
         )
 
     def collect_job_details(self, arguments: dict[str, Any]) -> dict[str, object]:
         task_id = str(arguments.get("capture_task_id") or "").strip()
         job_ids = [str(value) for value in arguments.get("job_ids") or [] if str(value)]
+        manual_override = bool(arguments.get("manual_override", False))
         current = boss_capture_task_manager.get_task(task_id)
         jobs_by_id = {str(job.get("job_id") or ""): job for job in current.get("jobs") or []}
         for job_id in job_ids:
@@ -616,13 +637,16 @@ class CodexToolService:
             history_id = str(job.get("history_record_id") or "")
             if history_id:
                 assert_job_action_allowed(
-                    self.db, history_id, strategy=strategy, action="detail"
+                    self.db,
+                    history_id,
+                    strategy=strategy,
+                    action="detail",
+                    allow_manual_override=manual_override,
                 )
-        task = boss_capture_task_manager.start_details(
-            task_id,
-            job_ids,
-            force=bool(arguments.get("force", False)),
-        )
+        detail_kwargs = {"force": bool(arguments.get("force", False))}
+        if manual_override:
+            detail_kwargs["manual_override"] = True
+        task = boss_capture_task_manager.start_details(task_id, job_ids, **detail_kwargs)
         return _result(
             result_type="task",
             status=str(task.get("status") or "queued"),
@@ -721,12 +745,19 @@ class CodexToolService:
 
     def collect_job_detail(self, arguments: dict[str, Any]) -> dict[str, object]:
         job_id = str(arguments.get("job_id") or "")
+        manual_override = bool(arguments.get("manual_override", False))
         if not boss_scraper_service.get_browser_status().running:
             raise AppError(status_code=409, error_category="BROWSER_NOT_RUNNING", error_message="FineJob 专用 Chrome 未运行。")
         job = get_capture_history_job(self.db, job_id)
         strategy_id = str(job.get("filter_strategy_id") or "")
         strategy = get_filter_strategy(self.db, strategy_id) if strategy_id else None
-        assert_job_action_allowed(self.db, job_id, strategy=strategy, action="detail")
+        assert_job_action_allowed(
+            self.db,
+            job_id,
+            strategy=strategy,
+            action="detail",
+            allow_manual_override=manual_override,
+        )
         task = boss_capture_task_manager.start_history_detail(
             job,
             output_dir=self.config.output_root / "fine-job" / "boss-capture",
@@ -994,7 +1025,13 @@ class CodexToolService:
         if str(arguments.get("recommendation_strategy_id") or "").strip():
             return self._save_v3_job_evaluation(arguments)
         job_id = str(arguments.get("job_id") or "")
-        assert_job_action_allowed(self.db, job_id, strategy=None, action="evaluation")
+        assert_job_action_allowed(
+            self.db,
+            job_id,
+            strategy=None,
+            action="evaluation",
+            allow_manual_override=bool(arguments.get("manual_override", False)),
+        )
         resume_id = str(arguments.get("resume_id") or "") or None
         profile_id = str(arguments.get("profile_id") or "") or None
         resume_version_id = str(arguments.get("resume_version_id") or "") or None
@@ -1087,7 +1124,11 @@ class CodexToolService:
             else None
         )
         assert_job_action_allowed(
-            self.db, job_id, strategy=filter_strategy, action="evaluation"
+            self.db,
+            job_id,
+            strategy=filter_strategy,
+            action="evaluation",
+            allow_manual_override=bool(arguments.get("manual_override", False)),
         )
         profile_id = str(recommendation_strategy.get("candidate_profile_id") or "")
         resume_version_id = str(recommendation_strategy.get("resume_version_id") or "")

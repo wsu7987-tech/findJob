@@ -347,26 +347,17 @@ const cloneDelivery = (value: FineJobDeliveryStrategy): FineJobDeliveryStrategy 
                 <span>上次完整刷新：{{ exclusionState.last_full_refreshed_at ? formatDateTime(exclusionState.last_full_refreshed_at) : "尚未刷新" }}</span>
                 <el-button size="small" :loading="refreshingExclusions" @click="refreshExclusions">立即刷新</el-button>
               </div>
-              <div class="cooldown-head">
-                <span>默认排除外包公司</span>
-                <el-switch v-model="filterForm.cooldown_rules.exclude_outsourcing_companies" />
-              </div>
               <div class="cooldown-grid">
                 <el-form-item label="已投递公司">
                   <el-select v-model="filterForm.cooldown_rules.applied_company.period"><el-option v-for="item in cooldownOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select>
-                  <el-checkbox v-model="filterForm.cooldown_rules.applied_company.exclude_outsourcing">外包公司不参与公司去重</el-checkbox>
+                  <el-checkbox v-model="filterForm.cooldown_rules.applied_company.exclude_outsourcing">外包公司不参与公司冷却</el-checkbox>
                 </el-form-item>
-                <el-form-item label="已获取详情公司">
-                  <el-select v-model="filterForm.cooldown_rules.detailed_company.period"><el-option v-for="item in cooldownOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select>
-                  <el-checkbox v-model="filterForm.cooldown_rules.detailed_company.exclude_outsourcing">外包公司不参与公司去重</el-checkbox>
-                </el-form-item>
-                <el-form-item label="已获取投递建议公司">
-                  <el-select v-model="filterForm.cooldown_rules.evaluated_company.period"><el-option v-for="item in cooldownOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select>
-                  <el-checkbox v-model="filterForm.cooldown_rules.evaluated_company.exclude_outsourcing">外包公司不参与公司去重</el-checkbox>
+                <el-form-item label="已获取详情和投递建议岗位的公司">
+                  <el-select v-model="filterForm.cooldown_rules.detailed_and_evaluated_company.period"><el-option v-for="item in cooldownOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select>
+                  <el-checkbox v-model="filterForm.cooldown_rules.detailed_and_evaluated_company.exclude_outsourcing">外包公司不参与公司冷却</el-checkbox>
                 </el-form-item>
                 <el-form-item label="已投递岗位"><el-select v-model="filterForm.cooldown_rules.applied_job.period"><el-option v-for="item in cooldownOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item>
-                <el-form-item label="已获取详情岗位"><el-select v-model="filterForm.cooldown_rules.detailed_job.period"><el-option v-for="item in cooldownOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item>
-                <el-form-item label="已获取投递建议岗位"><el-select v-model="filterForm.cooldown_rules.evaluated_job.period"><el-option v-for="item in cooldownOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item>
+                <el-form-item label="已获取详情和投递建议岗位"><el-select v-model="filterForm.cooldown_rules.detailed_and_evaluated_job.period"><el-option v-for="item in cooldownOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item>
               </div>
 
               <h3>技能与内容</h3>

@@ -337,6 +337,42 @@ def test_capture_history_job_details_starts_standalone_task(
     assert captured["job"]["id"] == "history-job-1"
 
 
+def test_capture_history_job_details_accepts_manual_override(
+    configured_client,
+    monkeypatch,
+) -> None:
+    captured = {}
+    monkeypatch.setattr(
+        "backend.app.routers.fine_job.boss_capture.get_capture_history_job",
+        lambda db, history_job_id: {
+            "id": history_job_id,
+            "job_id": "job-1",
+            "title": "被规则排除的岗位",
+            "location": "上海",
+        },
+    )
+    monkeypatch.setattr(
+        "backend.app.routers.fine_job.boss_capture.boss_scraper_service.get_browser_status",
+        lambda: BossBrowserStatus(running=True, cdp_port=9222),
+    )
+    monkeypatch.setattr(
+        "backend.app.routers.fine_job.boss_capture.assert_job_action_allowed",
+        lambda *args, **kwargs: captured.update(kwargs),
+    )
+    monkeypatch.setattr(
+        "backend.app.routers.fine_job.boss_capture.boss_capture_task_manager.start_history_detail",
+        lambda job, **kwargs: _task_payload(id="manual-detail-task", stage="details_queued"),
+    )
+
+    response = configured_client.post(
+        "/api/fine-job/boss-capture/history/history-job-1/details",
+        json={"manual_override": True},
+    )
+
+    assert response.status_code == 202
+    assert captured["allow_manual_override"] is True
+
+
 def test_apply_filter_strategy_to_capture_task(configured_client, monkeypatch) -> None:
     strategy = configured_client.post(
         "/api/fine-job/strategies/filters",
@@ -428,6 +464,7 @@ def test_delivery_evaluation_only_uses_selected_completed_details(
             {
                 "job_id": "job-selected",
                 "title": "已选岗位",
+                "is_blacklisted": True,
                 "detail_status": "completed",
                 "detail": {"jd": "完整 JD"},
             },
@@ -468,6 +505,7 @@ def test_delivery_evaluation_only_uses_selected_completed_details(
         json={
             "recommendation_strategy_id": strategy["id"],
             "job_ids": ["job-selected"],
+            "manual_override": True,
         },
     )
 

@@ -95,6 +95,10 @@ def record_evaluation_and_route(
                 _json(candidate_snapshot),
             ),
         )
+    # 评估记录落库后再刷新组合冷却，确保详情与建议两个事实同时可见。
+    from backend.app.services.fine_job.filter_exclusions import record_job_event
+
+    record_job_event(db, "evaluation", job_id, now)
 
     greeting = evaluation.get("greeting_draft")
     draft_message = (

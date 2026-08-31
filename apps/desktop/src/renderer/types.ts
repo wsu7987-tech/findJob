@@ -257,6 +257,9 @@ export interface FineJobBossCapturedJob {
   recommendation_source?: "strategy" | "ai" | "rules" | "llm" | null;
   recommendation_reason?: string | null;
   filter_status?: "pass" | "reject" | "review" | "exclude" | null;
+  strategy_filter_status?: "pass" | "reject" | "review" | "exclude" | null;
+  final_filter_status?: "pass" | "reject" | "review" | "exclude" | null;
+  processing_state?: "new" | "reprocessable" | "duplicate" | "excluded" | null;
   filter_reasons?: string[];
   filter_missing_fields?: string[];
   filter_strategy_id?: string | null;
@@ -460,13 +463,10 @@ export interface FineJobCooldownRule {
 }
 
 export interface FineJobCooldownRules {
-  exclude_outsourcing_companies: boolean;
   applied_company: FineJobCooldownRule;
-  detailed_company: FineJobCooldownRule;
-  evaluated_company: FineJobCooldownRule;
+  detailed_and_evaluated_company: FineJobCooldownRule;
   applied_job: FineJobCooldownRule;
-  detailed_job: FineJobCooldownRule;
-  evaluated_job: FineJobCooldownRule;
+  detailed_and_evaluated_job: FineJobCooldownRule;
 }
 
 export interface FineJobFilterStrategy {

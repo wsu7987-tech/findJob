@@ -721,20 +721,24 @@ export const api = {
   async captureSelectedFineJobBossDetails(
     taskId: string,
     jobIds: string[],
-    force = false
+    force = false,
+    manualOverride = true
   ) {
     return request<FineJobBossCaptureTask>(
       `/api/fine-job/boss-capture/tasks/${taskId}/details`,
       {
         method: "POST",
-        body: JSON.stringify({ job_ids: jobIds, force })
+        body: JSON.stringify({ job_ids: jobIds, force, manual_override: manualOverride })
       }
     );
   },
-  async captureFineJobBossHistoryDetails(historyJobId: string) {
+  async captureFineJobBossHistoryDetails(historyJobId: string, manualOverride = true) {
     return request<FineJobBossCaptureTask>(
       `/api/fine-job/boss-capture/history/${historyJobId}/details`,
-      { method: "POST" }
+      {
+        method: "POST",
+        body: JSON.stringify({ manual_override: manualOverride })
+      }
     );
   },
   async suggestFineJobBossDetails(
@@ -770,6 +774,7 @@ export const api = {
       extra_requirement?: string;
       job_ids?: string[];
       context_stale_action?: "regenerate" | "use_current" | "cancel";
+      manual_override?: boolean;
     }
   ) {
     return request<FineJobBossDeliveryEvaluationResponse>(
@@ -784,6 +789,7 @@ export const api = {
       filter_strategy_id?: string | null;
       extra_requirement?: string;
       context_stale_action?: "regenerate" | "use_current" | "cancel";
+      manual_override?: boolean;
     }
   ) {
     return request<FineJobBossHistoryDeliveryEvaluationResponse>(

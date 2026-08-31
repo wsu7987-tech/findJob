@@ -69,7 +69,10 @@ export const useFineJobBossHistoryStore = defineStore("fineJobBossHistory", () =
     error.value = null;
     deliveryJobId.value = historyJobId;
     try {
-      const response = await api.evaluateFineJobBossHistoryDelivery(historyJobId, payload);
+      const response = await api.evaluateFineJobBossHistoryDelivery(historyJobId, {
+        ...payload,
+        manual_override: true
+      });
       const index = items.value.findIndex((item) => item.id === historyJobId);
       if (index >= 0) items.value[index] = response.job;
       return response.job;

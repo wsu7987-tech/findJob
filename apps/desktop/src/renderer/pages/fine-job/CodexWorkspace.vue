@@ -5,9 +5,11 @@ import { useRoute } from "vue-router";
 import CodexTerminal from "@/components/CodexTerminal.vue";
 import { getCodexBridge } from "@/services/desktop-bridge";
 import { useFineJobCodexStore } from "@/stores/fineJobCodex";
+import { useFineJobStrategiesStore } from "@/stores/fineJobStrategies";
 import type { FineJobCodexPermissions } from "@/types";
 
 const store = useFineJobCodexStore();
+const strategiesStore = useFineJobStrategiesStore();
 const route = useRoute();
 const terminal = ref<{
   clear: () => void;
@@ -20,6 +22,12 @@ const terminalSize = ref({ cols: 120, rows: 36 });
 const savingPermissions = ref(false);
 const copyMessage = ref("");
 const profileAnalysisMessage = ref("");
+const quickTaskMessage = ref("");
+const quickTaskSubmitting = ref<"filter" | "recommendation" | null>(null);
+const filterTaskStrategyId = ref<string | null>(null);
+const recommendationTaskStrategyId = ref<string | null>(null);
+const filterTaskCount = ref(20);
+const recommendationTaskCount = ref(10);
 
 const labels: Record<string, string> = {
   send_greeting: "发送打招呼",
@@ -34,6 +42,12 @@ const labels: Record<string, string> = {
 };
 
 const isRunning = computed(() => store.status === "running" || store.status === "starting");
+const enabledFilterStrategies = computed(() =>
+  strategiesStore.filters.filter((item) => item.enabled && item.id)
+);
+const enabledRecommendationStrategies = computed(() =>
+  strategiesStore.recommendations.filter((item) => item.enabled && item.id)
+);
 
 const start = async (resume = false) => {
   await store.start(terminalSize.value.cols, terminalSize.value.rows, resume);
@@ -96,6 +110,41 @@ const submitProfileAnalysisTask = async () => {
   }
 };
 
+const submitQuickTask = async (taskType: "filter" | "recommendation") => {
+  const bridge = getCodexBridge();
+  if (!bridge?.submitCodexPrompt) {
+    quickTaskMessage.value = "快捷任务只在 FineJob 桌面端 Codex 工作台可用。";
+    return;
+  }
+
+  const strategy = taskType === "filter"
+    ? enabledFilterStrategies.value.find((item) => item.id === filterTaskStrategyId.value)
+    : enabledRecommendationStrategies.value.find((item) => item.id === recommendationTaskStrategyId.value);
+  const count = taskType === "filter" ? filterTaskCount.value : recommendationTaskCount.value;
+  if (!strategy?.id || !Number.isInteger(count) || count < 1) {
+    quickTaskMessage.value = "请选择可用策略并填写大于 0 的整数数量。";
+    return;
+  }
+
+  const prompt = taskType === "filter"
+    ? `使用 $finejob，按岗位筛选策略“${strategy.name}”（filter_strategy_id=${strategy.id}）从新采集开始，完成 ${count} 条岗位筛选。`
+    : `使用 $finejob，按建议投递策略“${strategy.name}”（recommendation_strategy_id=${strategy.id}）从新采集开始获取 ${count} 条推荐投递岗位。开始前提醒当前自动招呼状态；本任务只生成建议并放入待确认，不执行真实招呼。`;
+
+  quickTaskSubmitting.value = taskType;
+  quickTaskMessage.value = "正在提交快捷任务……";
+  try {
+    if (!isRunning.value) await start(false);
+    const submitted = await bridge.submitCodexPrompt(prompt);
+    quickTaskMessage.value = submitted
+      ? "任务已提交，执行过程会显示在下方 Codex 对话中。"
+      : "Codex 会话当前不可接收任务，请重新启动会话后再试。";
+  } catch (error) {
+    quickTaskMessage.value = `快捷任务提交失败：${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    quickTaskSubmitting.value = null;
+  }
+};
+
 const stop = () => getCodexBridge()?.stopCodex?.();
 const interrupt = () => getCodexBridge()?.interruptCodex?.();
 
@@ -134,7 +183,9 @@ const savePermissions = async () => {
 };
 
 onMounted(async () => {
-  await store.load();
+  await Promise.all([store.load(), strategiesStore.load()]);
+  filterTaskStrategyId.value = enabledFilterStrategies.value[0]?.id ?? null;
+  recommendationTaskStrategyId.value = enabledRecommendationStrategies.value[0]?.id ?? null;
   await submitProfileAnalysisTask();
 });
 </script>
@@ -170,6 +221,93 @@ onMounted(async () => {
       :type="store.status === 'failed' ? 'error' : 'info'"
       show-icon
     />
+
+    <section class="surface-card quick-task-card">
+      <div class="page-heading">
+        <div>
+          <h3>快捷任务</h3>
+          <p class="secondary-text">选择现有策略和目标数量，任务由 FineJob Skill 动态完成所需业务节点。</p>
+        </div>
+      </div>
+      <div class="quick-task-grid">
+        <article class="quick-task-item">
+          <div>
+            <strong>完成岗位筛选</strong>
+            <p class="secondary-text">从新采集开始，按正式筛选结果完成指定数量。</p>
+          </div>
+          <el-select
+            v-model="filterTaskStrategyId"
+            data-testid="filter-task-strategy"
+            placeholder="选择岗位筛选策略"
+          >
+            <el-option
+              v-for="strategy in enabledFilterStrategies"
+              :key="strategy.id"
+              :label="strategy.name"
+              :value="strategy.id"
+            />
+          </el-select>
+          <el-input-number
+            v-model="filterTaskCount"
+            :min="1"
+            :max="999"
+            :step="1"
+            controls-position="right"
+          />
+          <el-button
+            type="primary"
+            :disabled="!filterTaskStrategyId"
+            :loading="quickTaskSubmitting === 'filter'"
+            data-testid="submit-filter-task"
+            @click="submitQuickTask('filter')"
+          >
+            执行筛选任务
+          </el-button>
+        </article>
+
+        <article class="quick-task-item">
+          <div>
+            <strong>获取推荐投递岗位</strong>
+            <p class="secondary-text">只计算已保存为 recommend 的唯一岗位，结果进入待确认。</p>
+          </div>
+          <el-select
+            v-model="recommendationTaskStrategyId"
+            data-testid="recommendation-task-strategy"
+            placeholder="选择建议投递策略"
+          >
+            <el-option
+              v-for="strategy in enabledRecommendationStrategies"
+              :key="strategy.id"
+              :label="strategy.name"
+              :value="strategy.id"
+            />
+          </el-select>
+          <el-input-number
+            v-model="recommendationTaskCount"
+            :min="1"
+            :max="999"
+            :step="1"
+            controls-position="right"
+          />
+          <el-button
+            type="primary"
+            :disabled="!recommendationTaskStrategyId"
+            :loading="quickTaskSubmitting === 'recommendation'"
+            data-testid="submit-recommendation-task"
+            @click="submitQuickTask('recommendation')"
+          >
+            执行推荐任务
+          </el-button>
+        </article>
+      </div>
+      <el-alert
+        v-if="quickTaskMessage"
+        :title="quickTaskMessage"
+        type="info"
+        :closable="false"
+        show-icon
+      />
+    </section>
 
     <div class="surface-card terminal-card">
       <div class="terminal-toolbar">
@@ -258,6 +396,34 @@ onMounted(async () => {
   padding: 10px;
 }
 
+.quick-task-card,
+.quick-task-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.quick-task-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.quick-task-item {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) 110px auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+}
+
+.quick-task-item > div:first-child {
+  grid-column: 1 / -1;
+}
+
+.quick-task-item p {
+  margin: 4px 0 0;
+}
+
 .terminal-toolbar {
   display: flex;
   align-items: center;
@@ -293,6 +459,12 @@ onMounted(async () => {
 }
 
 @media (max-width: 1100px) {
-  .codex-columns { grid-template-columns: 1fr; }
+  .codex-columns,
+  .quick-task-grid { grid-template-columns: 1fr; }
+
+}
+
+@media (max-width: 760px) {
+  .quick-task-item { grid-template-columns: 1fr; }
 }
 </style>

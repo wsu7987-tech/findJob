@@ -33,13 +33,10 @@ export const emptyFilterStrategy = (): FineJobFilterStrategy => ({
   skill_exclude: [],
   boss_active_statuses: [],
   cooldown_rules: {
-    exclude_outsourcing_companies: true,
     applied_company: { period: "permanent", exclude_outsourcing: true },
-    detailed_company: { period: "days_3", exclude_outsourcing: true },
-    evaluated_company: { period: "days_3", exclude_outsourcing: true },
+    detailed_and_evaluated_company: { period: "days_3", exclude_outsourcing: true },
     applied_job: { period: "permanent", exclude_outsourcing: false },
-    detailed_job: { period: "days_3", exclude_outsourcing: false },
-    evaluated_job: { period: "days_7", exclude_outsourcing: false }
+    detailed_and_evaluated_job: { period: "days_7", exclude_outsourcing: false }
   },
   unknown_value_policy: "review",
   notes: ""

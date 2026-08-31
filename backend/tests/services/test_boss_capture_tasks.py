@@ -19,6 +19,9 @@ class ImmediateThread:
 
 
 class FakeScraper:
+    def __init__(self):
+        self.selected_detail_job_ids = []
+
     def capture_jobs(self, request, *, progress_callback, should_stop=None):
         jobs = [{"job_id": "job-1", "title": "Python 开发", "boss_name": "测试公司"}]
         progress_callback(
@@ -99,6 +102,7 @@ class FakeScraper:
         progress_callback,
     ):
         selected = [job for job in list_data["jobs"] if job["job_id"] in job_ids]
+        self.selected_detail_job_ids = [job["job_id"] for job in selected]
         for index, job in enumerate(selected, start=1):
             progress_callback(
                 {
@@ -117,6 +121,24 @@ class FakeScraper:
             {"job_id": job["job_id"], "jd": "重新采集的岗位描述"}
             for job in selected
         ]
+
+
+class GateFakeScraper(FakeScraper):
+    def capture_jobs(self, request, *, progress_callback, should_stop=None):
+        jobs = [{
+            "job_id": "job-1",
+            "title": "已排除岗位",
+            "boss_name": "测试公司",
+            "is_blacklisted": True,
+        }]
+        progress_callback({"stage": "list_completed", "jobs": jobs, "message": "列表完成"})
+        return BossCaptureResult(
+            list_data={"keyword": "Python", "city": "上海", "jobs": jobs, "has_more": False},
+            details=None,
+            jobs_path=Path("boss_jobs.json"),
+            details_path=None,
+            capture_target_id=None,
+        )
 
 
 def test_auto_detail_task_reports_completed_job(monkeypatch, tmp_path: Path) -> None:
@@ -204,6 +226,83 @@ def test_filter_result_is_written_to_existing_history_job(monkeypatch, tmp_path:
     assert history["filter_status"] == "pass"
     assert history["filter_reasons"] == ["岗位标题符合"]
     assert history["filter_strategy_id"] == "filter-1"
+
+
+def test_repeated_review_job_without_detail_or_evaluation_is_reprocessable(
+    monkeypatch,
+    tmp_path: Path,
+    test_db,
+) -> None:
+    monkeypatch.setattr(
+        "backend.app.services.fine_job.boss_capture_tasks.Thread",
+        ImmediateThread,
+    )
+    manager = BossCaptureTaskManager(scraper=FakeScraper())
+    request = BossCaptureRequest(
+        keyword="Python",
+        city="上海",
+        pages=1,
+        include_details=False,
+        output_dir=tmp_path,
+    )
+    manager.start_capture(request, output_dir=tmp_path, db=test_db)
+    repeated = manager.start_capture(request, output_dir=tmp_path, db=test_db)
+
+    updated = manager.apply_filter_results(
+        repeated["id"],
+        [{"job_id": "job-1", "status": "review", "reasons": [], "missing_fields": []}],
+    )
+
+    assert updated["jobs"][0]["strategy_filter_status"] == "review"
+    assert updated["jobs"][0]["final_filter_status"] == "review"
+    assert updated["jobs"][0]["processing_state"] == "reprocessable"
+
+
+def test_repeated_job_with_detail_and_evaluation_is_duplicate(
+    monkeypatch,
+    tmp_path: Path,
+    test_db,
+) -> None:
+    monkeypatch.setattr(
+        "backend.app.services.fine_job.boss_capture_tasks.Thread",
+        ImmediateThread,
+    )
+    manager = BossCaptureTaskManager(scraper=FakeScraper())
+    initial = manager.start_capture(
+        BossCaptureRequest(
+            keyword="Python",
+            city="上海",
+            pages=1,
+            include_details=True,
+            output_dir=tmp_path,
+        ),
+        output_dir=tmp_path,
+        db=test_db,
+    )
+    manager.apply_delivery_evaluations(
+        initial["id"],
+        [{"job_id": "job-1", "decision": "recommend", "source": "rules", "reasons": []}],
+    )
+    repeated = manager.start_capture(
+        BossCaptureRequest(
+            keyword="Python",
+            city="上海",
+            pages=1,
+            include_details=False,
+            output_dir=tmp_path,
+        ),
+        output_dir=tmp_path,
+        db=test_db,
+    )
+
+    updated = manager.apply_filter_results(
+        repeated["id"],
+        [{"job_id": "job-1", "status": "pass", "reasons": [], "missing_fields": []}],
+    )
+
+    assert updated["jobs"][0]["detail_status"] == "completed"
+    assert updated["jobs"][0]["delivery_evaluation"]["decision"] == "recommend"
+    assert updated["jobs"][0]["processing_state"] == "duplicate"
 
 
 def test_force_recaptures_a_completed_job_detail(monkeypatch, tmp_path: Path) -> None:
@@ -298,6 +397,36 @@ def test_history_detail_task_updates_detail_without_incrementing_count(
     assert task["status"] == "completed"
     assert refreshed["detail"]["jd"] == "重新采集的岗位描述"
     assert refreshed["collect_count"] == 1
+
+
+def test_manual_detail_can_use_job_removed_from_automatic_gate(
+    monkeypatch,
+    tmp_path: Path,
+    test_db,
+) -> None:
+    monkeypatch.setattr(
+        "backend.app.services.fine_job.boss_capture_tasks.Thread",
+        ImmediateThread,
+    )
+    scraper = GateFakeScraper()
+    manager = BossCaptureTaskManager(scraper=scraper)
+    initial = manager.start_capture(
+        BossCaptureRequest(
+            keyword="Python",
+            city="上海",
+            pages=1,
+            include_details=False,
+            output_dir=tmp_path,
+        ),
+        output_dir=tmp_path,
+        db=test_db,
+    )
+
+    refreshed = manager.start_details(initial["id"], ["job-1"], manual_override=True)
+
+    assert [job["job_id"] for job in initial["jobs"]] == ["job-1"]
+    assert scraper.selected_detail_job_ids == ["job-1"]
+    assert refreshed["jobs"][0]["detail_status"] == "completed"
 
 
 def test_continue_capture_appends_to_same_task_and_history(

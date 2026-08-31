@@ -179,7 +179,7 @@ const selectedJobs = computed(() =>
 );
 const selectedDetailJobIds = computed(() =>
   selectedJobs.value
-    .filter((job) => job.job_id && !job.cooldown_excluded && job.detail_status !== "completed" && job.detail_status !== "collecting")
+    .filter((job) => job.job_id && job.detail_status !== "completed" && job.detail_status !== "collecting")
     .map((job) => job.job_id as string)
 );
 const selectedDeliveryJobIds = computed(() =>
@@ -448,7 +448,7 @@ const stopCapture = async () => {
 };
 
 const canSelectJob = (job: FineJobBossCapturedJob) =>
-  job.detail_status !== "queued" && job.detail_status !== "collecting" && !job.cooldown_excluded;
+  job.detail_status !== "queued" && job.detail_status !== "collecting";
 
 const detailStatusLabel = (status?: string) =>
   ({
@@ -765,7 +765,7 @@ function formatDuration(seconds: number) {
               v-if="scope.row.detail_status === 'completed' && !scope.row.delivery_evaluation"
               link
               type="warning"
-              :disabled="taskRunning || !scope.row.job_id || !recommendationStrategyId || scope.row.cooldown_excluded"
+              :disabled="taskRunning || !scope.row.job_id || !recommendationStrategyId"
               :loading="captureStore.suggesting"
               @click.stop="evaluateSingleDelivery(scope.row)"
             >
@@ -775,7 +775,7 @@ function formatDuration(seconds: number) {
               v-else-if="scope.row.detail_status !== 'completed'"
               link
               type="success"
-              :disabled="taskRunning || !scope.row.job_id || scope.row.cooldown_excluded"
+              :disabled="taskRunning || !scope.row.job_id"
               @click.stop="captureSingleDetail(scope.row)"
             >
               {{ detailActionLabel(scope.row) }}

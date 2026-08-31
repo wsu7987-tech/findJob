@@ -472,7 +472,7 @@ watch(
               link
               type="warning"
               :loading="historyStore.deliveryJobId === row.id"
-              :disabled="historyActionRunning || !recommendationStrategyId || row.cooldown_excluded"
+              :disabled="historyActionRunning || !recommendationStrategyId"
               @click.stop="evaluateHistoryDelivery(row)"
             >
               获取投递详情
@@ -482,7 +482,7 @@ watch(
               link
               type="success"
               :loading="historyStore.detailJobId === row.id"
-              :disabled="row.cooldown_excluded || (historyActionRunning && historyStore.detailJobId !== row.id)"
+              :disabled="historyActionRunning && historyStore.detailJobId !== row.id"
               @click.stop="captureHistoryDetails(row)"
             >
               {{ detailActionLabel(row) }}
@@ -593,7 +593,7 @@ watch(
           v-if="selectedJob.detail_status === 'completed'"
           type="warning"
           :loading="historyStore.deliveryJobId === selectedJob.id"
-          :disabled="selectedJob.cooldown_excluded || (historyActionRunning && historyStore.deliveryJobId !== selectedJob.id) || !recommendationStrategyId"
+          :disabled="(historyActionRunning && historyStore.deliveryJobId !== selectedJob.id) || !recommendationStrategyId"
           @click="evaluateHistoryDelivery(selectedJob)"
         >
           {{ selectedJob.delivery_evaluation ? "重新获取投递建议" : "获取投递建议" }}
@@ -605,7 +605,7 @@ watch(
         <el-button
           type="primary"
           :loading="historyStore.detailJobId === selectedJob.id"
-          :disabled="selectedJob.cooldown_excluded || (historyActionRunning && historyStore.detailJobId !== selectedJob.id)"
+          :disabled="historyActionRunning && historyStore.detailJobId !== selectedJob.id"
           @click="captureHistoryDetails(selectedJob)"
         >
           {{ detailActionLabel(selectedJob) }}

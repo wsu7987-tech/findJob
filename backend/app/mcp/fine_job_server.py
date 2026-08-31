@@ -253,8 +253,9 @@ async def collect_job_details(
     capture_task_id: str,
     job_ids: list[str],
     force: bool = False,
+    manual_override: bool = False,
 ) -> dict[str, Any]:
-    """为筛选后的岗位启动现有详情采集，并覆盖保存最新 JD。"""
+    """按自动候选标准或用户人工覆盖选择岗位，启动详情采集并保存最新 JD。"""
     return await _invoke("collect_job_details", locals())
 
 
@@ -271,8 +272,8 @@ async def get_job_context(job_id: str, resume_id: str = "") -> dict[str, Any]:
 
 
 @server.tool(name="finejob.collect_job_detail", structured_output=True)
-async def collect_job_detail(job_id: str) -> dict[str, Any]:
-    """为已采集岗位创建详情采集任务。"""
+async def collect_job_detail(job_id: str, manual_override: bool = False) -> dict[str, Any]:
+    """为已采集岗位创建详情采集任务；用户明确操作时可覆盖不推荐结果。"""
     return await _invoke("collect_job_detail", locals())
 
 
@@ -417,6 +418,7 @@ async def save_job_evaluation(
     strengths: list[str] | None = None,
     resume_suggestions: list[Any] | None = None,
     greeting_draft: dict[str, Any] | None = None,
+    manual_override: bool = False,
 ) -> dict[str, Any]:
     """保存结构化岗位评估；传入建议投递策略时复用现有历史写入和审批路由。"""
     return await _invoke("save_job_evaluation", locals())

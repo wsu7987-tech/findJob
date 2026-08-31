@@ -35,6 +35,10 @@ describe("buildCodexExitMessage", () => {
       const skillsDir = path.resolve(tuiWorkspace, ".agents", "skills");
       const config = fs.readFileSync(path.resolve(tuiWorkspace, ".codex", "config.toml"), "utf8");
       const fineJobSkill = fs.readFileSync(path.resolve(skillsDir, "finejob", "SKILL.md"), "utf8");
+      const fineJobNodes = fs.readFileSync(
+        path.resolve(skillsDir, "finejob", "references", "job-task-nodes.md"),
+        "utf8"
+      );
       const profileSkill = fs.readFileSync(
         path.resolve(skillsDir, "finejob-profile", "SKILL.md"),
         "utf8"
@@ -47,6 +51,7 @@ describe("buildCodexExitMessage", () => {
       expect(config).toContain("[mcp_servers.finejob]");
       expect(config).toContain('args = ["-m", "backend.app.mcp.fine_job_server"]');
       expect(fineJobSkill).toContain("name: finejob");
+      expect(fineJobNodes).toContain("# 岗位任务节点");
       expect(profileSkill).toContain("name: finejob-profile");
       expect(profileRules).toContain("# 分析规则");
     } finally {

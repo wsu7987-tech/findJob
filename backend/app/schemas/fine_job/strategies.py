@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -18,19 +19,47 @@ class CooldownRule(BaseModel):
 
 
 class FineJobCooldownRules(BaseModel):
-    exclude_outsourcing_companies: bool = True
     applied_company: CooldownRule = Field(
         default_factory=lambda: CooldownRule(period="permanent", exclude_outsourcing=True)
     )
-    detailed_company: CooldownRule = Field(
-        default_factory=lambda: CooldownRule(period="days_3", exclude_outsourcing=True)
-    )
-    evaluated_company: CooldownRule = Field(
+    detailed_and_evaluated_company: CooldownRule = Field(
         default_factory=lambda: CooldownRule(period="days_3", exclude_outsourcing=True)
     )
     applied_job: CooldownRule = Field(default_factory=lambda: CooldownRule(period="permanent"))
-    detailed_job: CooldownRule = Field(default_factory=lambda: CooldownRule(period="days_3"))
-    evaluated_job: CooldownRule = Field(default_factory=lambda: CooldownRule(period="days_7"))
+    detailed_and_evaluated_job: CooldownRule = Field(default_factory=lambda: CooldownRule(period="days_7"))
+
+
+def normalize_cooldown_rules_payload(value: object) -> dict[str, object]:
+    """将旧的详情/建议分离配置转换为新的组合冷却配置。"""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value or "{}")
+        except json.JSONDecodeError:
+            value = {}
+    payload = dict(value) if isinstance(value, dict) else {}
+
+    if "detailed_and_evaluated_company" not in payload:
+        # 组合冷却在第二个业务事实完成时开始，沿用旧投递建议公司的期限。
+        payload["detailed_and_evaluated_company"] = payload.get(
+            "evaluated_company",
+            payload.get("detailed_company", {"period": "days_3", "exclude_outsourcing": True}),
+        )
+    if "detailed_and_evaluated_job" not in payload:
+        # 岗位组合冷却沿用旧投递建议岗位的 7 天期限。
+        payload["detailed_and_evaluated_job"] = payload.get(
+            "evaluated_job",
+            payload.get("detailed_job", {"period": "days_7"}),
+        )
+
+    for legacy_key in (
+        "exclude_outsourcing_companies",
+        "detailed_company",
+        "evaluated_company",
+        "detailed_job",
+        "evaluated_job",
+    ):
+        payload.pop(legacy_key, None)
+    return FineJobCooldownRules(**payload).model_dump()
 
 
 class FineJobFilterStrategyPayload(BaseModel):

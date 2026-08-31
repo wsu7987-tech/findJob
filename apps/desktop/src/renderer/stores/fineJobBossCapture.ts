@@ -223,6 +223,7 @@ export const useFineJobBossCaptureStore = defineStore("fineJobBossCapture", () =
         filter_strategy_id: filterStrategyId,
         extra_requirement: extraRequirement,
         job_ids: jobIds,
+        manual_override: true,
         context_stale_action: contextStaleAction
       });
       task.value = response.task;

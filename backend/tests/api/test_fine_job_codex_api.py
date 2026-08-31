@@ -417,6 +417,8 @@ def test_codex_capture_filter_and_detail_tools_reuse_existing_task_manager(
         "status": "completed",
         "keyword": "Python 后端",
         "city": "上海",
+        "continuation_available": True,
+        "has_more": True,
         "jobs": [{
             "job_id": "job-tool-1",
             "history_record_id": "history-tool-1",
@@ -544,6 +546,23 @@ def test_codex_capture_filter_and_detail_tools_reuse_existing_task_manager(
     )
     assert details["status"] == "queued"
     assert captured["detail_call"] == ("capture-tool-1", ["job-tool-1"], False)
+
+    task["jobs"][0]["title"] = "销售顾问"
+    excluded_page = invoke(
+        "apply_job_filter",
+        {
+            "capture_task_id": "capture-tool-1",
+            "filter_strategy_id": filter_strategy["id"],
+        },
+    )
+    assert excluded_page["data"]["selected_jobs"] == []
+    assert excluded_page["data"]["continuation"] == {
+        "available": True,
+        "has_more": True,
+        "capture_task_id": "capture-tool-1",
+        "next_tool": "finejob.continue_job_capture",
+    }
+    assert "请调用 finejob.continue_job_capture" in excluded_page["message"]
 
 
 def test_sensitive_content_classification_and_authorization(app_paths) -> None:

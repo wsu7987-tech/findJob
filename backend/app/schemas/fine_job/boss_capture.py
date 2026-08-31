@@ -81,6 +81,11 @@ class BossCaptureTaskResponse(BaseModel):
 class BossDetailCaptureRequest(BaseModel):
     job_ids: list[str] = Field(min_length=1)
     force: bool = False
+    manual_override: bool = False
+
+
+class BossHistoryDetailCaptureRequest(BaseModel):
+    manual_override: bool = False
 
 
 class BossDetailSuggestionRequest(BaseModel):
@@ -89,6 +94,7 @@ class BossDetailSuggestionRequest(BaseModel):
     filter_strategy_id: str | None = None
     recommendation_strategy_id: str | None = None
     extra_requirement: str = ""
+    context_stale_action: Literal["regenerate", "use_current", "cancel"] | None = None
 
 
 class BossFilterApplicationRequest(BaseModel):
@@ -101,7 +107,7 @@ class BossDeliveryEvaluationRequest(BaseModel):
     extra_requirement: str = ""
     context_stale_action: Literal["regenerate", "use_current", "cancel"] | None = None
     job_ids: list[str] | None = None
-    context_stale_action: Literal["regenerate", "use_current", "cancel"] | None = None
+    manual_override: bool = False
 
 
 class BossJobFilterResult(BaseModel):
@@ -110,6 +116,8 @@ class BossJobFilterResult(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     missing_fields: list[str] = Field(default_factory=list)
     strategy_id: str | None = None
+    strategy_filter_status: Literal["pass", "reject", "review", "exclude"] | None = None
+    final_filter_status: Literal["pass", "reject", "review", "exclude"] | None = None
     cooldown_excluded: bool = False
     cooldown_reasons: list[str] = Field(default_factory=list)
 

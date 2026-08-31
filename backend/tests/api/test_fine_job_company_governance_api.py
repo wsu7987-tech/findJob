@@ -6,9 +6,13 @@ from backend.app.services.fine_job.boss_capture_history import (
     record_capture_jobs,
     update_capture_job_detail,
 )
-from backend.app.services.fine_job.filter_exclusions import apply_filter_exclusions
+from backend.app.services.fine_job.filter_exclusions import (
+    apply_filter_exclusions,
+    assert_job_action_allowed,
+    record_job_event,
+)
 from backend.app.services.fine_job.strategies import get_filter_strategy
-from backend.app.utils import utc_now
+from backend.app.utils import new_id, utc_now
 
 
 def _record_job(test_db, *, job_id: str = "source-job-1", company: str = "示例科技"):
@@ -180,7 +184,7 @@ def test_company_management_supports_type_alias_and_blacklist(
     assert blacklisted["blacklist_reason"] == "岗位质量低"
 
 
-def test_cooldown_rules_exclude_detailed_job_and_update_application(
+def test_cooldown_rules_require_detail_and_evaluation_before_exclusion(
     configured_client,
     test_db,
 ) -> None:
@@ -188,13 +192,10 @@ def test_cooldown_rules_exclude_detailed_job_and_update_application(
     strategy_payload = {
         "name": "冷却策略",
         "cooldown_rules": {
-            "exclude_outsourcing_companies": False,
             "applied_company": {"period": "permanent", "exclude_outsourcing": True},
-            "detailed_company": {"period": "disabled", "exclude_outsourcing": True},
-            "evaluated_company": {"period": "disabled", "exclude_outsourcing": True},
+            "detailed_and_evaluated_company": {"period": "days_3", "exclude_outsourcing": True},
             "applied_job": {"period": "permanent", "exclude_outsourcing": False},
-            "detailed_job": {"period": "days_3", "exclude_outsourcing": False},
-            "evaluated_job": {"period": "disabled", "exclude_outsourcing": False},
+            "detailed_and_evaluated_job": {"period": "days_7", "exclude_outsourcing": False},
         },
     }
     strategy_response = configured_client.post(
@@ -215,9 +216,41 @@ def test_cooldown_rules_exclude_detailed_job_and_update_application(
         [job],
         [{"job_id": job["job_id"], "status": "pass", "reasons": [], "missing_fields": [], "strategy_id": strategy["id"]}],
     )
+    assert jobs[0]["cooldown_excluded"] is False
+    assert results[0]["status"] == "pass"
+
+    with test_db.connect() as connection:
+        connection.execute(
+            "INSERT INTO fj_job_evaluations (id, job_id, source, decision, confidence, evaluation_json, created_at) VALUES (?, ?, 'rules', 'recommend', 1, '{}', ?)",
+            (new_id(), job["history_record_id"], utc_now()),
+        )
+    record_job_event(test_db, "evaluation", job["history_record_id"])
+
+    jobs, results = apply_filter_exclusions(
+        test_db,
+        strategy,
+        [job],
+        [{"job_id": job["job_id"], "status": "review", "reasons": [], "missing_fields": [], "strategy_id": strategy["id"]}],
+    )
     assert jobs[0]["cooldown_excluded"] is True
     assert results[0]["status"] == "exclude"
-    assert "已获取详情岗位冷却" in results[0]["cooldown_reasons"]
+    assert "已获取详情和投递建议岗位冷却" in results[0]["cooldown_reasons"]
+
+    # 自动流程继续遵循冷却规则，用户明确操作时允许查看详情和生成建议。
+    assert_job_action_allowed(
+        test_db,
+        job["history_record_id"],
+        strategy=strategy,
+        action="detail",
+        allow_manual_override=True,
+    )
+    assert_job_action_allowed(
+        test_db,
+        job["history_record_id"],
+        strategy=strategy,
+        action="evaluation",
+        allow_manual_override=True,
+    )
 
     application = configured_client.put(
         f"/api/fine-job/companies/jobs/{job['history_record_id']}/application",
@@ -239,6 +272,42 @@ def test_filter_strategy_cooldown_defaults_are_returned(configured_client) -> No
 
     assert response.status_code == 201
     rules = response.json()["strategy"]["cooldown_rules"]
-    assert rules["exclude_outsourcing_companies"] is True
-    assert rules["detailed_company"]["period"] == "days_3"
-    assert rules["evaluated_job"]["period"] == "days_7"
+    assert "exclude_outsourcing_companies" not in rules
+    assert rules["detailed_and_evaluated_company"]["period"] == "days_3"
+    assert rules["detailed_and_evaluated_company"]["exclude_outsourcing"] is True
+    assert rules["detailed_and_evaluated_job"]["period"] == "days_7"
+
+
+def test_combined_company_cooldown_skips_outsourcing_company(
+    configured_client,
+    test_db,
+) -> None:
+    job = _record_job(test_db, company="外包服务公司")
+    configured_client.patch(
+        f"/api/fine-job/companies/{job['company_id']}",
+        json={"company_type": "outsourcing"},
+    )
+    strategy = get_filter_strategy(
+        test_db,
+        configured_client.post(
+            "/api/fine-job/strategies/filters", json={"name": "外包冷却"}
+        ).json()["strategy"]["id"],
+    )
+    update_capture_job_detail(
+        test_db,
+        job=job,
+        detail={"jd": "负责 Python 服务开发"},
+        status="completed",
+    )
+    with test_db.connect() as connection:
+        connection.execute(
+            "INSERT INTO fj_job_evaluations (id, job_id, source, decision, confidence, evaluation_json, created_at) VALUES (?, ?, 'rules', 'review', 1, '{}', ?)",
+            (new_id(), job["history_record_id"], utc_now()),
+        )
+    record_job_event(test_db, "evaluation", job["history_record_id"])
+
+    state = configured_client.get(
+        f"/api/fine-job/strategies/filters/{strategy['id']}/exclusions"
+    ).json()
+    assert state["company_count"] == 0
+    assert state["job_count"] == 1

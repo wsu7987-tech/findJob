@@ -174,6 +174,7 @@ class BossCaptureTaskManager:
         job_ids: list[str],
         *,
         force: bool = False,
+        manual_override: bool = False,
     ) -> dict[str, object]:
         with self._lock:
             task = self._require_task(task_id)
@@ -202,7 +203,11 @@ class BossCaptureTaskManager:
                     history_id = str(job.get("history_record_id") or "")
                     if history_id:
                         assert_job_action_allowed(
-                            db, history_id, strategy=strategy, action="detail"
+                            db,
+                            history_id,
+                            strategy=strategy,
+                            action="detail",
+                            allow_manual_override=manual_override,
                         )
             selected_ids = [
                 job_id
@@ -348,6 +353,12 @@ class BossCaptureTaskManager:
                 if not result:
                     continue
                 job["filter_status"] = result.get("status")
+                job["strategy_filter_status"] = result.get(
+                    "strategy_filter_status", result.get("status")
+                )
+                job["final_filter_status"] = result.get(
+                    "final_filter_status", result.get("status")
+                )
                 job["filter_reasons"] = list(result.get("reasons") or [])
                 job["filter_missing_fields"] = list(result.get("missing_fields") or [])
                 job["filter_strategy_id"] = result.get("strategy_id")
@@ -366,6 +377,21 @@ class BossCaptureTaskManager:
                 db = task.get("_db")
                 if isinstance(db, Database):
                     update_capture_job_filter_result(db, job=job, result=result)
+                strategy_status = str(
+                    result.get("strategy_filter_status") or result.get("status") or ""
+                )
+                final_status = str(result.get("status") or "")
+                detail_completed = job.get("detail_status") == "completed"
+                suggestion_completed = bool(job.get("delivery_evaluation"))
+                if final_status in {"pass", "review"}:
+                    if job.get("is_previously_collected") and detail_completed and suggestion_completed:
+                        job["processing_state"] = "duplicate"
+                    elif job.get("is_previously_collected") and strategy_status in {"pass", "review"}:
+                        job["processing_state"] = "reprocessable"
+                    else:
+                        job["processing_state"] = "new"
+                else:
+                    job["processing_state"] = "excluded"
             task["updated_at"] = utc_now()
         return self.get_task(task_id)
 
@@ -534,7 +560,11 @@ class BossCaptureTaskManager:
     def _run_selected_details(self, task_id: str, job_ids: list[str]) -> None:
         with self._lock:
             task = self._require_task(task_id)
-            list_data = task["_list_data"]
+            # 详情采集使用任务内保存的完整岗位集合，自动门禁只影响自动采集候选。
+            list_data = {
+                **(task.get("_list_data") or {}),
+                "jobs": [dict(job) for job in task["jobs"]],
+            }
             output_dir = Path(task["_output_dir"])
             output_path = output_dir / f"boss_details_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
             task.update(
@@ -783,10 +813,13 @@ class BossCaptureTaskManager:
                     "recommendation_source": previous.get("recommendation_source"),
                     "recommendation_reason": previous.get("recommendation_reason"),
                     "filter_status": previous.get("filter_status"),
+                    "strategy_filter_status": previous.get("strategy_filter_status"),
+                    "final_filter_status": previous.get("final_filter_status"),
                     "filter_reasons": previous.get("filter_reasons", []),
                     "filter_missing_fields": previous.get("filter_missing_fields", []),
                     "filter_strategy_id": previous.get("filter_strategy_id"),
                     "delivery_evaluation": previous.get("delivery_evaluation"),
+                    "processing_state": previous.get("processing_state"),
                     "list_collected_at": previous.get("list_collected_at") or utc_now(),
                     "detail_collected_at": previous.get("detail_collected_at"),
                 }

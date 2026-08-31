@@ -7,6 +7,7 @@ from backend.app.errors import AppError
 from backend.app.schemas.fine_job.strategies import (
     FineJobFilterStrategyPayload,
     FineJobRecommendationStrategyPayload,
+    normalize_cooldown_rules_payload,
 )
 from backend.app.schemas.fine_job.profile_v3 import SearchKeywordPayload, StrategyChangeSetApply
 from backend.app.services.fine_job import profile_store
@@ -489,7 +490,7 @@ def _serialize_filter(row) -> dict[str, object]:
         "based_on_facts_version": row["based_on_facts_version"],
         "based_on_qa_version": row["based_on_qa_version"],
         **{field: _load_list(row[f"{field}_json"]) for field in FILTER_LIST_FIELDS},
-        "cooldown_rules": _load_object(row["cooldown_rules_json"]),
+        "cooldown_rules": normalize_cooldown_rules_payload(row["cooldown_rules_json"]),
         "monthly_salary_min": row["monthly_salary_min"],
         "monthly_salary_max_at_least": row["monthly_salary_max_at_least"],
         "daily_salary_min": row["daily_salary_min"],

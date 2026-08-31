@@ -188,11 +188,22 @@ def record_capture_jobs(
                     if incoming_status != "not_collected" or not existing["detail_json"]
                     else str(existing["detail_status"])
                 )
+                # 重复采集时把历史详情状态带回当前任务，避免已完成详情被误判为未采集。
+                if incoming_status == "not_collected" and existing["detail_json"]:
+                    job["detail"] = _load_json(detail_json)
+                    job["detail_status"] = detail_status
+                    job["detail_error"] = existing["detail_error"]
+                    job["detail_version"] = existing["detail_version"]
+                    job["detail_collected_at"] = existing["detail_collected_at"]
+                if delivery_evaluation_json:
+                    job["delivery_evaluation"] = _load_json(delivery_evaluation_json)
                 existing_payload = _load_json(existing["payload_json"])
                 if isinstance(existing_payload, dict):
                     # 重复采集后继续保留上一次正式筛选结果，新的筛选完成时再覆盖。
                     for key in (
                         "filter_status",
+                        "strategy_filter_status",
+                        "final_filter_status",
                         "filter_reasons",
                         "filter_missing_fields",
                         "filter_strategy_id",
@@ -310,6 +321,12 @@ def update_capture_job_filter_result(
         payload.update(
             {
                 "filter_status": result.get("status"),
+                "strategy_filter_status": result.get(
+                    "strategy_filter_status", result.get("status")
+                ),
+                "final_filter_status": result.get(
+                    "final_filter_status", result.get("status")
+                ),
                 "filter_reasons": list(result.get("reasons") or []),
                 "filter_missing_fields": list(result.get("missing_fields") or []),
                 "filter_strategy_id": result.get("strategy_id"),
@@ -419,11 +436,6 @@ def update_capture_job_delivery_evaluation(
             """,
             (_json(evaluation), _json(payload), identity_value),
         )
-    from backend.app.services.fine_job.filter_exclusions import record_job_event
-
-    record_job_event(db, "evaluation", str(row["id"]), utc_now())
-
-
 def get_capture_history_job(db: Database, history_job_id: str) -> dict[str, object]:
     with db.connect() as connection:
         row = connection.execute(
@@ -606,6 +618,12 @@ def _serialize_history_row(row) -> dict[str, object]:
         "job_labels": row["job_labels"],
         "search_keyword": row["search_keyword"],
         "filter_status": payload.get("filter_status"),
+        "strategy_filter_status": payload.get(
+            "strategy_filter_status", payload.get("filter_status")
+        ),
+        "final_filter_status": payload.get(
+            "final_filter_status", payload.get("filter_status")
+        ),
         "filter_reasons": list(payload.get("filter_reasons") or []),
         "filter_missing_fields": list(payload.get("filter_missing_fields") or []),
         "filter_strategy_id": payload.get("filter_strategy_id"),
