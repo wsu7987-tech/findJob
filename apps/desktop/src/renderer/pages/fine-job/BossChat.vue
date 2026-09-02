@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
+import { useRouter } from "vue-router";
 
 import { formatDateTime } from "@/services/format";
 import {
@@ -9,12 +10,16 @@ import {
   fineJobChatSendStatusLabel
 } from "@/services/fineJobChatPolicy";
 import { useFineJobBossChatStore } from "@/stores/fineJobBossChat";
-import type { FineJobChatSession, FineJobChatSessionStatus } from "@/types";
+import type { FineJobChatSession } from "@/types";
 
 
 const store = useFineJobBossChatStore();
+const router = useRouter();
 const instruction = ref("");
 const finalText = ref("");
+const expandedMessages = ref<Record<string, boolean>>({});
+const messagePreviewNeedsExpand = ref<Record<string, boolean>>({});
+const messagePreviewElements = new Map<string, HTMLElement>();
 const editorDrafts = ref<Record<string, {
   instruction: string;
   finalText: string;
@@ -22,7 +27,6 @@ const editorDrafts = ref<Record<string, {
   sourceUpdatedAt: string;
   dirty: boolean;
 }>>({});
-let pollTimer: number | null = null;
 
 const session = computed(() => store.detail?.session ?? null);
 const task = computed(() => store.currentTask);
@@ -105,14 +109,6 @@ watch(
   { immediate: true }
 );
 
-const statusLabel = (status: FineJobChatSessionStatus) => ({
-  active: "AI 辅助中",
-  human_takeover: "人工接管",
-  paused: "已暂停",
-  unsupported: "身份待补全"
-})[status];
-const statusType = (status: FineJobChatSessionStatus) =>
-  status === "active" ? "success" : status === "unsupported" ? "warning" : "info";
 const sendStatusLabel = fineJobChatSendStatusLabel;
 const warningLabel = (warning: string) => ({
   send_contact_info: "联系方式",
@@ -121,6 +117,11 @@ const warningLabel = (warning: string) => ({
   salary: "薪资",
   interview_time: "面试时间"
 })[warning] ?? warning;
+const latestMessageStatusLabel = (value?: number | null) => ({
+  0: "【new】",
+  1: "【已送达】",
+  2: "【已读】"
+}[value ?? -1] ?? "");
 
 const selectSession = async (item: FineJobChatSession) => {
   saveEditor();
@@ -187,6 +188,112 @@ const checkNow = async () => {
   }
 };
 
+const refreshFriendList = async () => {
+  try {
+    const result = await store.refreshFriendList();
+    ElMessage.success(`消息列表已更新，共 ${result.count} 条，${result.changed_count} 条消息有变化`);
+  } catch {
+    ElMessage.error(store.error ?? "消息列表更新失败");
+  }
+};
+
+const refreshJob = async () => {
+  try {
+    const result = await store.updateJob();
+    if (result.action === "view") {
+      await router.push({
+        name: "fine-job-capture-history",
+        query: { history_id: result.history_job_id }
+      });
+      return;
+    }
+    ElMessage.success("岗位详情获取任务已启动，历史岗位记录已创建");
+  } catch {
+    ElMessage.error(store.error ?? "岗位详情获取失败");
+  }
+};
+
+const startBatchUpdate = async () => {
+  try {
+    const task = await store.startBatchUpdate();
+    ElMessage.success(`已开始批量更新 ${task.total} 条聊天记录`);
+  } catch {
+    ElMessage.error(store.error ?? "批量更新启动失败");
+  }
+};
+
+const batchProgressPercentage = computed(() => {
+  const progress = store.batchProgress;
+  if (!progress?.total) return 0;
+  return Math.round((progress.current / progress.total) * 100);
+});
+
+const viewJob = async () => {
+  if (!session.value?.job_id) return;
+  await router.push({
+    name: "fine-job-capture-history",
+    query: { history_id: session.value.job_id }
+  });
+};
+
+const rejectJob = async () => {
+  try {
+    await store.rejectJob();
+    ElMessage.success("投递状态已更新为已被拒绝");
+  } catch {
+    ElMessage.error(store.error ?? "投递状态更新失败");
+  }
+};
+
+const refreshHistory = async () => {
+  try {
+    const result = await store.refreshHistory();
+    ElMessage.success(`聊天消息已获取，本次新增 ${result.inserted_count} 条`);
+  } catch {
+    ElMessage.error(store.error ?? "聊天消息获取失败");
+  }
+};
+
+const loadMoreHistory = async () => {
+  try {
+    const result = await store.loadMoreHistory();
+    ElMessage.success(`已获取更早消息，本次新增 ${result.inserted_count} 条`);
+  } catch {
+    ElMessage.error(store.error ?? "获取更多消息失败");
+  }
+};
+
+const toggleMessageExpanded = (sessionId: string) => {
+  if (!messagePreviewNeedsExpand.value[sessionId] && !expandedMessages.value[sessionId]) return;
+  expandedMessages.value[sessionId] = !expandedMessages.value[sessionId];
+};
+
+const setMessagePreviewElement = (sessionId: string, element: unknown) => {
+  if (element instanceof HTMLElement) {
+    messagePreviewElements.set(sessionId, element);
+  } else {
+    messagePreviewElements.delete(sessionId);
+  }
+};
+
+const measureMessagePreviews = async () => {
+  await nextTick();
+  const nextNeedsExpand: Record<string, boolean> = {};
+  for (const [sessionId, element] of messagePreviewElements) {
+    const wasExpanded = Boolean(expandedMessages.value[sessionId]);
+    if (wasExpanded) element.classList.remove("session-card__preview--expanded");
+    nextNeedsExpand[sessionId] = element.scrollHeight > element.clientHeight + 1;
+    if (wasExpanded) element.classList.add("session-card__preview--expanded");
+  }
+  messagePreviewNeedsExpand.value = nextNeedsExpand;
+};
+
+watch(
+  () => store.sessions.map((item) => `${item.id}:${item.latest_message_content || ""}`),
+  measureMessagePreviews,
+  { immediate: true }
+);
+
 const generate = async (regenerate = false) => {
   try {
     await store.generate(instruction.value, regenerate);
@@ -228,16 +335,6 @@ const cancel = async () => {
   }
 };
 
-const setSessionStatus = async (operation: "take-over" | "resume" | "pause") => {
-  const reason = operation === "take-over" ? "用户人工接管" : operation === "pause" ? "用户暂停会话" : "用户恢复 AI 辅助";
-  try {
-    await store.setSessionStatus(operation, reason);
-    ElMessage.success(operation === "resume" ? "已恢复 AI 辅助" : operation === "pause" ? "会话已暂停" : "已人工接管");
-  } catch {
-    ElMessage.error(store.error ?? "会话状态更新失败");
-  }
-};
-
 const pauseAll = async () => {
   try {
     await store.updateRuntime({ generation_enabled: false });
@@ -258,13 +355,10 @@ const emergencyStop = async () => {
 
 onMounted(() => {
   void store.load().catch(() => ElMessage.error(store.error ?? "自动代聊加载失败"));
-  pollTimer = window.setInterval(() => {
-    if (!document.hidden) void store.poll();
-  }, 3_000);
 });
 onBeforeUnmount(() => {
   saveEditor();
-  if (pollTimer !== null) window.clearInterval(pollTimer);
+  store.stopBatchPolling();
 });
 </script>
 
@@ -277,20 +371,61 @@ onBeforeUnmount(() => {
         <p class="secondary-text">监听新消息、生成回复草稿；每条真实发送都必须由你编辑并确认。</p>
       </div>
       <div class="heading-actions">
+        <el-button type="primary" :loading="store.mutating" @click="refreshFriendList">更新聊天列表</el-button>
         <el-button :loading="store.mutating" @click="checkNow">处理待生成任务</el-button>
         <el-button @click="pauseAll">暂停生成</el-button>
         <el-button type="danger" plain @click="emergencyStop">紧急停止</el-button>
       </div>
     </div>
 
-    <el-alert
-      type="warning"
-      :closable="false"
-      show-icon
-      title="首版不读取 BOSS 历史聊天"
-      description="这里只使用插件启用后在本地观察到的消息。上下文可能不完整，发送前请人工核对。"
-    />
     <el-alert v-if="store.error" type="error" show-icon title="自动代聊操作失败" :description="store.error" />
+
+    <section v-if="store.batchSummary" class="page-panel batch-summary-panel">
+      <span>待更新聊天：{{ store.batchSummary.pending_chat_count }} 条</span>
+      <span>
+        本次批量：
+        <el-input-number
+          v-model="store.batchSize"
+          :min="1"
+          :max="Math.min(store.batchSummary.pending_chat_count, store.batchSummary.batch_limit)"
+          :disabled="!store.batchSummary.pending_chat_count || Boolean(store.batchProgress) || store.mutating"
+          controls-position="right"
+          size="small"
+        />
+        条
+      </span>
+      <span>待采集岗位：{{ store.batchSummary.pending_job_count }} 条</span>
+      <el-button
+        class="batch-summary-panel__action"
+        type="primary"
+        plain
+        size="small"
+        :disabled="!store.batchSummary.queued_chat_count || Boolean(store.batchProgress) || store.mutating"
+        :loading="store.mutating"
+        @click="startBatchUpdate"
+      >批量更新聊天记录</el-button>
+    </section>
+
+    <section v-if="store.batchProgress" class="page-panel batch-progress-panel">
+      <div class="panel-title-row">
+        <div>
+          <p class="panel-eyebrow">Batch Update</p>
+          <h2>批量更新进度</h2>
+        </div>
+      </div>
+      <el-progress :percentage="batchProgressPercentage" />
+      <p>{{ store.batchProgress.message }}</p>
+      <p v-if="store.batchProgress.current_session_name">
+        当前会话：{{ store.batchProgress.current_session_name }}
+        <template v-if="store.batchProgress.current_job_title"> · {{ store.batchProgress.current_job_title }}</template>
+      </p>
+      <div class="batch-progress-metrics">
+        <span>聊天已更新 {{ store.batchProgress.chat_completed }}</span>
+        <span>岗位已采集 {{ store.batchProgress.job_completed }}</span>
+        <span>岗位已跳过 {{ store.batchProgress.job_skipped }}</span>
+        <span>失败 {{ store.batchProgress.failed }}</span>
+      </div>
+    </section>
 
     <section class="page-panel runtime-panel">
       <div class="runtime-item">
@@ -338,6 +473,9 @@ onBeforeUnmount(() => {
         </el-tag>
         <span>BOSS 账号：{{ session?.account_uid || "等待消息" }}</span>
       </div>
+      <div class="runtime-actions">
+        <el-link href="https://www.zhipin.com/web/geek/chat" target="_blank" type="primary">打开 BOSS 沟通页</el-link>
+      </div>
     </section>
 
     <section class="chat-workbench page-panel">
@@ -354,12 +492,6 @@ onBeforeUnmount(() => {
             @keyup.enter="applySessionFilters"
             @clear="applySessionFilters"
           />
-          <el-select v-model="store.statusFilter" placeholder="全部状态" clearable @change="applySessionFilters">
-            <el-option label="AI 辅助中" value="active" />
-            <el-option label="已暂停" value="paused" />
-            <el-option label="人工接管" value="human_takeover" />
-            <el-option label="身份待补全" value="unsupported" />
-          </el-select>
         </div>
         <button
           v-for="item in store.sessions"
@@ -369,11 +501,69 @@ onBeforeUnmount(() => {
           type="button"
           @click="selectSession(item)"
         >
-          <span class="session-card__title">{{ item.peer_name || `联系人 ${item.peer_uid}` }}</span>
-          <small>{{ item.company_name || "未知公司" }} · {{ item.job_title || "岗位未确认" }}</small>
-          <span class="session-card__preview">{{ item.latest_message_content || "暂无文本消息" }}</span>
+          <span class="session-card__head">
+            <span class="session-card__company">
+              <span class="session-card__title">{{ item.company_name || "未知公司" }}</span>
+              <span
+                v-if="item.message_update_required || !item.has_local_messages"
+                class="session-card__update-dot"
+                aria-label="消息待更新"
+              />
+            </span>
+            <span class="session-card__hr">{{ item.peer_name || `联系人 ${item.peer_uid}` }}</span>
+          </span>
+          <el-tag
+            v-if="item.platform_relation_type === 1"
+            class="session-card__relation-badge"
+            size="small"
+            type="primary"
+          >new</el-tag>
+          <el-tag
+            v-else-if="item.platform_relation_type === 2"
+            class="session-card__relation-badge"
+            size="small"
+            type="danger"
+          >REJECT</el-tag>
+          <small v-if="item.job_title" class="session-card__job-title">{{ item.job_title }}</small>
+          <el-tag v-else size="small" type="info" effect="plain">岗位未返回</el-tag>
+          <span
+            class="session-card__message-row"
+            :class="{ 'session-card__message-row--expandable': messagePreviewNeedsExpand[item.id] }"
+            @click.stop="toggleMessageExpanded(item.id)"
+          >
+            <span
+              class="session-card__preview"
+              :ref="(element) => setMessagePreviewElement(item.id, element)"
+              :class="[
+                item.latest_message_direction === 'inbound'
+                  ? 'session-card__preview--inbound'
+                  : 'session-card__preview--outbound',
+                { 'session-card__preview--expanded': expandedMessages[item.id] }
+              ]"
+            >
+              <span
+                v-if="latestMessageStatusLabel(item.platform_latest_message_status)"
+                class="session-card__message-tag"
+              >{{ latestMessageStatusLabel(item.platform_latest_message_status) }}</span>
+              <span>{{ item.latest_message_content || "暂无文本消息" }}</span>
+            </span>
+            <span
+              v-if="messagePreviewNeedsExpand[item.id]"
+              class="session-card__expand-icon"
+              role="button"
+              tabindex="0"
+              :aria-label="expandedMessages[item.id] ? '收起最新消息' : '展开最新消息'"
+              :aria-expanded="expandedMessages[item.id]"
+              @click.stop="toggleMessageExpanded(item.id)"
+              @keydown.enter.prevent.stop="toggleMessageExpanded(item.id)"
+              @keydown.space.prevent.stop="toggleMessageExpanded(item.id)"
+            >{{ expandedMessages[item.id] ? "⌃" : "⌄" }}</span>
+          </span>
           <span class="session-card__meta">
-            <el-tag size="small" :type="statusType(item.status)">{{ statusLabel(item.status) }}</el-tag>
+            <el-tag v-if="item.message_update_required" size="small" type="warning">消息需更新</el-tag>
+            <span v-if="item.platform_latest_message_at" class="session-card__time secondary-text">
+              {{ formatDateTime(item.platform_latest_message_at) }}
+            </span>
             <b v-if="item.unhandled_count">{{ item.unhandled_count }} 条待处理</b>
           </span>
         </button>
@@ -385,22 +575,55 @@ onBeforeUnmount(() => {
         <template v-if="session">
           <div class="section-heading conversation-heading">
             <div>
-              <h2>{{ session.peer_name || session.peer_uid }}</h2>
-              <p>{{ session.company_name || "未知公司" }} · {{ session.job_title || "岗位未确认" }}</p>
+              <div class="conversation-contact">
+                <h2>{{ session.company_name || "未知公司" }}</h2>
+                <span class="conversation-contact__hr">{{ session.peer_name || session.peer_uid }}</span>
+              </div>
+              <p v-if="session.job_title">{{ session.job_title }}</p>
               <div class="identity-tags">
-                <el-tag size="small" :type="session.identity_state === 'ready' ? 'success' : 'warning'">
-                  {{ session.identity_state === 'ready' ? '平台身份完整' : '平台身份待补全' }}
-                </el-tag>
+                <el-tag v-if="session.message_update_required" size="small" type="warning">消息需更新</el-tag>
+              </div>
+              <div class="identity-tags">
                 <el-tag size="small" :type="session.job_context_state === 'linked' ? 'success' : 'info'">
                   {{ session.job_context_state === 'linked' ? '已关联本地岗位' : '本地岗位未关联' }}
                 </el-tag>
               </div>
             </div>
             <div class="heading-actions">
-              <el-button v-if="session.status === 'active'" size="small" @click="setSessionStatus('pause')">暂停会话</el-button>
-              <el-button v-if="session.status === 'active'" size="small" type="warning" @click="setSessionStatus('take-over')">人工接管</el-button>
-              <el-button v-if="['paused', 'human_takeover'].includes(session.status)" size="small" type="primary" @click="setSessionStatus('resume')">恢复 AI 辅助</el-button>
-              <el-link href="https://www.zhipin.com/web/geek/chat" target="_blank" type="primary">打开 BOSS 沟通页</el-link>
+              <el-button
+                v-if="session.job_context_state === 'linked'"
+                size="small"
+                type="primary"
+                @click="viewJob"
+              >查看岗位</el-button>
+              <el-button
+                v-else
+                size="small"
+                :loading="store.mutating"
+                @click="refreshJob"
+              >更新岗位</el-button>
+              <el-button
+                v-if="session.job_context_state === 'linked'"
+                size="small"
+                type="danger"
+                plain
+                :loading="store.mutating"
+                @click="rejectJob"
+              >已被拒绝</el-button>
+              <el-button
+                v-if="(store.detail?.message_count ?? 0) === 0"
+                type="primary"
+                size="small"
+                :loading="store.mutating"
+                @click="refreshHistory"
+              >获取消息</el-button>
+              <el-button
+                v-else-if="session.message_update_required"
+                type="primary"
+                size="small"
+                :loading="store.mutating"
+                @click="refreshHistory"
+              >更新</el-button>
             </div>
           </div>
           <el-alert
@@ -422,9 +645,16 @@ onBeforeUnmount(() => {
               class="message-bubble"
               :class="`message-bubble--${message.direction}`"
             >
-              <small>{{ message.direction === "inbound" ? session.peer_name || "HR" : "我" }} · {{ formatDateTime(message.sent_at) }}</small>
+              <small class="message-bubble__meta">{{ message.direction === "inbound" ? session.peer_name || "HR" : "我" }} · {{ formatDateTime(message.sent_at) }}</small>
               <p>{{ message.content || `[${message.message_type}]` }}</p>
             </article>
+          </div>
+          <div v-if="session.history_has_more" class="message-more-actions">
+            <el-button
+              plain
+              :loading="store.mutating"
+              @click="loadMoreHistory"
+            >获取更多</el-button>
           </div>
         </template>
         <el-empty v-else description="选择一个会话查看本地消息" />
@@ -518,6 +748,7 @@ onBeforeUnmount(() => {
 .heading-actions,
 .reply-actions,
 .runtime-summary,
+.runtime-actions,
 .session-card__meta,
 .identity-tags {
   display: flex;
@@ -540,8 +771,13 @@ onBeforeUnmount(() => {
 }
 
 .runtime-item--wide,
-.runtime-summary {
+.runtime-summary,
+.runtime-actions {
   grid-column: 1 / -1;
+}
+
+.runtime-actions {
+  justify-content: flex-end;
 }
 
 .runtime-item--wide {
@@ -562,6 +798,7 @@ onBeforeUnmount(() => {
   grid-template-columns: minmax(230px, 0.75fr) minmax(360px, 1.4fr) minmax(300px, 1fr);
   gap: 0;
   min-height: 620px;
+  max-height: 1000px;
   padding: 0;
   overflow: hidden;
 }
@@ -571,6 +808,8 @@ onBeforeUnmount(() => {
 .reply-panel {
   min-width: 0;
   padding: 20px;
+  max-height: 1000px;
+  overflow: auto;
 }
 
 .conversation-panel,
@@ -592,10 +831,23 @@ onBeforeUnmount(() => {
   margin: 0;
 }
 
+.conversation-contact {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.conversation-contact__hr {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  font-weight: 400;
+}
+
 .session-card {
+  position: relative;
   width: 100%;
   display: grid;
-  gap: 6px;
+  gap: 5px;
   margin-top: 10px;
   padding: 12px;
   border: 1px solid var(--el-border-color-lighter);
@@ -604,6 +856,26 @@ onBeforeUnmount(() => {
   color: inherit;
   text-align: left;
   cursor: pointer;
+}
+
+.session-card__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.session-card__relation-badge {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 1;
+}
+
+.session-card__hr {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  font-weight: 400;
 }
 
 .session-filters {
@@ -626,12 +898,97 @@ onBeforeUnmount(() => {
   font-weight: 700;
 }
 
+.session-card__company {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.session-card__update-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--el-color-danger);
+}
+
 .session-card__preview,
 .session-card small {
   color: var(--el-text-color-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
+}
+
+.session-card .session-card__job-title {
+  color: var(--el-text-color-primary);
+  font-weight: 400;
+}
+
+.session-card__preview {
+  display: -webkit-box;
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.session-card__message-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
+}
+
+.session-card__message-row--expandable {
+  cursor: pointer;
+}
+
+.session-card__preview--expanded {
+  display: block;
+  overflow: visible;
+  -webkit-line-clamp: unset;
+}
+
+.session-card__preview--inbound {
+  color: var(--el-color-danger);
+}
+
+.session-card__preview--outbound {
+  color: var(--el-color-primary);
+}
+
+.session-card__message-tag {
+  display: inline;
+  margin-right: 6px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.session-card__expand-icon {
+  flex: 0 0 auto;
+  color: var(--el-text-color-secondary);
+  font-size: 16px;
+  line-height: 1.25;
+  cursor: pointer;
+  user-select: none;
+}
+
+.session-card__relation-badge {
+  height: 16px;
+  padding: 0 4px;
+  font-size: 10px;
+  line-height: 14px;
+  pointer-events: none;
+}
+
+.session-card__time {
+  font-size: 11px;
 }
 
 .message-timeline {
@@ -641,6 +998,33 @@ onBeforeUnmount(() => {
   margin-top: 18px;
   max-height: 510px;
   overflow: auto;
+}
+
+.batch-summary-panel,
+.batch-progress-metrics {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.batch-summary-panel__action {
+  margin-left: auto;
+}
+
+.batch-progress-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.batch-progress-panel p {
+  margin: 0;
+}
+
+.message-more-actions {
+  display: flex;
+  justify-content: center;
+  margin-top: 14px;
 }
 
 .message-bubble {
@@ -657,7 +1041,23 @@ onBeforeUnmount(() => {
 
 .message-bubble p {
   margin: 5px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.message-bubble__meta {
+  font-size: 11px;
+}
+
+.message-bubble--inbound p {
+  color: var(--el-color-danger);
+}
+
+.message-bubble--outbound p {
+  color: var(--el-color-primary);
 }
 
 .reply-panel {

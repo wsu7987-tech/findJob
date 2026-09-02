@@ -73,11 +73,15 @@ class JobApplicationRequest(BaseModel):
     note: str = ""
 
 
+class JobApplicationStatusRequest(BaseModel):
+    status: Literal["pending_greeting", "pending_application", "communicating", "rejected"] | None = None
+    note: str = ""
+
+
 class JobApplicationResponse(BaseModel):
     job_id: str
     company_id: str | None
-    status: Literal["applied", "cleared"]
+    status: Literal["pending_greeting", "pending_application", "communicating", "rejected"] | None
     source: Literal["boss_action", "manual", "mcp", "migration"]
     applied_at: str
     note: str
-

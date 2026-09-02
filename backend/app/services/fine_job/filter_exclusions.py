@@ -112,13 +112,13 @@ def rebuild_exclusion_state(
                 SELECT a.job_id AS entity_id, a.applied_at AS event_at, c.company_type
                 FROM fj_job_applications a
                 LEFT JOIN fj_companies c ON c.id = a.company_id
-                WHERE a.status = 'applied'
+                WHERE a.status = 'communicating'
             """,
             "applied_company": """
                 SELECT a.company_id AS entity_id, MAX(a.applied_at) AS event_at, c.company_type
                 FROM fj_job_applications a
                 LEFT JOIN fj_companies c ON c.id = a.company_id
-                WHERE a.status = 'applied' AND a.company_id IS NOT NULL
+                WHERE a.status = 'communicating' AND a.company_id IS NOT NULL
                 GROUP BY a.company_id
             """,
             "detailed_and_evaluated_job": """
@@ -308,7 +308,7 @@ def assert_job_action_allowed(
         return
     if governance.get("is_blacklisted") and not allow_manual_override:
         raise AppError(409, "JOB_EXCLUDED", "该岗位公司已加入黑名单。")
-    if action == "application" and governance.get("application_status") == "applied":
+    if action == "application" and governance.get("application_status") == "communicating":
         raise AppError(409, "JOB_ALREADY_APPLIED", "该岗位已经投递。")
     if strategy is None:
         return

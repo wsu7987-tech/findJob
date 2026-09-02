@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from backend.app.services.fine_job import boss_chat
+
 
 def _pair(client) -> tuple[str, str]:
     code = client.post("/api/fine-job/boss-executor/pairing-code").json()["code"]
@@ -16,6 +18,15 @@ def _pair(client) -> tuple[str, str]:
     )
     assert paired.status_code == 200
     return paired.json()["executor_id"], paired.json()["token"]
+
+
+def _resume_session(client, session_id: str) -> None:
+    resumed = client.post(
+        f"/api/fine-job/boss-chat/sessions/{session_id}/resume",
+        json={"reason": "测试恢复 AI 辅助"},
+    )
+    assert resumed.status_code == 200
+    assert resumed.json()["session"]["status"] == "active"
 
 
 def _message_event(
@@ -52,6 +63,198 @@ def _message_event(
             "source": source,
         },
     }
+
+
+def test_refresh_friend_list_saves_identity_and_detects_latest_message_change(configured_client) -> None:
+    from backend.app.services.fine_job.boss_capture_history import (
+        create_capture_batch,
+        record_capture_jobs,
+    )
+
+    create_capture_batch(
+        configured_client.app.state.db,
+        capture_id="chat-job-capture",
+        keyword="Python",
+        city="广州",
+        pages=1,
+        auto_details=False,
+        created_at="2026-08-31T10:00:00Z",
+    )
+    record_capture_jobs(
+        configured_client.app.state.db,
+        capture_id="chat-job-capture",
+        jobs=[{
+            "job_id": "internal-job-id",
+            "encrypt_job_id": "enc-job-300",
+            "title": "Python 后端开发工程师",
+            "boss_name": "示例科技",
+            "job_link": "https://www.zhipin.com/job_detail/enc-job-300.html",
+            "detail_status": "not_collected",
+        }],
+        collected_at="2026-08-31T10:01:00Z",
+    )
+
+    payload = {
+        "code": 0,
+        "zpData": {
+            "result": [{
+                "uid": 200,
+                "encryptFriendId": "enc-peer-200",
+                "securityId": "security-200",
+                "encryptJobId": "enc-job-300",
+                "jobId": 300,
+                "name": "王经理",
+                "title": "招聘经理",
+                "brandName": "示例科技",
+                "lastMsg": "请问方便沟通吗？",
+                "lastMessageInfo": {
+                    "msgId": 1001,
+                    "showText": "请问方便沟通吗？",
+                    "fromId": 200,
+                    "toId": 100,
+                    "status": 0,
+                    "msgTime": 1788168981115,
+                },
+                "relationType": 3,
+                "chatStatus": 0,
+            }],
+        },
+    }
+
+    first = boss_chat.sync_friend_list(
+        configured_client.app.state.db,
+        account_uid="100",
+        response=payload,
+        source_url="https://www.zhipin.com/wapi/zprelation/friend/getGeekFriendList.json",
+    )
+    assert first["count"] == 1
+    assert first["created_count"] == 1
+    assert first["changed_count"] == 0
+
+    session = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]
+    assert session["encrypt_peer_uid"] == "enc-peer-200"
+    assert session["security_id"] == "security-200"
+    assert session["peer_title"] == "招聘经理"
+    assert session["job_title"] == "Python 后端开发工程师"
+    assert session["latest_message_content"] == "请问方便沟通吗？"
+    assert session["latest_message_direction"] == "inbound"
+    assert session["message_update_required"] is False
+
+    payload["zpData"]["result"][0]["lastMsg"] = "可以，下午沟通。"  # type: ignore[index]
+    payload["zpData"]["result"][0]["lastMessageInfo"]["msgId"] = 1002  # type: ignore[index]
+    second = boss_chat.sync_friend_list(
+        configured_client.app.state.db,
+        account_uid="100",
+        response=payload,
+        source_url="https://www.zhipin.com/wapi/zprelation/friend/getGeekFriendList.json",
+    )
+    assert second["count"] == 1
+    assert second["created_count"] == 0
+    assert second["changed_count"] == 1
+    updated = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]
+    assert updated["latest_platform_msg_id"] == "1002"
+    assert updated["message_update_required"] is True
+
+
+def test_refresh_history_uses_saved_identity_and_persists_platform_messages(configured_client, monkeypatch) -> None:
+    from backend.app.services.fine_job.boss_scraper.service import boss_scraper_service
+
+    friend_payload = {
+        "code": 0,
+        "zpData": {
+            "result": [{
+                "uid": 200,
+                "encryptUid": "enc-peer-200",
+                "securityId": "security-200",
+                "encryptJobId": "enc-job-300",
+                "name": "王经理",
+                "title": "招聘经理",
+                "brandName": "示例科技",
+                "lastMsg": "收到，我先把简历推送用人部门",
+                "lastMessageInfo": {
+                    "msgId": 1002,
+                    "fromId": 200,
+                    "toId": 100,
+                    "status": 2,
+                    "msgTime": 1788161054529,
+                },
+            }],
+        },
+    }
+    boss_chat.sync_friend_list(
+        configured_client.app.state.db,
+        account_uid="100",
+        response=friend_payload,
+        source_url="https://www.zhipin.com/wapi/zprelation/friend/getGeekFriendList.json",
+    )
+    session = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]
+    captured_args: list[dict[str, str]] = []
+
+    def capture_history(*, boss_id: str, security_id: str, max_message_id: str = "0", **_kwargs):
+        captured_args.append({
+            "boss_id": boss_id,
+            "security_id": security_id,
+            "max_message_id": max_message_id,
+        })
+        if max_message_id == "0":
+            return {
+                "messages": [{
+                    "mid": 1002,
+                    "type": 1,
+                    "body": {"type": 1, "text": "收到，我先把简历推送用人部门"},
+                    "from": {"uid": 200},
+                    "to": {"uid": 100},
+                    "time": 1788161054529,
+                    "status": 2,
+                }],
+                "has_more": True,
+                "next_cursor": "1001",
+            }
+        return {
+            "messages": [{
+                "mid": 1001,
+                "type": 1,
+                "body": {"type": 1, "text": "您好，想了解一下岗位详情"},
+                "from": {"uid": 100},
+                "to": {"uid": 200},
+                "time": 1788160054529,
+                "status": 2,
+            }],
+            "has_more": False,
+            "next_cursor": "",
+        }
+
+    monkeypatch.setattr(boss_scraper_service, "capture_chat_history", capture_history)
+    refreshed = configured_client.post(
+        f"/api/fine-job/boss-chat/sessions/{session['id']}/history/refresh"
+    )
+
+    assert refreshed.status_code == 200
+    assert captured_args == [{
+        "boss_id": "enc-peer-200",
+        "security_id": "security-200",
+        "max_message_id": "0",
+    }]
+    assert refreshed.json()["inserted_count"] == 1
+    assert refreshed.json()["has_more"] is True
+    more = configured_client.post(
+        f"/api/fine-job/boss-chat/sessions/{session['id']}/history/more"
+    )
+    assert more.status_code == 200
+    assert more.json()["inserted_count"] == 1
+    assert more.json()["has_more"] is False
+    assert captured_args[-1]["max_message_id"] == "1001"
+    detail = configured_client.get(f"/api/fine-job/boss-chat/sessions/{session['id']}").json()
+    assert [item["content"] for item in detail["messages"]] == [
+        "您好，想了解一下岗位详情",
+        "收到，我先把简历推送用人部门",
+    ]
+    assert detail["session"]["message_update_required"] is False
+    listed_ids = {
+        item["id"]
+        for item in configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"]
+    }
+    assert session["id"] in listed_ids
 
 
 def test_chat_observe_generate_confirm_and_send(configured_client) -> None:
@@ -96,7 +299,23 @@ def test_chat_observe_generate_confirm_and_send(configured_client) -> None:
     assert observed.status_code == 200
     assert observed.json()["accepted"] == 1
     assert observed.json()["generated"] == 0
-    assert observed.json()["processing_deferred"] is True
+    assert observed.json()["processing_deferred"] is False
+
+    pending_detail = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]
+    assert pending_detail["status"] == "human_takeover"
+    _resume_session(configured_client, pending_detail["id"])
+    follow_up = _message_event(
+        "event-1-follow-up",
+        "message-1-follow-up",
+        "这个岗位需要到岗办公吗？我还想了解面试流程。",
+    )
+    resumed_observed = configured_client.post(
+        "/api/fine-job/boss-chat/executor/events/batch",
+        headers=headers,
+        json={"events": [follow_up]},
+    )
+    assert resumed_observed.status_code == 200
+    assert resumed_observed.json()["processing_deferred"] is True
 
     pending_detail = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]
     pending_session = configured_client.get(
@@ -180,7 +399,7 @@ def test_chat_observe_generate_confirm_and_send(configured_client) -> None:
     assert completed.status_code == 200
     assert completed.json()["action"]["status"] == "accepted"
     detail = configured_client.get(f"/api/fine-job/boss-chat/sessions/{session_id}").json()
-    assert [item["direction"] for item in detail["messages"]] == ["inbound", "outbound"]
+    assert [item["direction"] for item in detail["messages"]] == ["inbound", "inbound", "outbound"]
 
     assistant_echo = _message_event(
         "event-assistant-echo",
@@ -198,7 +417,7 @@ def test_chat_observe_generate_confirm_and_send(configured_client) -> None:
     assert echoed.status_code == 200
     detail = configured_client.get(f"/api/fine-job/boss-chat/sessions/{session_id}").json()
     assert detail["session"]["status"] == "active"
-    assert len(detail["messages"]) == 2
+    assert len(detail["messages"]) == 3
 
 
 def test_new_message_invalidates_old_draft_and_manual_send_takes_over(configured_client) -> None:
@@ -213,6 +432,7 @@ def test_new_message_invalidates_old_draft_and_manual_send_takes_over(configured
         "/api/fine-job/boss-chat/executor/events/batch", headers=headers, json={"events": [first]}
     )
     session = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]
+    _resume_session(configured_client, session["id"])
     generated = configured_client.post(
         f"/api/fine-job/boss-chat/sessions/{session['id']}/generate", json={"instruction": "先礼貌确认"}
     )
@@ -298,6 +518,8 @@ def test_immediate_mode_debounces_continuous_messages(configured_client) -> None
         headers=headers,
         json={"events": [first]},
     )
+    first_session = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]
+    _resume_session(configured_client, first_session["id"])
     second_response = configured_client.post(
         "/api/fine-job/boss-chat/executor/events/batch",
         headers=headers,
@@ -316,7 +538,6 @@ def test_immediate_mode_debounces_continuous_messages(configured_client) -> None
     assert len(pending_tasks) == 1
     assert pending_tasks[0]["based_on_message_id"] == detail["messages"][-1]["id"]
     assert pending_tasks[0]["input_message_ids"] == [
-        detail["messages"][0]["id"],
         detail["messages"][1]["id"],
     ]
 
@@ -344,6 +565,7 @@ def test_pause_cancels_queued_send_action(configured_client) -> None:
         json={"events": [_message_event("event-pause", "message-pause", "方便沟通吗？")]},
     )
     session = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]
+    _resume_session(configured_client, session["id"])
     task = configured_client.post(
         f"/api/fine-job/boss-chat/sessions/{session['id']}/generate",
         json={"instruction": "礼貌回复"},
@@ -388,6 +610,7 @@ def test_dispatch_timeout_becomes_unknown_and_is_not_reclaimed(configured_client
         json={"events": [_message_event("event-timeout", "message-timeout", "您好")]},
     )
     session = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]
+    _resume_session(configured_client, session["id"])
     task = configured_client.post(
         f"/api/fine-job/boss-chat/sessions/{session['id']}/generate",
         json={"instruction": "礼貌回复"},

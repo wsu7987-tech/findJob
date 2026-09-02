@@ -727,7 +727,7 @@ function formatDuration(seconds: number) {
             <span>{{ scope.row.boss_name }}</span>
             <el-tag v-if="scope.row.is_outsourcing_company" type="warning" size="small">外包</el-tag>
             <el-tag v-if="scope.row.is_blacklisted" type="danger" size="small">黑名单</el-tag>
-            <el-tag v-if="scope.row.application_status === 'applied'" type="info" size="small">已投递</el-tag>
+            <el-tag v-if="scope.row.application_status === 'communicating'" type="success" size="small">沟通中</el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="salary" label="薪资" width="110" sortable="custom" />
@@ -750,16 +750,17 @@ function formatDuration(seconds: number) {
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="285" fixed="right">
+        <el-table-column label="操作" width="100" fixed="right">
           <template #default="scope">
-            <el-button link type="primary" @click.stop="openDetail(scope.row)">查看详情</el-button>
+            <el-button link type="primary" @click.stop="openDetail(scope.row)">详情
+            </el-button>
             <el-button
               link
               type="primary"
               :loading="executorStore.openingJobId === scope.row.job_id"
               @click.stop="openInDedicatedBrowser(scope.row)"
             >
-              专用浏览器打开
+              打开
             </el-button>
             <el-button
               v-if="scope.row.detail_status === 'completed' && !scope.row.delivery_evaluation"
@@ -807,7 +808,7 @@ function formatDuration(seconds: number) {
             <el-tag v-if="currentDetailJob.is_previously_collected" type="warning">历史岗位</el-tag>
             <el-tag v-if="currentDetailJob.is_outsourcing_company" type="warning">外包公司</el-tag>
             <el-tag v-if="currentDetailJob.is_blacklisted" type="danger">公司黑名单</el-tag>
-            <el-tag v-if="currentDetailJob.application_status === 'applied'" type="info">已投递</el-tag>
+            <el-tag v-if="currentDetailJob.application_status === 'communicating'" type="success">沟通中</el-tag>
           </div>
         </div>
 

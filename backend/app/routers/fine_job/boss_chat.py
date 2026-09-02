@@ -1,16 +1,24 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header, Query
+from fastapi import APIRouter, Depends, Header, Query, status
 
 from backend.app.config import AppConfig
 from backend.app.db import Database
 from backend.app.dependencies import get_config, get_database
+from backend.app.errors import AppError
 from backend.app.routers.fine_job.boss_executor import _executor
+from backend.app.services.fine_job.boss_capture_tasks import boss_capture_task_manager
 from backend.app.schemas.fine_job.boss_chat import (
     BossChatActionCompleteRequest,
+    BossChatBatchStartRequest,
+    BossChatBatchSummaryResponse,
+    BossChatBatchTaskResponse,
     BossChatClaimActionRequest,
     BossChatDispatchStartedRequest,
     BossChatEventBatchRequest,
+    BossChatFriendListRefreshResponse,
+    BossChatHistoryRefreshResponse,
+    BossChatJobUpdateResponse,
     BossChatGenerateRequest,
     BossChatHeartbeatRequest,
     BossChatReasonRequest,
@@ -19,6 +27,7 @@ from backend.app.schemas.fine_job.boss_chat import (
     BossChatRuntimeUpdateRequest,
 )
 from backend.app.services.fine_job import boss_chat
+from backend.app.services.fine_job.boss_scraper.service import boss_scraper_service
 
 
 router = APIRouter(prefix="/fine-job/boss-chat", tags=["fine-job-boss-chat"])
@@ -34,12 +43,61 @@ def update_runtime(payload: BossChatRuntimeUpdateRequest, db: Database = Depends
     return {"runtime": boss_chat.update_runtime(db, payload.model_dump(exclude_none=True))}
 
 
+@router.get("/batch/summary", response_model=BossChatBatchSummaryResponse)
+def batch_summary(db: Database = Depends(get_database)) -> BossChatBatchSummaryResponse:
+    return BossChatBatchSummaryResponse(**boss_chat.get_batch_summary(db))
+
+
+@router.post("/batch", response_model=BossChatBatchTaskResponse, status_code=status.HTTP_202_ACCEPTED)
+def start_batch(
+    payload: BossChatBatchStartRequest,
+    config: AppConfig = Depends(get_config),
+    db: Database = Depends(get_database),
+) -> BossChatBatchTaskResponse:
+    return BossChatBatchTaskResponse(**boss_chat.boss_chat_batch_manager.start(
+        db, config, batch_size=payload.batch_size,
+    ))
+
+
+@router.get("/batch/{task_id}", response_model=BossChatBatchTaskResponse)
+def batch_status(task_id: str) -> BossChatBatchTaskResponse:
+    return BossChatBatchTaskResponse(**boss_chat.boss_chat_batch_manager.get(task_id))
+
+
 @router.post("/check")
 def check_pending(
     db: Database = Depends(get_database),
     config: AppConfig = Depends(get_config),
 ):
     return {"generated": boss_chat.process_due_tasks(db, config, force=True)}
+
+
+@router.post("/friend-list/refresh", response_model=BossChatFriendListRefreshResponse)
+def refresh_friend_list(
+    db: Database = Depends(get_database),
+) -> BossChatFriendListRefreshResponse:
+    """打开 BOSS 聊天页，监听页面自身的联系人列表请求并保存结果。"""
+    try:
+        captured = boss_scraper_service.capture_chat_friend_list()
+        result = boss_chat.sync_friend_list(
+            db,
+            account_uid=str(captured["account_uid"]),
+            response=captured["response"],
+            source_url=str(captured["url"]),
+        )
+    except ValueError as exc:
+        raise AppError(
+            status_code=400,
+            error_category="BOSS_CHAT_LIST_CAPTURE_INVALID",
+            error_message=str(exc),
+        ) from exc
+    except RuntimeError as exc:
+        raise AppError(
+            status_code=409,
+            error_category="BOSS_CHAT_LIST_CAPTURE_FAILED",
+            error_message=str(exc),
+        ) from exc
+    return BossChatFriendListRefreshResponse(**result)
 
 
 @router.post("/executor/heartbeat")
@@ -138,10 +196,145 @@ def sessions(
 @router.get("/sessions/{session_id}")
 def session(
     session_id: str,
-    message_limit: int = Query(default=200, ge=20, le=500),
     db: Database = Depends(get_database),
 ):
-    return boss_chat.get_session(db, session_id, message_limit=message_limit)
+    return boss_chat.get_session(db, session_id)
+
+
+@router.post("/sessions/{session_id}/history/refresh", response_model=BossChatHistoryRefreshResponse)
+def refresh_history(
+    session_id: str,
+    db: Database = Depends(get_database),
+) -> BossChatHistoryRefreshResponse:
+    """使用会话保存的 encryptFriendId 和 securityId 获取历史消息。"""
+    try:
+        with db.connect() as connection:
+            session = connection.execute(
+                """
+                SELECT encrypt_peer_uid, security_id
+                FROM fj_chat_sessions WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        if session is None:
+            raise AppError(
+                status_code=404,
+                error_category="CHAT_SESSION_NOT_FOUND",
+                error_message="聊天会话不存在。",
+            )
+        captured = boss_scraper_service.capture_chat_history(
+            boss_id=str(session["encrypt_peer_uid"] or ""),
+            security_id=str(session["security_id"] or ""),
+        )
+        result = boss_chat.sync_history_messages(
+            db,
+            session_id=session_id,
+            messages=list(captured.get("messages") or []),
+            history_has_more=bool(captured.get("has_more")),
+            history_next_cursor=str(captured.get("next_cursor") or ""),
+        )
+    except ValueError as exc:
+        raise AppError(
+            status_code=400,
+            error_category="BOSS_CHAT_HISTORY_INVALID",
+            error_message=str(exc),
+        ) from exc
+    except RuntimeError as exc:
+        raise AppError(
+            status_code=409,
+            error_category="BOSS_CHAT_HISTORY_CAPTURE_FAILED",
+            error_message=str(exc),
+        ) from exc
+    return BossChatHistoryRefreshResponse(**result)
+
+
+@router.post(
+    "/sessions/{session_id}/history/more",
+    response_model=BossChatHistoryRefreshResponse,
+)
+def load_more_history(
+    session_id: str,
+    db: Database = Depends(get_database),
+) -> BossChatHistoryRefreshResponse:
+    """使用会话保存的分页游标补充更早的 20 条聊天记录。"""
+    try:
+        with db.connect() as connection:
+            session = connection.execute(
+                """
+                SELECT encrypt_peer_uid, security_id, history_has_more, history_next_cursor
+                FROM fj_chat_sessions WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        if session is None:
+            raise AppError(
+                status_code=404,
+                error_category="CHAT_SESSION_NOT_FOUND",
+                error_message="聊天会话不存在。",
+            )
+        if not bool(session["history_has_more"]):
+            raise AppError(
+                status_code=409,
+                error_category="CHAT_HISTORY_COMPLETE",
+                error_message="当前会话没有更多历史消息。",
+            )
+        cursor = str(session["history_next_cursor"] or "")
+        if not cursor:
+            raise AppError(
+                status_code=409,
+                error_category="CHAT_HISTORY_CURSOR_MISSING",
+                error_message="当前会话缺少继续获取历史消息的位置。",
+            )
+        captured = boss_scraper_service.capture_chat_history(
+            boss_id=str(session["encrypt_peer_uid"] or ""),
+            security_id=str(session["security_id"] or ""),
+            max_message_id=cursor,
+        )
+        result = boss_chat.sync_history_messages(
+            db,
+            session_id=session_id,
+            messages=list(captured.get("messages") or []),
+            history_has_more=bool(captured.get("has_more")),
+            history_next_cursor=str(captured.get("next_cursor") or ""),
+        )
+    except ValueError as exc:
+        raise AppError(
+            status_code=400,
+            error_category="BOSS_CHAT_HISTORY_INVALID",
+            error_message=str(exc),
+        ) from exc
+    except RuntimeError as exc:
+        raise AppError(
+            status_code=409,
+            error_category="BOSS_CHAT_HISTORY_CAPTURE_FAILED",
+            error_message=str(exc),
+        ) from exc
+    return BossChatHistoryRefreshResponse(**result)
+
+
+@router.post(
+    "/sessions/{session_id}/job/update",
+    response_model=BossChatJobUpdateResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def update_session_job(
+    session_id: str,
+    config: AppConfig = Depends(get_config),
+    db: Database = Depends(get_database),
+) -> BossChatJobUpdateResponse:
+    """补录聊天岗位并复用历史岗位详情采集任务。"""
+    result = boss_chat.prepare_chat_job(
+        db,
+        session_id,
+        can_fetch_details=boss_scraper_service.get_browser_status().running,
+    )
+    if result["action"] == "update":
+        result["task"] = boss_capture_task_manager.start_history_detail(
+            result["job"],
+            output_dir=config.output_root / "fine-job" / "boss-capture",
+            db=db,
+        )
+    return BossChatJobUpdateResponse(**result)
 
 
 @router.post("/sessions/{session_id}/generate")

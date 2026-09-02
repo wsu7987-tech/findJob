@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
 from typing import Callable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from backend.app.services.fine_job.boss_scraper import boss_cdp_raw as engine
+from backend.app.services.fine_job.boss_scraper.boss_job_detail import fetch_job_detail
 
 
 # 引擎的请求计数和 CDP 事件缓冲是进程级状态，因此即使调用方创建多个服务实例，
@@ -59,6 +61,7 @@ class BossScraperService:
 
     def __init__(self) -> None:
         self._interactive_target_id: str | None = None
+        self._chat_target_id: str | None = None
 
     def check_environment(self, *, cdp_port: int = engine.DEFAULT_CDP_PORT) -> int:
         return engine.run_check(cdp_port)
@@ -91,6 +94,7 @@ class BossScraperService:
 
     def stop_browser(self) -> int:
         self._interactive_target_id = None
+        self._chat_target_id = None
         return engine.run_stop_chrome()
 
     def open_login_page(
@@ -111,6 +115,180 @@ class BossScraperService:
         finally:
             cdp.close()
         return login_url
+
+    def capture_chat_friend_list(
+        self,
+        *,
+        cdp_port: int = engine.DEFAULT_CDP_PORT,
+        timeout: int = 30,
+    ) -> dict[str, object]:
+        """打开聊天页并旁听页面自身发出的联系人列表请求。"""
+        if not engine.is_cdp_ready(cdp_port):
+            raise RuntimeError("FineJob 专用 Chrome 未启动，请先打开浏览器。")
+
+        chat_url = "https://www.zhipin.com/web/geek/chat?ka=header-message"
+        with _CAPTURE_LOCK:
+            cdp = engine.CDPSession(cdp_port)
+            target_id = ""
+            session_id = ""
+            try:
+                targets = cdp.send("Target.getTargets").get("result", {}).get("targetInfos", [])
+                target = next(
+                    (
+                        item for item in targets
+                        if item.get("type") == "page"
+                        and str(item.get("targetId") or "") == self._chat_target_id
+                    ),
+                    None,
+                )
+                if target is None:
+                    target = next(
+                        (
+                            item for item in targets
+                            if item.get("type") == "page"
+                            and urlparse(str(item.get("url") or "")).path.rstrip("/") == "/web/geek/chat"
+                        ),
+                        None,
+                    )
+                if target is None:
+                    created = cdp.send(
+                        "Target.createTarget",
+                        {"url": "about:blank", "background": False},
+                    )
+                    target_id = str(created["result"]["targetId"])
+                else:
+                    target_id = str(target["targetId"])
+                session_id = engine.attach_page_session(cdp, target_id)
+                capture = engine.NetworkChatFriendListCapture(cdp, session_id)
+                capture.enable()
+                cdp.send("Page.navigate", {"url": chat_url}, session_id)
+                cdp.send("Target.activateTarget", {"targetId": target_id})
+                data = capture.wait_next_response(timeout=timeout)
+                if not isinstance(data, dict):
+                    raise RuntimeError("聊天页未捕获到联系人列表接口响应，请确认已登录 BOSS。")
+                account_uid = cdp.eval_js(
+                    "String((window._PAGE && (window._PAGE.uid || window._PAGE.userId)) || '')",
+                    session_id,
+                )
+                account_uid = str(account_uid or "").strip()
+                if not account_uid:
+                    raise RuntimeError("未能从聊天页读取当前 BOSS 账号，请确认登录状态。")
+                self._chat_target_id = target_id
+                self._interactive_target_id = target_id
+                return {
+                    "url": chat_url,
+                    "account_uid": account_uid,
+                    "response": data,
+                    "target_id": target_id,
+                }
+            finally:
+                try:
+                    if session_id:
+                        cdp.send("Network.disable", {}, session_id, timeout=3)
+                except Exception:
+                    pass
+                cdp.close()
+
+    def capture_chat_history(
+        self,
+        *,
+        boss_id: str,
+        security_id: str,
+        max_message_id: str = "0",
+        cdp_port: int = engine.DEFAULT_CDP_PORT,
+        page_size: int = 20,
+        timeout: int = 30,
+    ) -> dict[str, object]:
+        """使用聊天页登录态请求指定 HR 的历史消息接口。"""
+        boss_id = boss_id.strip()
+        security_id = security_id.strip()
+        if not boss_id or not security_id:
+            raise ValueError("获取聊天记录缺少 encryptFriendId 或 securityId。")
+        if not engine.is_cdp_ready(cdp_port):
+            raise RuntimeError("FineJob 专用 Chrome 未启动，请先打开浏览器。")
+
+        with _CAPTURE_LOCK:
+            cdp = engine.CDPSession(cdp_port)
+            session_id = ""
+            try:
+                targets = cdp.send("Target.getTargets").get("result", {}).get("targetInfos", [])
+                target = next(
+                    (
+                        item for item in targets
+                        if item.get("type") == "page"
+                        and str(item.get("targetId") or "") == self._chat_target_id
+                    ),
+                    None,
+                )
+                if target is None:
+                    target = next(
+                        (
+                            item for item in targets
+                            if item.get("type") == "page"
+                            and urlparse(str(item.get("url") or "")).path.rstrip("/") == "/web/geek/chat"
+                        ),
+                        None,
+                )
+                if target is None:
+                    raise RuntimeError("BOSS 聊天页尚未准备，请先点击“更新信息”。")
+
+                target_id = str(target["targetId"])
+                session_id = engine.attach_page_session(cdp, target_id)
+                query = urlencode({
+                    "bossId": boss_id,
+                    "maxMsgId": max_message_id,
+                    "c": page_size,
+                    "page": 1,
+                    "src": 0,
+                    "securityId": security_id,
+                })
+                url = f"https://www.zhipin.com{engine.API_CHAT_HISTORY_PATH}?{query}"
+                expression = (
+                    "(async () => {"
+                    f"const response = await fetch({json.dumps(url)}, {{credentials: 'include'}});"
+                    "return {status: response.status, text: await response.text()};"
+                    "})()"
+                )
+                result = cdp.send(
+                    "Runtime.evaluate",
+                    {
+                        "expression": expression,
+                        "awaitPromise": True,
+                        "returnByValue": True,
+                    },
+                    session_id,
+                    timeout=timeout,
+                )
+                value = result.get("result", {}).get("result", {}).get("value") or {}
+                if int(value.get("status") or 0) != 200:
+                    raise RuntimeError(f"聊天历史接口请求失败，HTTP 状态码 {value.get('status')}。")
+                try:
+                    payload = json.loads(str(value.get("text") or ""))
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("聊天历史接口返回内容不是有效 JSON。") from exc
+                if payload.get("code") not in (None, 0):
+                    raise RuntimeError(str(payload.get("message") or "BOSS 聊天历史接口返回失败。"))
+                zp_data = payload.get("zpData") or {}
+                page_messages = zp_data.get("messages") if isinstance(zp_data, dict) else None
+                if not isinstance(page_messages, list):
+                    raise RuntimeError("聊天历史接口响应中没有 messages。")
+                messages = [message for message in page_messages if isinstance(message, dict)]
+                has_more = bool(zp_data.get("hasMore"))
+                next_cursor = str(zp_data.get("minMsgId") or "") if has_more else ""
+                return {
+                    "url": url,
+                    "messages": messages,
+                    "target_id": target_id,
+                    "has_more": bool(has_more and next_cursor),
+                    "next_cursor": next_cursor,
+                }
+            finally:
+                try:
+                    if session_id:
+                        cdp.send("Runtime.disable", {}, session_id, timeout=3)
+                except Exception:
+                    pass
+                cdp.close()
 
     def get_browser_status(
         self,
@@ -479,6 +657,23 @@ class BossScraperService:
                 str(output_path),
                 cdp_port=cdp_port,
                 fmt="json",
+                progress_callback=progress_callback,
+            )
+
+    def capture_chat_job_detail(
+        self,
+        *,
+        job: dict[str, object],
+        output_path: Path,
+        cdp_port: int = engine.DEFAULT_CDP_PORT,
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
+    ) -> dict[str, object]:
+        """使用独立详情脚本获取聊天岗位字段，保持普通批量详情链路不变。"""
+        with _CAPTURE_LOCK:
+            return fetch_job_detail(
+                job,
+                output_path=output_path,
+                cdp_port=cdp_port,
                 progress_callback=progress_callback,
             )
 

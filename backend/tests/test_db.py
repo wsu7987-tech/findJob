@@ -171,6 +171,14 @@ def test_database_initializes_boss_chat_debounce_columns(
     assert "idx_fj_chat_reply_tasks_due" in indexes
 
     with database.connect() as connection:
+        chat_session_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(fj_chat_sessions)").fetchall()
+    }
+
+    assert {"history_has_more", "history_next_cursor"} <= chat_session_columns
+
+    with database.connect() as connection:
         send_columns = {
             row[1]
             for row in connection.execute("PRAGMA table_info(fj_chat_send_actions)").fetchall()

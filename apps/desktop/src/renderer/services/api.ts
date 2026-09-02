@@ -35,6 +35,7 @@
   FineJobPlatformLoginActionEnvelope,
   FineJobPlatformSessionListEnvelope,
   FineJobBossBrowserStatus,
+  FineJobBossNetworkDebugStatus,
   FineJobBossCityListResponse,
   FineJobBossCaptureRequest,
   FineJobBossCaptureTask,
@@ -43,6 +44,7 @@
   FineJobBossDeliveryEvaluationResponse,
   FineJobBossHistoryDeliveryEvaluationResponse,
   FineJobBossHistoryQuery,
+  FineJobBossHistoryJob,
   FineJobBossHistoryResponse,
   FineJobBossSearchPageRequest,
   FineJobBossSearchPageResponse,
@@ -59,6 +61,11 @@
   FineJobChatRuntimeEnvelope,
   FineJobChatSessionDetail,
   FineJobChatSessionListEnvelope,
+  FineJobChatFriendListRefreshResponse,
+  FineJobChatHistoryRefreshResponse,
+  FineJobChatBatchSummary,
+  FineJobChatBatchTask,
+  FineJobChatJobUpdateResponse,
   FineJobChatReplyEnvelope,
   FineJobChatSendActionEnvelope,
   FineJobCodexPendingWork,
@@ -676,6 +683,19 @@ export const api = {
       method: "POST"
     });
   },
+  async getFineJobBossNetworkDebugStatus() {
+    return request<FineJobBossNetworkDebugStatus>("/api/fine-job/boss-network-debug/status");
+  },
+  async startFineJobBossNetworkDebug() {
+    return request<FineJobBossNetworkDebugStatus>("/api/fine-job/boss-network-debug/start", {
+      method: "POST"
+    });
+  },
+  async stopFineJobBossNetworkDebug() {
+    return request<FineJobBossNetworkDebugStatus>("/api/fine-job/boss-network-debug/stop", {
+      method: "POST"
+    });
+  },
   async locateFineJobBossSearchPage(payload: FineJobBossSearchPageRequest) {
     return request<FineJobBossSearchPageResponse>("/api/fine-job/boss-capture/locate", {
       method: "POST",
@@ -970,6 +990,12 @@ export const api = {
   async checkFineJobChatNow() {
     return request<{ generated: number }>("/api/fine-job/boss-chat/check", { method: "POST" });
   },
+  async refreshFineJobChatFriendList() {
+    return request<FineJobChatFriendListRefreshResponse>(
+      "/api/fine-job/boss-chat/friend-list/refresh",
+      { method: "POST" }
+    );
+  },
   async listFineJobChatSessions(params: {
     status?: string;
     account_uid?: string;
@@ -990,6 +1016,53 @@ export const api = {
     return request<FineJobChatSessionDetail>(
       `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}`
     );
+  },
+  async refreshFineJobChatHistory(sessionId: string) {
+    return request<FineJobChatHistoryRefreshResponse>(
+      `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/history/refresh`,
+      { method: "POST" }
+    );
+  },
+  async getFineJobChatBatchSummary() {
+    return request<FineJobChatBatchSummary>("/api/fine-job/boss-chat/batch/summary");
+  },
+  async startFineJobChatBatch(batchSize: number) {
+    return request<FineJobChatBatchTask>("/api/fine-job/boss-chat/batch", {
+      method: "POST",
+      body: JSON.stringify({ batch_size: batchSize })
+    });
+  },
+  async getFineJobChatBatch(taskId: string) {
+    return request<FineJobChatBatchTask>(
+      `/api/fine-job/boss-chat/batch/${encodeURIComponent(taskId)}`
+    );
+  },
+  async loadMoreFineJobChatHistory(sessionId: string) {
+    return request<FineJobChatHistoryRefreshResponse>(
+      `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/history/more`,
+      { method: "POST" }
+    );
+  },
+  async getFineJobBossCaptureHistoryJob(historyJobId: string) {
+    return request<FineJobBossHistoryJob>(
+      `/api/fine-job/boss-capture/history/${encodeURIComponent(historyJobId)}`
+    );
+  },
+  async updateFineJobChatJob(sessionId: string) {
+    return request<FineJobChatJobUpdateResponse>(
+      `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/job/update`,
+      { method: "POST" }
+    );
+  },
+  async setFineJobJobApplicationStatus(
+    jobId: string,
+    status: "pending_greeting" | "pending_application" | "communicating" | "rejected" | null,
+    note = ""
+  ) {
+    return request(`/api/fine-job/companies/jobs/${encodeURIComponent(jobId)}/application-status`, {
+      method: "PUT",
+      body: JSON.stringify({ status, note })
+    });
   },
   async generateFineJobChatReply(sessionId: string, instruction = "", regenerate = false) {
     const operation = regenerate ? "regenerate" : "generate";

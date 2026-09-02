@@ -13,10 +13,14 @@ from backend.app.schemas.fine_job.companies import (
     CompanyListEnvelope,
     CompanyUpdateRequest,
     JobApplicationRequest,
+    JobApplicationStatusRequest,
     JobApplicationResponse,
 )
 from backend.app.services.fine_job import companies
-from backend.app.services.fine_job.job_applications import set_job_application
+from backend.app.services.fine_job.job_applications import (
+    set_job_application,
+    set_job_application_status,
+)
 
 
 router = APIRouter(prefix="/fine-job/companies", tags=["fine-job-companies"])
@@ -140,3 +144,19 @@ def edit_job_application(
         )
     )
 
+
+@router.put("/jobs/{job_id}/application-status", response_model=JobApplicationResponse)
+def edit_job_application_status(
+    job_id: str,
+    payload: JobApplicationStatusRequest,
+    db: Database = Depends(get_database),
+) -> JobApplicationResponse:
+    return JobApplicationResponse(
+        **set_job_application_status(
+            db,
+            job_id,
+            status=payload.status,
+            source="manual",
+            note=payload.note,
+        )
+    )

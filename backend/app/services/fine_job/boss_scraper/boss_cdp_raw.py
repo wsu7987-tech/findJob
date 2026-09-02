@@ -57,6 +57,8 @@ DEFAULT_CDP_PORT = 9222
 
 # API 基础路径（便于统一修改）
 API_JOB_LIST_PATH = "/wapi/zpgeek/search/joblist.json"
+API_CHAT_FRIEND_LIST_PATH = "/wapi/zprelation/friend/getGeekFriendList.json"
+API_CHAT_HISTORY_PATH = "/wapi/zpchat/geek/historyMsg"
 HOT_CITY_URL = "https://www.zhipin.com/wapi/zpgeek/search/job/hot/city.json"
 CITY_GROUP_URL = "https://www.zhipin.com/wapi/zpCommon/data/cityGroup.json"
 
@@ -541,6 +543,78 @@ class NetworkJoblistCapture:
                 body = base64.b64decode(body).decode("utf-8", errors="replace")
             except (ValueError, TypeError) as e:
                 log.debug(f"响应体 base64 解码失败: {e}")
+                return None
+        return body
+
+
+class NetworkChatFriendListCapture:
+    """监听聊天页自身发出的联系人列表请求。"""
+
+    def __init__(self, cdp, sid):
+        self.cdp = cdp
+        self.sid = sid
+        self._consumed = set()
+
+    def enable(self):
+        self.cdp.send("Network.enable", {}, self.sid)
+
+    def _next_completed(self):
+        """从 CDP 事件缓冲中找到已完成的聊天联系人列表请求。"""
+        requests_seen = {}
+        finished = set()
+        for event in self.cdp.events:
+            method = event.get("method", "")
+            params = event.get("params", {})
+            request_id = params.get("requestId")
+            if method == "Network.requestWillBeSent":
+                request = params.get("request") or {}
+                if request_id and self._is_friend_list_url(request.get("url", "")):
+                    requests_seen[request_id] = True
+            elif method == "Network.loadingFinished" and request_id:
+                finished.add(request_id)
+        for request_id in requests_seen:
+            if request_id in finished and request_id not in self._consumed:
+                return request_id
+        return None
+
+    @staticmethod
+    def _is_friend_list_url(url):
+        return API_CHAT_FRIEND_LIST_PATH in urlparse(url).path
+
+    def wait_next_response(self, timeout, trigger=None, poll=0.5):
+        """等待聊天联系人列表响应，并返回页面收到的 JSON。"""
+        if trigger is not None:
+            trigger()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            request_id = self._next_completed()
+            if request_id is None:
+                self.cdp.drain_events(min(poll, deadline - time.time()))
+                continue
+            self._consumed.add(request_id)
+            body = self._fetch_body(request_id)
+            if body is None:
+                continue
+            try:
+                return json.loads(body)
+            except (json.JSONDecodeError, ValueError) as exc:
+                log.warning(f"聊天联系人列表响应不是有效 JSON: {exc}")
+        return None
+
+    def _fetch_body(self, request_id):
+        try:
+            result = self.cdp.send(
+                "Network.getResponseBody", {"requestId": request_id}, self.sid
+            )
+        except (websocket.WebSocketException, TimeoutError) as exc:
+            log.debug(f"读取聊天联系人列表响应失败 request={request_id}: {exc}")
+            return None
+        body = result.get("result", {}).get("body", "")
+        if result.get("result", {}).get("base64Encoded"):
+            try:
+                body = base64.b64decode(body).decode("utf-8", errors="replace")
+            except (ValueError, TypeError) as exc:
+                log.debug(f"聊天联系人列表响应 base64 解码失败: {exc}")
                 return None
         return body
 
@@ -2298,6 +2372,9 @@ def prepare_cdp_profile(copy_login_state=False, reset=False):
 
 
 def is_cdp_ready(cdp_port):
+    # 状态接口可能在浏览器启动流程之外单独调用，先确保 HTTP 依赖已加载。
+    if not require_runtime_dependencies("requests"):
+        return False
     try:
         resp = requests.get(f"http://127.0.0.1:{cdp_port}/json/version", timeout=2)
         return resp.status_code == 200

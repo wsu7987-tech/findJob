@@ -298,6 +298,78 @@ def record_capture_jobs(
     return enriched
 
 
+def record_chat_job(
+    db: Database,
+    *,
+    session: dict[str, object],
+    application_status: str | None,
+) -> dict[str, object]:
+    """把聊天会话中的 BOSS 岗位补录为历史岗位，并保留详情采集入口。"""
+    encrypt_job_id = _text(session.get("encrypt_job_id"))
+    if not encrypt_job_id:
+        raise AppError(409, "JOB_ID_MISSING", "当前聊天缺少 BOSS 岗位加密标识，无法获取岗位详情。")
+
+    with db.connect() as connection:
+        existing = connection.execute(
+            "SELECT id FROM fj_boss_jobs WHERE encrypt_job_id = ? LIMIT 1",
+            (encrypt_job_id,),
+        ).fetchone()
+    if existing is not None:
+        return {
+            "history_record_id": str(existing["id"]),
+            "created": False,
+        }
+
+    capture_id = new_id()
+    now = utc_now()
+    create_capture_batch(
+        db,
+        capture_id=capture_id,
+        keyword="聊天岗位补录",
+        city="",
+        pages=1,
+        auto_details=False,
+        created_at=now,
+    )
+    job_link = f"https://www.zhipin.com/job_detail/{encrypt_job_id}.html"
+    persisted = record_capture_jobs(
+        db,
+        capture_id=capture_id,
+        search_keyword="聊天岗位补录",
+        jobs=[
+            {
+                # 聊天会话里的 job_id 是本地关联值，新补录记录的来源岗位编号暂时留空。
+                "job_id": "",
+                "encrypt_job_id": encrypt_job_id,
+                # 保留聊天列表已经返回的岗位名称，详情采集后再补充完整岗位资料。
+                "title": _text(session.get("job_title")),
+                "boss_name": _text(session.get("company_name")),
+                "job_link": job_link,
+                "filter_status": "pass_for_human",
+                "strategy_filter_status": "pass_for_human",
+                "final_filter_status": "pass_for_human",
+                "application_status": application_status,
+                "detail_status": "queued",
+            }
+        ],
+        collected_at=now,
+    )
+    history_record_id = str(persisted[0]["history_record_id"])
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_chat_sessions SET job_id = ?, updated_at = ? WHERE id = ?",
+            (history_record_id, now, str(session["id"])),
+        )
+        connection.execute(
+            "UPDATE fj_boss_capture_batches SET status = 'running', jobs_collected = 1, updated_at = ? WHERE id = ?",
+            (now, capture_id),
+        )
+    return {
+        "history_record_id": history_record_id,
+        "created": True,
+    }
+
+
 def update_capture_job_filter_result(
     db: Database,
     *,
@@ -355,31 +427,73 @@ def update_capture_job_detail(
     now = collected_at or utc_now()
     with db.connect() as connection:
         existing = connection.execute(
-            f"SELECT id, detail_json FROM fj_boss_jobs WHERE {identity_column} = ?",
+            f"""
+            SELECT id, encrypt_job_id, detail_json, payload_json
+            FROM fj_boss_jobs
+            WHERE {identity_column} = ?
+            """,
             (identity_value,),
         ).fetchone()
         if existing is None:
             return
         if status == "completed":
             detail_payload = detail if isinstance(detail, dict) else {}
-            connection.execute(
-                f"""
-                UPDATE fj_boss_jobs
-                SET detail_json = ?, detail_status = 'completed', detail_error = NULL,
-                    detail_collected_at = ?, detail_version = detail_version + 1,
-                    boss_active_status = CASE
-                      WHEN ? <> '' THEN ? ELSE boss_active_status
-                    END
-                WHERE {identity_column} = ?
-                """,
-                (
-                    _json_or_none(detail),
-                    now,
-                    _text(detail_payload.get("boss_active_status")),
-                    _text(detail_payload.get("boss_active_status")),
-                    identity_value,
+            payload = _load_json(existing["payload_json"])
+            if not isinstance(payload, dict):
+                payload = {}
+            field_values = {
+                "title": _text(detail_payload.get("title")),
+                "salary": _text(detail_payload.get("salary")),
+                "company_name": _text(
+                    detail_payload.get("company_name") or detail_payload.get("company")
                 ),
+                "company_scale": _text(detail_payload.get("company_scale")),
+                "company_industry": _text(detail_payload.get("company_industry")),
+                "company_stage": _text(detail_payload.get("company_stage")),
+                "welfare": _text(detail_payload.get("welfare")),
+                "location": _text(detail_payload.get("location")),
+                "experience": _text(detail_payload.get("experience")),
+                "degree": _text(detail_payload.get("degree")),
+            }
+            for field_name, value in field_values.items():
+                if value:
+                    payload[field_name] = value
+            assignments = [
+                "detail_json = ?",
+                "payload_json = ?",
+                "detail_status = 'completed'",
+                "detail_error = NULL",
+                "detail_collected_at = ?",
+                "detail_version = detail_version + 1",
+                "boss_active_status = CASE WHEN ? <> '' THEN ? ELSE boss_active_status END",
+            ]
+            values: list[object] = [
+                _json_or_none(detail),
+                _json(payload),
+                now,
+                _text(detail_payload.get("boss_active_status")),
+                _text(detail_payload.get("boss_active_status")),
+            ]
+            for field_name, value in field_values.items():
+                if value:
+                    assignments.append(f"{field_name} = ?")
+                    values.append(value)
+            values.append(identity_value)
+            connection.execute(
+                f"UPDATE fj_boss_jobs SET {', '.join(assignments)} WHERE {identity_column} = ?",
+                values,
             )
+            if field_values["title"]:
+                # 详情采集得到标题后回填关联会话，列表立即展示真实岗位名称。
+                connection.execute(
+                    """
+                    UPDATE fj_chat_sessions
+                    SET job_title = ?, updated_at = ?
+                    WHERE job_title = ''
+                      AND (job_id = ? OR encrypt_job_id = ?)
+                    """,
+                    (field_values["title"], now, existing["id"], existing["encrypt_job_id"]),
+                )
         elif existing["detail_json"] is None:
             connection.execute(
                 f"""

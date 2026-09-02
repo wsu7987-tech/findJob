@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import random
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
@@ -12,8 +14,15 @@ from backend.app.db import Database
 from backend.app.errors import AppError
 from backend.app.services.ai import _post_json
 from backend.app.services.fine_job import profile_store
+from backend.app.services.fine_job.boss_capture_history import (
+    get_capture_history_job,
+    record_chat_job,
+)
+from backend.app.services.fine_job.boss_capture_tasks import boss_capture_task_manager
+from backend.app.services.fine_job.boss_scraper.service import boss_scraper_service
 from backend.app.services.fine_job.codex_authorization import classify_outbound_content
 from backend.app.services.fine_job.profile_context import get_profile_context
+from backend.app.services.fine_job.job_applications import set_job_application_status
 
 
 RUNTIME_ID = "boss"
@@ -60,6 +69,9 @@ def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return None
     result = dict(row)
     for key in ("listen_enabled", "generation_enabled", "send_enabled"):
+        if key in result:
+            result[key] = bool(result[key])
+    for key in ("message_update_required", "history_has_more", "has_local_messages"):
         if key in result:
             result[key] = bool(result[key])
     for key in (
@@ -220,7 +232,8 @@ def report_heartbeat(
 
 
 def _resolve_job_id(connection: sqlite3.Connection, message: dict[str, Any]) -> str | None:
-    candidates = [message.get("job_id"), message.get("encrypt_job_id")]
+    # 聊天列表的 encryptJobId 与岗位表的 encrypt_job_id 是稳定的岗位关联键，优先使用它匹配。
+    candidates = [message.get("encrypt_job_id"), message.get("job_id")]
     for candidate in candidates:
         if not candidate:
             continue
@@ -235,6 +248,389 @@ def _resolve_job_id(connection: sqlite3.Connection, message: dict[str, Any]) -> 
         if row:
             return str(row["id"])
     return None
+
+
+def _epoch_ms_to_iso(value: Any) -> str | None:
+    """把 BOSS 列表中的毫秒时间戳转换为统一的 UTC 时间。"""
+    try:
+        milliseconds = int(value or 0)
+    except (TypeError, ValueError):
+        return None
+    if milliseconds <= 0:
+        return None
+    return datetime.fromtimestamp(milliseconds / 1000, tz=timezone.utc).isoformat()
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _friend_session_row(
+    connection: sqlite3.Connection,
+    *,
+    account_uid: str,
+    peer_uid: str,
+    encrypt_job_id: str,
+) -> sqlite3.Row | None:
+    """按联系人和岗位查找列表同步对应的聊天会话。"""
+    row = connection.execute(
+        """
+        SELECT * FROM fj_chat_sessions
+        WHERE platform = 'boss' AND account_uid = ? AND peer_uid = ? AND encrypt_job_id = ?
+        """,
+        (account_uid, peer_uid, encrypt_job_id),
+    ).fetchone()
+    if row is not None or encrypt_job_id:
+        return row
+    related = connection.execute(
+        """
+        SELECT * FROM fj_chat_sessions
+        WHERE platform = 'boss' AND account_uid = ? AND peer_uid = ?
+        ORDER BY updated_at DESC
+        """,
+        (account_uid, peer_uid),
+    ).fetchall()
+    return related[0] if len(related) == 1 else None
+
+
+def sync_friend_list(
+    db: Database,
+    *,
+    account_uid: str,
+    response: dict[str, Any],
+    source_url: str,
+) -> dict[str, Any]:
+    """保存 BOSS 聊天列表，并比较本次与上次保存的最新消息编号。"""
+    zp_data = response.get("zpData") if isinstance(response, dict) else None
+    items = zp_data.get("result") if isinstance(zp_data, dict) else None
+    if not isinstance(items, list):
+        raise AppError(
+            status_code=502,
+            error_category="BOSS_CHAT_LIST_INVALID",
+            error_message="BOSS 聊天列表响应中没有可用的联系人数据。",
+        )
+    account_uid = account_uid.strip()
+    if not account_uid:
+        raise AppError(
+            status_code=502,
+            error_category="BOSS_CHAT_ACCOUNT_MISSING",
+            error_message="未能识别当前 BOSS 账号。",
+        )
+
+    created_count = 0
+    changed_count = 0
+    synced_count = 0
+    synced_at = _now()
+    with db.connect() as connection:
+        # 保存 BOSS 原始数组位置，列表展示和批量队列共用这个顺序。
+        for platform_list_index, raw in enumerate(items):
+            if not isinstance(raw, dict) or not raw.get("uid"):
+                continue
+            synced_count += 1
+            peer_uid = str(raw.get("uid"))
+            info = raw.get("lastMessageInfo")
+            info = info if isinstance(info, dict) else {}
+            encrypt_job_id = str(raw.get("encryptJobId") or "")
+            encrypt_peer_uid = str(
+                raw.get("encryptFriendId")
+                or raw.get("encryptUid")
+                or raw.get("encryptBossId")
+                or ""
+            )
+            security_id = str(raw.get("securityId") or "")
+            job_id = _resolve_job_id(
+                connection,
+                {
+                    "job_id": raw.get("jobId"),
+                    "encrypt_job_id": encrypt_job_id,
+                },
+            )
+            job_title = str(raw.get("jobName") or raw.get("jobTitle") or "")
+            if not job_title and job_id:
+                job_row = connection.execute(
+                    "SELECT title FROM fj_boss_jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+                job_title = str(job_row["title"] or "") if job_row else ""
+            existing = _friend_session_row(
+                connection,
+                account_uid=account_uid,
+                peer_uid=peer_uid,
+                encrypt_job_id=encrypt_job_id,
+            )
+            latest_msg_id = str(info.get("msgId") or "")
+            previous_msg_id = str(existing["platform_latest_msg_id"] or "") if existing else ""
+            message_changed = bool(previous_msg_id and latest_msg_id and previous_msg_id != latest_msg_id)
+            if message_changed:
+                changed_count += 1
+            latest_message_at = _epoch_ms_to_iso(info.get("msgTime") or raw.get("lastTS"))
+            latest_message_text = str(
+                raw.get("lastMsg") or info.get("showText") or ""
+            )
+            identity_complete = bool(encrypt_peer_uid and security_id and encrypt_job_id)
+            status = (
+                "human_takeover"
+                if identity_complete
+                else "unsupported"
+            )
+            if existing is None:
+                session_id = _id("chat_session")
+                connection.execute(
+                    """
+                    INSERT INTO fj_chat_sessions (
+                      id, platform, account_uid, peer_uid, encrypt_peer_uid, security_id,
+                      job_id, encrypt_job_id, job_title, peer_name, company_name,
+                      peer_title,
+                      platform_latest_msg_id, platform_latest_message_status,
+                      platform_relation_type, platform_chat_status, platform_latest_message_text,
+                      platform_latest_message_at, platform_latest_from_id, platform_latest_to_id,
+                      platform_synced_at, platform_list_index, message_update_required, status, session_version,
+                      created_at, updated_at
+                    ) VALUES (?, 'boss', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        account_uid,
+                        peer_uid,
+                        encrypt_peer_uid,
+                        security_id,
+                        job_id,
+                        encrypt_job_id,
+                        job_title,
+                        str(raw.get("name") or ""),
+                        str(raw.get("brandName") or ""),
+                        str(raw.get("title") or ""),
+                        latest_msg_id,
+                        _optional_int(info.get("status")),
+                        _optional_int(raw.get("relationType")),
+                        _optional_int(raw.get("chatStatus")),
+                        latest_message_text,
+                        latest_message_at,
+                        str(info.get("fromId") or ""),
+                        str(info.get("toId") or ""),
+                        synced_at,
+                        platform_list_index,
+                        int(message_changed),
+                        status,
+                        synced_at,
+                        synced_at,
+                    ),
+                )
+                created_count += 1
+                continue
+
+            next_status = (
+                "active"
+                if existing["status"] == "unsupported" and identity_complete
+                else existing["status"]
+            )
+            connection.execute(
+                """
+                UPDATE fj_chat_sessions SET
+                  encrypt_peer_uid = CASE WHEN ? <> '' THEN ? ELSE encrypt_peer_uid END,
+                  security_id = CASE WHEN ? <> '' THEN ? ELSE security_id END,
+                  job_id = COALESCE(?, job_id),
+                  encrypt_job_id = CASE WHEN encrypt_job_id = '' AND ? <> '' THEN ? ELSE encrypt_job_id END,
+                  job_title = CASE WHEN ? <> '' THEN ? ELSE job_title END,
+                  peer_name = CASE WHEN ? <> '' THEN ? ELSE peer_name END,
+                  peer_title = CASE WHEN ? <> '' THEN ? ELSE peer_title END,
+                  company_name = CASE WHEN ? <> '' THEN ? ELSE company_name END,
+                  platform_latest_msg_id = ?,
+                  platform_latest_message_status = ?,
+                  platform_relation_type = ?,
+                  platform_chat_status = ?,
+                  platform_latest_message_text = ?,
+                  platform_latest_message_at = ?,
+                  platform_latest_from_id = ?,
+                  platform_latest_to_id = ?,
+                  platform_synced_at = ?,
+                  platform_list_index = ?,
+                  message_update_required = ?,
+                  status = ?,
+                  updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    encrypt_peer_uid,
+                    encrypt_peer_uid,
+                    security_id,
+                    security_id,
+                    job_id,
+                    encrypt_job_id,
+                    encrypt_job_id,
+                    job_title,
+                    job_title,
+                    str(raw.get("name") or ""),
+                    str(raw.get("name") or ""),
+                    str(raw.get("title") or ""),
+                    str(raw.get("title") or ""),
+                    str(raw.get("brandName") or ""),
+                    str(raw.get("brandName") or ""),
+                    latest_msg_id,
+                    _optional_int(info.get("status")),
+                    _optional_int(raw.get("relationType")),
+                    _optional_int(raw.get("chatStatus")),
+                    latest_message_text,
+                    latest_message_at,
+                    str(info.get("fromId") or ""),
+                    str(info.get("toId") or ""),
+                    synced_at,
+                    platform_list_index,
+                    int(message_changed),
+                    next_status,
+                    synced_at,
+                    existing["id"],
+                ),
+            )
+        return {
+            "account_uid": account_uid,
+            "count": synced_count,
+            "created_count": created_count,
+            "changed_count": changed_count,
+            "source_url": source_url,
+            "synced_at": synced_at,
+        }
+
+
+def _history_message_content(message: dict[str, Any]) -> str:
+    """从历史消息的 body 中提取文本或系统消息摘要。"""
+    body = message.get("body") if isinstance(message.get("body"), dict) else {}
+    body_type = _optional_int(body.get("type"))
+    text = str(body.get("text") or message.get("pushText") or "").strip()
+    if text:
+        return text
+    if body_type == 8:
+        job_desc = body.get("jobDesc") if isinstance(body.get("jobDesc"), dict) else {}
+        title = str(job_desc.get("title") or "").strip()
+        company = str(job_desc.get("company") or "").strip()
+        if title and company:
+            return f"岗位：{title} · {company}"
+        if title:
+            return f"岗位：{title}"
+        return str(body.get("headTitle") or "岗位沟通卡片")
+    return {
+        4: "附件状态更新",
+        7: "附件请求",
+        12: "附件已发送",
+    }.get(body_type, str(body.get("headTitle") or "系统消息"))
+
+
+def sync_history_messages(
+    db: Database,
+    *,
+    session_id: str,
+    messages: list[dict[str, Any]],
+    history_has_more: bool | None = None,
+    history_next_cursor: str | None = None,
+) -> dict[str, Any]:
+    """保存一页历史消息，按平台 mid 去重并更新会话分页状态。"""
+    inserted_count = 0
+    now = _now()
+    with db.connect() as connection:
+        session = _session_or_404(connection, session_id)
+        account_uid = str(session["account_uid"] or "")
+        for raw in messages:
+            if not isinstance(raw, dict) or not raw.get("mid"):
+                continue
+            message_id = str(raw["mid"])
+            sender = raw.get("from") if isinstance(raw.get("from"), dict) else {}
+            receiver = raw.get("to") if isinstance(raw.get("to"), dict) else {}
+            sender_uid = str(sender.get("uid") or "")
+            receiver_uid = str(receiver.get("uid") or "")
+            direction = "outbound" if sender_uid == account_uid else "inbound"
+            body = raw.get("body") if isinstance(raw.get("body"), dict) else {}
+            body_type = _optional_int(body.get("type"))
+            message_type = "text" if body_type == 1 else "system"
+            sent_at = _epoch_ms_to_iso(raw.get("time")) or now
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO fj_chat_messages (
+                  id, session_id, platform_message_id, direction, message_type,
+                  content, sender_uid, receiver_uid, client_mid, source,
+                  sent_at, observed_at, raw_meta_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 'websocket', ?, ?, ?, ?)
+                """,
+                (
+                    _id("chat_message"),
+                    session_id,
+                    message_id,
+                    direction,
+                    message_type,
+                    _history_message_content(raw),
+                    sender_uid,
+                    receiver_uid,
+                    sent_at,
+                    now,
+                    json.dumps({"history": True, "platform_type": raw.get("type"), "raw": raw}, ensure_ascii=False),
+                    now,
+                ),
+            )
+            inserted_count += int(cursor.rowcount > 0)
+
+        latest = connection.execute(
+            """
+            SELECT * FROM fj_chat_messages
+            WHERE session_id = ?
+            ORDER BY sent_at DESC, rowid DESC LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        latest_inbound = connection.execute(
+            """
+            SELECT id FROM fj_chat_messages
+            WHERE session_id = ? AND direction = 'inbound'
+            ORDER BY sent_at DESC, rowid DESC LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        current_platform_msg_id = str(session["platform_latest_msg_id"] or "")
+        current_message_loaded = bool(current_platform_msg_id and connection.execute(
+            "SELECT 1 FROM fj_chat_messages WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
+            (session_id, current_platform_msg_id),
+        ).fetchone())
+        next_version = int(session["session_version"] or 0) + inserted_count
+        assignments = [
+            "session_version = ?",
+            "latest_message_id = ?",
+            "latest_inbound_message_id = ?",
+            "last_message_at = ?",
+            "message_update_required = ?",
+            "updated_at = ?",
+        ]
+        params: list[Any] = [
+            next_version,
+            latest["id"] if latest else session["latest_message_id"],
+            latest_inbound["id"] if latest_inbound else session["latest_inbound_message_id"],
+            latest["sent_at"] if latest else session["last_message_at"],
+            int(bool(current_platform_msg_id and not current_message_loaded)),
+            now,
+        ]
+        if history_has_more is not None:
+            assignments.extend([
+                "history_has_more = ?",
+                "history_next_cursor = ?",
+            ])
+            params.extend([
+                int(history_has_more),
+                history_next_cursor if history_has_more and history_next_cursor else "",
+            ])
+        connection.execute(
+            f"UPDATE fj_chat_sessions SET {', '.join(assignments)} WHERE id = ?",
+            (*params, session_id),
+        )
+        updated_session = connection.execute(
+            "SELECT history_has_more FROM fj_chat_sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        return {
+            "session_id": session_id,
+            "fetched_count": len(messages),
+            "inserted_count": inserted_count,
+            "message_update_required": bool(current_platform_msg_id and not current_message_loaded),
+            "has_more": bool(updated_session["history_has_more"]),
+        }
 
 
 def _find_or_create_session(
@@ -295,7 +691,7 @@ def _find_or_create_session(
                 message.get("job_title") or "",
                 message.get("peer_name") or "",
                 message.get("company_name") or "",
-                "active" if identity_complete else "unsupported",
+                "human_takeover" if identity_complete else "unsupported",
                 now,
                 now,
             ),
@@ -647,8 +1043,27 @@ def _task_or_404(connection: sqlite3.Connection, task_id: str) -> sqlite3.Row:
     return row
 
 
-def _session_payload(row: sqlite3.Row) -> dict[str, Any]:
+def _session_payload(
+    row: sqlite3.Row,
+    connection: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
     payload = _row(row) or {}
+    if connection is not None:
+        history = None
+        if payload.get("job_id"):
+            history = connection.execute(
+                "SELECT id, title FROM fj_boss_jobs WHERE id = ?", (payload["job_id"],)
+            ).fetchone()
+        if history is None and payload.get("encrypt_job_id"):
+            history = connection.execute(
+                "SELECT id, title FROM fj_boss_jobs WHERE encrypt_job_id = ? LIMIT 1",
+                (payload["encrypt_job_id"],),
+            ).fetchone()
+        if history is not None:
+            payload["job_id"] = str(history["id"])
+            # 历史岗位已拿到标题时，优先补齐旧会话留下的空标题。
+            if not payload.get("job_title"):
+                payload["job_title"] = str(history["title"] or "")
     payload["identity_state"] = (
         "ready"
         if payload.get("encrypt_peer_uid") and payload.get("security_id") and payload.get("encrypt_job_id")
@@ -679,17 +1094,33 @@ def list_sessions(
             params.append(account_uid)
         if query:
             conditions.append(
-                "(s.peer_name LIKE ? OR s.company_name LIKE ? OR s.job_title LIKE ? OR m.content LIKE ?)"
+                "(s.peer_name LIKE ? OR s.company_name LIKE ? OR s.job_title LIKE ? "
+                "OR m.content LIKE ? OR s.platform_latest_message_text LIKE ?)"
             )
             like = f"%{query.strip()}%"
-            params.extend([like, like, like, like])
+            params.extend([like, like, like, like, like])
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         params.extend([limit, offset])
         rows = connection.execute(
             f"""
             SELECT s.*,
-              m.content AS latest_message_content,
-              m.direction AS latest_message_direction,
+              COALESCE(NULLIF(s.platform_latest_message_text, ''), m.content) AS latest_message_content,
+              CASE
+                WHEN s.platform_latest_msg_id <> '' AND s.platform_latest_from_id = s.account_uid THEN 'outbound'
+                WHEN s.platform_latest_msg_id <> '' AND s.platform_latest_to_id = s.account_uid THEN 'inbound'
+                WHEN m.id IS NOT NULL THEN m.direction
+                ELSE NULL
+              END AS latest_message_direction,
+              s.platform_latest_msg_id AS latest_platform_msg_id,
+              s.platform_latest_message_status,
+              s.platform_relation_type,
+              s.platform_chat_status,
+              s.platform_latest_message_at,
+              s.platform_synced_at,
+              s.message_update_required,
+              EXISTS(
+                SELECT 1 FROM fj_chat_messages local_message WHERE local_message.session_id = s.id
+              ) AS has_local_messages,
               t.id AS reply_task_id,
               t.status AS reply_task_status,
               t.draft_text AS reply_draft_text,
@@ -707,26 +1138,25 @@ def list_sessions(
               ORDER BY created_at DESC LIMIT 1
             )
             {where}
-            ORDER BY COALESCE(s.last_message_at, s.updated_at) DESC
+            -- 严格沿用 BOSS 好友列表顺序，聊天消息同步不会改变会话位置。
+            ORDER BY s.platform_synced_at DESC, s.platform_list_index ASC, s.id ASC
             LIMIT ? OFFSET ?
             """,
             params,
         ).fetchall()
-        return [_session_payload(row) for row in rows]
+        return [_session_payload(row, connection) for row in rows]
 
 
-def get_session(db: Database, session_id: str, *, message_limit: int = 200) -> dict[str, Any]:
+def get_session(db: Database, session_id: str) -> dict[str, Any]:
     with db.connect() as connection:
         session = _session_or_404(connection, session_id)
         messages = connection.execute(
             """
             SELECT * FROM fj_chat_messages
-            WHERE id IN (
-              SELECT id FROM fj_chat_messages
-              WHERE session_id = ? ORDER BY sent_at DESC, rowid DESC LIMIT ?
-            ) ORDER BY sent_at ASC, rowid ASC
+            WHERE session_id = ?
+            ORDER BY sent_at ASC, rowid ASC
             """,
-            (session_id, message_limit),
+            (session_id,),
         ).fetchall()
         tasks = connection.execute(
             "SELECT * FROM fj_chat_reply_tasks WHERE session_id = ? ORDER BY created_at DESC",
@@ -741,13 +1171,142 @@ def get_session(db: Database, session_id: str, *, message_limit: int = 200) -> d
             (session_id,),
         ).fetchone()[0])
         return {
-            "session": _session_payload(session),
+            "session": _session_payload(session, connection),
             "messages": [_row(item) for item in messages],
             "reply_tasks": [_row(item) for item in tasks],
             "send_actions": [_row(item) for item in actions],
-            "messages_truncated": message_count > message_limit,
+            "messages_truncated": False,
             "message_count": message_count,
         }
+
+
+def prepare_chat_job(
+    db: Database,
+    session_id: str,
+    *,
+    can_fetch_details: bool,
+) -> dict[str, Any]:
+    """为聊天岗位准备历史记录，并返回查看或详情采集动作。"""
+    with db.connect() as connection:
+        session = _session_or_404(connection, session_id)
+        session_data = dict(session)
+        history = None
+        if session["job_id"]:
+            history = connection.execute(
+                "SELECT id FROM fj_boss_jobs WHERE id = ?",
+                (session["job_id"],),
+            ).fetchone()
+        if history is None and session["encrypt_job_id"]:
+            history = connection.execute(
+                "SELECT id FROM fj_boss_jobs WHERE encrypt_job_id = ? LIMIT 1",
+                (session["encrypt_job_id"],),
+            ).fetchone()
+
+    if history is not None:
+        history_id = str(history["id"])
+        if str(session_data.get("job_id") or "") != history_id:
+            with db.connect() as connection:
+                connection.execute(
+                    "UPDATE fj_chat_sessions SET job_id = ?, updated_at = ? WHERE id = ?",
+                    (history_id, _now(), session_id),
+                )
+        job = get_capture_history_job(db, history_id)
+        if str(job.get("detail_status") or "") != "completed":
+            if not can_fetch_details:
+                raise AppError(
+                    409,
+                    "BROWSER_NOT_RUNNING",
+                    "FineJob 专用 Chrome 未启动，请先打开并完成 BOSS 登录。",
+                )
+            return {
+                "action": "update",
+                "history_job_id": history_id,
+                "job": job,
+                "task": None,
+            }
+        return {
+            "action": "view",
+            "history_job_id": history_id,
+            "job": job,
+            "task": None,
+        }
+
+    if not can_fetch_details:
+        raise AppError(
+            409,
+            "BROWSER_NOT_RUNNING",
+            "FineJob 专用 Chrome 未启动，请先打开并完成 BOSS 登录。",
+        )
+
+    application_status = _derive_chat_application_status(
+        db,
+        session_id=session_id,
+        job_id=str(session_data.get("job_id") or ""),
+    )
+    recorded = record_chat_job(
+        db,
+        session=session_data,
+        application_status=application_status,
+    )
+    history_id = str(recorded["history_record_id"])
+    set_job_application_status(
+        db,
+        history_id,
+        status=application_status,
+        source="manual",
+        note="自动代聊页面补录岗位状态",
+    )
+    return {
+        "action": "update",
+        "history_job_id": history_id,
+        "job": get_capture_history_job(db, history_id),
+        "task": None,
+    }
+
+
+def _derive_chat_application_status(
+    db: Database,
+    *,
+    session_id: str,
+    job_id: str,
+) -> str | None:
+    """根据当前聊天消息和自动打招呼动作计算投递阶段。"""
+    with db.connect() as connection:
+        attachment_update = connection.execute(
+            """
+            SELECT 1 FROM fj_chat_messages
+            WHERE session_id = ? AND direction = 'outbound'
+              AND content = '附件状态更新'
+            LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        if attachment_update:
+            return "communicating"
+
+        greeting_rows = connection.execute(
+            """
+            SELECT status FROM fj_automation_actions
+            WHERE job_id = ? AND action_type = 'BOSS_DEFAULT_GREETING'
+            """,
+            (job_id,),
+        ).fetchall() if job_id else []
+
+        if greeting_rows and all(row["status"] == "succeeded" for row in greeting_rows):
+            return "pending_application"
+        if greeting_rows:
+            return "pending_greeting"
+
+        recommendation = connection.execute(
+            """
+            SELECT decision FROM fj_job_evaluations
+            WHERE job_id = ? ORDER BY created_at DESC LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone() if job_id else None
+        if recommendation and recommendation["decision"] == "recommend":
+            return "pending_greeting"
+    return None
 
 
 def _build_context(db: Database, connection: sqlite3.Connection, session: sqlite3.Row) -> dict[str, Any]:
@@ -1431,6 +1990,161 @@ def process_due_tasks(
             # 单条生成失败已写入任务，不能阻断其它会话。
             continue
     return completed
+
+
+CHAT_BATCH_LIMIT = 20
+
+
+def _batch_candidates(db: Database) -> list[dict[str, Any]]:
+    """返回需要同步最新消息的会话，并计算岗位详情状态。"""
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT s.id, s.peer_name, s.company_name, s.job_title,
+                   s.message_update_required,
+                   EXISTS(
+                     SELECT 1 FROM fj_chat_messages m WHERE m.session_id = s.id
+                   ) AS has_local_messages,
+                   COALESCE(
+                     (SELECT j.detail_status FROM fj_boss_jobs j WHERE j.id = s.job_id LIMIT 1),
+                     (SELECT j.detail_status FROM fj_boss_jobs j
+                      WHERE s.encrypt_job_id <> '' AND j.encrypt_job_id = s.encrypt_job_id LIMIT 1),
+                     'not_collected'
+                   ) AS job_detail_status
+            FROM fj_chat_sessions s
+            WHERE NOT EXISTS(
+              SELECT 1 FROM fj_chat_messages m WHERE m.session_id = s.id
+            ) OR s.message_update_required = 1
+            -- 批量队列与左侧会话列表保持同一套 BOSS 顺序。
+            ORDER BY s.platform_synced_at DESC, s.platform_list_index ASC, s.id ASC
+            """
+        ).fetchall()
+    return [_row(row) or {} for row in rows]
+
+
+def get_batch_summary(db: Database) -> dict[str, int]:
+    candidates = _batch_candidates(db)
+    queued = candidates[:CHAT_BATCH_LIMIT]
+    return {
+        "pending_chat_count": len(candidates),
+        "pending_job_count": sum(
+            1 for item in candidates if item.get("job_detail_status") != "completed"
+        ),
+        "queued_chat_count": len(queued),
+        "batch_limit": CHAT_BATCH_LIMIT,
+    }
+
+
+class BossChatBatchManager:
+    """按会话顺序同步最新聊天，并按需补齐岗位详情。"""
+
+    def __init__(self) -> None:
+        self._tasks: dict[str, dict[str, Any]] = {}
+        self._active_task_id = ""
+
+    def start(self, db: Database, config: AppConfig, *, batch_size: int = CHAT_BATCH_LIMIT) -> dict[str, Any]:
+        if self._active_task_id:
+            active = self._tasks.get(self._active_task_id)
+            if active and active["status"] in {"queued", "running"}:
+                return self.get(self._active_task_id)
+        candidates = _batch_candidates(db)[:max(1, min(batch_size, CHAT_BATCH_LIMIT))]
+        if not candidates:
+            raise AppError(409, "CHAT_BATCH_EMPTY", "当前没有需要更新的聊天记录。")
+        now = _now()
+        task_id = _id("chat_batch")
+        self._tasks[task_id] = {
+            "id": task_id,
+            "status": "queued",
+            "total": len(candidates),
+            "current": 0,
+            "chat_completed": 0,
+            "job_completed": 0,
+            "job_skipped": 0,
+            "failed": 0,
+            "current_session_name": "",
+            "current_job_title": "",
+            "stage": "queued",
+            "message": "批量更新任务已创建。",
+            "created_at": now,
+            "finished_at": None,
+            "candidates": candidates,
+        }
+        self._active_task_id = task_id
+        threading.Thread(target=self._run, args=(task_id, db, config), daemon=True).start()
+        return self.get(task_id)
+
+    def get(self, task_id: str) -> dict[str, Any]:
+        task = self._tasks.get(task_id)
+        if task is None:
+            raise AppError(404, "CHAT_BATCH_NOT_FOUND", "批量更新任务不存在。")
+        return {key: value for key, value in task.items() if key != "candidates"}
+
+    def _run(self, task_id: str, db: Database, config: AppConfig) -> None:
+        task = self._tasks[task_id]
+        task.update(status="running", stage="syncing_chat", message="开始同步聊天记录。")
+        try:
+            for index, candidate in enumerate(task["candidates"], start=1):
+                task.update(
+                    current=index - 1,
+                    current_session_name=str(candidate.get("peer_name") or candidate.get("company_name") or "当前会话"),
+                    current_job_title=str(candidate.get("job_title") or ""),
+                    stage="syncing_chat",
+                    message="正在获取最新 20 条聊天消息。",
+                )
+                try:
+                    with db.connect() as connection:
+                        session = _session_or_404(connection, str(candidate["id"]))
+                    captured = boss_scraper_service.capture_chat_history(
+                        boss_id=str(session["encrypt_peer_uid"] or ""),
+                        security_id=str(session["security_id"] or ""),
+                    )
+                    sync_history_messages(
+                        db,
+                        session_id=str(candidate["id"]),
+                        messages=list(captured.get("messages") or []),
+                        history_has_more=bool(captured.get("has_more")),
+                        history_next_cursor=str(captured.get("next_cursor") or ""),
+                    )
+                    task["chat_completed"] += 1
+                    job_action = prepare_chat_job(
+                        db,
+                        str(candidate["id"]),
+                        can_fetch_details=True,
+                    )
+                    if job_action["action"] == "update":
+                        task.update(stage="waiting_for_job", message="等待后开始采集岗位详情。")
+                        time.sleep(random.randint(1, 3))
+                        task.update(stage="collecting_job", message="正在采集岗位详情。")
+                        job_task = boss_capture_task_manager.start_history_detail(
+                            job_action["job"],
+                            output_dir=config.output_root / "fine-job" / "boss-capture",
+                            db=db,
+                        )
+                        while str(job_task.get("status") or "") in {"queued", "running"}:
+                            time.sleep(1)
+                            job_task = boss_capture_task_manager.get_task(str(job_task["id"]))
+                        if str(job_task.get("status") or "") == "completed":
+                            task["job_completed"] += 1
+                        else:
+                            task["failed"] += 1
+                    else:
+                        task["job_skipped"] += 1
+                except Exception as exc:
+                    task["failed"] += 1
+                    task["message"] = f"当前会话处理失败：{str(exc)[:120]}"
+                task["current"] = index
+                if index < task["total"]:
+                    task.update(stage="waiting_next", message="等待后处理下一条聊天记录。")
+                    time.sleep(random.randint(2, 5))
+            task.update(status="completed", stage="completed", message="批量更新已完成。", finished_at=_now())
+        except Exception as exc:
+            task.update(status="failed", stage="failed", message=str(exc)[:300], finished_at=_now())
+        finally:
+            if self._active_task_id == task_id:
+                self._active_task_id = ""
+
+
+boss_chat_batch_manager = BossChatBatchManager()
 
 
 class BossChatScheduler:

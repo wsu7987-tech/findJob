@@ -307,6 +307,8 @@ class BossCaptureTaskManager:
             },
             "_db": db,
             "_history_recorded": True,
+            "_capture_id": str(job.get("latest_capture_id") or ""),
+            "_detail_mode": "chat",
         }
         with self._lock:
             self._tasks[task_id] = task
@@ -574,12 +576,20 @@ class BossCaptureTaskManager:
                 updated_at=utc_now(),
             )
         try:
-            self._scraper.capture_selected_details(
-                list_data=list_data,
-                job_ids=job_ids,
-                output_path=output_path,
-                progress_callback=lambda event: self._handle_progress(task_id, event),
-            )
+            progress_callback = lambda event: self._handle_progress(task_id, event)
+            if task.get("_detail_mode") == "chat":
+                self._scraper.capture_chat_job_detail(
+                    job=dict(task["jobs"][0]),
+                    output_path=output_path,
+                    progress_callback=progress_callback,
+                )
+            else:
+                self._scraper.capture_selected_details(
+                    list_data=list_data,
+                    job_ids=job_ids,
+                    output_path=output_path,
+                    progress_callback=progress_callback,
+                )
             with self._lock:
                 task = self._require_task(task_id)
                 selected_jobs = [
@@ -664,6 +674,24 @@ class BossCaptureTaskManager:
                 if status == "completed":
                     detail = event.get("detail")
                     job["detail"] = detail
+                    if isinstance(detail, dict):
+                        # 详情任务返回的字段同步到任务快照，前端轮询时可立即看到岗位名称。
+                        for field_name in (
+                            "title",
+                            "salary",
+                            "company_name",
+                            "company_scale",
+                            "company_industry",
+                            "company_stage",
+                            "location",
+                            "experience",
+                            "degree",
+                        ):
+                            value = detail.get(field_name)
+                            if value not in (None, ""):
+                                job[field_name] = value
+                        if detail.get("company_name"):
+                            job["boss_name"] = detail["company_name"]
                     if isinstance(detail, dict) and detail.get("boss_active_status"):
                         # 列表接口常不返回活跃状态，详情完成后同步到表格正式字段。
                         job["boss_active_status"] = str(detail["boss_active_status"])
@@ -783,7 +811,7 @@ class BossCaptureTaskManager:
             return
         update_capture_batch(
             db,
-            capture_id=str(task["id"]),
+            capture_id=str(task.get("_capture_id") or task["id"]),
             status=status,
             source_url=str(task.get("source_url") or "") or None,
             jobs_collected=int(task.get("jobs_collected") or 0),

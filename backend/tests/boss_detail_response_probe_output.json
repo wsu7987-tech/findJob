@@ -1,0 +1,18 @@
+{
+  "requested_url": "https://www.zhipin.com/job_detail/1bcae9d5cf6386fa0nZ83Nq-FFpW.html",
+  "html_response_url": "https://www.zhipin.com/job_detail/1bcae9d5cf6386fa0nZ83Nq-FFpW.html",
+  "captured_at": "2026-09-01T21:40:42Z",
+  "job": {
+    "job_name": "AI架构师(J10811)",
+    "salary": "40-55K",
+    "location": "深圳",
+    "experience": "5-10年",
+    "degree": "本科",
+    "company_name": "谱程集团",
+    "company_stage": "不需要融资",
+    "company_scale": "500-999人",
+    "company_industry": "智能硬件/消费电子",
+    "work_address": "深圳龙岗区天安云谷二期东区-4栋28楼谱程",
+    "job_description": "工作职责:\n1、负责跨境电商场景的AI Agent 技术架构设计与规划，构建可扩展、可治理、可监控的智能业务自动化体系（选品、补货、定价、客服、履约、物流等）。\n2、主导 Agent 系统整体架构：包括 Agent Loop、任务规划（Planning）、工具链（Tools/Skills）、RAG 知识体系、工作流引擎、多 Agent 协同机制与控制策略。\n3、负责企业级 智能中台/Agent 平台化能⼒设计与落地，例如技能插件体系、Agent 运⾏时、对话/任务状态机、观察-思考-⾏动循环（OODA/React框架）、安全与审计机制等。\n4、参与大型模型体系建设：模型调用层、推理优化、Prompt/指令⼯程、策略模板（Policy）、Graph-based Agent 调度设计等。\n5、主导与业务团队合作，通过业务建模（Domain Modeling）将需求分解为可执行的 Agent/Tool/Workflow，并推动在生产环境落地。\n6、解决 AI Agent 在业务场景中的核心工程挑战：\n可控性（Determinism & Constraints）\n可靠性（超时、回滚、重试、Failover）\n长上下文推理与RAG效果稳定性\n工具调用精度、数据一致性\n7、指导研发团队进行具体模块开发（Python/Java），并持续推进技术架构演进。\n8、关注行业与前沿 AI 技术（LangGraph、Swarm、AutoGen、GraphRAG、LLM OS），并将其转化为企业级解决方案。\n任职资格:\n1、本科及以上学历，计算机、人工智能、软件工程等相关专业。\n2、5年以上研发经验，至少2年AI/大模型/Agent项目架构或核心研发经验。\n3、具备电商/跨境电商/零售/供应链任一方向的完整业务理解与平台落地经验（预测、库存、履约、物流、客服、商品管理等）。\n4、必须具有AI Agent实际落地经验（满足以下任意至少两项）：\n生产级Agent服务设计与上线运维\n多工具、多任务、多Agent协作系统\n面向流程的Workflow Agent/IT Automation\n图结构Agent调度（LangGraph/自研 DAG/状态机）\nAgent可控性体系（约束、校验器、规则引擎）\n5、扎实的工程能力：\n精通Python或Java，能进行核心组件设计和实现\n熟悉微服务体系、事件驱动架构（EDA）、消息队列、缓存、API设计\n熟悉向量数据库、检索系统、特征加工、RAG 系统设计\n具备较强的算法与模型理解能力：\nNLP（对话、推理、召回、排序）\n深度学习/机器学习基础\n预测/推荐算法（加分）\n6、熟悉主流大模型生态：OpenAI、DeepSeek、Qwen、Llama、Gemini 等，并能够结合业务进行策略优化与模型链路设计。\n7、具备很强的抽象能力、系统设计能力和跨团队沟通能力，可作为企业AI架构方向的核心推动者。\n加分项（我们特别看重）：\n1、有从 0 到 1 设计 AI 平台或中台的经验\n2、强系统架构能力（抽象、建模、框架化能力）\n3、对 AI-native Architecture / LLM OS 有研究或实践\n4、有原创性解决方案或独立观点\n5、对趋势敏感、喜欢探索 AI 的未来形态\n这是一个 参与“搭建未来公司 AI 基础设施” 的机会。你的工作将直接影响公司未来 3–5 年的智能化速度与能力边界。"
+  }
+}

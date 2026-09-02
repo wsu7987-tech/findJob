@@ -75,8 +75,8 @@ describe("fineJobBossChat store", () => {
     await store.load();
 
     expect(store.runtime?.leader_epoch).toBe(3);
-    expect(store.selectedSessionId).toBe("session-1");
-    expect(store.detail?.session.peer_name).toBe("王经理");
+    expect(store.selectedSessionId).toBeNull();
+    expect(store.detail).toBeNull();
   });
 
   it("确认发送时携带草稿依据消息和会话版本", async () => {
@@ -86,6 +86,7 @@ describe("fineJobBossChat store", () => {
     } as never);
     const store = useFineJobBossChatStore();
     await store.load();
+    await store.loadDetail("session-1");
     await store.confirm("人工编辑后的回复");
 
     expect(confirmSpy).toHaveBeenCalledWith("reply-1", {
@@ -128,17 +129,39 @@ describe("fineJobBossChat store", () => {
     });
   });
 
-  it("轻量轮询保持当前选中会话并刷新运行状态", async () => {
+  it("已有本地消息且没有更新时不重复请求历史接口", async () => {
+    vi.mocked(api.getFineJobChatSession).mockResolvedValue({
+      ...detail(),
+      messages: [{ id: "message-1" }],
+      message_count: 1,
+      session: { ...session, message_update_required: false }
+    } as never);
+    const historySpy = vi.spyOn(api, "refreshFineJobChatHistory");
     const store = useFineJobBossChatStore();
     await store.load();
-    vi.mocked(api.getFineJobChatRuntime).mockResolvedValue({
-      runtime: { ...runtime, generation_enabled: true }
+    await store.loadDetail("session-1");
+
+    const result = await store.refreshHistory();
+
+    expect(historySpy).not.toHaveBeenCalled();
+    expect(result.inserted_count).toBe(0);
+  });
+
+  it("获取更多消息后刷新当前会话", async () => {
+    const moreSpy = vi.spyOn(api, "loadMoreFineJobChatHistory").mockResolvedValue({
+      session_id: "session-1",
+      fetched_count: 20,
+      inserted_count: 18,
+      message_update_required: false,
+      has_more: false
     } as never);
+    const store = useFineJobBossChatStore();
+    await store.load();
+    await store.loadDetail("session-1");
 
-    await store.poll();
+    const result = await store.loadMoreHistory();
 
-    expect(store.selectedSessionId).toBe("session-1");
-    expect(store.runtime?.generation_enabled).toBe(true);
-    expect(store.detail?.session.id).toBe("session-1");
+    expect(moreSpy).toHaveBeenCalledWith("session-1");
+    expect(result.inserted_count).toBe(18);
   });
 });

@@ -1099,7 +1099,7 @@ CREATE TABLE IF NOT EXISTS fj_job_applications (
   id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL UNIQUE,
   company_id TEXT,
-  status TEXT NOT NULL DEFAULT 'applied',
+  status TEXT DEFAULT 'pending_greeting',
   source TEXT NOT NULL DEFAULT 'manual',
   source_action_id TEXT,
   evidence_level TEXT NOT NULL DEFAULT 'confirmed',
@@ -1109,7 +1109,7 @@ CREATE TABLE IF NOT EXISTS fj_job_applications (
   updated_at TEXT NOT NULL,
   FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
   FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE SET NULL,
-  CHECK (status IN ('applied', 'cleared')),
+  CHECK (status IS NULL OR status IN ('pending_greeting', 'pending_application', 'communicating', 'rejected')),
   CHECK (source IN ('boss_action', 'manual', 'mcp', 'migration')),
   CHECK (evidence_level IN ('confirmed', 'inferred'))
 );
@@ -1348,8 +1348,22 @@ CREATE TABLE IF NOT EXISTS fj_chat_sessions (
   encrypt_job_id TEXT NOT NULL DEFAULT '',
   job_title TEXT NOT NULL DEFAULT '',
   peer_name TEXT NOT NULL DEFAULT '',
+  peer_title TEXT NOT NULL DEFAULT '',
   company_name TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'active',
+  platform_latest_msg_id TEXT NOT NULL DEFAULT '',
+  platform_latest_message_status INTEGER,
+  platform_relation_type INTEGER,
+  platform_chat_status INTEGER,
+  platform_latest_message_text TEXT NOT NULL DEFAULT '',
+  platform_latest_message_at TEXT,
+  platform_latest_from_id TEXT NOT NULL DEFAULT '',
+  platform_latest_to_id TEXT NOT NULL DEFAULT '',
+  platform_synced_at TEXT,
+  platform_list_index INTEGER NOT NULL DEFAULT 0,
+  message_update_required INTEGER NOT NULL DEFAULT 0,
+  history_has_more INTEGER NOT NULL DEFAULT 0,
+  history_next_cursor TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'human_takeover',
   session_version INTEGER NOT NULL DEFAULT 0,
   latest_message_id TEXT,
   latest_inbound_message_id TEXT,
@@ -2016,12 +2030,17 @@ class Database:
               ON fj_company_aliases(company_id, created_at DESC);
             CREATE TABLE IF NOT EXISTS fj_job_applications (
               id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE, company_id TEXT,
-              status TEXT NOT NULL DEFAULT 'applied', source TEXT NOT NULL DEFAULT 'manual',
+              status TEXT DEFAULT 'pending_greeting', source TEXT NOT NULL DEFAULT 'manual',
               source_action_id TEXT, evidence_level TEXT NOT NULL DEFAULT 'confirmed',
               applied_at TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
               FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
-              FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE SET NULL
+              FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE SET NULL,
+              CHECK (status IS NULL OR status IN (
+                'pending_greeting', 'pending_application', 'communicating', 'rejected'
+              )),
+              CHECK (source IN ('boss_action', 'manual', 'mcp', 'migration')),
+              CHECK (evidence_level IN ('confirmed', 'inferred'))
             );
             CREATE INDEX IF NOT EXISTS idx_fj_job_applications_status_time
               ON fj_job_applications(status, applied_at DESC);
@@ -2047,6 +2066,8 @@ class Database:
             """
         )
 
+        self._migrate_fj_job_application_status(connection)
+
         # 每次初始化按最新包含规则校正旧岗位，已有外包配置升级后立即生效。
         from backend.app.services.fine_job.companies import reconcile_job_companies
 
@@ -2071,13 +2092,82 @@ class Database:
                 INSERT OR IGNORE INTO fj_job_applications (
                   id, job_id, company_id, status, source, source_action_id,
                   evidence_level, applied_at, note, created_at, updated_at
-                ) VALUES (?, ?, ?, 'applied', 'migration', ?, 'confirmed', ?, '', ?, ?)
+                ) VALUES (?, ?, ?, 'pending_application', 'migration', ?, 'confirmed', ?, '', ?, ?)
                 """,
                 (
                     str(uuid4()), row["job_id"], row["company_id"], row["id"],
                     row["applied_at"] or now, now, now,
                 ),
             )
+
+    def _migrate_fj_job_application_status(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """把旧投递状态一次性转换为新的投递阶段枚举。"""
+        table_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fj_job_applications'"
+        ).fetchone()
+        table_sql = str(table_row[0] or "") if table_row else ""
+        if "'applied', 'cleared'" not in table_sql:
+            return
+
+        connection.execute("ALTER TABLE fj_job_applications RENAME TO fj_job_applications_legacy")
+        connection.execute(
+            """
+            CREATE TABLE fj_job_applications (
+              id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE, company_id TEXT,
+              status TEXT DEFAULT 'pending_greeting', source TEXT NOT NULL DEFAULT 'manual',
+              source_action_id TEXT, evidence_level TEXT NOT NULL DEFAULT 'confirmed',
+              applied_at TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+              FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE SET NULL,
+              CHECK (status IS NULL OR status IN (
+                'pending_greeting', 'pending_application', 'communicating', 'rejected'
+              )),
+              CHECK (source IN ('boss_action', 'manual', 'mcp', 'migration')),
+              CHECK (evidence_level IN ('confirmed', 'inferred'))
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO fj_job_applications (
+              id, job_id, company_id, status, source, source_action_id,
+              evidence_level, applied_at, note, created_at, updated_at
+            )
+            SELECT
+              old.id, old.job_id, old.company_id,
+              CASE
+                WHEN old.status = 'cleared' THEN 'pending_greeting'
+                WHEN old.status = 'applied' THEN CASE
+                  WHEN EXISTS (
+                    SELECT 1 FROM fj_chat_messages m
+                    WHERE m.session_id IN (
+                      SELECT s.id FROM fj_chat_sessions s WHERE s.job_id = old.job_id
+                    )
+                    AND m.direction = 'outbound'
+                    AND m.content = '附件状态更新'
+                  ) THEN 'communicating'
+                  ELSE 'pending_application'
+                END
+                ELSE NULL
+              END,
+              old.source, old.source_action_id, old.evidence_level,
+              old.applied_at, old.note, old.created_at, old.updated_at
+            FROM fj_job_applications_legacy old
+            """
+        )
+        connection.execute("DROP TABLE fj_job_applications_legacy")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fj_job_applications_status_time "
+            "ON fj_job_applications(status, applied_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fj_job_applications_company "
+            "ON fj_job_applications(company_id, status, applied_at DESC)"
+        )
 
     def _ensure_fj_delivery_strategy_columns(
         self,
@@ -2597,6 +2687,20 @@ class Database:
                 "resume_version_id": "ALTER TABLE fj_chat_sessions ADD COLUMN resume_version_id TEXT",
                 "context_revision_id": "ALTER TABLE fj_chat_sessions ADD COLUMN context_revision_id TEXT",
                 "evaluation_id": "ALTER TABLE fj_chat_sessions ADD COLUMN evaluation_id TEXT",
+                "peer_title": "ALTER TABLE fj_chat_sessions ADD COLUMN peer_title TEXT NOT NULL DEFAULT ''",
+                "platform_latest_msg_id": "ALTER TABLE fj_chat_sessions ADD COLUMN platform_latest_msg_id TEXT NOT NULL DEFAULT ''",
+                "platform_latest_message_status": "ALTER TABLE fj_chat_sessions ADD COLUMN platform_latest_message_status INTEGER",
+                "platform_relation_type": "ALTER TABLE fj_chat_sessions ADD COLUMN platform_relation_type INTEGER",
+                "platform_chat_status": "ALTER TABLE fj_chat_sessions ADD COLUMN platform_chat_status INTEGER",
+                "platform_latest_message_text": "ALTER TABLE fj_chat_sessions ADD COLUMN platform_latest_message_text TEXT NOT NULL DEFAULT ''",
+                "platform_latest_message_at": "ALTER TABLE fj_chat_sessions ADD COLUMN platform_latest_message_at TEXT",
+                "platform_latest_from_id": "ALTER TABLE fj_chat_sessions ADD COLUMN platform_latest_from_id TEXT NOT NULL DEFAULT ''",
+                "platform_latest_to_id": "ALTER TABLE fj_chat_sessions ADD COLUMN platform_latest_to_id TEXT NOT NULL DEFAULT ''",
+                "platform_synced_at": "ALTER TABLE fj_chat_sessions ADD COLUMN platform_synced_at TEXT",
+                "platform_list_index": "ALTER TABLE fj_chat_sessions ADD COLUMN platform_list_index INTEGER NOT NULL DEFAULT 0",
+                "message_update_required": "ALTER TABLE fj_chat_sessions ADD COLUMN message_update_required INTEGER NOT NULL DEFAULT 0",
+                "history_has_more": "ALTER TABLE fj_chat_sessions ADD COLUMN history_has_more INTEGER NOT NULL DEFAULT 0",
+                "history_next_cursor": "ALTER TABLE fj_chat_sessions ADD COLUMN history_next_cursor TEXT NOT NULL DEFAULT ''",
             },
             "fj_chat_reply_tasks": {
                 "resume_version_id": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN resume_version_id TEXT",

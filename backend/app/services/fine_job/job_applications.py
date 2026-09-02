@@ -1,21 +1,32 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from backend.app.db import Database
 from backend.app.errors import AppError
 from backend.app.utils import new_id, utc_now
 
 
-def set_job_application(
+JobApplicationStatus = Literal[
+    "pending_greeting",
+    "pending_application",
+    "communicating",
+    "rejected",
+]
+
+
+def set_job_application_status(
     db: Database,
     job_id: str,
     *,
-    applied: bool,
+    status: JobApplicationStatus | None,
     source: str,
     applied_at: str | None = None,
     note: str = "",
     source_action_id: str | None = None,
     evidence_level: str = "confirmed",
 ) -> dict[str, object]:
+    """保存岗位投递阶段，保留岗位关联和人工状态来源。"""
     now = utc_now()
     event_at = applied_at or now
     with db.connect() as connection:
@@ -39,12 +50,11 @@ def set_job_application(
               note = excluded.note, updated_at = excluded.updated_at
             """,
             (
-                new_id(), resolved_job_id, job["company_id"],
-                "applied" if applied else "cleared", source, source_action_id,
-                evidence_level, event_at, note.strip(), now, now,
+                new_id(), resolved_job_id, job["company_id"], status, source,
+                source_action_id, evidence_level, event_at, note.strip(), now, now,
             ),
         )
-    if applied:
+    if status in {"pending_application", "communicating"}:
         from backend.app.services.fine_job.filter_exclusions import record_job_event
 
         record_job_event(db, "application", resolved_job_id, event_at)
@@ -53,6 +63,30 @@ def set_job_application(
 
         mark_all_states_stale(db)
     return get_job_application(db, resolved_job_id)
+
+
+def set_job_application(
+    db: Database,
+    job_id: str,
+    *,
+    applied: bool,
+    source: str,
+    applied_at: str | None = None,
+    note: str = "",
+    source_action_id: str | None = None,
+    evidence_level: str = "confirmed",
+) -> dict[str, object]:
+    # 兼容已有调用入口：成功打招呼进入待投递，撤销标记回到待打招呼。
+    return set_job_application_status(
+        db,
+        job_id,
+        status="pending_application" if applied else "pending_greeting",
+        source=source,
+        applied_at=applied_at,
+        note=note,
+        source_action_id=source_action_id,
+        evidence_level=evidence_level,
+    )
 
 
 def get_job_application(db: Database, job_id: str) -> dict[str, object]:
@@ -73,21 +107,22 @@ def get_job_application(db: Database, job_id: str) -> dict[str, object]:
 
 
 def sync_succeeded_applications(db: Database) -> int:
-    """把新完成的打招呼动作同步为投递事实，供下一次筛选立即使用。"""
+    """把成功打招呼动作同步为待投递状态，供下一次筛选立即使用。"""
     with db.connect() as connection:
         rows = connection.execute(
             """
             SELECT a.id, a.job_id, COALESCE(a.completed_at, a.updated_at) AS applied_at
             FROM fj_automation_actions a
-            LEFT JOIN fj_job_applications p ON p.job_id = a.job_id AND p.status = 'applied'
-            WHERE a.status = 'succeeded' AND p.id IS NULL
+            LEFT JOIN fj_job_applications p ON p.job_id = a.job_id
+            WHERE a.status = 'succeeded'
+              AND (p.id IS NULL OR p.status IN ('pending_greeting', 'pending_application'))
             """
         ).fetchall()
     for row in rows:
-        set_job_application(
+        set_job_application_status(
             db,
             str(row["job_id"]),
-            applied=True,
+            status="pending_application",
             source="boss_action",
             source_action_id=str(row["id"]),
             applied_at=str(row["applied_at"]),

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
+import { useRoute } from "vue-router";
 
 import { ApiError, api } from "@/services/api";
 import { formatDateTime } from "@/services/format";
@@ -14,6 +15,7 @@ const captureStore = useFineJobBossCaptureStore();
 const executorStore = useFineJobBossExecutorStore();
 const historyStore = useFineJobBossHistoryStore();
 const strategiesStore = useFineJobStrategiesStore();
+const route = useRoute();
 const selectedJob = ref<FineJobBossHistoryJob | null>(null);
 const detailDrawerOpen = ref(false);
 const recommendationStrategyId = ref<string | null>(null);
@@ -186,7 +188,7 @@ const evaluateHistoryDelivery = async (
 };
 
 const detailActionLabel = (job: FineJobBossHistoryJob) =>
-  job.detail_status === "completed" || Boolean(job.detail) ? "重新采集详情" : "采集详情";
+  job.detail_status === "completed" || Boolean(job.detail) ? "重新采集" : "采集";
 
 const openDetail = (job: FineJobBossHistoryJob) => {
   selectedJob.value = job;
@@ -219,33 +221,36 @@ const detailStatusType = (status?: string) => {
 
 const filterStatusLabel = (status?: string | null) => ({
   pass: "通过",
+  pass_for_human: "跳过",
   review: "待判断",
   reject: "不通过",
   exclude: "冷却排除"
 }[status || ""] || "未筛选");
 
 const filterStatusType = (status?: string | null) => {
-  if (status === "pass") return "success";
+  if (status === "pass" || status === "pass_for_human") return "success";
   if (status === "review") return "warning";
   if (status === "reject" || status === "exclude") return "danger";
+  return "info";
+};
+
+const applicationStatusLabel = (status?: string | null) => ({
+  pending_greeting: "待打招呼",
+  pending_application: "待投递",
+  communicating: "沟通中",
+  rejected: "已被拒绝"
+}[status || ""] || "");
+
+const applicationStatusType = (status?: string | null) => {
+  if (status === "communicating") return "success";
+  if (status === "rejected") return "danger";
+  if (status === "pending_greeting" || status === "pending_application") return "warning";
   return "info";
 };
 
 const filterStrategyName = (strategyId?: string | null) => {
   if (!strategyId) return "未关联";
   return strategiesStore.filters.find((item) => item.id === strategyId)?.name || strategyId;
-};
-
-const toggleApplication = async (job: FineJobBossHistoryJob) => {
-  const applied = job.application_status !== "applied";
-  try {
-    await api.setFineJobJobApplication(job.id, applied, applied ? "历史岗位页面人工标记" : "撤销人工标记");
-    await loadHistory();
-    selectedJob.value = historyStore.items.find((item) => item.id === job.id) ?? selectedJob.value;
-    ElMessage.success(applied ? "已标记为已投递" : "已取消已投递标记");
-  } catch (error) {
-    ElMessage.error((error as Error).message || "投递状态更新失败");
-  }
 };
 
 const deliveryDecisionLabel = (decision?: string) =>
@@ -269,6 +274,15 @@ onMounted(async () => {
   const initialRecommendation = strategiesStore.recommendations.find((item) => item.enabled)
     ?? strategiesStore.recommendations[0];
   recommendationStrategyId.value = initialRecommendation?.id ?? null;
+  const historyId = String(route.query.history_id || "");
+  if (historyId) {
+    try {
+      selectedJob.value = await api.getFineJobBossCaptureHistoryJob(historyId);
+      detailDrawerOpen.value = true;
+    } catch (error) {
+      ElMessage.error((error as Error).message || "历史岗位详情加载失败");
+    }
+  }
 });
 
 onBeforeUnmount(() => historyStore.stopDetailPolling());
@@ -402,33 +416,50 @@ watch(
         v-loading="historyStore.loading"
         :data="historyStore.items"
         row-key="id"
-        max-height="600"
+        max-height="500"
         :default-sort="{ prop: 'last_collected_at', order: 'descending' }"
         empty-text="暂无历史采集岗位"
         @sort-change="handleSortChange"
         @row-click="openDetail"
       >
-        <el-table-column label="记录" width="90">
+                <el-table-column label="筛选" width="100">
           <template #default="{ row }">
-            <el-tag :type="row.collect_count > 1 ? 'warning' : 'success'" size="small">
-              {{ row.collect_count > 1 ? "重复" : "首次" }}
+            <el-tag :type="filterStatusType(row.filter_status)" size="small">
+              {{ filterStatusLabel(row.filter_status) }}
             </el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="投递状态" width="120">
+          <template #default="{ row }">
+            <el-tag v-if="row.application_status" :type="applicationStatusType(row.application_status)" size="small">
+              {{ applicationStatusLabel(row.application_status) }}
+            </el-tag>
+            <span v-else class="secondary-text">未设置</span>
+          </template>
+        </el-table-column>
+
         <el-table-column prop="title" label="岗位" min-width="180" show-overflow-tooltip sortable="custom" />
-        <el-table-column prop="search_keyword" label="搜索词" min-width="130" show-overflow-tooltip />
         <el-table-column prop="boss_name" label="公司" min-width="190" sortable="custom">
           <template #default="{ row }">
             <span>{{ row.boss_name }}</span>
             <el-tag v-if="row.is_outsourcing_company" type="warning" size="small">外包</el-tag>
             <el-tag v-if="row.is_blacklisted" type="danger" size="small">黑名单</el-tag>
-            <el-tag v-if="row.application_status === 'applied'" type="info" size="small">已投递</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="salary" label="薪资" width="110" />
+                <el-table-column label="投递建议" min-width="130" show-overflow-tooltip>
+          <template #default="{ row }">
+            {{ row.delivery_evaluation?.summary || row.recommendation_reason || "未获取" }}
           </template>
         </el-table-column>
         <el-table-column prop="company_scale" label="公司规模" width="120" />
+
+        <el-table-column prop="search_keyword" label="搜索词" min-width="130" show-overflow-tooltip />
+
+
         <el-table-column prop="company_industry" label="行业" width="120" show-overflow-tooltip />
         <el-table-column prop="company_stage" label="融资阶段" width="110" />
-        <el-table-column prop="salary" label="薪资" width="110" />
+        
         <el-table-column prop="location" label="地点" min-width="130" show-overflow-tooltip />
         <el-table-column prop="experience" label="经验" width="100" />
         <el-table-column prop="degree" label="学历" width="90" />
@@ -439,10 +470,11 @@ watch(
           <template #default="{ row }">{{ formatDateTime(row.last_collected_at) }}</template>
         </el-table-column>
         <el-table-column prop="collect_count" label="次数" width="100" align="center" sortable="custom" />
-        <el-table-column label="筛选" width="100">
+
+        <el-table-column label="记录" width="90">
           <template #default="{ row }">
-            <el-tag :type="filterStatusType(row.filter_status)" size="small">
-              {{ filterStatusLabel(row.filter_status) }}
+            <el-tag :type="row.collect_count > 1 ? 'warning' : 'success'" size="small">
+              {{ row.collect_count > 1 ? "重复" : "首次" }}
             </el-tag>
           </template>
         </el-table-column>
@@ -453,19 +485,16 @@ watch(
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="355" fixed="right">
+        <el-table-column label="操作" width="150" fixed="right">
           <template #default="{ row }">
-            <el-button link type="primary" @click.stop="openDetail(row)">查看详情</el-button>
-            <el-button link :type="row.application_status === 'applied' ? 'info' : 'success'" @click.stop="toggleApplication(row)">
-              {{ row.application_status === "applied" ? "取消已投递" : "标记已投递" }}
-            </el-button>
+            <el-button link type="primary" @click.stop="openDetail(row)">详情</el-button>
             <el-button
               link
               type="primary"
               :loading="executorStore.openingJobId === row.id"
               @click.stop="openInDedicatedBrowser(row)"
             >
-              专用浏览器打开
+              打开
             </el-button>
             <el-button
               v-if="row.detail_status === 'completed' && !row.delivery_evaluation"
@@ -475,7 +504,7 @@ watch(
               :disabled="historyActionRunning || !recommendationStrategyId"
               @click.stop="evaluateHistoryDelivery(row)"
             >
-              获取投递详情
+              建议
             </el-button>
             <el-button
               v-else-if="row.detail_status !== 'completed'"
@@ -516,7 +545,9 @@ watch(
             <el-tag :type="detailStatusType(selectedJob.detail_status)">{{ detailStatusLabel(selectedJob.detail_status) }}</el-tag>
             <el-tag v-if="selectedJob.is_outsourcing_company" type="warning">外包公司</el-tag>
             <el-tag v-if="selectedJob.is_blacklisted" type="danger">公司黑名单</el-tag>
-            <el-tag v-if="selectedJob.application_status === 'applied'" type="info">已投递</el-tag>
+            <el-tag v-if="selectedJob.application_status" :type="applicationStatusType(selectedJob.application_status)">
+              {{ applicationStatusLabel(selectedJob.application_status) }}
+            </el-tag>
           </div>
         </div>
         <el-divider />
@@ -599,9 +630,6 @@ watch(
           {{ selectedJob.delivery_evaluation ? "重新获取投递建议" : "获取投递建议" }}
         </el-button>
         <el-divider />
-        <el-button :type="selectedJob.application_status === 'applied' ? 'info' : 'success'" @click="toggleApplication(selectedJob)">
-          {{ selectedJob.application_status === "applied" ? "取消已投递" : "标记已投递" }}
-        </el-button>
         <el-button
           type="primary"
           :loading="historyStore.detailJobId === selectedJob.id"

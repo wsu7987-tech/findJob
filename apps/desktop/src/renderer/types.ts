@@ -204,6 +204,22 @@ export interface FineJobBossBrowserStatus {
   is_search_page: boolean;
 }
 
+export interface FineJobBossNetworkDebugStatus {
+  active: boolean;
+  event_count: number;
+  request_count: number;
+  output_path?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  target_count: number;
+  targets: Array<{
+    target_id: string;
+    url: string;
+    title: string;
+  }>;
+  error_message?: string | null;
+}
+
 export interface FineJobBossCity {
   name: string;
   code: string;
@@ -256,9 +272,9 @@ export interface FineJobBossCapturedJob {
   recommended?: boolean;
   recommendation_source?: "strategy" | "ai" | "rules" | "llm" | null;
   recommendation_reason?: string | null;
-  filter_status?: "pass" | "reject" | "review" | "exclude" | null;
-  strategy_filter_status?: "pass" | "reject" | "review" | "exclude" | null;
-  final_filter_status?: "pass" | "reject" | "review" | "exclude" | null;
+  filter_status?: "pass" | "pass_for_human" | "reject" | "review" | "exclude" | null;
+  strategy_filter_status?: "pass" | "pass_for_human" | "reject" | "review" | "exclude" | null;
+  final_filter_status?: "pass" | "pass_for_human" | "reject" | "review" | "exclude" | null;
   processing_state?: "new" | "reprocessable" | "duplicate" | "excluded" | null;
   filter_reasons?: string[];
   filter_missing_fields?: string[];
@@ -267,7 +283,7 @@ export interface FineJobBossCapturedJob {
   company_type?: FineJobCompanyType;
   is_outsourcing_company?: boolean;
   is_blacklisted?: boolean;
-  application_status?: "applied" | "cleared" | null;
+  application_status?: "pending_greeting" | "pending_application" | "communicating" | "rejected" | null;
   applied_at?: string | null;
   cooldown_excluded?: boolean;
   cooldown_reasons?: string[];
@@ -982,6 +998,7 @@ export interface FineJobChatSession {
   encrypt_job_id: string;
   job_title: string;
   peer_name: string;
+  peer_title?: string;
   company_name: string;
   status: FineJobChatSessionStatus;
   identity_state?: "ready" | "incomplete";
@@ -992,6 +1009,15 @@ export interface FineJobChatSession {
   last_message_at?: string | null;
   latest_message_content?: string;
   latest_message_direction?: "inbound" | "outbound";
+  latest_platform_msg_id?: string;
+  platform_latest_message_status?: 0 | 1 | 2 | null;
+  platform_relation_type?: 1 | 2 | 3 | 5 | null;
+  platform_chat_status?: number | null;
+  platform_latest_message_at?: string | null;
+  platform_synced_at?: string | null;
+  message_update_required?: boolean;
+  has_local_messages?: boolean;
+  history_has_more?: boolean;
   reply_task_id?: string | null;
   reply_task_status?: FineJobChatReplyStatus | null;
   reply_draft_text?: string;
@@ -1072,6 +1098,50 @@ export interface FineJobChatRuntimeEnvelope { runtime: FineJobChatRuntime }
 export interface FineJobChatSessionListEnvelope {
   sessions: FineJobChatSession[];
   next_offset?: number | null;
+}
+
+export interface FineJobChatFriendListRefreshResponse {
+  account_uid: string;
+  count: number;
+  created_count: number;
+  changed_count: number;
+  source_url: string;
+  synced_at: string;
+}
+export interface FineJobChatHistoryRefreshResponse {
+  session_id: string;
+  fetched_count: number;
+  inserted_count: number;
+  message_update_required: boolean;
+  has_more: boolean;
+}
+export interface FineJobChatBatchSummary {
+  pending_chat_count: number;
+  pending_job_count: number;
+  queued_chat_count: number;
+  batch_limit: number;
+}
+export interface FineJobChatBatchTask {
+  id: string;
+  status: "queued" | "running" | "completed" | "failed";
+  total: number;
+  current: number;
+  chat_completed: number;
+  job_completed: number;
+  job_skipped: number;
+  failed: number;
+  current_session_name: string;
+  current_job_title: string;
+  stage: string;
+  message: string;
+  created_at: string;
+  finished_at?: string | null;
+}
+export interface FineJobChatJobUpdateResponse {
+  action: "view" | "update";
+  history_job_id: string;
+  job: FineJobBossHistoryJob;
+  task?: FineJobBossCaptureTask | null;
 }
 export interface FineJobChatReplyEnvelope { reply_task: FineJobChatReplyTask }
 export interface FineJobChatSendActionEnvelope { action: FineJobChatSendAction }

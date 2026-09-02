@@ -12,6 +12,7 @@ from backend.app.routers.fine_job.codex import router as fine_job_codex_router
 from backend.app.routers.fine_job.companies import router as fine_job_companies_router
 from backend.app.routers.fine_job.boss_chat import router as fine_job_boss_chat_router
 from backend.app.routers.fine_job.boss_executor import router as fine_job_boss_executor_router
+from backend.app.routers.fine_job.boss_network_debug import router as fine_job_boss_network_debug_router
 from backend.app.routers.fine_job.delivery_runs import router as fine_job_delivery_runs_router
 from backend.app.routers.fine_job.delivery_strategies import router as fine_job_delivery_strategies_router
 from backend.app.routers.fine_job.job_intents import router as fine_job_intents_router
@@ -91,6 +92,7 @@ def create_app() -> FastAPI:
     app.include_router(fine_job_companies_router, prefix="/api")
     app.include_router(fine_job_boss_chat_router, prefix="/api")
     app.include_router(fine_job_boss_executor_router, prefix="/api")
+    app.include_router(fine_job_boss_network_debug_router, prefix="/api")
     app.include_router(fine_job_delivery_runs_router, prefix="/api")
     app.include_router(fine_job_delivery_strategies_router, prefix="/api")
     app.include_router(fine_job_intents_router, prefix="/api")

@@ -395,10 +395,10 @@ def _serialize_company(
     stats = connection.execute(
         """
         SELECT COUNT(DISTINCT j.id) AS job_count,
-               COUNT(DISTINCT CASE WHEN a.status = 'applied' THEN j.id END) AS applied_job_count,
+               COUNT(DISTINCT CASE WHEN a.status = 'communicating' THEN j.id END) AS applied_job_count,
                MAX(j.detail_collected_at) AS last_detail_at,
                MAX(e.created_at) AS last_evaluated_at,
-               MAX(CASE WHEN a.status = 'applied' THEN a.applied_at END) AS last_applied_at
+               MAX(CASE WHEN a.status = 'communicating' THEN a.applied_at END) AS last_applied_at
         FROM fj_boss_jobs j
         LEFT JOIN fj_job_applications a ON a.job_id = j.id
         LEFT JOIN fj_job_evaluations e ON e.job_id = j.id

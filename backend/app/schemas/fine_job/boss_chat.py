@@ -19,6 +19,58 @@ class BossChatRuntimeUpdateRequest(BaseModel):
         return self
 
 
+class BossChatFriendListRefreshResponse(BaseModel):
+    account_uid: str
+    count: int
+    created_count: int
+    changed_count: int
+    source_url: str
+    synced_at: str
+
+
+class BossChatHistoryRefreshResponse(BaseModel):
+    session_id: str
+    fetched_count: int
+    inserted_count: int
+    message_update_required: bool
+    has_more: bool
+
+
+class BossChatBatchSummaryResponse(BaseModel):
+    pending_chat_count: int
+    pending_job_count: int
+    queued_chat_count: int
+    batch_limit: int
+
+
+class BossChatBatchStartRequest(BaseModel):
+    batch_size: int = Field(default=20, ge=1, le=20)
+
+
+class BossChatBatchTaskResponse(BaseModel):
+    id: str
+    status: Literal["queued", "running", "completed", "failed"]
+    total: int
+    current: int
+    chat_completed: int
+    job_completed: int
+    job_skipped: int
+    failed: int
+    current_session_name: str = ""
+    current_job_title: str = ""
+    stage: str
+    message: str
+    created_at: str
+    finished_at: str | None = None
+
+
+class BossChatJobUpdateResponse(BaseModel):
+    action: Literal["view", "update"]
+    history_job_id: str
+    job: dict[str, Any]
+    task: dict[str, Any] | None = None
+
+
 class BossChatHeartbeatRequest(BaseModel):
     account_uid: str = Field(min_length=1, max_length=80)
     tab_id: str = Field(min_length=1, max_length=120)

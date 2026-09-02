@@ -166,6 +166,14 @@ def locate_boss_search_page(payload: BossSearchPageRequest) -> BossSearchPageRes
     )
 
 
+@router.get("/history/{history_job_id}")
+def get_boss_capture_history_job(
+    history_job_id: str,
+    db: Database = Depends(get_database),
+) -> dict[str, object]:
+    return get_capture_history_job(db, history_job_id)
+
+
 @router.post(
     "/capture",
     response_model=BossCaptureTaskResponse,
