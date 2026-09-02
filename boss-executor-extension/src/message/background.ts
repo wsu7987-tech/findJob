@@ -44,6 +44,16 @@ export class BackgroundService {
     return { accepted: true };
   }
 
+  async testHeartbeat(): Promise<{ accepted: true }> {
+    await fineJobExecutorClient.testHeartbeat();
+    return { accepted: true };
+  }
+
+  async disconnect(): Promise<{ accepted: true }> {
+    await fineJobExecutorClient.disconnect();
+    return { accepted: true };
+  }
+
   async control(command: "allow" | "pause" | "resume" | "emergency_stop"): Promise<{ accepted: true }> {
     await fineJobExecutorClient.control(command);
     return { accepted: true };
@@ -51,6 +61,26 @@ export class BackgroundService {
 
   async returnToReview(actionId: string): Promise<{ accepted: true }> {
     await fineJobExecutorClient.returnToReview(actionId);
+    return { accepted: true };
+  }
+
+  async retryFailedAction(actionId: string): Promise<{ accepted: true }> {
+    await fineJobExecutorClient.retryFailedAction(actionId);
+    return { accepted: true };
+  }
+
+  async cancelFailedAction(actionId: string): Promise<{ accepted: true }> {
+    await fineJobExecutorClient.cancelFailedAction(actionId);
+    return { accepted: true };
+  }
+
+  async retryAllFailed(): Promise<{ accepted: true }> {
+    await fineJobExecutorClient.retryAllFailed();
+    return { accepted: true };
+  }
+
+  async cancelAllFailed(): Promise<{ accepted: true }> {
+    await fineJobExecutorClient.cancelAllFailed();
     return { accepted: true };
   }
 

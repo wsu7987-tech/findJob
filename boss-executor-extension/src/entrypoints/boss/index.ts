@@ -31,9 +31,6 @@ export default defineUnlistedScript(async () => {
       chatObserver.setEnabled(await contentService.isChatListeningEnabled());
     };
     await syncChatObservationPermission();
-    const chatPermissionTimer = window.setInterval(() => {
-      void syncChatObservationPermission().catch(() => chatObserver.setEnabled(false));
-    }, 2_000);
 
     const reportChatIdentity = async () => {
       await contentService.reportChatIdentity(readBossChatIdentity());
@@ -90,7 +87,6 @@ export default defineUnlistedScript(async () => {
     window.addEventListener("pagehide", () => window.clearInterval(commandTimer), { once: true });
     window.addEventListener("pagehide", () => {
       window.clearInterval(chatIdentityTimer);
-      window.clearInterval(chatPermissionTimer);
       chatObserver.uninstall();
     }, { once: true });
   } catch (error) {

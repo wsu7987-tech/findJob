@@ -16,12 +16,13 @@ const API_ROOT = "http://127.0.0.1:8000/api/fine-job/boss-executor";
 const CREDENTIALS_KEY = "finejobBossExecutorCredentialsV1";
 const PENDING_RESULTS_KEY = "finejobBossExecutorPendingResultsV1";
 const COMMAND_MESSAGE = "finejob:boss-executor:execute:v1";
+const CONTROL_CHANNEL_URL = "ws://127.0.0.1:8000/api/fine-job/boss-executor/channel";
 const PROTOCOL_VERSION = "1.1";
+const TASK_HEARTBEAT_TIMEOUT_MS = 10_000;
 const CAPABILITIES = [
   "default_greeting",
   "page_identity",
   "queue_control",
-  "contact_verification_snapshot",
   "chat_observe",
   "chat_send",
   "chat_multitab_leader"
@@ -35,6 +36,7 @@ const initialState = (): ExecutorRuntimeState => ({
   detail: "尚未与FineJob配对",
   executor: null,
   queue: [],
+  failedQueue: [],
   currentAction: null,
   lastResult: ""
 });
@@ -42,23 +44,36 @@ const initialState = (): ExecutorRuntimeState => ({
 export class FineJobExecutorClient {
   private credentials: Credentials | null = null;
   private state = initialState();
-  private timer: number | null = null;
-  private tickRunning = false;
+  private startupPromise: Promise<void> | null = null;
+  private heartbeatPromise: Promise<void> | null = null;
+  private controlSocket: WebSocket | null = null;
+  private controlReconnectTimer: number | null = null;
+  private taskHeartbeatTimer: number | null = null;
   private latestSnapshot: BossReadOnlySnapshot | null = null;
   private lastPageReportKey = "";
   private dispatchingKey = "";
   private pendingResults: Record<string, MainWorldExecutionResult> = {};
 
   async start(): Promise<void> {
-    const stored = await browser.storage.local.get([CREDENTIALS_KEY, PENDING_RESULTS_KEY]);
-    this.credentials = (stored[CREDENTIALS_KEY] as Credentials | undefined) ?? null;
-    this.pendingResults = (stored[PENDING_RESULTS_KEY] as Record<string, MainWorldExecutionResult> | undefined) ?? {};
-    this.state.paired = this.credentials !== null;
-    this.state.detail = this.credentials ? "正在连接FineJob" : "尚未与FineJob配对";
-    if (this.timer === null) {
-      this.timer = globalThis.setInterval(() => void this.tick(), 1500) as unknown as number;
+    if (this.startupPromise) return this.startupPromise;
+    const startup = (async () => {
+      const stored = await browser.storage.local.get([CREDENTIALS_KEY, PENDING_RESULTS_KEY]);
+      this.credentials = (stored[CREDENTIALS_KEY] as Credentials | undefined) ?? null;
+      this.pendingResults = (stored[PENDING_RESULTS_KEY] as Record<string, MainWorldExecutionResult> | undefined) ?? {};
+      this.state.paired = this.credentials !== null;
+      this.state.detail = this.credentials ? "正在连接FineJob" : "尚未与FineJob配对";
+      if (this.credentials) {
+        // 插件启动时只执行一次连接确认，并建立桌面端命令通道。
+        await this.testHeartbeat().catch(() => undefined);
+        this.connectControlChannel();
+      }
+    })();
+    this.startupPromise = startup;
+    try {
+      await startup;
+    } finally {
+      if (this.startupPromise === startup) this.startupPromise = null;
     }
-    await this.tick();
   }
 
   getState(): ExecutorRuntimeState {
@@ -66,6 +81,8 @@ export class FineJobExecutorClient {
   }
 
   async pair(code: string): Promise<void> {
+    // 等待后台完成存储恢复，避免初始化结果覆盖刚配对的凭证和连接状态。
+    if (this.startupPromise) await this.startupPromise;
     const response = await this.request<{ executor_id: string; token: string }>("/pair", {
       method: "POST",
       body: JSON.stringify({
@@ -80,7 +97,133 @@ export class FineJobExecutorClient {
     await browser.storage.local.set({ [CREDENTIALS_KEY]: this.credentials });
     this.state.paired = true;
     this.state.detail = "配对成功；自动打招呼默认未授权";
-    await this.tick();
+    await this.testHeartbeat();
+    this.connectControlChannel();
+  }
+
+  async testHeartbeat(): Promise<void> {
+    if (!this.credentials) throw new Error("插件尚未与FineJob配对");
+    if (this.heartbeatPromise) return this.heartbeatPromise;
+    this.heartbeatPromise = (async () => {
+      try {
+        const snapshot = this.latestSnapshot;
+        const heartbeat = await this.request<{
+          executor: ExecutorRuntimeState["executor"];
+          queue: { actions: FineJobQueueAction[]; failed_actions?: FineJobQueueAction[] };
+        }>("/heartbeat", {
+          method: "POST",
+          body: JSON.stringify({
+            protocol_version: PROTOCOL_VERSION,
+            plugin_version: packageJson.version,
+            capabilities: CAPABILITIES,
+            // 该字段记录插件心跳是否已确认，不再依据当前BOSS页面快照判断。
+            browser_connected: true,
+            current_action_id: this.state.currentAction?.id ?? null,
+            current_epoch: this.state.currentAction?.execution_epoch ?? null,
+            page_kind: snapshot?.pageKind ?? "other",
+            page_state: snapshot?.state ?? "waiting",
+            logged_in: snapshot?.loggedIn ?? false,
+            risk_state: snapshot && !snapshot.loggedIn ? "login" : "none"
+          })
+        });
+        this.state.connected = true;
+        this.state.paired = true;
+        this.state.executor = heartbeat.executor;
+        this.state.queue = heartbeat.queue.actions;
+        this.state.failedQueue = heartbeat.queue.failed_actions ?? [];
+        this.state.detail = "FineJob通信正常";
+        await this.flushPendingResults();
+      } catch (error) {
+        this.state.connected = false;
+        this.state.detail = (error as Error).message || "FineJob连接失败";
+        throw error;
+      }
+    })();
+    try {
+      await this.heartbeatPromise;
+    } finally {
+      this.heartbeatPromise = null;
+    }
+  }
+
+  private connectControlChannel(): void {
+    if (!this.credentials || (this.controlSocket && (
+      this.controlSocket.readyState === WebSocket.OPEN
+      || this.controlSocket.readyState === WebSocket.CONNECTING
+    ))) return;
+    const token = encodeURIComponent(this.credentials.token);
+    const socket = new WebSocket(CONTROL_CHANNEL_URL + "?token=" + token);
+    this.controlSocket = socket;
+    socket.addEventListener("open", () => {
+      // 控制通道建立后主动同步一次心跳，立即刷新FineJob的插件联通状态。
+      void this.testHeartbeat().catch(() => undefined);
+    });
+    socket.addEventListener("message", (event) => {
+      void this.handleControlMessage(socket, String(event.data));
+    });
+    socket.addEventListener("close", (event) => {
+      if (this.controlSocket !== socket) return;
+      this.controlSocket = null;
+      if (event.code === 4001) {
+        void this.clearLocalConnection();
+        return;
+      }
+      this.scheduleControlReconnect();
+    });
+  }
+
+  private scheduleControlReconnect(): void {
+    if (!this.credentials || this.controlReconnectTimer !== null) return;
+    // 控制通道断开后只通过一次性延迟重连恢复，不建立轮询请求。
+    this.controlReconnectTimer = globalThis.setTimeout(() => {
+      this.controlReconnectTimer = null;
+      this.connectControlChannel();
+    }, 2000) as unknown as number;
+  }
+
+  private async handleControlMessage(socket: WebSocket, rawMessage: string): Promise<void> {
+    let message: { type?: string; request_id?: string };
+    try {
+      message = JSON.parse(rawMessage) as { type?: string; request_id?: string };
+    } catch {
+      return;
+    }
+    if (message.type !== "heartbeat_test" || !message.request_id || socket.readyState !== WebSocket.OPEN) return;
+    try {
+      await this.testHeartbeat();
+      socket.send(JSON.stringify({ type: "heartbeat_test_result", request_id: message.request_id, ok: true }));
+    } catch (error) {
+      socket.send(JSON.stringify({
+        type: "heartbeat_test_result",
+        request_id: message.request_id,
+        ok: false,
+        message: (error as Error).message || "插件心跳失败。"
+      }));
+    }
+  }
+
+  async disconnect(): Promise<void> {
+    try {
+      if (this.credentials) {
+        await this.request("/disconnect", { method: "POST" });
+      }
+    } finally {
+      await this.clearLocalConnection();
+    }
+  }
+
+  private async clearLocalConnection(): Promise<void> {
+    if (this.controlReconnectTimer !== null) {
+      globalThis.clearTimeout(this.controlReconnectTimer);
+      this.controlReconnectTimer = null;
+    }
+    const socket = this.controlSocket;
+    this.controlSocket = null;
+    if (socket) socket.close();
+    this.credentials = null;
+    this.state = initialState();
+    this.clearTaskHeartbeat();
+    await browser.storage.local.remove(CREDENTIALS_KEY);
   }
 
   async control(command: "allow" | "pause" | "resume" | "emergency_stop"): Promise<void> {
@@ -92,6 +235,7 @@ export class FineJobExecutorClient {
     this.state.detail = command === "allow" || command === "resume"
       ? "自动打招呼已允许"
       : command === "emergency_stop" ? "已紧急停止" : "队列已暂停";
+    if (command === "allow" || command === "resume") await this.startNextAction();
   }
 
   async returnToReview(actionId: string): Promise<void> {
@@ -100,7 +244,46 @@ export class FineJobExecutorClient {
       body: JSON.stringify({ reason: "用户在插件中退回待确认" })
     });
     this.state.currentAction = null;
-    await this.tick();
+    this.clearTaskHeartbeat();
+    await this.startNextAction();
+  }
+
+  async retryFailedAction(actionId: string): Promise<void> {
+    const response = await this.request<{ queue: { actions: FineJobQueueAction[]; failed_actions?: FineJobQueueAction[] } }>(
+      `/actions/${encodeURIComponent(actionId)}/retry-failed`,
+      { method: "POST" }
+    );
+    this.state.queue = response.queue.actions;
+    this.state.failedQueue = response.queue.failed_actions ?? [];
+    await this.startNextAction();
+  }
+
+  async cancelFailedAction(actionId: string): Promise<void> {
+    const response = await this.request<{ queue: { actions: FineJobQueueAction[]; failed_actions?: FineJobQueueAction[] } }>(
+      `/actions/${encodeURIComponent(actionId)}/cancel-failed`,
+      { method: "POST" }
+    );
+    this.state.queue = response.queue.actions;
+    this.state.failedQueue = response.queue.failed_actions ?? [];
+  }
+
+  async retryAllFailed(): Promise<void> {
+    const response = await this.request<{ queue: { actions: FineJobQueueAction[]; failed_actions?: FineJobQueueAction[] } }>(
+      "/failed-actions/retry-all",
+      { method: "POST" }
+    );
+    this.state.queue = response.queue.actions;
+    this.state.failedQueue = response.queue.failed_actions ?? [];
+    await this.startNextAction();
+  }
+
+  async cancelAllFailed(): Promise<void> {
+    const response = await this.request<{ queue: { actions: FineJobQueueAction[]; failed_actions?: FineJobQueueAction[] } }>(
+      "/failed-actions/cancel-all",
+      { method: "POST" }
+    );
+    this.state.queue = response.queue.actions;
+    this.state.failedQueue = response.queue.failed_actions ?? [];
   }
 
   async reportSnapshot(snapshot: BossReadOnlySnapshot): Promise<void> {
@@ -252,67 +435,41 @@ export class FineJobExecutorClient {
     });
   }
 
-  private async tick(): Promise<void> {
-    if (this.tickRunning || !this.credentials) return;
-    this.tickRunning = true;
+  private async startNextAction(): Promise<void> {
+    if (!this.credentials) return;
     try {
-      const snapshot = this.latestSnapshot;
-      const heartbeat = await this.request<{
-        executor: ExecutorRuntimeState["executor"];
-        queue: { actions: FineJobQueueAction[] };
-      }>("/heartbeat", {
-        method: "POST",
-        body: JSON.stringify({
-          protocol_version: PROTOCOL_VERSION,
-          plugin_version: packageJson.version,
-          capabilities: CAPABILITIES,
-          browser_connected: Boolean(snapshot),
-          current_action_id: this.state.currentAction?.id ?? null,
-          current_epoch: this.state.currentAction?.execution_epoch ?? null,
-          page_kind: snapshot?.pageKind ?? "other",
-          page_state: snapshot?.state ?? "waiting",
-          logged_in: snapshot?.loggedIn ?? false,
-          risk_state: snapshot && !snapshot.loggedIn ? "login" : "none"
-        })
-      });
-      this.state.connected = true;
-      this.state.paired = true;
-      this.state.executor = heartbeat.executor;
-      this.state.queue = heartbeat.queue.actions;
-      this.state.detail = "FineJob通信正常";
-
-      await this.flushPendingResults();
-
+      // 每项任务领取前先确认一次插件与FineJob的连接。
+      await this.testHeartbeat();
+      const executor = this.state.executor;
       if (
-        heartbeat.executor?.permission_state === "allowed" &&
-        heartbeat.executor.queue_state === "running" &&
-        heartbeat.executor.risk_state === "none"
-      ) {
-        const claimed = await this.request<{ action: FineJobQueueAction | null }>("/actions/claim", {
-          method: "POST"
-        });
-        if (claimed.action) {
-          const previousVerificationState = this.state.currentAction?.verification_state;
-          this.state.currentAction = claimed.action;
-          this.replaceQueueAction(claimed.action);
-          if (previousVerificationState !== claimed.action.verification_state) {
-            this.lastPageReportKey = "";
-          }
-          if (claimed.action.execution_state === "ready_to_dispatch") {
-            await this.dispatch(claimed.action);
-          } else if (this.latestSnapshot) {
-            this.lastPageReportKey = "";
-            await this.reportSnapshot(this.latestSnapshot);
-          }
-        } else {
-          this.state.currentAction = null;
+        executor?.permission_state !== "allowed"
+        || executor.queue_state !== "running"
+        || executor.risk_state !== "none"
+      ) return;
+      const claimed = await this.request<{ action: FineJobQueueAction | null }>("/actions/claim", {
+        method: "POST"
+      });
+      if (claimed.action) {
+        const previousVerificationState = this.state.currentAction?.verification_state;
+        this.state.currentAction = claimed.action;
+        this.replaceQueueAction(claimed.action);
+        this.scheduleTaskHeartbeat(claimed.action);
+        if (previousVerificationState !== claimed.action.verification_state) {
+          this.lastPageReportKey = "";
         }
+        if (claimed.action.execution_state === "ready_to_dispatch") {
+          await this.dispatch(claimed.action);
+        } else if (this.latestSnapshot) {
+          this.lastPageReportKey = "";
+          await this.reportSnapshot(this.latestSnapshot);
+        }
+      } else {
+        this.clearTaskHeartbeat();
+        this.state.currentAction = null;
       }
     } catch (error) {
       this.state.connected = false;
       this.state.detail = (error as Error).message || "FineJob连接失败";
-    } finally {
-      this.tickRunning = false;
     }
   }
 
@@ -333,6 +490,7 @@ export class FineJobExecutorClient {
       { method: "POST", body: JSON.stringify({ execution_epoch: action.execution_epoch }) }
     );
     this.state.currentAction = response.action;
+    this.scheduleTaskHeartbeat(response.action);
     try {
       await browser.tabs.sendMessage(target.id, {
         type: COMMAND_MESSAGE,
@@ -362,16 +520,11 @@ export class FineJobExecutorClient {
   }
 
   private canReportSnapshot(action: FineJobQueueAction): boolean {
-    return ["waiting_page_ready", "page_verified", "ready_to_dispatch"].includes(action.execution_state)
-      || (action.execution_state === "request_accepted" && action.verification_state === "waiting_snapshot");
+    return ["waiting_page_ready", "page_verified", "ready_to_dispatch"].includes(action.execution_state);
   }
 
   private isActiveAction(action: FineJobQueueAction): boolean {
-    if (["queued", "request_accepted", "succeeded", "failed_after_dispatch", "cancelled", "blocked", "unknown_after_dispatch"].includes(action.execution_state)) {
-      return action.execution_state === "request_accepted"
-        && ["waiting_refresh", "refreshing", "waiting_snapshot"].includes(action.verification_state);
-    }
-    return true;
+    return !["queued", "succeeded", "failed_before_dispatch", "failed_after_dispatch", "cancelled", "blocked", "unknown_after_dispatch", "request_accepted"].includes(action.execution_state);
   }
 
   private resultKey(result: MainWorldExecutionResult): string {
@@ -408,6 +561,26 @@ export class FineJobExecutorClient {
     this.state.currentAction = this.isActiveAction(response.action) ? response.action : null;
     this.replaceQueueAction(response.action);
     this.dispatchingKey = "";
+    if (!this.state.currentAction) {
+      this.clearTaskHeartbeat();
+      await this.startNextAction();
+    }
+  }
+
+  private scheduleTaskHeartbeat(action: FineJobQueueAction): void {
+    this.clearTaskHeartbeat();
+    const actionKey = `${action.id}:${action.execution_epoch}`;
+    // 任务长时间未回传时只补发一次心跳测试，不建立持续检查循环。
+    this.taskHeartbeatTimer = globalThis.setTimeout(() => {
+      if (`${this.state.currentAction?.id}:${this.state.currentAction?.execution_epoch}` !== actionKey) return;
+      void this.testHeartbeat().catch(() => undefined);
+    }, TASK_HEARTBEAT_TIMEOUT_MS) as unknown as number;
+  }
+
+  private clearTaskHeartbeat(): void {
+    if (this.taskHeartbeatTimer === null) return;
+    globalThis.clearTimeout(this.taskHeartbeatTimer);
+    this.taskHeartbeatTimer = null;
   }
 
   private async flushPendingResults(): Promise<void> {

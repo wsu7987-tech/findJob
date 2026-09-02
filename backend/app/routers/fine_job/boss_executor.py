@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Query, WebSocket, WebSocketDisconnect
 
 from backend.app.db import Database
 from backend.app.dependencies import get_database
@@ -51,6 +51,30 @@ def heartbeat(
 ):
     executor = _executor(db, authorization)
     return boss_executor.heartbeat(db, str(executor["id"]), payload.model_dump())
+
+
+@router.websocket("/boss-executor/channel")
+async def executor_channel(
+    websocket: WebSocket,
+    token: str = Query(default=""),
+):
+    db = websocket.app.state.db
+    try:
+        executor = boss_executor.authenticate_executor(db, token)
+    except AppError:
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    executor_id = str(executor["id"])
+    await boss_executor.register_executor_channel(executor_id, websocket)
+    try:
+        while True:
+            message = await websocket.receive_json()
+            await boss_executor.handle_executor_channel_message(executor_id, message)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await boss_executor.unregister_executor_channel(executor_id, websocket)
 
 
 @router.get("/boss-executor/queue")
@@ -109,6 +133,44 @@ def executor_return(
     return {"action": boss_executor.return_to_review(db, action_id, reason=payload.reason, executor_id=str(executor["id"]))}
 
 
+@router.post("/boss-executor/actions/{action_id}/retry-failed")
+def retry_failed_action(
+    action_id: str,
+    authorization: str = Header(default=""),
+    db: Database = Depends(get_database),
+):
+    _executor(db, authorization)
+    return boss_executor.retry_failed_action(db, action_id)
+
+
+@router.post("/boss-executor/actions/{action_id}/cancel-failed")
+def cancel_failed_action(
+    action_id: str,
+    authorization: str = Header(default=""),
+    db: Database = Depends(get_database),
+):
+    _executor(db, authorization)
+    return boss_executor.cancel_failed_action(db, action_id)
+
+
+@router.post("/boss-executor/failed-actions/retry-all")
+def retry_all_failed_actions(
+    authorization: str = Header(default=""),
+    db: Database = Depends(get_database),
+):
+    _executor(db, authorization)
+    return boss_executor.retry_all_failed_actions(db)
+
+
+@router.post("/boss-executor/failed-actions/cancel-all")
+def cancel_all_failed_actions(
+    authorization: str = Header(default=""),
+    db: Database = Depends(get_database),
+):
+    _executor(db, authorization)
+    return boss_executor.cancel_all_failed_actions(db)
+
+
 @router.post("/boss-executor/actions/{action_id}/manual-verify")
 def executor_manual_verify(
     action_id: str,
@@ -152,6 +214,33 @@ def desktop_control(
     if not isinstance(executor, dict):
         raise AppError(409, "EXECUTOR_NOT_PAIRED", "尚未配对BOSS执行器。")
     return boss_executor.set_control(db, str(executor["id"]), payload.command)
+
+
+@router.post("/boss-executor/desktop-heartbeat-test")
+async def desktop_heartbeat_test(db: Database = Depends(get_database)):
+    snapshot = boss_executor.executor_snapshot(db)
+    executor = snapshot.get("executor")
+    if not isinstance(executor, dict):
+        raise AppError(409, "EXECUTOR_NOT_PAIRED", "尚未配对BOSS执行器。")
+    return await boss_executor.request_heartbeat_test(db, str(executor["id"]))
+
+
+@router.post("/boss-executor/desktop-disconnect")
+async def desktop_disconnect(db: Database = Depends(get_database)):
+    snapshot = boss_executor.executor_snapshot(db)
+    executor = snapshot.get("executor")
+    if not isinstance(executor, dict):
+        raise AppError(409, "EXECUTOR_NOT_PAIRED", "尚未配对BOSS执行器。")
+    return await boss_executor.disconnect_executor(db, str(executor["id"]))
+
+
+@router.post("/boss-executor/disconnect")
+async def disconnect(
+    authorization: str = Header(default=""),
+    db: Database = Depends(get_database),
+):
+    executor = _executor(db, authorization)
+    return await boss_executor.disconnect_executor(db, str(executor["id"]))
 
 
 @router.post("/boss-navigation/open")

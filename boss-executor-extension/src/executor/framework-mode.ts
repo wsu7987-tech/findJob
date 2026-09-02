@@ -44,6 +44,7 @@ export const createFrameworkStatus = (pathname: string): FrameworkStatus => ({
     detail: "尚未与FineJob配对",
     executor: null,
     queue: [],
+    failedQueue: [],
     currentAction: null,
     lastResult: ""
   }

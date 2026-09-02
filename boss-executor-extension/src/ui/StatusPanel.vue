@@ -13,15 +13,23 @@ const props = defineProps<{
 const pairingCode = ref("");
 const busy = ref(false);
 const uiError = ref("");
-const nowMs = ref(Date.now());
 const panel = ref<HTMLElement | null>(null);
 const collapsed = ref(false);
+const queueExpanded = ref(false);
 const position = ref<{ left: number; top: number } | null>(null);
 const PANEL_UI_KEY = "finejobBossExecutorPanelUiV1";
-let countdownTimer: number | null = null;
 let dragging: { offsetX: number; offsetY: number } | null = null;
 
-const displayAction = computed(() => props.status.executor.currentAction ?? props.status.executor.queue[0] ?? null);
+const queueDisplay = computed(() => {
+  const actions = props.status.executor.queue;
+  const current = props.status.executor.currentAction;
+  if (!current || actions.some((action) => action.id === current.id)) return actions;
+  return [current, ...actions];
+});
+// 默认只展示队列前3项，展开后查看完整队列。
+const visibleQueue = computed(() => queueExpanded.value ? queueDisplay.value : queueDisplay.value.slice(0, 3));
+const queueHasMore = computed(() => queueDisplay.value.length > 3);
+const queueRunning = computed(() => props.status.executor.executor?.queue_state === "running");
 const panelStyle = computed(() => position.value ? {
   left: `${position.value.left}px`,
   top: `${position.value.top}px`,
@@ -138,29 +146,13 @@ const hrLabel = (job?: BossJobIdentity | null) => {
   return displayName || `标识 ${suffix(job.encryptBossId)}（待验证）`;
 };
 
-const verificationRemaining = (action: FineJobQueueAction) => {
-  if (!action.verification_due_at) return 0;
-  return Math.max(0, Math.ceil((new Date(action.verification_due_at).getTime() - nowMs.value) / 1000));
-};
-
 const actionLabel = (action: FineJobQueueAction) => {
-  if (action.execution_state === "request_accepted") {
-    if (action.verification_state === "waiting_refresh") {
-      return `平台已受理，${verificationRemaining(action)}秒后刷新验证`;
-    }
-    if (action.verification_state === "refreshing") return "正在刷新当前岗位页面";
-    if (action.verification_state === "waiting_snapshot") return "正在确认是否已建立沟通";
-    if (action.verification_state === "pending") return "已提交，页面暂未确认";
-    return "平台已受理，待后续验证";
-  }
-  if (action.verification_state === "page_confirmed") return "页面验证成功";
-  if (action.verification_state === "manual_confirmed") return "人工核验完成";
-  if (action.execution_state === "unknown_after_dispatch") return "未知错误";
-  return action.execution_state;
+  if (["failed_before_dispatch", "failed_after_dispatch"].includes(action.execution_state)) return "执行失败";
+  if (action.execution_state === "unknown_after_dispatch") return "未知结果";
+  return "待执行";
 };
 
 onMounted(() => {
-  countdownTimer = window.setInterval(() => { nowMs.value = Date.now(); }, 1000);
   void browser.storage.local.get(PANEL_UI_KEY).then(async (stored) => {
     const ui = stored[PANEL_UI_KEY] as {
       collapsed?: boolean;
@@ -174,7 +166,6 @@ onMounted(() => {
   window.addEventListener("resize", clampPosition);
 });
 onBeforeUnmount(() => {
-  if (countdownTimer !== null) window.clearInterval(countdownTimer);
   stopDragging();
   window.removeEventListener("resize", clampPosition);
 });
@@ -207,6 +198,10 @@ onBeforeUnmount(() => {
         <dt>FineJob</dt>
         <dd :data-state="status.executor.connected ? 'ready' : 'error'">
           {{ status.executor.connected ? "已连接" : status.executor.paired ? "连接失败" : "未配对" }}
+          <span v-if="status.executor.paired" class="inline-actions">
+            <button :disabled="busy" @click="run(() => controller.testHeartbeat())">心跳测试</button>
+            <button :disabled="busy" @click="run(() => controller.disconnect())">断开</button>
+          </span>
         </dd>
       </div>
       <div>
@@ -225,10 +220,6 @@ onBeforeUnmount(() => {
         <dt>队列</dt>
         <dd>{{ status.executor.queue.length }} 项</dd>
       </div>
-      <div>
-        <dt>当前页面</dt>
-        <dd>{{ pageLabel(status.bossSnapshot?.pageKind) }}</dd>
-      </div>
     </dl>
     <section v-if="!status.executor.paired" class="probe">
       <p class="probe-title">与FineJob配对</p>
@@ -239,23 +230,58 @@ onBeforeUnmount(() => {
     </section>
     <section v-else class="probe">
       <p class="probe-title">执行控制</p>
+      <span>
+        <button
+          v-if="queueRunning"
+          :disabled="busy"
+          @click="run(() => controller.control('pause'))"
+        >暂停</button>
+        <button
+          v-else
+          class="primary"
+          :disabled="busy"
+          @click="run(() => controller.control('allow'))"
+        >开始</button>
+      </span>
+
+
       <div class="actions">
-        <button class="primary" :disabled="busy" @click="run(() => controller.control('allow'))">允许自动打招呼</button>
-        <button :disabled="busy" @click="run(() => controller.control('pause'))">暂停</button>
-        <button :disabled="busy" @click="run(() => controller.control('resume'))">恢复队列</button>
-        <button class="danger" :disabled="busy" @click="run(() => controller.control('emergency_stop'))">紧急停止</button>
+
         <button
           v-if="status.executor.currentAction"
           :disabled="busy"
           @click="returnCurrentToReview"
         >退回确认</button>
       </div>
-      <p class="detail">
-        {{ displayAction
-          ? `${status.executor.currentAction ? "当前" : "下一项"}：${displayAction.job_title} · ${actionLabel(displayAction)}`
-          : "当前打招呼队列为空" }}
-      </p>
+      <p v-if="!queueDisplay.length" class="detail">当前打招呼队列为空</p>
+      <div v-else class="queue">
+        <p v-for="action in visibleQueue" :key="action.id" class="detail">
+          {{ action.id === status.executor.currentAction?.id ? "当前" : "待执行" }}：{{ action.job_title }} · {{ actionLabel(action) }}
+        </p>
+        <button v-if="queueHasMore" @click="queueExpanded = !queueExpanded">
+          {{ queueExpanded ? "收起" : `展开其余 ${queueDisplay.length - 3} 项` }}
+        </button>
+      </div>
       <p v-if="status.executor.lastResult" class="detail">上次结果：{{ status.executor.lastResult }}</p>
+    </section>
+    <section v-if="status.executor.failedQueue.length" class="probe">
+      <div class="queue-header">
+        <p class="probe-title">执行失败</p>
+        <span class="inline-actions">
+          <button :disabled="busy" @click="run(() => controller.retryAllFailed())">全部重试</button>
+          <button :disabled="busy" @click="run(() => controller.cancelAllFailed())">全部撤销</button>
+        </span>
+      </div>
+      <div class="queue failed-queue">
+        <div v-for="action in status.executor.failedQueue" :key="action.id" class="failed-item">
+          <p class="detail">{{ action.job_title }} · 执行失败</p>
+          <p v-if="action.last_error" class="detail">{{ action.last_error }}</p>
+          <span class="inline-actions">
+            <button :disabled="busy" @click="run(() => controller.retryFailedAction(action.id))">重试</button>
+            <button :disabled="busy" @click="run(() => controller.cancelFailedAction(action.id))">撤销</button>
+          </span>
+        </div>
+      </div>
     </section>
     <details class="probe">
       <summary class="probe-title">诊断详情</summary>
@@ -276,6 +302,12 @@ onBeforeUnmount(() => {
       <p class="detail">{{ status.bossSnapshot?.reason || status.detail || "等待岗位页面数据" }}</p>
       <p v-if="status.executor.chat?.lastError" class="detail">自动代聊：{{ status.executor.chat.lastError }}</p>
     </details>
+    <dl class="page-status">
+      <div>
+        <dt>当前页面</dt>
+        <dd>{{ pageLabel(status.bossSnapshot?.pageKind) }}</dd>
+      </div>
+    </dl>
     <p v-if="uiError" class="detail">{{ uiError }}</p>
     </div>
   </section>

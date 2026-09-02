@@ -30,6 +30,9 @@ SEND_LEASE_SECONDS = 30
 SEND_DISPATCH_TIMEOUT_SECONDS = 45
 REPLY_DEBOUNCE_SECONDS = 3
 
+_generation_timers: dict[str, threading.Timer] = {}
+_generation_timers_lock = threading.Lock()
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -1992,6 +1995,69 @@ def process_due_tasks(
     return completed
 
 
+def _run_generation_timer(db: Database, config: AppConfig, task_id: str) -> None:
+    with _generation_timers_lock:
+        _generation_timers.pop(task_id, None)
+    try:
+        process_due_tasks(db, config)
+    finally:
+        # 生成失败或间隔尚未到达时，按数据库中的最新时间重新安排一次性任务。
+        schedule_pending_generation(db, config)
+
+
+def schedule_pending_generation(db: Database, config: AppConfig) -> None:
+    """根据待生成任务的到期时间安排一次性回调，不启动常驻扫描线程。"""
+    runtime = get_runtime(db)
+    if not runtime.get("generation_enabled") or runtime.get("trigger_mode") == "manual":
+        with _generation_timers_lock:
+            for timer in _generation_timers.values():
+                timer.cancel()
+            _generation_timers.clear()
+        return
+
+    now = datetime.now(timezone.utc)
+    interval_due = None
+    if runtime.get("trigger_mode") == "interval":
+        last_scheduled = _parse_time(runtime.get("last_scheduled_at"))
+        if last_scheduled is not None:
+            interval_due = last_scheduled + timedelta(
+                minutes=int(runtime.get("interval_minutes") or 30)
+            )
+
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT t.id, t.generation_due_at
+            FROM fj_chat_reply_tasks t
+            JOIN fj_chat_sessions s ON s.id = t.session_id
+            WHERE t.status = 'pending_generation' AND s.status = 'active'
+            """
+        ).fetchall()
+
+    active_ids = {str(row["id"]) for row in rows}
+    with _generation_timers_lock:
+        for task_id in set(_generation_timers) - active_ids:
+            _generation_timers.pop(task_id).cancel()
+
+    for row in rows:
+        due = _parse_time(row["generation_due_at"]) or now
+        if interval_due is not None and interval_due > due:
+            due = interval_due
+        delay = max(0.0, (due - datetime.now(timezone.utc)).total_seconds())
+        timer = threading.Timer(
+            delay,
+            _run_generation_timer,
+            args=(db, config, str(row["id"])),
+        )
+        timer.daemon = True
+        with _generation_timers_lock:
+            previous = _generation_timers.get(str(row["id"]))
+            if previous is not None:
+                previous.cancel()
+            _generation_timers[str(row["id"])] = timer
+        timer.start()
+
+
 CHAT_BATCH_LIMIT = 20
 
 
@@ -2145,35 +2211,3 @@ class BossChatBatchManager:
 
 
 boss_chat_batch_manager = BossChatBatchManager()
-
-
-class BossChatScheduler:
-    """按秒检查已过防抖时间的任务；停止事件保证测试和应用退出时可回收。"""
-
-    def __init__(self, db: Database, config: AppConfig, interval_seconds: int = 1) -> None:
-        self.db = db
-        self.config = config
-        self.interval_seconds = interval_seconds
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="boss-chat-scheduler", daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=2)
-
-    def _run(self) -> None:
-        while not self._stop.wait(self.interval_seconds):
-            try:
-                sweep_stale_send_actions(self.db)
-                process_due_tasks(self.db, self.config)
-            except Exception:
-                # 后台调度不能影响主 API；具体任务错误由状态记录供桌面端查看。
-                continue

@@ -39,8 +39,14 @@ def runtime(db: Database = Depends(get_database)):
 
 
 @router.patch("/runtime")
-def update_runtime(payload: BossChatRuntimeUpdateRequest, db: Database = Depends(get_database)):
-    return {"runtime": boss_chat.update_runtime(db, payload.model_dump(exclude_none=True))}
+def update_runtime(
+    payload: BossChatRuntimeUpdateRequest,
+    config: AppConfig = Depends(get_config),
+    db: Database = Depends(get_database),
+):
+    runtime = boss_chat.update_runtime(db, payload.model_dump(exclude_none=True))
+    boss_chat.schedule_pending_generation(db, config)
+    return {"runtime": runtime}
 
 
 @router.get("/batch/summary", response_model=BossChatBatchSummaryResponse)
@@ -114,6 +120,7 @@ def executor_heartbeat(
 def executor_events(
     payload: BossChatEventBatchRequest,
     authorization: str = Header(default=""),
+    config: AppConfig = Depends(get_config),
     db: Database = Depends(get_database),
 ):
     executor = _executor(db, authorization)
@@ -122,7 +129,8 @@ def executor_events(
         str(executor["id"]),
         [event.model_dump() for event in payload.events],
     )
-    # 事件接口只负责可靠入库，草稿由后台调度器在防抖时间到期后生成。
+    # 事件入库后安排一次性生成回调，防抖到期时只处理对应的业务事件。
+    boss_chat.schedule_pending_generation(db, config)
     result["generated"] = 0
     result["processing_deferred"] = bool(result["queued_task_ids"])
     return result

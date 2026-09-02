@@ -36,8 +36,7 @@ export class BossChatCoordinator {
   private readonly activeActions = new Map<string, ActiveAction>();
   private eventOutbox: Record<string, ChatObservedMessage> = {};
   private resultOutbox: Record<string, ChatSendExecutionResult> = {};
-  private timer: number | null = null;
-  private tickRunning = false;
+  private processing = false;
   private listenEnabled = false;
   private runtimeKnown = false;
   private runtimeCache: RuntimeCache | null = null;
@@ -65,16 +64,27 @@ export class BossChatCoordinator {
     for (const [accountUid, lease] of Object.entries(stored ?? {})) {
       this.leaders.set(accountUid, lease);
     }
-    if (this.timer === null) {
-      this.timer = globalThis.setInterval(() => void this.tick(), 2_000) as unknown as number;
+    // 只在协调器启动时读取一次运行配置，后续由页面事件和发送结果触发处理。
+    try {
+      const currentRuntime = await this.client.getChatRuntime();
+      this.listenEnabled = currentRuntime.listen_enabled;
+      this.runtimeKnown = true;
+      await this.updateRuntimeCache(
+        currentRuntime.listen_enabled,
+        currentRuntime.generation_enabled,
+        currentRuntime.send_enabled
+      );
+    } catch (error) {
+      this.lastError = (error as Error).message || "自动代聊运行配置读取失败";
     }
-    await this.tick();
+    await this.processAccounts();
   }
 
   async reportTabHeartbeat(heartbeat: ChatTabHeartbeat): Promise<{ isLeader: boolean; leaderEpoch: number }> {
     const key = `${heartbeat.accountUid}:${heartbeat.tabId}`;
     this.candidates.set(key, { ...heartbeat, receivedAt: Date.now() });
     const leader = await this.elect(heartbeat.accountUid);
+    void this.processAccounts();
     return {
       isLeader: leader?.tabId === heartbeat.tabId,
       leaderEpoch: leader?.epoch ?? 0
@@ -96,9 +106,9 @@ export class BossChatCoordinator {
       return { accepted: false };
     }
     this.eventOutbox[message.eventId] = message;
-    // 收到消息后先持久化，后端上传失败时由后续 tick 继续处理。
+    // 收到消息后先持久化，后端上传失败时由后续页面事件继续处理。
     await this.persistOutbox();
-    void this.tick();
+    void this.processAccounts();
     return { accepted: true };
   }
 
@@ -109,24 +119,17 @@ export class BossChatCoordinator {
     }
     try {
       await this.flushResultOutbox();
+      void this.processAccounts();
     } catch (error) {
       this.lastError = `自动代聊发送结果等待回传：${(error as Error).message}`;
     }
   }
 
-  private async tick(): Promise<void> {
-    if (this.tickRunning) return;
-    this.tickRunning = true;
+  private async processAccounts(): Promise<void> {
+    if (this.processing) return;
+    this.processing = true;
     try {
       this.pruneCandidates();
-      const runtime = await this.client.getChatRuntime();
-      this.listenEnabled = runtime.listen_enabled;
-      this.runtimeKnown = true;
-      await this.updateRuntimeCache(
-        runtime.listen_enabled,
-        runtime.generation_enabled,
-        runtime.send_enabled
-      );
       await this.flushResultOutbox();
       const accounts = new Set<string>();
       for (const candidate of this.candidates.values()) accounts.add(candidate.accountUid);
@@ -137,16 +140,16 @@ export class BossChatCoordinator {
           this.candidates.get(`${accountUid}:${leader.tabId}`) as Candidate,
           leader.epoch
         );
-        if (runtime.listen_enabled) await this.flushAccountOutbox(accountUid, leader.epoch);
-        if (runtime.send_enabled) await this.claimAndDispatch(accountUid, leader);
+        if (this.listenEnabled) await this.flushAccountOutbox(accountUid, leader.epoch);
+        if (this.runtimeCache?.sendEnabled) await this.claimAndDispatch(accountUid, leader);
       }
       await this.expireUnreportedActions();
       this.lastError = "";
     } catch (error) {
-      // 后端或页面暂时不可用时保留 outbox，下一个 tick 自动续传。
+      // 后端或页面暂时不可用时保留 outbox，等待下一次业务事件重新处理。
       this.lastError = (error as Error).message || "自动代聊协调器暂时不可用";
     } finally {
-      this.tickRunning = false;
+      this.processing = false;
     }
   }
 

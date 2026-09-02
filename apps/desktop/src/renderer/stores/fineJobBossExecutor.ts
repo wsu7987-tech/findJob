@@ -13,6 +13,7 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
   const pairingExpiresAt = ref<string | null>(null);
   const openingJobId = ref<string | null>(null);
   const loading = ref(false);
+  const heartbeatTesting = ref(false);
   const error = ref<string | null>(null);
 
   const load = async () => {
@@ -46,6 +47,41 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
     error.value = null;
     try {
       dashboard.value = await api.controlFineJobBossExecutor(command);
+      return dashboard.value;
+    } catch (value) {
+      error.value = mapError(value);
+      throw value;
+    }
+  };
+
+  const testHeartbeat = async () => {
+    heartbeatTesting.value = true;
+    error.value = null;
+    try {
+      dashboard.value = await api.testFineJobBossExecutorHeartbeat();
+      return dashboard.value;
+    } catch (value) {
+      error.value = mapError(value);
+      // 心跳失败时立即给桌面端提供新的配对入口。
+      try {
+        const result = await api.createFineJobBossPairingCode();
+        pairingCode.value = result.code;
+        pairingExpiresAt.value = result.expires_at;
+      } catch {
+        // 保留原心跳错误，避免配对码生成失败覆盖根因。
+      }
+      throw value;
+    } finally {
+      heartbeatTesting.value = false;
+    }
+  };
+
+  const disconnect = async () => {
+    error.value = null;
+    try {
+      dashboard.value = await api.disconnectFineJobBossExecutor();
+      pairingCode.value = null;
+      pairingExpiresAt.value = null;
       return dashboard.value;
     } catch (value) {
       error.value = mapError(value);
@@ -99,10 +135,13 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
     pairingExpiresAt,
     openingJobId,
     loading,
+    heartbeatTesting,
     error,
     load,
     createPairingCode,
     control,
+    testHeartbeat,
+    disconnect,
     openJob,
     returnToReview,
     manualVerifyUnknown

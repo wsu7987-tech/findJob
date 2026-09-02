@@ -133,7 +133,7 @@ const runtimeStatus = computed(() => {
   const executor = runsStore.dashboard?.executor;
   if (!runsStore.dashboard) return "加载中";
   if (!executor) return "未配对";
-  if (!executor.browser_connected) return "浏览器未连接";
+  if (!executor.browser_connected) return "FineJob未连接";
   if (executor.risk_state !== "none") return "风险暂停";
   return executor.queue_state === "running" ? "运行中" : "已暂停";
 });

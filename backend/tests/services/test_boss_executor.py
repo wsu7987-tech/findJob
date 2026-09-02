@@ -9,8 +9,6 @@ from backend.app.errors import AppError
 from backend.app.db import Database
 from backend.app.services.fine_job import boss_executor
 from backend.app.services.fine_job import workflow
-from backend.app.schemas.fine_job.delivery_strategies import FineJobDeliveryStrategyPayload
-from backend.app.services.fine_job.delivery_strategies import save_delivery_strategy
 from backend.app.services.fine_job.boss_capture_history import create_capture_batch, record_capture_jobs
 from backend.app.utils import utc_now
 
@@ -90,17 +88,6 @@ def _prepare_dispatch(db, *, suffix: str = "1") -> tuple[str, dict[str, object]]
     })
     boss_executor.mark_dispatch_started(db, executor_id, str(action["id"]), int(action["execution_epoch"]))
     return executor_id, action
-
-
-def _enable_force_verification(db) -> None:
-    save_delivery_strategy(
-        db,
-        FineJobDeliveryStrategyPayload(
-            automation_level="auto_greeting",
-            auto_greeting_enabled=True,
-            force_contact_verification_enabled=True,
-        ),
-    )
 
 
 def _complete_unknown(db, executor_id: str, suffix: str) -> dict[str, object]:
@@ -234,7 +221,7 @@ def test_second_page_timeout_blocks_job_but_keeps_queue_available(test_db) -> No
     assert queue_state == "running"
 
 
-def test_unknown_result_moves_to_tail_without_blocking_other_jobs(test_db) -> None:
+def test_unknown_result_is_recorded_but_hidden_from_both_queues(test_db) -> None:
     _seed_action(test_db, "1")
     _seed_action(test_db, "2")
     executor_id, _token = _paired_executor(test_db)
@@ -245,7 +232,8 @@ def test_unknown_result_moves_to_tail_without_blocking_other_jobs(test_db) -> No
     assert snapshot["risk_state"] == "none"
     assert snapshot["current_action_id"] is None
     queue_ids = [item["id"] for item in boss_executor.list_queue(test_db)["actions"]]
-    assert queue_ids == ["action-2", "action-1"]
+    assert queue_ids == ["action-2"]
+    assert boss_executor.list_queue(test_db)["failed_actions"] == []
     # 兼容修补前已经写入全局未知锁的历史执行器状态。
     with test_db.connect() as connection:
         connection.execute(
@@ -298,7 +286,7 @@ def test_manual_unknown_verification_returns_uncontacted_job_for_reapproval(test
     assert reapproved["last_status_code"] == "REAPPROVED_AFTER_MANUAL_NOT_CONTACTED"
 
 
-def test_code_zero_is_accepted_without_locking_queue_when_verification_is_off(test_db) -> None:
+def test_code_zero_is_completed_without_waiting_for_verification(test_db) -> None:
     executor_id, action = _prepare_dispatch(test_db)
 
     result = boss_executor.complete_executor_action(test_db, executor_id, str(action["id"]), {
@@ -307,7 +295,7 @@ def test_code_zero_is_accepted_without_locking_queue_when_verification_is_off(te
         "evidence": {"responseCode": 0, "token": "must-not-be-saved"},
     })
 
-    assert result["execution_state"] == "request_accepted"
+    assert result["execution_state"] == "succeeded"
     assert result["verification_state"] == "not_required"
     assert result["cooldown_seconds"] in {1, 2, 3}
     snapshot = boss_executor.executor_snapshot(test_db, executor_id)["executor"]
@@ -321,81 +309,32 @@ def test_code_zero_is_accepted_without_locking_queue_when_verification_is_off(te
     assert "must-not-be-saved" not in stored
 
 
-def test_force_verification_waits_refreshes_once_and_confirms_same_job(test_db) -> None:
-    _enable_force_verification(test_db)
+def test_failed_queue_supports_retry_and_cancel(test_db) -> None:
     executor_id, action = _prepare_dispatch(test_db)
-    payload = {
-        "execution_epoch": action["execution_epoch"], "outcome": "accepted", "contacted": None,
-        "status_code": "BOSS_REQUEST_ACCEPTED", "message": "平台已受理",
-        "evidence": {"responseCode": 0},
-    }
-    accepted = boss_executor.complete_executor_action(
-        test_db, executor_id, str(action["id"]), payload,
-        verification_delay_provider=lambda: 18,
-    )
-    due_at = accepted["verification_due_at"]
-    assert accepted["verification_state"] == "waiting_refresh"
-    assert accepted["verification_delay_seconds"] == 18
-
-    # 相同结果回写是幂等操作，不能重新生成等待时间。
-    repeated = boss_executor.complete_executor_action(test_db, executor_id, str(action["id"]), payload)
-    assert repeated["verification_due_at"] == due_at
-
-    with test_db.connect() as connection:
-        connection.execute(
-            "UPDATE fj_automation_actions SET verification_due_at = '2000-01-01T00:00:00Z' WHERE id = ?",
-            (action["id"],),
-        )
-    reload_calls: list[tuple[str, str]] = []
-    boss_executor.sweep_page_timeout(
-        test_db,
-        executor_id,
-        browser_status_provider=lambda: _BrowserStatus(True, "https://www.zhipin.com/job_detail/encrypt-1.html"),
-        verification_reload_provider=lambda target_id, job_id: reload_calls.append((target_id, job_id)) or target_id,
-    )
-    waiting = boss_executor.executor_snapshot(test_db, executor_id)["queue"]["actions"][0]
-    assert waiting["verification_state"] == "waiting_snapshot"
-    assert waiting["verification_attempts"] == 1
-    assert reload_calls == [("target-1", "encrypt-1")]
-
-    confirmed = boss_executor.report_page_status(test_db, executor_id, str(action["id"]), {
-        "execution_epoch": action["execution_epoch"], "state": "ready", "logged_in": True,
-        "page_kind": "detail", "encrypt_job_id": "encrypt-1", "contacted": True,
-        "reason": "刷新后已沟通", "observed_at": int(time.time() * 1000) + 1000,
+    failed = boss_executor.complete_executor_action(test_db, executor_id, str(action["id"]), {
+        "execution_epoch": action["execution_epoch"], "outcome": "failed", "contacted": False,
+        "status_code": "BOSS_REQUEST_REJECTED", "message": "平台拒绝", "evidence": {},
     })
-    assert confirmed["execution_state"] == "succeeded"
-    assert confirmed["verification_state"] == "page_confirmed"
-    assert boss_executor.executor_snapshot(test_db, executor_id)["executor"]["current_action_id"] is None
+    assert failed["execution_state"] == "failed_after_dispatch"
+    queue = boss_executor.list_queue(test_db)
+    assert queue["actions"] == []
+    assert [item["id"] for item in queue["failed_actions"]] == [action["id"]]
 
+    retried = boss_executor.retry_failed_action(test_db, str(action["id"]))
+    assert retried["action"]["execution_state"] == "queued"
+    assert [item["id"] for item in retried["queue"]["actions"]] == [action["id"]]
+    assert retried["queue"]["failed_actions"] == []
 
-def test_force_verification_false_snapshot_stays_pending_and_never_resends(test_db) -> None:
-    _enable_force_verification(test_db)
-    executor_id, action = _prepare_dispatch(test_db)
-    accepted = boss_executor.complete_executor_action(
-        test_db, executor_id, str(action["id"]), {
-            "execution_epoch": action["execution_epoch"], "outcome": "accepted", "contacted": None,
-            "status_code": "BOSS_REQUEST_ACCEPTED", "message": "平台已受理",
-            "evidence": {"responseCode": 0},
-        },
-        verification_delay_provider=lambda: 10,
-    )
-    with test_db.connect() as connection:
-        connection.execute(
-            "UPDATE fj_automation_actions SET verification_state = 'waiting_snapshot', verification_started_at = '2000-01-01T00:00:00Z', page_deadline_at = '2099-01-01T00:00:00Z', verification_attempts = 1 WHERE id = ?",
-            (action["id"],),
-        )
-    pending = boss_executor.report_page_status(test_db, executor_id, str(action["id"]), {
-        "execution_epoch": action["execution_epoch"], "state": "ready", "logged_in": True,
-        "page_kind": "detail", "encrypt_job_id": "encrypt-1", "contacted": False,
-        "reason": "页面仍未更新", "observed_at": int(time.time() * 1000),
+    executor_two, action_two = _prepare_dispatch(test_db, suffix="2")
+    boss_executor.complete_executor_action(test_db, executor_two, str(action_two["id"]), {
+        "execution_epoch": action_two["execution_epoch"], "outcome": "failed", "contacted": False,
+        "status_code": "BOSS_REQUEST_REJECTED", "message": "平台拒绝", "evidence": {},
     })
-    assert accepted["execution_state"] == "request_accepted"
-    assert pending["execution_state"] == "request_accepted"
-    assert pending["verification_state"] == "pending"
-    assert boss_executor.executor_snapshot(test_db, executor_id)["executor"]["queue_state"] == "running"
+    cancelled = boss_executor.cancel_failed_action(test_db, str(action_two["id"]))
     with pytest.raises(AppError) as error:
-        boss_executor.mark_dispatch_started(test_db, executor_id, str(action["id"]), int(action["execution_epoch"]))
-    assert error.value.error_category == "INVALID_LEASE"
+        boss_executor.cancel_failed_action(test_db, str(action_two["id"]))
+    assert error.value.error_category == "CANCEL_NOT_ALLOWED"
+    assert cancelled["queue"]["failed_actions"] == []
 
 
 def test_dispatch_result_timeout_becomes_unknown_without_immediate_pause(test_db) -> None:

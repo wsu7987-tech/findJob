@@ -47,7 +47,7 @@ const load = async () => {
 
 const executorStatusLabel = computed(() => {
   if (!executor.value) return "未配对";
-  if (!executor.value.browser_connected) return "浏览器未连接";
+  if (!executor.value.browser_connected) return "FineJob未连接";
   if (executor.value.risk_state !== "none") return "风险暂停";
   return executor.value.queue_state === "running" ? "运行中" : "已暂停";
 });
@@ -92,6 +92,34 @@ const createPairingCode = async () => {
     await executorStore.createPairingCode();
   } catch {
     ElMessage.error(executorStore.error ?? "生成配对码失败");
+  }
+};
+
+const testHeartbeat = async () => {
+  try {
+    await executorStore.testHeartbeat();
+    await load();
+    ElMessage.success("心跳测试成功，FineJob已连接");
+  } catch {
+    await load().catch(() => undefined);
+    ElMessage.error(executorStore.error ?? "心跳测试失败");
+  }
+};
+
+const disconnect = async () => {
+  try {
+    await ElMessageBox.confirm(
+      "断开后需要重新使用配对码连接插件，已保存的岗位和任务不会删除。",
+      "断开 BOSS 插件连接",
+      { type: "warning", confirmButtonText: "断开连接", cancelButtonText: "取消" }
+    );
+    await executorStore.disconnect();
+    await load();
+    ElMessage.success("BOSS 插件已断开");
+  } catch (value) {
+    if (value !== "cancel" && value !== "close") {
+      ElMessage.error(executorStore.error ?? "断开插件连接失败");
+    }
   }
 };
 
@@ -185,7 +213,9 @@ onBeforeUnmount(() => {
         <div><p class="panel-eyebrow">BOSS Executor</p><h2>BOSS 执行器</h2></div>
         <el-tag :type="executorStatusType">{{ executorStatusLabel }}</el-tag>
       </div>
-      <el-empty v-if="!executor" description="尚未配对执行器">
+      <el-empty v-if="!executor || !executor.browser_connected" description="等待BOSS执行器心跳连接">
+        <el-button :loading="executorStore.heartbeatTesting" @click="testHeartbeat">心跳测试</el-button>
+        <el-button v-if="executor" @click="disconnect">断开连接</el-button>
         <el-button type="primary" @click="createPairingCode">生成插件配对码</el-button>
       </el-empty>
       <template v-else>
@@ -196,6 +226,8 @@ onBeforeUnmount(() => {
           <el-descriptions-item label="最近心跳">{{ formatDateTime(executor.last_heartbeat_at || '') }}</el-descriptions-item>
         </el-descriptions>
         <div class="executor-actions">
+          <el-button :loading="executorStore.heartbeatTesting" @click="testHeartbeat">心跳测试</el-button>
+          <el-button @click="disconnect">断开连接</el-button>
           <el-button type="primary" @click="control(executor.permission_state === 'allowed' ? 'resume' : 'allow')">允许并运行</el-button>
           <el-button @click="control('pause')">暂停</el-button>
           <el-button type="danger" plain @click="control('emergency_stop')">紧急停止</el-button>

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import secrets
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from backend.app.db import Database
@@ -23,10 +24,15 @@ PAIRING_CODE_TTL_SECONDS = 300
 VERIFICATION_DELAY_MIN_SECONDS = 10
 VERIFICATION_DELAY_MAX_SECONDS = 30
 ACTIVE_VERIFICATION_STATES = {"waiting_refresh", "refreshing", "waiting_snapshot"}
+FAILED_QUEUE_STATES = {"failed_before_dispatch", "failed_after_dispatch"}
 TERMINAL_EXECUTION_STATES = {
     "succeeded", "cancelled", "blocked", "failed_before_dispatch", "failed_after_dispatch",
     "unknown_after_dispatch",
 }
+
+# 控制通道只在当前后端进程内保存连接和等待中的一次性请求，不增加数据库字段。
+_executor_channels: dict[str, Any] = {}
+_heartbeat_requests: dict[str, tuple[str, asyncio.Future[dict[str, object]]]] = {}
 
 
 def _hash(value: str) -> str:
@@ -60,6 +66,15 @@ def create_pairing_code(db: Database) -> dict[str, str]:
             (new_id(), _hash(code), expires_at, now),
         )
     return {"code": code, "expires_at": expires_at}
+
+
+def reset_executor_connections(db: Database) -> None:
+    """后端重启后由插件的下一次单次心跳重新确认连接。"""
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_boss_executor_instances SET browser_connected = 0, updated_at = ?",
+            (utc_now(),),
+        )
 
 
 def pair_executor(
@@ -112,6 +127,98 @@ def authenticate_executor(db: Database, token: str) -> dict[str, object]:
     if row is None:
         raise AppError(status_code=401, error_category="EXECUTOR_UNAUTHORIZED", error_message="执行器令牌无效。")
     return dict(row)
+
+
+async def register_executor_channel(executor_id: str, websocket: Any) -> None:
+    previous = _executor_channels.get(executor_id)
+    if previous is not None and previous is not websocket:
+        await previous.close(code=1000)
+    _executor_channels[executor_id] = websocket
+
+
+async def unregister_executor_channel(executor_id: str, websocket: Any) -> None:
+    if _executor_channels.get(executor_id) is websocket:
+        _executor_channels.pop(executor_id, None)
+    for request_id, (owner_id, future) in list(_heartbeat_requests.items()):
+        if owner_id != executor_id:
+            continue
+        _heartbeat_requests.pop(request_id, None)
+        if not future.done():
+            future.set_result({"ok": False, "message": "插件控制通道已断开。"})
+
+
+async def close_executor_channel(executor_id: str) -> None:
+    websocket = _executor_channels.pop(executor_id, None)
+    if websocket is None:
+        return
+    try:
+        await websocket.close(code=4001, reason="executor_disconnected")
+    except Exception:
+        pass
+
+
+async def handle_executor_channel_message(executor_id: str, message: object) -> None:
+    if not isinstance(message, dict) or message.get("type") != "heartbeat_test_result":
+        return
+    request_id = str(message.get("request_id") or "")
+    pending = _heartbeat_requests.pop(request_id, None)
+    if pending is None or pending[0] != executor_id:
+        return
+    future = pending[1]
+    if not future.done():
+        future.set_result({
+            "ok": bool(message.get("ok")),
+            "message": str(message.get("message") or ""),
+        })
+
+
+async def request_heartbeat_test(db: Database, executor_id: str) -> dict[str, object]:
+    websocket = _executor_channels.get(executor_id)
+    if websocket is None:
+        mark_executor_disconnected(db, executor_id)
+        raise AppError(status_code=409, error_category="EXECUTOR_NOT_CONNECTED", error_message="插件未连接，无法进行心跳测试。")
+    request_id = new_id()
+    future = asyncio.get_running_loop().create_future()
+    _heartbeat_requests[request_id] = (executor_id, future)
+    try:
+        await websocket.send_json({"type": "heartbeat_test", "request_id": request_id})
+        result = await asyncio.wait_for(future, timeout=6)
+    except asyncio.TimeoutError as exc:
+        _heartbeat_requests.pop(request_id, None)
+        mark_executor_disconnected(db, executor_id)
+        raise AppError(status_code=504, error_category="HEARTBEAT_TIMEOUT", error_message="插件未在规定时间内返回心跳。") from exc
+    except Exception as exc:
+        _heartbeat_requests.pop(request_id, None)
+        mark_executor_disconnected(db, executor_id)
+        raise AppError(status_code=409, error_category="EXECUTOR_NOT_CONNECTED", error_message="插件控制通道不可用。") from exc
+    if not result.get("ok"):
+        mark_executor_disconnected(db, executor_id)
+        raise AppError(status_code=502, error_category="HEARTBEAT_FAILED", error_message=str(result.get("message") or "插件心跳失败。"))
+    return executor_snapshot(db, executor_id)
+
+
+def mark_executor_disconnected(db: Database, executor_id: str) -> None:
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_boss_executor_instances SET browser_connected = 0, updated_at = ? WHERE id = ?",
+            (utc_now(), executor_id),
+        )
+
+
+async def disconnect_executor(db: Database, executor_id: str) -> dict[str, object]:
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_boss_executor_instances
+            SET token_hash = 'revoked:' || id, browser_connected = 0,
+                permission_state = 'not_authorized', queue_state = 'paused',
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (utc_now(), executor_id),
+        )
+    await close_executor_channel(executor_id)
+    return executor_snapshot(db, executor_id)
 
 
 def heartbeat(db: Database, executor_id: str, payload: dict[str, object]) -> dict[str, object]:
@@ -196,15 +303,18 @@ def executor_snapshot(db: Database, executor_id: str | None = None) -> dict[str,
 
 def list_queue(db: Database) -> dict[str, object]:
     with db.connect() as connection:
-        rows = connection.execute(
+        pending_rows = connection.execute(
             """
             SELECT a.*, j.title AS job_title, j.company_name, j.encrypt_job_id, j.job_link
             FROM fj_automation_actions a JOIN fj_boss_jobs j ON j.id = a.job_id
             WHERE a.action_type = 'BOSS_DEFAULT_GREETING'
-              AND a.execution_state NOT IN ('succeeded', 'cancelled', 'failed_before_dispatch', 'failed_after_dispatch')
+              AND a.execution_state IN (
+                'queued', 'opening_page', 'waiting_page_ready', 'page_verified',
+                'ready_to_dispatch', 'dispatch_started'
+              )
             ORDER BY CASE
               WHEN a.execution_state IN (
-                'opening_page','waiting_page_ready','page_verified','ready_to_dispatch','dispatch_started','request_accepted'
+                'opening_page','waiting_page_ready','page_verified','ready_to_dispatch','dispatch_started'
               ) THEN 0
               WHEN a.execution_state = 'unknown_after_dispatch' THEN 2
               ELSE 1
@@ -212,8 +322,132 @@ def list_queue(db: Database) -> dict[str, object]:
               a.queue_position ASC, a.created_at ASC
             """
         ).fetchall()
-    actions = [_serialize_action(row, include_payload=False) for row in rows]
-    return {"actions": actions, "total": len(actions)}
+        failed_rows = connection.execute(
+            """
+            SELECT a.*, j.title AS job_title, j.company_name, j.encrypt_job_id, j.job_link
+            FROM fj_automation_actions a JOIN fj_boss_jobs j ON j.id = a.job_id
+            WHERE a.action_type = 'BOSS_DEFAULT_GREETING'
+              AND a.execution_state IN ('failed_before_dispatch', 'failed_after_dispatch')
+            ORDER BY a.updated_at DESC, a.created_at DESC
+            """
+        ).fetchall()
+    actions = [_serialize_action(row, include_payload=False) for row in pending_rows]
+    failed_actions = [_serialize_action(row, include_payload=False) for row in failed_rows]
+    return {
+        "actions": actions,
+        "total": len(actions),
+        "failed_actions": failed_actions,
+        "failed_total": len(failed_actions),
+    }
+
+
+def _reset_failed_action(connection, action_id: str, queue_position: int, now: str) -> None:
+    # 重试动作重新进入待执行队列，并让旧执行轮次立即失效。
+    connection.execute(
+        """
+        UPDATE fj_automation_actions
+        SET status = 'queued', execution_state = 'queued', queue_position = ?,
+            execution_epoch = execution_epoch + 1, lease_owner = NULL,
+            lease_expires_at = NULL, page_open_attempts = 0, page_deadline_at = NULL,
+            dispatch_started_at = NULL, request_accepted_at = NULL,
+            verification_state = 'not_required', verification_method = 'none',
+            verification_delay_seconds = NULL, verification_due_at = NULL,
+            verification_started_at = NULL, verification_completed_at = NULL,
+            verification_attempts = 0, cooldown_seconds = NULL, next_eligible_at = NULL,
+            last_status_code = 'RETRY_QUEUED', last_error = NULL,
+            result_json = '{}', completed_at = NULL, updated_at = ?
+        WHERE id = ?
+        """,
+        (queue_position, now, action_id),
+    )
+
+
+def retry_failed_action(db: Database, action_id: str) -> dict[str, object]:
+    action = _require_action(db, action_id)
+    if action["execution_state"] not in FAILED_QUEUE_STATES:
+        raise AppError(status_code=409, error_category="RETRY_NOT_ALLOWED", error_message="当前动作不在执行失败队列。")
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        max_position = int(connection.execute(
+            "SELECT COALESCE(MAX(queue_position), 0) FROM fj_automation_actions"
+        ).fetchone()[0])
+        _reset_failed_action(connection, action_id, max_position + 1, now)
+    _audit(db, "boss_failed_action_retried", "执行失败动作已重新加入待执行队列。", {"action_id": action_id})
+    return {"action": _serialize_action(_require_action(db, action_id)), "queue": list_queue(db)}
+
+
+def retry_all_failed_actions(db: Database) -> dict[str, object]:
+    now = utc_now()
+    retried_ids: list[str] = []
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute(
+            """
+            SELECT id FROM fj_automation_actions
+            WHERE action_type = 'BOSS_DEFAULT_GREETING'
+              AND execution_state IN ('failed_before_dispatch', 'failed_after_dispatch')
+            ORDER BY updated_at ASC, created_at ASC
+            """
+        ).fetchall()
+        max_position = int(connection.execute(
+            "SELECT COALESCE(MAX(queue_position), 0) FROM fj_automation_actions"
+        ).fetchone()[0])
+        for offset, row in enumerate(rows, start=1):
+            action_id = str(row["id"])
+            _reset_failed_action(connection, action_id, max_position + offset, now)
+            retried_ids.append(action_id)
+    _audit(db, "boss_failed_actions_retried", "执行失败动作已全部重新加入待执行队列。", {"action_ids": retried_ids})
+    return {"action_ids": retried_ids, "queue": list_queue(db)}
+
+
+def cancel_failed_action(db: Database, action_id: str) -> dict[str, object]:
+    action = _require_action(db, action_id)
+    if action["execution_state"] not in FAILED_QUEUE_STATES:
+        raise AppError(status_code=409, error_category="CANCEL_NOT_ALLOWED", error_message="当前动作不在执行失败队列。")
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_automation_actions
+            SET status = 'cancelled', execution_state = 'cancelled', lease_owner = NULL,
+                lease_expires_at = NULL, page_deadline_at = NULL,
+                last_status_code = 'FAILURE_CANCELLED', updated_at = ?, completed_at = ?
+            WHERE id = ?
+            """,
+            (now, now, action_id),
+        )
+    _audit(db, "boss_failed_action_cancelled", "执行失败动作已撤销。", {"action_id": action_id})
+    return {"action": _serialize_action(_require_action(db, action_id)), "queue": list_queue(db)}
+
+
+def cancel_all_failed_actions(db: Database) -> dict[str, object]:
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute(
+            """
+            SELECT id FROM fj_automation_actions
+            WHERE action_type = 'BOSS_DEFAULT_GREETING'
+              AND execution_state IN ('failed_before_dispatch', 'failed_after_dispatch')
+            ORDER BY updated_at ASC, created_at ASC
+            """
+        ).fetchall()
+        action_ids = [str(row["id"]) for row in rows]
+        if action_ids:
+            connection.execute(
+                """
+                UPDATE fj_automation_actions
+                SET status = 'cancelled', execution_state = 'cancelled', lease_owner = NULL,
+                    lease_expires_at = NULL, page_deadline_at = NULL,
+                    last_status_code = 'FAILURE_CANCELLED', updated_at = ?, completed_at = ?
+                WHERE action_type = 'BOSS_DEFAULT_GREETING'
+                  AND execution_state IN ('failed_before_dispatch', 'failed_after_dispatch')
+                """,
+                (now, now),
+            )
+    _audit(db, "boss_failed_actions_cancelled", "执行失败动作已全部撤销。", {"action_ids": action_ids})
+    return {"action_ids": action_ids, "queue": list_queue(db)}
 
 
 def open_navigation(
@@ -364,7 +598,15 @@ def report_page_status(
 ) -> dict[str, object]:
     action = _require_owned_action(db, executor_id, action_id, int(payload["execution_epoch"]))
     if action["execution_state"] == "request_accepted":
-        return _report_verification_snapshot(db, executor_id, action, payload)
+        # 兼容历史待验证动作，收到页面状态时保持成功结果，不再恢复验证流程。
+        return _finish_action(
+            db,
+            executor_id,
+            action_id,
+            "succeeded",
+            "BOSS_REQUEST_ACCEPTED_LEGACY_COMPLETED",
+            {"legacy_verification_removed": True},
+        )
     if action["execution_state"] not in {"waiting_page_ready", "page_verified", "ready_to_dispatch"}:
         raise AppError(status_code=409, error_category="INVALID_STATE", error_message="当前动作不再等待页面状态。")
     state = str(payload.get("state") or "waiting")
@@ -412,29 +654,25 @@ def complete_executor_action(
     executor_id: str,
     action_id: str,
     payload: dict[str, object],
-    *,
-    verification_delay_provider: Callable[[], int] | None = None,
 ) -> dict[str, object]:
     epoch = int(payload["execution_epoch"])
     action = _require_action(db, action_id)
     if int(action["execution_epoch"]) != epoch:
         raise AppError(status_code=409, error_category="STALE_EXECUTION_EPOCH", error_message="该状态属于已经失效的执行轮次。")
-    # accepted 回写允许幂等重试；只重试状态回写，绝不能再次调用平台请求。
-    if payload.get("outcome") == "accepted" and action["request_accepted_at"]:
-        return _serialize_action(action)
     action = _require_owned_action(db, executor_id, action_id, epoch)
     if action["execution_state"] != "dispatch_started":
         raise AppError(status_code=409, error_category="INVALID_STATE", error_message="动作尚未进入真实发送阶段。")
     evidence = _sanitize_execution_evidence(payload.get("evidence"))
     evidence.update({"message": str(payload.get("message") or ""), "contacted": payload.get("contacted")})
     if payload.get("outcome") == "accepted":
-        return _accept_action(
+        # 平台明确受理后立即完成动作，成功结果不再进入页面验证状态。
+        return _finish_action(
             db,
             executor_id,
             action_id,
+            "succeeded",
             str(payload.get("status_code") or "BOSS_REQUEST_ACCEPTED"),
             evidence,
-            verification_delay_provider=verification_delay_provider,
         )
     if payload.get("outcome") == "succeeded" and payload.get("contacted") is True:
         return _finish_action(db, executor_id, action_id, "succeeded", str(payload.get("status_code") or "SUCCESS"), evidence)
@@ -575,13 +813,14 @@ def sweep_page_timeout(
     if not action:
         return
     if action["execution_state"] == "request_accepted":
-        _sweep_contact_verification(
+        # 兼容历史待验证动作，后续心跳将其直接收敛为成功。
+        _finish_action(
             db,
             executor_id,
-            action,
-            browser_status_provider=browser_status_provider,
-            random_seconds=random_seconds,
-            verification_reload_provider=verification_reload_provider,
+            action_id,
+            "succeeded",
+            "BOSS_REQUEST_ACCEPTED_LEGACY_COMPLETED",
+            {"legacy_verification_removed": True},
         )
         return
     if action["execution_state"] == "dispatch_started":
@@ -591,6 +830,17 @@ def sweep_page_timeout(
             and (datetime.now(timezone.utc) - dispatch_started_at).total_seconds()
             >= DISPATCH_RESULT_TIMEOUT_SECONDS
         ):
+            heartbeat_at = _parse_time(executor["last_heartbeat_at"])
+            heartbeat_ok = bool(
+                heartbeat_at
+                and (datetime.now(timezone.utc) - heartbeat_at).total_seconds() <= HEARTBEAT_TTL_SECONDS
+            )
+            if not heartbeat_ok:
+                with db.connect() as connection:
+                    connection.execute(
+                        "UPDATE fj_boss_executor_instances SET browser_connected = 0, updated_at = ? WHERE id = ?",
+                        (utc_now(), executor_id),
+                    )
             _mark_unknown_after_dispatch(
                 db,
                 executor_id,

@@ -81,7 +81,7 @@ export const executeDefaultGreeting = async (
       outcome: "accepted",
       contacted: null,
       statusCode: "BOSS_REQUEST_ACCEPTED",
-      message: "平台已受理建立沟通请求，等待状态验证",
+      message: "平台已受理建立沟通请求，执行成功",
       evidence: { responseCode: body.code, httpStatus: response.status }
     };
   } catch (error) {

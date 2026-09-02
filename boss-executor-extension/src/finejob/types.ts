@@ -54,6 +54,7 @@ export type ExecutorRuntimeState = {
   detail: string;
   executor: FineJobExecutorInstance | null;
   queue: FineJobQueueAction[];
+  failedQueue: FineJobQueueAction[];
   currentAction: FineJobQueueAction | null;
   lastResult: string;
   chat?: BossChatCoordinatorStatus;
@@ -157,8 +158,14 @@ export type MainWorldExecutionResult = {
 
 export type ExecutorPanelController = {
   pair(code: string): Promise<void>;
+  testHeartbeat(): Promise<void>;
+  disconnect(): Promise<void>;
   control(command: "allow" | "pause" | "resume" | "emergency_stop"): Promise<void>;
   returnToReview(actionId: string): Promise<void>;
+  retryFailedAction(actionId: string): Promise<void>;
+  cancelFailedAction(actionId: string): Promise<void>;
+  retryAllFailed(): Promise<void>;
+  cancelAllFailed(): Promise<void>;
 };
 
 export type SnapshotReport = Pick<

@@ -940,6 +940,16 @@ export const api = {
       body: JSON.stringify({ command })
     });
   },
+  async testFineJobBossExecutorHeartbeat() {
+    return request<FineJobBossExecutorDashboard>("/api/fine-job/boss-executor/desktop-heartbeat-test", {
+      method: "POST"
+    });
+  },
+  async disconnectFineJobBossExecutor() {
+    return request<FineJobBossExecutorDashboard>("/api/fine-job/boss-executor/desktop-disconnect", {
+      method: "POST"
+    });
+  },
   async createFineJobBossPairingCode() {
     return request<{ code: string; expires_at: string }>(
       "/api/fine-job/boss-executor/pairing-code",

@@ -28,7 +28,7 @@ const pageDescription = computed(() => ({
 const executorLabel = computed(() => {
   const executor = executorStore.dashboard?.executor;
   if (!executor) return "未配对";
-  if (!executor.browser_connected) return "浏览器未连接";
+  if (!executor.browser_connected) return "FineJob未连接";
   if (executor.risk_state !== "none") return "风险暂停";
   if (executor.queue_state === "running") return "运行中";
   return "已暂停";
@@ -36,7 +36,7 @@ const executorLabel = computed(() => {
 
 const executorType = computed(() => {
   if (executorLabel.value === "运行中") return "success";
-  if (["未配对", "浏览器未连接"].includes(executorLabel.value)) return "info";
+  if (["未配对", "FineJob未连接"].includes(executorLabel.value)) return "info";
   return "warning";
 });
 
@@ -248,7 +248,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <div class="card-actions">
-        <el-button v-if="!executorStore.dashboard?.executor" @click="createPairingCode">生成配对码</el-button>
+        <el-button v-if="!executorStore.dashboard?.executor || !executorStore.dashboard.executor.browser_connected" @click="createPairingCode">生成配对码</el-button>
         <el-button type="primary" plain @click="router.push({ name: 'fine-job-runs' })">查看运行状态</el-button>
       </div>
     </section>

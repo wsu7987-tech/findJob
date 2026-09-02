@@ -42,7 +42,7 @@ from backend.app.services.pdf_reparse_job_store import PdfReparseJobStore
 from backend.app.services.web_draft_store import WebDraftStore
 from backend.app.services.web_reparse_job_store import WebReparseJobStore
 from backend.app.services.web_session_profiles import WebSessionProfileStore
-from backend.app.services.fine_job.boss_chat import BossChatScheduler
+from backend.app.services.fine_job import boss_executor
 from backend.app.services.fine_job.codex_runtime import CodexRuntimeRegistry
 from backend.app.services.fine_job.profile_store import ensure_default_profile
 
@@ -57,13 +57,15 @@ def create_app() -> FastAPI:
 
     db = Database(config.sqlite_path)
     db.initialize()
+    # 后端启动后等待插件主动完成一次心跳测试，再恢复执行器连接状态。
+    boss_executor.reset_executor_connections(db)
     ensure_default_profile(db)
 
     app = FastAPI(title="Knowledge Curator Backend")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["null"],
-        allow_origin_regex=r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$",
+        allow_origin_regex=r"^(https?://(127\.0\.0\.1|localhost)(:\d+)?|chrome-extension://[a-z0-9-]+)$",
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -77,11 +79,7 @@ def create_app() -> FastAPI:
     app.state.web_session_profile_store = WebSessionProfileStore(
         config.app_data_dir / "web-session-profiles.json"
     )
-    app.state.boss_chat_scheduler = BossChatScheduler(db, config)
     app.state.codex_runtime_registry = CodexRuntimeRegistry()
-    # 当前 FastAPI 版本由 Router 暴露生命周期注册接口。
-    app.router.add_event_handler("startup", app.state.boss_chat_scheduler.start)
-    app.router.add_event_handler("shutdown", app.state.boss_chat_scheduler.stop)
 
     register_error_handlers(app)
 
