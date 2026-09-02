@@ -11,6 +11,26 @@ from backend.app.services.fine_job.boss_scraper.service import (
 )
 
 
+def test_build_search_url_includes_multiple_filter_values() -> None:
+    url = engine.build_search_url(
+        "AI Agent应用开发",
+        "101280100",
+        1,
+        {
+            "jobType": "1901",
+            "salary": "406",
+            "experience": "105,106,104,103,101",
+            "degree": "202,203,206,208,209",
+        },
+    )
+
+    assert url == (
+        "https://www.zhipin.com/web/geek/jobs?query=AI+Agent%E5%BA%94%E7%94%A8%E5%BC%80%E5%8F%91"
+        "&city=101280100&page=1&jobType=1901&salary=406"
+        "&experience=105,106,104,103,101&degree=202,203,206,208,209"
+    )
+
+
 def test_network_capture_stop_interrupts_before_waiting() -> None:
     capture = engine.NetworkJoblistCapture(None, "session-1")
 

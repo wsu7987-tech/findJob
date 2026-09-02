@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 
 ReviewStatus = Literal["pending", "approved", "rejected", "dismissed"]
+ReviewExecutionView = Literal["running", "executed"]
 ReviewDecision = Literal["recommend", "review", "reject"]
 ActionStatus = Literal[
     "queued", "leased", "succeeded", "failed", "blocked", "unknown", "cancelled"
@@ -26,6 +27,8 @@ class FineJobReviewItemResponse(BaseModel):
     job_title: str
     company_name: str
     job_link: str
+    company_id: str | None = None
+    company_type: str | None = None
     evaluation: dict[str, Any]
     created_at: str
     updated_at: str
@@ -34,6 +37,8 @@ class FineJobReviewItemResponse(BaseModel):
     action_status: ActionStatus | None = None
     execution_state: str | None = None
     action_last_error: str | None = None
+    company_chat_session_id: str | None = None
+    job_chat_session_id: str | None = None
 
 
 class FineJobReviewItemListEnvelope(BaseModel):
@@ -41,6 +46,23 @@ class FineJobReviewItemListEnvelope(BaseModel):
     total: int
     page: int = 1
     page_size: int = 50
+
+
+class FineJobReviewChatLinkBatchRequest(BaseModel):
+    status: Literal["pending", "rejected", "approved"]
+    execution_view: Literal["running"] | None = None
+    decision: ReviewDecision | None = None
+    query: str = Field(default="", max_length=120)
+    execution_state: str | None = Field(default=None, max_length=80)
+    created_from: str | None = Field(default=None, max_length=40)
+    created_to: str | None = Field(default=None, max_length=40)
+
+
+class FineJobReviewChatLinkBatchResponse(BaseModel):
+    matched: int
+    archived: int
+    confirmed: int
+    unmatched: int
 
 
 class FineJobReviewApproveRequest(BaseModel):

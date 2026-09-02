@@ -1470,7 +1470,8 @@ def build_search_url(keyword, city_code, page, filters):
         if code:
             params[key] = code
     # BOSS 当前搜索页使用复数路径，直接生成实际地址以避免导航后重定向。
-    return f"https://www.zhipin.com/web/geek/jobs?{urlencode(params)}"
+    # 多选条件按 BOSS 页面约定保留英文逗号，方便在地址栏直接识别选项组合。
+    return f"https://www.zhipin.com/web/geek/jobs?{urlencode(params, safe=',')}"
 
 
 def build_detail_url(job):

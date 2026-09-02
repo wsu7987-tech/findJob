@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { useRouter } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 
 import { formatDateTime } from "@/services/format";
 import {
@@ -15,6 +15,7 @@ import type { FineJobChatSession } from "@/types";
 
 const store = useFineJobBossChatStore();
 const router = useRouter();
+const route = useRoute();
 const instruction = ref("");
 const finalText = ref("");
 const expandedMessages = ref<Record<string, boolean>>({});
@@ -354,7 +355,12 @@ const emergencyStop = async () => {
 };
 
 onMounted(() => {
-  void store.load().catch(() => ElMessage.error(store.error ?? "自动代聊加载失败"));
+  void store.load()
+    .then(async () => {
+      const sessionId = typeof route.query.session_id === "string" ? route.query.session_id : "";
+      if (sessionId) await store.loadDetail(sessionId);
+    })
+    .catch(() => ElMessage.error(store.error ?? "自动代聊加载失败"));
 });
 onBeforeUnmount(() => {
   saveEditor();
@@ -797,8 +803,8 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: minmax(230px, 0.75fr) minmax(360px, 1.4fr) minmax(300px, 1fr);
   gap: 0;
-  min-height: 620px;
-  max-height: 1000px;
+  min-height: 300px;
+  max-height: 600px;
   padding: 0;
   overflow: hidden;
 }

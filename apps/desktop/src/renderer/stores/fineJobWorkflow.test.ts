@@ -66,6 +66,7 @@ describe("fineJobWorkflow store", () => {
 
     expect(api.listFineJobReviewItems).toHaveBeenCalledWith({
       status: "pending",
+      execution_view: "",
       decision: "",
       query: "",
       execution_state: "",

@@ -49,6 +49,7 @@
   FineJobBossSearchPageRequest,
   FineJobBossSearchPageResponse,
   FineJobReviewBatchResponse,
+  FineJobReviewChatLinkBatchResponse,
   FineJobReviewItemListEnvelope,
   FineJobReviewQuery,
   FineJobAutomationActionEnvelope,
@@ -1022,6 +1023,20 @@ export const api = {
       `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/history/refresh`,
       { method: "POST" }
     );
+  },
+  async linkFineJobReviewItemsChat(payload: {
+    status: "pending" | "rejected" | "approved";
+    execution_view?: "running";
+    decision?: FineJobReviewQuery["decision"];
+    query?: string;
+    execution_state?: FineJobReviewQuery["execution_state"];
+    created_from?: string;
+    created_to?: string;
+  }) {
+    return request<FineJobReviewChatLinkBatchResponse>("/api/fine-job/review-items/link-chat", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
   },
   async getFineJobChatBatchSummary() {
     return request<FineJobChatBatchSummary>("/api/fine-job/boss-chat/batch/summary");

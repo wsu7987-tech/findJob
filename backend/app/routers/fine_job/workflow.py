@@ -15,16 +15,20 @@ from backend.app.schemas.fine_job.workflow import (
     FineJobReviewArchiveRequest,
     FineJobReviewBatchRequest,
     FineJobReviewBatchResponse,
+    FineJobReviewChatLinkBatchRequest,
+    FineJobReviewChatLinkBatchResponse,
     FineJobReviewItemListEnvelope,
     FineJobReviewItemResponse,
     FineJobReviewRejectRequest,
     ReviewDecision,
+    ReviewExecutionView,
     ReviewStatus,
 )
 from backend.app.services.fine_job.workflow import (
     approve_review_item,
     archive_review_item,
     batch_review_items,
+    link_review_items_chat,
     claim_next_action,
     complete_action,
     list_automation_actions,
@@ -40,6 +44,7 @@ router = APIRouter(prefix="/fine-job", tags=["fine-job-workflow"])
 @router.get("/review-items", response_model=FineJobReviewItemListEnvelope)
 def get_fine_job_review_items(
     status: ReviewStatus | None = None,
+    execution_view: ReviewExecutionView | None = None,
     decision: ReviewDecision | None = None,
     query: str = Query(default="", max_length=120),
     execution_state: str | None = Query(default=None, max_length=80),
@@ -52,6 +57,7 @@ def get_fine_job_review_items(
     return FineJobReviewItemListEnvelope(**list_review_items(
         db,
         status=status,
+        execution_view=execution_view,
         decision=decision,
         query=query,
         execution_state=execution_state,
@@ -106,6 +112,26 @@ def archive_fine_job_review_item(
     return FineJobReviewItemResponse(
         **archive_review_item(db, review_item_id, note=payload.note)
     )
+
+
+@router.post(
+    "/review-items/link-chat",
+    response_model=FineJobReviewChatLinkBatchResponse,
+)
+def link_fine_job_review_items_chat(
+    payload: FineJobReviewChatLinkBatchRequest,
+    db: Database = Depends(get_database),
+) -> FineJobReviewChatLinkBatchResponse:
+    return FineJobReviewChatLinkBatchResponse(**link_review_items_chat(
+        db,
+        status=payload.status,
+        execution_view=payload.execution_view,
+        decision=payload.decision,
+        query=payload.query,
+        execution_state=payload.execution_state,
+        created_from=payload.created_from,
+        created_to=payload.created_to,
+    ))
 
 
 @router.post(

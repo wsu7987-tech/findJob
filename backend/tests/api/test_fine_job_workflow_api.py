@@ -205,6 +205,45 @@ def test_review_filters_batch_archive_and_restore(configured_client) -> None:
     assert approved_item["action_status"] == "queued"
 
 
+def test_review_execution_views_separate_running_and_executed_items(configured_client) -> None:
+    strategy = configured_client.post(
+        "/api/fine-job/strategies/recommendations",
+        json={"name": "执行视图测试", "evaluation_method": "rules", "required_skills": ["Python"]},
+    ).json()["strategy"]
+    job = _create_history_job(
+        configured_client,
+        job_id="workflow-execution-view",
+        title="Python 执行状态",
+        jd="负责 Python 服务开发",
+    )
+    configured_client.post(
+        f"/api/fine-job/boss-capture/history/{job['id']}/delivery-evaluations",
+        json={"recommendation_strategy_id": strategy["id"]},
+    )
+    review_id = configured_client.get(
+        "/api/fine-job/review-items", params={"status": "pending"}
+    ).json()["items"][0]["id"]
+    action_id = configured_client.post(
+        f"/api/fine-job/review-items/{review_id}/approve", json={"message": "您好"}
+    ).json()["action"]["id"]
+
+    running = configured_client.get(
+        "/api/fine-job/review-items", params={"execution_view": "running"}
+    ).json()
+    assert [item["action_id"] for item in running["items"]] == [action_id]
+
+    db = configured_client.app.state.db
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_automation_actions SET execution_state = 'succeeded' WHERE id = ?",
+            (action_id,),
+        )
+    executed = configured_client.get(
+        "/api/fine-job/review-items", params={"execution_view": "executed"}
+    ).json()
+    assert [item["action_id"] for item in executed["items"]] == [action_id]
+
+
 def test_recommended_job_is_auto_queued_only_with_confirmed_auto_policy(
     configured_client,
 ) -> None:

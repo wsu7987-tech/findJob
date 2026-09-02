@@ -6,7 +6,7 @@ import { useRouter } from "vue-router";
 import { formatDateTime } from "@/services/format";
 import { useFineJobBossExecutorStore } from "@/stores/fineJobBossExecutor";
 import { useFineJobWorkflowStore } from "@/stores/fineJobWorkflow";
-import type { FineJobReviewItem, FineJobReviewStatus } from "@/types";
+import type { FineJobReviewItem, FineJobReviewTab } from "@/types";
 
 const router = useRouter();
 const workflowStore = useFineJobWorkflowStore();
@@ -20,7 +20,8 @@ let executorPollTimer: number | null = null;
 const pageDescription = computed(() => ({
   pending: "集中审核推荐岗位和需要判断的岗位，批准后进入默认招呼队列。",
   rejected: "查看 AI 不建议或用户拒绝的岗位，可明确覆盖结论。",
-  approved: "跟踪已经批准的岗位及其实际执行状态。",
+  running: "查看已经批准、等待执行或正在推进的岗位。",
+  executed: "查看已经完成沟通、发送后失败或结果未知的岗位。",
   dismissed: "保存用户主动归档和被新评估替代的历史事项。"
 })[workflowStore.selectedStatus]);
 
@@ -39,7 +40,7 @@ const executorType = computed(() => {
   return "warning";
 });
 
-const loadStatus = async (status: FineJobReviewStatus, resetPage = false) => {
+const loadStatus = async (status: FineJobReviewTab, resetPage = false) => {
   if (resetPage) workflowStore.page = 1;
   try {
     await workflowStore.load(status);
@@ -51,7 +52,7 @@ const loadStatus = async (status: FineJobReviewStatus, resetPage = false) => {
 
 const search = () => loadStatus(workflowStore.selectedStatus, true);
 const handleTabChange = (name: string | number) =>
-  loadStatus(String(name) as FineJobReviewStatus, true);
+  loadStatus(String(name) as FineJobReviewTab, true);
 const resetFilters = () => {
   workflowStore.query = "";
   workflowStore.decision = "";
@@ -108,6 +109,26 @@ const restore = async (item: FineJobReviewItem) => {
   }
 };
 
+const canRestore = (item: FineJobReviewItem) => item.status === "dismissed" && (
+  item.resolution_note.startsWith("用户归档")
+  || item.resolution_note.startsWith("用户关联已有聊天会话后归档")
+);
+
+const linkChatBatch = async () => {
+  try {
+    const result = await workflowStore.linkChatBatch();
+    const completed = result.confirmed ? `；确认已执行 ${result.confirmed} 项` : "";
+    ElMessage.success(`已关联 ${result.matched} 项并归档 ${result.archived} 项${completed}；未匹配 ${result.unmatched} 项`);
+  } catch {
+    ElMessage.error(workflowStore.error ?? "关联聊天信息失败");
+  }
+};
+
+const openChat = (sessionId: string) => router.push({
+  name: "fine-job-chat",
+  query: { session_id: sessionId }
+});
+
 const runBatch = async (operation: "approve" | "reject" | "archive") => {
   if (!selectedRows.value.length) return;
   const labels = { approve: "批准并加入队列", reject: "拒绝", archive: "归档" };
@@ -150,7 +171,7 @@ const returnToReview = async (item: FineJobReviewItem) => {
   if (!item.action_id) return;
   try {
     await executorStore.returnToReview(item.action_id);
-    await workflowStore.load("approved");
+    await workflowStore.load(workflowStore.selectedStatus);
     ElMessage.success("已取消未发送动作并退回待确认");
   } catch {
     ElMessage.error(executorStore.error ?? "退回待确认失败");
@@ -285,7 +306,8 @@ onBeforeUnmount(() => {
       <el-tabs v-model="workflowStore.selectedStatus" @tab-change="handleTabChange">
         <el-tab-pane label="待确认" name="pending" />
         <el-tab-pane label="不建议/已拒绝" name="rejected" />
-        <el-tab-pane label="已批准" name="approved" />
+        <el-tab-pane label="待执行" name="running" />
+        <el-tab-pane label="已执行" name="executed" />
         <el-tab-pane label="已归档" name="dismissed" />
       </el-tabs>
 
@@ -294,6 +316,14 @@ onBeforeUnmount(() => {
         <el-button type="primary" @click="runBatch('approve')">批量批准</el-button>
         <el-button v-if="workflowStore.selectedStatus === 'pending'" type="danger" plain @click="runBatch('reject')">批量拒绝</el-button>
         <el-button @click="runBatch('archive')">批量归档</el-button>
+      </div>
+      <div v-if="['pending', 'rejected', 'running'].includes(workflowStore.selectedStatus)" class="batch-toolbar">
+        <el-button type="success" :loading="workflowStore.loading" @click="linkChatBatch">关联聊天信息</el-button>
+        <span class="secondary-text">
+          {{ workflowStore.selectedStatus === 'running'
+            ? '按当前筛选条件关联全部分页记录，匹配到同岗位聊天会话后确认已执行。'
+            : '按当前筛选条件关联全部分页记录，匹配到同岗位聊天会话后归档。' }}
+        </span>
       </div>
 
       <el-table
@@ -312,7 +342,21 @@ onBeforeUnmount(() => {
             <p v-if="navigationErrors[row.id]" class="row-error">{{ navigationErrors[row.id] }}</p>
           </template>
         </el-table-column>
-        <el-table-column prop="company_name" label="公司" min-width="150" />
+        <el-table-column label="公司" min-width="220">
+          <template #default="{ row }">
+            <div class="company-cell">
+              <span>{{ row.company_name }}</span>
+              <el-tag v-if="row.company_type === 'outsourcing'" type="warning" size="small">外包公司</el-tag>
+              <el-tag
+                v-if="row.company_chat_session_id"
+                class="company-chat-tag"
+                type="success"
+                size="small"
+                @click="openChat(row.company_chat_session_id)"
+              >有过沟通</el-tag>
+            </div>
+          </template>
+        </el-table-column>
         <el-table-column label="AI 结论" width="115">
           <template #default="{ row }"><el-tag :type="decisionType(row.ai_decision)">{{ decisionLabel(row.ai_decision) }}</el-tag></template>
         </el-table-column>
@@ -340,7 +384,7 @@ onBeforeUnmount(() => {
               <el-button link type="warning" @click="approve(row)">仍要沟通</el-button>
               <el-button link @click="archive(row)">归档</el-button>
             </template>
-            <el-button v-else-if="row.status === 'dismissed' && row.resolution_note.startsWith('用户归档')" link type="primary" @click="restore(row)">恢复</el-button>
+            <el-button v-else-if="canRestore(row)" link type="primary" @click="restore(row)">恢复</el-button>
             <el-button v-else-if="canReturnToReview(row)" link type="danger" @click="returnToReview(row)">退回</el-button>
           </template>
         </el-table-column>
@@ -405,6 +449,8 @@ onBeforeUnmount(() => {
 .batch-toolbar { padding: 10px 0 14px; }
 .review-pagination { display: flex; justify-content: flex-end; padding-top: 18px; }
 .row-error { margin: 2px 0 0; color: var(--el-color-danger); font-size: 12px; }
+.company-cell { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.company-chat-tag { cursor: pointer; }
 .review-detail { padding-top: 18px; line-height: 1.75; }
 .review-detail h3 { margin: 18px 0 6px; }
 .evaluation-warning { color: var(--el-color-warning); }

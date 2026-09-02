@@ -742,6 +742,7 @@ export interface FineJobActionLogListEnvelope {
 }
 
 export type FineJobReviewStatus = "pending" | "approved" | "rejected" | "dismissed";
+export type FineJobReviewTab = FineJobReviewStatus | "running" | "executed";
 export type FineJobAutomationActionStatus =
   | "queued"
   | "leased"
@@ -791,6 +792,8 @@ export interface FineJobReviewItem {
   job_title: string;
   company_name: string;
   job_link: string;
+  company_id?: string | null;
+  company_type?: FineJobCompanyType | null;
   evaluation: FineJobBossDeliveryEvaluation;
   created_at: string;
   updated_at: string;
@@ -799,6 +802,8 @@ export interface FineJobReviewItem {
   action_status?: FineJobAutomationActionStatus | null;
   execution_state?: FineJobBossExecutionState | null;
   action_last_error?: string | null;
+  company_chat_session_id?: string | null;
+  job_chat_session_id?: string | null;
 }
 
 export interface FineJobReviewItemListEnvelope {
@@ -810,6 +815,7 @@ export interface FineJobReviewItemListEnvelope {
 
 export interface FineJobReviewQuery {
   status?: FineJobReviewStatus;
+  execution_view?: "running" | "executed" | "";
   decision?: FineJobReviewItem["ai_decision"] | "";
   query?: string;
   execution_state?: FineJobBossExecutionState | "";
@@ -1114,6 +1120,13 @@ export interface FineJobChatHistoryRefreshResponse {
   inserted_count: number;
   message_update_required: boolean;
   has_more: boolean;
+}
+
+export interface FineJobReviewChatLinkBatchResponse {
+  matched: number;
+  archived: number;
+  confirmed: number;
+  unmatched: number;
 }
 export interface FineJobChatBatchSummary {
   pending_chat_count: number;

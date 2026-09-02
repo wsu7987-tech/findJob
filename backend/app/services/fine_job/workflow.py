@@ -13,6 +13,7 @@ from backend.app.utils import new_id, utc_now
 
 
 ReviewStatus = Literal["pending", "approved", "rejected", "dismissed"]
+ReviewExecutionView = Literal["running", "executed"]
 ActionStatus = Literal[
     "queued", "leased", "succeeded", "failed", "blocked", "unknown", "cancelled"
 ]
@@ -186,6 +187,7 @@ def list_review_items(
     db: Database,
     *,
     status: ReviewStatus | None = None,
+    execution_view: ReviewExecutionView | None = None,
     decision: str | None = None,
     query: str = "",
     execution_state: str | None = None,
@@ -199,6 +201,20 @@ def list_review_items(
     if status:
         conditions.append("r.status = ?")
         values.append(status)
+    if execution_view:
+        # 执行视图只呈现已批准且已经创建动作的事项，避免和待确认、归档状态混在一起。
+        conditions.append("r.status = 'approved'")
+        if execution_view == "running":
+            conditions.append(
+                "a.execution_state IN ('queued', 'opening_page', 'waiting_page_ready', "
+                "'page_verified', 'ready_to_dispatch', 'dispatch_started', "
+                "'request_accepted', 'cancellation_requested')"
+            )
+        else:
+            conditions.append(
+                "a.execution_state IN ('succeeded', 'failed_after_dispatch', "
+                "'unknown_after_dispatch')"
+            )
     if decision:
         conditions.append("r.ai_decision = ?")
         values.append(decision)
@@ -234,14 +250,32 @@ def list_review_items(
         rows = connection.execute(
             f"""
             SELECT r.*, j.title AS job_title, j.company_name, j.job_link,
-                   j.source_job_id, j.encrypt_job_id,
+                   j.source_job_id, j.encrypt_job_id, j.company_id,
+                   c.company_type,
                    e.evaluation_json,
                    a.id AS action_id, a.status AS action_status,
-                   a.execution_state, a.last_error AS action_last_error
+                   a.execution_state, a.last_error AS action_last_error,
+                   (
+                     SELECT s.id
+                     FROM fj_chat_sessions s
+                     JOIN fj_boss_jobs chat_job ON chat_job.id = s.job_id
+                     WHERE chat_job.company_id = j.company_id
+                     ORDER BY s.updated_at DESC, s.id DESC
+                     LIMIT 1
+                   ) AS company_chat_session_id,
+                   (
+                     SELECT s.id
+                     FROM fj_chat_sessions s
+                     WHERE s.job_id = r.job_id
+                        OR (j.encrypt_job_id <> '' AND s.encrypt_job_id = j.encrypt_job_id)
+                     ORDER BY s.updated_at DESC, s.id DESC
+                     LIMIT 1
+                   ) AS job_chat_session_id
             FROM fj_review_items r
             JOIN fj_boss_jobs j ON j.id = r.job_id
             JOIN fj_job_evaluations e ON e.id = r.evaluation_id
             LEFT JOIN fj_automation_actions a ON a.review_item_id = r.id
+            LEFT JOIN fj_companies c ON c.id = j.company_id
             {condition}
             ORDER BY r.created_at DESC, r.id DESC
             LIMIT ? OFFSET ?
@@ -387,10 +421,164 @@ def archive_review_item(
     return _serialize_review(_get_review_row(db, review_item_id))
 
 
+def _link_review_item_chat(
+    db: Database,
+    row,
+) -> str | None:
+    """关联单条待确认事项的同岗位聊天会话，命中后归档。"""
+    session_id = _find_job_chat_session_id(db, row)
+    if session_id is None:
+        return None
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_review_items
+            SET status = 'dismissed', resolution_note = '用户关联已有聊天会话后归档',
+                updated_at = ?, resolved_at = ?
+            WHERE id = ?
+            """,
+            (now, now, row["id"]),
+        )
+    _log(
+        db,
+        "review_archived",
+        f"已关联岗位“{row['job_title']}”的聊天会话并归档待确认事项。",
+        detail={"job_id": row["job_id"], "review_item_id": row["id"], "chat_session_id": session_id},
+    )
+    return session_id
+
+
+def _find_job_chat_session_id(db: Database, row) -> str | None:
+    """按岗位身份查找最近的 BOSS 聊天会话。"""
+    with db.connect() as connection:
+        session = connection.execute(
+            """
+            SELECT id FROM fj_chat_sessions
+            WHERE job_id = ?
+               OR (? <> '' AND encrypt_job_id = ?)
+            ORDER BY CASE WHEN job_id = ? THEN 0 ELSE 1 END, updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (row["job_id"], row["encrypt_job_id"], row["encrypt_job_id"], row["job_id"]),
+        ).fetchone()
+        if session is None:
+            return None
+    return str(session["id"])
+
+
+def _confirm_running_action_from_chat(db: Database, row) -> str | None:
+    """已有同岗位聊天时，将仍在运行的动作确认到已执行状态。"""
+    session_id = _find_job_chat_session_id(db, row)
+    if session_id is None:
+        return None
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_automation_actions
+            SET status = 'succeeded', execution_state = 'succeeded',
+                execution_epoch = execution_epoch + 1,
+                verification_state = 'chat_confirmed', verification_method = 'chat_session',
+                verification_completed_at = ?, last_status_code = 'CHAT_SESSION_MATCHED',
+                last_error = NULL, result_json = ?, updated_at = ?, completed_at = ?
+            WHERE id = ?
+            """,
+            (
+                now,
+                _json({"contacted": True, "verificationMethod": "chat_session", "chatSessionId": session_id}),
+                now,
+                now,
+                row["action_id"],
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE fj_boss_executor_instances
+            SET current_action_id = NULL, current_epoch = NULL, updated_at = ?
+            WHERE current_action_id = ?
+            """,
+            (now, row["action_id"]),
+        )
+    _log(
+        db,
+        "action_succeeded",
+        f"已关联岗位“{row['job_title']}”的聊天会话并确认沟通成功。",
+        detail={"job_id": row["job_id"], "review_item_id": row["id"], "chat_session_id": session_id},
+    )
+    return session_id
+
+
+def link_review_items_chat(
+    db: Database,
+    *,
+    status: Literal["pending", "rejected", "approved"],
+    execution_view: Literal["running"] | None = None,
+    decision: str | None = None,
+    query: str = "",
+    execution_state: str | None = None,
+    created_from: str | None = None,
+    created_to: str | None = None,
+) -> dict[str, int]:
+    """对当前筛选范围内的全部待确认事项关联同岗位聊天会话。"""
+    conditions = ["r.status = ?"]
+    values: list[object] = [status]
+    if execution_view == "running":
+        conditions.append(
+            "a.execution_state IN ('queued', 'opening_page', 'waiting_page_ready', "
+            "'page_verified', 'ready_to_dispatch', 'dispatch_started', "
+            "'request_accepted', 'cancellation_requested')"
+        )
+    if decision:
+        conditions.append("r.ai_decision = ?")
+        values.append(decision)
+    if query.strip():
+        wildcard = f"%{query.strip()}%"
+        conditions.append("(j.title LIKE ? OR j.company_name LIKE ? OR r.resolution_note LIKE ?)")
+        values.extend([wildcard, wildcard, wildcard])
+    if execution_state:
+        conditions.append("a.execution_state = ?")
+        values.append(execution_state)
+    if created_from:
+        conditions.append("r.created_at >= ?")
+        values.append(created_from)
+    if created_to:
+        conditions.append("r.created_at <= ?")
+        values.append(created_to)
+    with db.connect() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT r.*, j.title AS job_title, j.company_name, j.job_link,
+                   j.encrypt_job_id, j.company_id, c.company_type,
+                   e.evaluation_json, a.id AS action_id, a.status AS action_status,
+                   a.execution_state, a.last_error AS action_last_error
+            FROM fj_review_items r
+            JOIN fj_boss_jobs j ON j.id = r.job_id
+            JOIN fj_job_evaluations e ON e.id = r.evaluation_id
+            LEFT JOIN fj_automation_actions a ON a.review_item_id = r.id
+            LEFT JOIN fj_companies c ON c.id = j.company_id
+            WHERE {' AND '.join(conditions)}
+            ORDER BY r.created_at DESC, r.id DESC
+            """,
+            values,
+        ).fetchall()
+    archived = 0
+    confirmed = 0
+    for row in rows:
+        if status == "approved":
+            if _confirm_running_action_from_chat(db, row):
+                confirmed += 1
+        elif _link_review_item_chat(db, row):
+            archived += 1
+    matched = archived + confirmed
+    return {"matched": matched, "archived": archived, "confirmed": confirmed, "unmatched": len(rows) - matched}
+
+
 def restore_review_item(db: Database, review_item_id: str) -> dict[str, object]:
     row = _get_review_row(db, review_item_id)
     # 只恢复用户主动归档的事项，保留“新评估替代旧事项”的业务终态。
-    if row["status"] != "dismissed" or not str(row["resolution_note"] or "").startswith("用户归档"):
+    user_archived = str(row["resolution_note"] or "").startswith(("用户归档", "用户关联已有聊天会话后归档"))
+    if row["status"] != "dismissed" or not user_archived:
         raise AppError(
             status_code=409,
             error_category="INVALID_STATE",
@@ -652,12 +840,9 @@ def _enqueue_action(
                     """,
                     (evaluation_id, review_item_id, _json(payload), now, action_id),
                 )
-            elif (
-                existing["status"] == "cancelled"
-                and existing["last_status_code"] == "MANUAL_CONFIRMED_NOT_CONTACTED"
-            ):
-                # 只有用户人工确认“尚未沟通”并再次批准后，才允许复用原幂等动作。
-                # 重新批准只恢复队列状态，不会在本事务内发起任何BOSS请求。
+            elif existing["status"] == "cancelled":
+                # 当前事项再次获得批准后，统一恢复对应动作进入队列。
+                # 重新批准只恢复队列状态，不会在本事务内发起任何 BOSS 请求。
                 connection.execute(
                     """
                     UPDATE fj_automation_actions
@@ -672,7 +857,7 @@ def _enqueue_action(
                         verification_due_at = NULL, verification_started_at = NULL,
                         verification_completed_at = NULL, verification_attempts = 0,
                         cooldown_seconds = NULL, next_eligible_at = NULL,
-                        last_status_code = 'REAPPROVED_AFTER_MANUAL_NOT_CONTACTED',
+                        last_status_code = 'REAPPROVED',
                         last_error = NULL, result_json = '{}', completed_at = NULL,
                         updated_at = ?
                     WHERE id = ?
@@ -703,6 +888,7 @@ def _get_review_row(db: Database, review_item_id: str):
         row = connection.execute(
             """
             SELECT r.*, j.title AS job_title, j.company_name, j.job_link,
+                   j.encrypt_job_id, j.company_id, c.company_type,
                    e.evaluation_json, e.filter_strategy_id,
                    a.id AS action_id, a.status AS action_status,
                    a.execution_state, a.last_error AS action_last_error
@@ -710,6 +896,7 @@ def _get_review_row(db: Database, review_item_id: str):
             JOIN fj_boss_jobs j ON j.id = r.job_id
             JOIN fj_job_evaluations e ON e.id = r.evaluation_id
             LEFT JOIN fj_automation_actions a ON a.review_item_id = r.id
+            LEFT JOIN fj_companies c ON c.id = j.company_id
             WHERE r.id = ?
             """,
             (review_item_id,),
@@ -758,6 +945,8 @@ def _serialize_review(row) -> dict[str, object]:
         "job_title": row["job_title"],
         "company_name": row["company_name"],
         "job_link": row["job_link"],
+        "company_id": row["company_id"] if "company_id" in row.keys() else None,
+        "company_type": row["company_type"] if "company_type" in row.keys() else None,
         "evaluation": _load_json(row["evaluation_json"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -766,6 +955,8 @@ def _serialize_review(row) -> dict[str, object]:
         "action_status": row["action_status"] if "action_status" in row.keys() else None,
         "execution_state": row["execution_state"] if "execution_state" in row.keys() else None,
         "action_last_error": row["action_last_error"] if "action_last_error" in row.keys() else None,
+        "company_chat_session_id": row["company_chat_session_id"] if "company_chat_session_id" in row.keys() else None,
+        "job_chat_session_id": row["job_chat_session_id"] if "job_chat_session_id" in row.keys() else None,
     }
 
 

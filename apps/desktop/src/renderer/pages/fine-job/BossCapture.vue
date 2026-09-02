@@ -20,6 +20,83 @@ const form = reactive({
   includeDetails: false,
   preferCurrentPage: true
 });
+const moreFiltersOpen = ref(false);
+const bossFilters = reactive({
+  jobType: "",
+  salary: "",
+  payType: [] as string[],
+  partTime: [] as string[],
+  experience: [] as string[],
+  degree: [] as string[],
+  scale: [] as string[],
+  stage: [] as string[]
+});
+const fullTimeSalaryOptions = [
+  { label: "3k以下", value: "402" },
+  { label: "3-5k", value: "403" },
+  { label: "5-10k", value: "404" },
+  { label: "10-20k", value: "405" },
+  { label: "20-50k", value: "406" },
+  // BOSS 对这两个薪资文案使用同一个查询值，保留不同选项以便用户按页面文案选择。
+  { label: "50k以上", value: "406-plus" }
+];
+const payTypeOptions = [
+  { label: "日结", value: "2501" },
+  { label: "周结", value: "2502" },
+  { label: "月结", value: "2503" },
+  { label: "完工结", value: "2504" }
+];
+const partTimeOptions = [
+  { label: "周末/节假日", value: "2701" },
+  { label: "寒暑假", value: "2702" },
+  { label: "短期兼职", value: "2703" },
+  { label: "长期兼职", value: "2704" },
+  { label: "工作日", value: "2705" },
+  { label: "夜班", value: "2706" }
+];
+const experienceOptions = [
+  { label: "在校生", value: "108" },
+  { label: "应届生", value: "102" },
+  { label: "经验不限", value: "101" },
+  { label: "一年以内", value: "103" },
+  { label: "1-3年", value: "104" },
+  { label: "3-5年", value: "105" },
+  { label: "5-10年", value: "106" },
+  { label: "10年以上", value: "107" }
+];
+const degreeOptions = [
+  { label: "初中及以下", value: "209" },
+  { label: "中专/中技", value: "208" },
+  { label: "高中", value: "206" },
+  { label: "大专", value: "202" },
+  { label: "本科", value: "203" },
+  { label: "硕士", value: "204" },
+  { label: "博士", value: "205" }
+];
+const scaleOptions = [
+  { label: "0-20人", value: "301" },
+  { label: "20-99人", value: "302" },
+  { label: "100-499人", value: "303" },
+  { label: "500-999人", value: "304" },
+  { label: "1000-9999人", value: "305" },
+  { label: "10000人以上", value: "306" }
+];
+const stageOptions = [
+  { label: "未融资", value: "801" },
+  { label: "天使轮", value: "802" },
+  { label: "A轮", value: "803" },
+  { label: "B轮", value: "804" },
+  { label: "C轮", value: "805" },
+  { label: "D轮及以上", value: "806" },
+  { label: "已上市", value: "807" },
+  { label: "不需要融资", value: "808" }
+];
+const strategyJobTypeCodes: Record<string, string> = {
+  full_time: "1901",
+  part_time: "1903"
+};
+const optionValues = (labels: string[], options: { label: string; value: string }[]) =>
+  labels.flatMap((label) => options.filter((option) => option.label === label).map((option) => option.value));
 const aiCommand = ref("");
 const filterStrategyId = ref<string | null>(null);
 const recommendationStrategyId = ref<string | null>(null);
@@ -55,6 +132,26 @@ const cityOptions = computed(() =>
     return left.name.localeCompare(right.name, "zh-CN");
   })
 );
+const selectedBossFilters = computed<Record<string, string>>(() => {
+  const filters: Record<string, string> = {};
+  const addMultiValue = (key: string, values: string[]) => {
+    if (values.length) filters[key] = values.join(",");
+  };
+
+  if (bossFilters.jobType) filters.jobType = bossFilters.jobType;
+  if (bossFilters.jobType === "1901" && bossFilters.salary) {
+    filters.salary = bossFilters.salary === "406-plus" ? "406" : bossFilters.salary;
+  }
+  if (bossFilters.jobType === "1903") {
+    addMultiValue("payType", bossFilters.payType);
+    addMultiValue("partTime", bossFilters.partTime);
+  }
+  addMultiValue("experience", bossFilters.experience);
+  addMultiValue("degree", bossFilters.degree);
+  addMultiValue("scale", bossFilters.scale);
+  addMultiValue("stage", bossFilters.stage);
+  return filters;
+});
 
 const browserStateLabel = computed(() => {
   if (!captureStore.status?.running) return "未启动";
@@ -214,6 +311,55 @@ const ensureSearchInput = () => {
   return true;
 };
 
+const handleJobTypeChange = () => {
+  // 求职类型切换后，清除已不属于当前类型的附属筛选条件。
+  bossFilters.salary = "";
+  bossFilters.payType = [];
+  bossFilters.partTime = [];
+};
+
+const selectBossFiltersFromStrategy = () => {
+  const strategy = strategiesStore.filters.find((item) => item.id === filterStrategyId.value);
+  if (!strategy) {
+    ElMessage.warning("请先选择岗位筛选策略");
+    return;
+  }
+
+  // BOSS 搜索页只支持单个求职类型；策略同时包含多种类型时按全职、兼职的顺序应用。
+  bossFilters.jobType = strategy.job_types
+    .map((type) => strategyJobTypeCodes[type])
+    .find(Boolean) ?? "";
+  bossFilters.salary = "";
+  bossFilters.payType = [];
+  bossFilters.partTime = [];
+  bossFilters.experience = strategy.experiences.flatMap((value) =>
+    value === "在校/应届" ? ["108", "102"] : optionValues([value], experienceOptions)
+  );
+  bossFilters.degree = optionValues(
+    strategy.degrees.filter((value) => value !== "学历不限"),
+    degreeOptions
+  );
+  bossFilters.scale = optionValues(strategy.company_scales, scaleOptions);
+  bossFilters.stage = optionValues(strategy.company_stages, stageOptions);
+
+  const monthlySalaryTarget = Math.max(
+    Number(strategy.monthly_salary_min ?? 0),
+    Number(strategy.monthly_salary_max_at_least ?? 0)
+  );
+  if (bossFilters.jobType === "1901" && monthlySalaryTarget > 0) {
+    bossFilters.salary = monthlySalaryTarget >= 20
+      ? "406"
+      : monthlySalaryTarget >= 10
+        ? "405"
+        : monthlySalaryTarget >= 5
+          ? "404"
+          : monthlySalaryTarget >= 3
+            ? "403"
+            : "402";
+  }
+  ElMessage.success(`已应用“${strategy.name}”中的 BOSS 可用筛选条件`);
+};
+
 const startBrowser = async () => {
   try {
     await platformStore.openBossLoginWindow();
@@ -247,7 +393,11 @@ const stopBrowser = async () => {
 const locateSearchPage = async () => {
   if (!ensureSearchInput()) return;
   try {
-    await captureStore.locate({ keyword: form.keyword.trim(), city: form.city.trim() });
+    await captureStore.locate({
+      keyword: form.keyword.trim(),
+      city: form.city.trim(),
+      filters: selectedBossFilters.value
+    });
     ElMessage.success("已定位到 BOSS 搜索页，可在浏览器中继续调整筛选条件");
   } catch {
     ElMessage.error(captureStore.error ?? "定位 BOSS 搜索页失败");
@@ -264,6 +414,7 @@ const captureJobs = async () => {
       pages: form.pages,
       include_details: form.includeDetails,
       prefer_current_page: form.preferCurrentPage,
+      filters: selectedBossFilters.value,
       filter_strategy_id: filterStrategyId.value
     });
     ElMessage.success("采集任务已启动，可在本页查看实时进度");
@@ -562,6 +713,91 @@ function formatDuration(seconds: number) {
             <el-input-number v-model="form.pages" :min="1" :max="10" />
           </el-form-item>
         </div>
+        <el-button class="more-filter-button" text type="primary" @click="moreFiltersOpen = !moreFiltersOpen">
+          {{ moreFiltersOpen ? "收起更多筛选条件" : "更多筛选条件" }}
+        </el-button>
+        <el-collapse-transition>
+          <div v-show="moreFiltersOpen" class="more-filters">
+            <el-form-item label="岗位筛选策略">
+              <div class="strategy-filter-actions">
+                <el-select v-model="filterStrategyId" clearable placeholder="选择岗位筛选策略">
+                  <el-option
+                    v-for="item in strategiesStore.filters"
+                    :key="item.id"
+                    :label="item.name"
+                    :value="item.id"
+                  />
+                </el-select>
+                <el-button type="primary" plain @click="selectBossFiltersFromStrategy">智能选择</el-button>
+              </div>
+              <p class="secondary-text strategy-filter-hint">
+                自动填充策略中可映射到 BOSS 的工作类型、薪资、经验、学历、公司规模和融资阶段。
+              </p>
+            </el-form-item>
+            <el-form-item label="求职类型">
+              <el-radio-group v-model="bossFilters.jobType" @change="handleJobTypeChange">
+                <el-radio value="">不限</el-radio>
+                <el-radio value="1901">全职</el-radio>
+                <el-radio value="1903">兼职</el-radio>
+              </el-radio-group>
+            </el-form-item>
+
+            <el-form-item v-if="bossFilters.jobType === '1901'" label="薪资待遇">
+              <el-radio-group v-model="bossFilters.salary">
+                <el-radio value="">不限</el-radio>
+                <el-radio v-for="option in fullTimeSalaryOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </el-radio>
+              </el-radio-group>
+            </el-form-item>
+
+            <template v-if="bossFilters.jobType === '1903'">
+              <el-form-item label="结算方式">
+                <el-checkbox-group v-model="bossFilters.payType" class="filter-checkboxes">
+                  <el-checkbox v-for="option in payTypeOptions" :key="option.value" :value="option.value">
+                    {{ option.label }}
+                  </el-checkbox>
+                </el-checkbox-group>
+              </el-form-item>
+              <el-form-item label="兼职时间">
+                <el-checkbox-group v-model="bossFilters.partTime" class="filter-checkboxes">
+                  <el-checkbox v-for="option in partTimeOptions" :key="option.value" :value="option.value">
+                    {{ option.label }}
+                  </el-checkbox>
+                </el-checkbox-group>
+              </el-form-item>
+            </template>
+
+            <el-form-item label="工作经验">
+              <el-checkbox-group v-model="bossFilters.experience" class="filter-checkboxes">
+                <el-checkbox v-for="option in experienceOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </el-checkbox>
+              </el-checkbox-group>
+            </el-form-item>
+            <el-form-item label="学历要求">
+              <el-checkbox-group v-model="bossFilters.degree" class="filter-checkboxes">
+                <el-checkbox v-for="option in degreeOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </el-checkbox>
+              </el-checkbox-group>
+            </el-form-item>
+            <el-form-item label="公司规模">
+              <el-checkbox-group v-model="bossFilters.scale" class="filter-checkboxes">
+                <el-checkbox v-for="option in scaleOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </el-checkbox>
+              </el-checkbox-group>
+            </el-form-item>
+            <el-form-item label="融资阶段">
+              <el-checkbox-group v-model="bossFilters.stage" class="filter-checkboxes">
+                <el-checkbox v-for="option in stageOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </el-checkbox>
+              </el-checkbox-group>
+            </el-form-item>
+          </div>
+        </el-collapse-transition>
         <div class="capture-options">
           <el-switch v-model="form.preferCurrentPage" />
           <span>优先采集当前 BOSS 搜索页；当前页无效时自动定位</span>
@@ -938,6 +1174,53 @@ function formatDuration(seconds: number) {
 
 .capture-options {
   margin: 12px 0;
+}
+
+.more-filter-button {
+  margin: 4px 0 12px;
+}
+
+.more-filters {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 12px;
+  padding: 16px;
+  border-radius: 8px;
+  background: var(--el-fill-color-lighter);
+}
+
+.more-filters :deep(.el-form-item) {
+  margin-bottom: 12px;
+}
+
+.more-filters :deep(.el-form-item:last-child) {
+  margin-bottom: 0;
+}
+
+.filter-checkboxes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+
+.filter-checkboxes :deep(.el-checkbox) {
+  margin-right: 0;
+}
+
+.strategy-filter-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.strategy-filter-actions .el-select {
+  min-width: 260px;
+}
+
+.strategy-filter-hint {
+  width: 100%;
+  margin: 8px 0 0;
 }
 
 .detail-actions {
