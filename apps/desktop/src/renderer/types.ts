@@ -790,6 +790,97 @@ export interface FineJobReviewItem {
   job_chat_session_id?: string | null;
 }
 
+export interface FineJobPipelineSnapshot {
+  job_id: string;
+  company_id?: string | null;
+  stage: string;
+  stage_source: string;
+  stage_event_id: string;
+  stage_updated_at: string;
+  projection_version: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FineJobActivityEvent {
+  id: string;
+  job_id: string;
+  company_id?: string | null;
+  chat_session_id?: string | null;
+  event_type: string;
+  occurred_at: string;
+  source: string;
+  source_ref_type: string;
+  source_ref_id: string;
+  confidence: number;
+  evidence_level: "direct" | "strong_inferred" | "weak_inferred";
+  payload: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface FineJobExecutionEvidence {
+  id: string;
+  action_ref_type: string;
+  action_ref_id: string;
+  evidence_type: string;
+  source: string;
+  source_ref_type: string;
+  source_ref_id: string;
+  observed_at: string;
+  confidence: number;
+  evidence_level: "direct" | "strong_inferred" | "weak_inferred";
+  payload: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface FineJobExecutionReconciliation {
+  id: string;
+  previous_status: string;
+  new_status: string;
+  reconciled_at: string;
+  reconciliation_reason: string;
+  evidence_id: string;
+  evidence_level: string;
+}
+
+export interface FineJobExecutionSummary {
+  action_ref_type: string;
+  action_ref_id: string;
+  action_type: string;
+  dedupe_identity: string;
+  session_id?: string | null;
+  raw_status: string;
+  canonical_status: string;
+  canonical_reason: string;
+  canonical_updated_at?: string | null;
+  status_code: string;
+  error_message: string;
+  executor_id: string;
+  leader_tab_id: string;
+  execution_epoch: number;
+  attempt_count: number;
+  created_at: string;
+  started_at?: string | null;
+  dispatch_started_at?: string | null;
+  completed_at?: string | null;
+  evidence: FineJobExecutionEvidence[];
+  reconciliations: FineJobExecutionReconciliation[];
+}
+
+export interface FineJobJobJourney {
+  job_id: string;
+  pipeline?: FineJobPipelineSnapshot | null;
+  legacy_application?: {
+    id: string;
+    status?: string | null;
+    source: string;
+    applied_at: string;
+    updated_at: string;
+  } | null;
+  activities: FineJobActivityEvent[];
+  executions: FineJobExecutionSummary[];
+}
+
 export interface FineJobReviewItemListEnvelope {
   items: FineJobReviewItem[];
   total: number;

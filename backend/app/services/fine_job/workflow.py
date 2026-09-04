@@ -460,38 +460,6 @@ def _find_job_chat_session_id(db: Database, row) -> str | None:
     return str(session["id"])
 
 
-def _confirm_running_action_from_chat(db: Database, row) -> str | None:
-    """已有同岗位聊天时，将仍在运行的动作确认到已执行状态。"""
-    session_id = _find_job_chat_session_id(db, row)
-    if session_id is None:
-        return None
-    now = utc_now()
-    with db.connect() as connection:
-        connection.execute(
-            """
-            UPDATE fj_automation_actions
-            SET status = 'succeeded', execution_state = 'succeeded',
-                execution_epoch = execution_epoch + 1,
-                last_status_code = 'CHAT_SESSION_MATCHED',
-                last_error = NULL, result_json = ?, updated_at = ?, completed_at = ?
-            WHERE id = ?
-            """,
-            (
-                _json({"contacted": True, "chatSessionId": session_id}),
-                now,
-                now,
-                row["action_id"],
-            ),
-        )
-    _log(
-        db,
-        "action_succeeded",
-        f"已关联岗位“{row['job_title']}”的聊天会话并确认沟通成功。",
-        detail={"job_id": row["job_id"], "review_item_id": row["id"], "chat_session_id": session_id},
-    )
-    return session_id
-
-
 def link_review_items_chat(
     db: Database,
     *,
@@ -545,8 +513,8 @@ def link_review_items_chat(
     confirmed = 0
     for row in rows:
         if status == "approved":
-            if _confirm_running_action_from_chat(db, row):
-                confirmed += 1
+            # 同岗位出现会话不能确认某个执行动作，等待 action-specific 直接 Evidence。
+            continue
         elif _link_review_item_chat(db, row):
             archived += 1
     matched = archived + confirmed
@@ -702,15 +670,19 @@ def _enqueue_action(
             "SELECT id, status, last_status_code FROM fj_automation_actions WHERE idempotency_key = ?",
             (idempotency_key,),
         ).fetchone()
+        requested_epoch: int | None = None
         if existing is None:
             action_id = new_id()
+            requested_epoch = 0
             connection.execute(
                 """
                 INSERT INTO fj_automation_actions (
                   id, job_id, evaluation_id, review_item_id, action_type,
                   status, idempotency_key, payload_json, execution_state,
+                  canonical_status, canonical_updated_at, canonical_reason,
                   created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'BOSS_DEFAULT_GREETING', 'queued', ?, ?, 'queued', ?, ?)
+                ) VALUES (?, ?, ?, ?, 'BOSS_DEFAULT_GREETING', 'queued', ?, ?, 'queued',
+                          'pending', ?, '等待执行', ?, ?)
                 """,
                 (
                     action_id,
@@ -719,6 +691,7 @@ def _enqueue_action(
                     review_item_id,
                     idempotency_key,
                     _json(payload),
+                    now,
                     now,
                     now,
                 ),
@@ -746,11 +719,33 @@ def _enqueue_action(
                         execution_epoch = execution_epoch + 1,
                         last_status_code = 'REAPPROVED',
                         last_error = NULL, result_json = '{}', completed_at = NULL,
+                        canonical_status = 'pending', canonical_updated_at = ?,
+                        canonical_reason = '用户重新批准，等待执行',
                         updated_at = ?
                     WHERE id = ?
                     """,
-                    (evaluation_id, review_item_id, _json(payload), now, action_id),
+                    (evaluation_id, review_item_id, _json(payload), now, now, action_id),
                 )
+                epoch_row = connection.execute(
+                    "SELECT execution_epoch FROM fj_automation_actions WHERE id = ?",
+                    (action_id,),
+                ).fetchone()
+                requested_epoch = int(epoch_row["execution_epoch"])
+        if requested_epoch is not None:
+            from backend.app.services.fine_job.job_activity import append_job_activity_with_connection
+
+            append_job_activity_with_connection(
+                connection,
+                job_id=job_id,
+                event_type="greeting_requested",
+                occurred_at=now,
+                source="workflow",
+                source_ref_type="automation_action",
+                source_ref_id=action_id,
+                evidence_level="direct",
+                payload={"execution_epoch": requested_epoch},
+                dedupe_key=f"automation_action:{action_id}:epoch:{requested_epoch}:greeting_requested",
+            )
     return _get_action(db, action_id)
 
 

@@ -5,6 +5,7 @@ from typing import Literal
 from backend.app.db import Database
 from backend.app.errors import AppError
 from backend.app.utils import new_id, utc_now
+from backend.app.services.fine_job.job_activity import append_job_activity_with_connection
 
 
 JobApplicationStatus = Literal[
@@ -54,6 +55,25 @@ def set_job_application_status(
                 source_action_id, evidence_level, event_at, note.strip(), now, now,
             ),
         )
+        if status == "rejected":
+            application = connection.execute(
+                "SELECT id FROM fj_job_applications WHERE job_id = ?",
+                (resolved_job_id,),
+            ).fetchone()
+            append_job_activity_with_connection(
+                connection,
+                job_id=resolved_job_id,
+                company_id=str(job["company_id"]) if job["company_id"] else None,
+                event_type="rejected",
+                occurred_at=event_at,
+                source="manual" if source == "manual" else source,
+                source_ref_type="job_application",
+                source_ref_id=str(application["id"]),
+                confidence=1.0,
+                evidence_level="direct" if evidence_level == "confirmed" else "strong_inferred",
+                payload={"legacy_status": "rejected"},
+                dedupe_key=f"job_application:{application['id']}:rejected",
+            )
     if status in {"pending_application", "communicating"}:
         from backend.app.services.fine_job.filter_exclusions import record_job_event
 
@@ -115,6 +135,7 @@ def sync_succeeded_applications(db: Database) -> int:
             FROM fj_automation_actions a
             LEFT JOIN fj_job_applications p ON p.job_id = a.job_id
             WHERE a.status = 'succeeded'
+              AND a.action_type = 'BOSS_DEFAULT_GREETING'
               AND (p.id IS NULL OR p.status IN ('pending_greeting', 'pending_application'))
             """
         ).fetchall()

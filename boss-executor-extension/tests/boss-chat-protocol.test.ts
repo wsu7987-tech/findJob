@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { decodeObservedChatFrame } from "../src/platform/boss/chat/observer";
+import { decodeObservedChatFrame, markAssistantClientMid } from "../src/platform/boss/chat/observer";
 import { bossChatProtocol } from "../src/platform/boss/chat/protocol";
 
 
@@ -75,5 +75,26 @@ describe("BOSS 聊天协议", () => {
 
   it("忽略非 chat 主题和非 PUBLISH 数据", async () => {
     expect(await decodeObservedChatFrame(Uint8Array.from([0x20, 0]))).toEqual([]);
+  });
+
+  it("保留带 clientMid 的助手 outbound 平台回显", async () => {
+    markAssistantClientMid("assistant-echo-1");
+    const protobuf = bossChatProtocol.encodeText({
+      fromUid: "100",
+      toUid: "200",
+      encryptToUid: "enc-boss",
+      friendSource: 0,
+      clientMid: "assistant-echo-1",
+      text: "你好，我目前还在职"
+    });
+
+    const messages = await decodeObservedChatFrame(mqttPublish(protobuf));
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      direction: "outbound",
+      source: "assistant",
+      clientMid: "assistant-echo-1"
+    });
   });
 });

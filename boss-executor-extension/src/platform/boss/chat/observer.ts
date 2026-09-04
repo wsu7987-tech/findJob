@@ -74,7 +74,11 @@ const normalizeMessage = async (message: DecodedChatMessage): Promise<ChatObserv
   const peerUid = direction === "inbound" ? senderUid : receiverUid;
   const clientMid = String(message.cmid ?? "");
   pruneAssistantClientMids();
-  if (direction === "outbound" && assistantClientMids.has(clientMid)) return null;
+  const assistantObserved = direction === "outbound" && assistantClientMids.has(clientMid);
+  if (assistantObserved) {
+    assistantClientMids.delete(clientMid);
+    persistAssistantClientMids();
+  }
   const platformMessageId = String(
     message.mid ?? message.cmid ?? `${senderUid}:${message.time ?? Date.now()}:${message.body?.type ?? 0}`
   );
@@ -103,7 +107,7 @@ const normalizeMessage = async (message: DecodedChatMessage): Promise<ChatObserv
     companyName: contact.companyName || String(message.from?.company ?? message.to?.company ?? ""),
     sentAt: isoFromMilliseconds(message.time),
     observedAt: new Date().toISOString(),
-    source: direction === "outbound" ? "manual" : "websocket",
+    source: direction === "outbound" ? (assistantObserved ? "assistant" : "manual") : "websocket",
     rawMeta: { bodyType, messageType: message.type ?? 0 }
   };
 };

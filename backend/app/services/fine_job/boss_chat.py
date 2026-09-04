@@ -23,6 +23,12 @@ from backend.app.services.fine_job.boss_scraper.service import boss_scraper_serv
 from backend.app.services.fine_job.codex_authorization import classify_outbound_content
 from backend.app.services.fine_job.profile_context import get_profile_context
 from backend.app.services.fine_job.job_applications import set_job_application_status
+from backend.app.services.fine_job.execution_reconciliation import (
+    observe_outbound_chat_message,
+    record_execution_evidence_with_connection,
+    set_canonical_from_raw,
+)
+from backend.app.services.fine_job.job_activity import append_job_activity_with_connection
 
 
 RUNTIME_ID = "boss"
@@ -520,6 +526,37 @@ def _history_message_content(message: dict[str, Any]) -> str:
     }.get(body_type, str(body.get("headTitle") or "系统消息"))
 
 
+def _record_message_activity(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    message_id: str,
+    direction: str,
+    occurred_at: str,
+    platform_message_id: str,
+) -> None:
+    session = connection.execute(
+        "SELECT job_id, company_name FROM fj_chat_sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    if session is None or not session["job_id"]:
+        return
+    event_type = "recruiter_replied" if direction == "inbound" else "candidate_replied"
+    append_job_activity_with_connection(
+        connection,
+        job_id=str(session["job_id"]),
+        chat_session_id=session_id,
+        event_type=event_type,
+        occurred_at=occurred_at,
+        source="chat",
+        source_ref_type="chat_message",
+        source_ref_id=message_id,
+        evidence_level="direct",
+        payload={"direction": direction, "platform_message_id": platform_message_id},
+        dedupe_key=f"chat_message:{message_id}:{event_type}",
+    )
+
+
 def sync_history_messages(
     db: Database,
     *,
@@ -547,6 +584,7 @@ def sync_history_messages(
             body_type = _optional_int(body.get("type"))
             message_type = "text" if body_type == 1 else "system"
             sent_at = _epoch_ms_to_iso(raw.get("time")) or now
+            local_message_id = _id("chat_message")
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO fj_chat_messages (
@@ -556,7 +594,7 @@ def sync_history_messages(
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 'websocket', ?, ?, ?, ?)
                 """,
                 (
-                    _id("chat_message"),
+                    local_message_id,
                     session_id,
                     message_id,
                     direction,
@@ -571,6 +609,17 @@ def sync_history_messages(
                 ),
             )
             inserted_count += int(cursor.rowcount > 0)
+            if cursor.rowcount > 0:
+                _record_message_activity(
+                    connection,
+                    session_id=session_id,
+                    message_id=local_message_id,
+                    direction=direction,
+                    occurred_at=sent_at,
+                    platform_message_id=message_id,
+                )
+                if direction == "outbound":
+                    observe_outbound_chat_message(connection, message_id=local_message_id)
 
         latest = connection.execute(
             """
@@ -774,12 +823,14 @@ def _queue_reply_task(
     # 还没有开始真实发送的旧动作可以安全取消，禁止新消息到达后发送旧草稿。
     connection.execute(
         """
-        UPDATE fj_chat_send_actions SET status = 'cancelled', updated_at = ?, completed_at = ?
+        UPDATE fj_chat_send_actions SET status = 'cancelled', updated_at = ?, completed_at = ?,
+          canonical_status = 'cancelled', canonical_updated_at = ?,
+          canonical_reason = '新 inbound 消息使未发送草稿失效'
         WHERE reply_task_id IN (
           SELECT id FROM fj_chat_reply_tasks WHERE session_id = ?
         ) AND status IN ('queued', 'leased')
         """,
-        (now, now, session["id"]),
+        (now, now, now, session["id"]),
     )
     pending = connection.execute(
         """
@@ -857,10 +908,11 @@ def _cancel_session_send_actions(
         UPDATE fj_chat_send_actions
         SET status = 'cancelled', outcome = NULL, status_code = ?,
             error_message = '会话已暂停或由用户接管', completed_at = ?, updated_at = ?,
-            lease_expires_at = NULL
+            lease_expires_at = NULL, canonical_status = 'cancelled',
+            canonical_updated_at = ?, canonical_reason = '会话已暂停或由用户接管'
         WHERE session_id = ? AND status IN ('queued', 'leased')
         """,
-        (status_code, now, now, session_id),
+        (status_code, now, now, now, session_id),
     )
     # 已进入页面发送边界的动作只收口为未知，禁止再次领取和自动重发。
     connection.execute(
@@ -868,10 +920,12 @@ def _cancel_session_send_actions(
         UPDATE fj_chat_send_actions
         SET status = 'unknown', outcome = 'unknown', status_code = ?,
             error_message = '接管发生在发送边界内，请人工核对 BOSS 会话',
-            completed_at = ?, updated_at = ?, lease_expires_at = NULL
+            completed_at = ?, updated_at = ?, lease_expires_at = NULL,
+            canonical_status = 'unknown', canonical_updated_at = ?,
+            canonical_reason = '接管发生在发送边界内'
         WHERE session_id = ? AND status = 'dispatching'
         """,
-        (status_code, now, now, session_id),
+        (status_code, now, now, now, session_id),
     )
 
 
@@ -934,6 +988,7 @@ def ingest_events(
                 account_uid=event["account_uid"],
                 message=message,
             )
+            assistant_echo = None
             if message.get("direction") == "outbound" and message.get("client_mid"):
                 assistant_echo = connection.execute(
                     """
@@ -943,38 +998,74 @@ def ingest_events(
                     """,
                     (session["id"], message.get("client_mid")),
                 ).fetchone()
-                if assistant_echo is not None:
-                    continue
-            message_id = _id("chat_message")
+            message_id = str(assistant_echo["id"]) if assistant_echo is not None else _id("chat_message")
             try:
-                connection.execute(
-                    """
-                    INSERT INTO fj_chat_messages (
-                      id, session_id, platform_message_id, direction, message_type,
-                      content, sender_uid, receiver_uid, client_mid, source,
-                      sent_at, observed_at, raw_meta_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        message_id,
-                        session["id"],
-                        message["platform_message_id"],
-                        message["direction"],
-                        message.get("message_type") or "text",
-                        message.get("content") or "",
-                        message.get("sender_uid") or "",
-                        message.get("receiver_uid") or "",
-                        message.get("client_mid") or "",
-                        message.get("source") or "websocket",
-                        message["sent_at"],
-                        message["observed_at"],
-                        json.dumps(message.get("raw_meta") or {}, ensure_ascii=False),
-                        _now(),
-                    ),
-                )
+                if assistant_echo is not None:
+                    # 将发送完成时的占位消息升级为平台实际回显，保留稳定的本地消息 ID。
+                    connection.execute(
+                        """
+                        UPDATE fj_chat_messages
+                        SET platform_message_id = ?, direction = ?, message_type = ?, content = ?,
+                            sender_uid = ?, receiver_uid = ?, source = 'assistant', sent_at = ?,
+                            observed_at = ?, raw_meta_json = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            message["platform_message_id"],
+                            message["direction"],
+                            message.get("message_type") or "text",
+                            message.get("content") or "",
+                            message.get("sender_uid") or "",
+                            message.get("receiver_uid") or "",
+                            message["sent_at"],
+                            message["observed_at"],
+                            json.dumps(message.get("raw_meta") or {}, ensure_ascii=False),
+                            message_id,
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO fj_chat_messages (
+                          id, session_id, platform_message_id, direction, message_type,
+                          content, sender_uid, receiver_uid, client_mid, source,
+                          sent_at, observed_at, raw_meta_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            message_id,
+                            session["id"],
+                            message["platform_message_id"],
+                            message["direction"],
+                            message.get("message_type") or "text",
+                            message.get("content") or "",
+                            message.get("sender_uid") or "",
+                            message.get("receiver_uid") or "",
+                            message.get("client_mid") or "",
+                            message.get("source") or "websocket",
+                            message["sent_at"],
+                            message["observed_at"],
+                            json.dumps(message.get("raw_meta") or {}, ensure_ascii=False),
+                            _now(),
+                        ),
+                    )
             except sqlite3.IntegrityError:
                 duplicates += 1
                 continue
+            _record_message_activity(
+                connection,
+                session_id=str(session["id"]),
+                message_id=message_id,
+                direction=str(message["direction"]),
+                occurred_at=str(message["sent_at"]),
+                platform_message_id=str(message["platform_message_id"]),
+            )
+            if message["direction"] == "outbound":
+                observe_outbound_chat_message(
+                    connection,
+                    message_id=message_id,
+                    observed_account_uid=str(event["account_uid"]),
+                )
             next_version = int(session["session_version"]) + 1
             inbound_id = message_id if message["direction"] == "inbound" else session["latest_inbound_message_id"]
             next_status = "human_takeover" if (
@@ -1721,8 +1812,10 @@ def confirm_reply(db: Database, task_id: str, payload: dict[str, Any]) -> dict[s
             """
             INSERT INTO fj_chat_send_actions (
               id, reply_task_id, session_id, status, text,
-              content_categories_json, classification_version, created_at, updated_at
-            ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+              content_categories_json, classification_version,
+              canonical_status, canonical_updated_at, canonical_reason,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, 'queued', ?, ?, ?, 'pending', ?, '等待执行', ?, ?)
             """,
             (
                 action_id,
@@ -1731,6 +1824,7 @@ def confirm_reply(db: Database, task_id: str, payload: dict[str, Any]) -> dict[s
                 final_text,
                 json.dumps(classification.categories, ensure_ascii=False),
                 classification.classification_version,
+                now,
                 now,
                 now,
             ),
@@ -1840,10 +1934,12 @@ def mark_dispatch_started(db: Database, executor_id: str, action_id: str, execut
         connection.execute(
             """
             UPDATE fj_chat_send_actions
-            SET status = 'dispatching', dispatched_at = ?, dispatch_deadline_at = ?, updated_at = ?
+            SET status = 'dispatching', dispatched_at = ?, dispatch_deadline_at = ?,
+                canonical_status = 'dispatching', canonical_updated_at = ?,
+                canonical_reason = '页面发送已开始', updated_at = ?
             WHERE id = ?
             """,
-            (now, _after(SEND_DISPATCH_TIMEOUT_SECONDS), now, action_id),
+            (now, _after(SEND_DISPATCH_TIMEOUT_SECONDS), now, now, action_id),
         )
         return _action_payload(connection, action_id)
 
@@ -1884,6 +1980,70 @@ def complete_send_action(
                 action_id,
             ),
         )
+        set_canonical_from_raw(
+            connection,
+            action_ref_type="chat_send_action",
+            action_ref_id=action_id,
+            raw_status=str(outcome),
+            updated_at=now,
+            reason=(
+                "发送协议已接受，等待平台 outbound observation"
+                if outcome == "accepted"
+                else str(payload.get("message") or payload.get("status_code") or outcome)
+            ),
+        )
+        if outcome == "accepted":
+            record_execution_evidence_with_connection(
+                connection,
+                action_ref_type="chat_send_action",
+                action_ref_id=action_id,
+                evidence_type="protocol_acknowledged",
+                source="executor",
+                source_ref_type="chat_send_result",
+                source_ref_id=f"{action_id}:{payload['execution_epoch']}",
+                observed_at=now,
+                confidence=0.9,
+                evidence_level="strong_inferred",
+                payload={
+                    "confirmed": True,
+                    "status_code": str(payload.get("status_code") or ""),
+                    "client_mid": str(payload.get("client_mid") or ""),
+                },
+                dedupe_key=f"chat_send:{action_id}:epoch:{payload['execution_epoch']}:protocol_ack",
+            )
+        elif outcome == "failed":
+            record_execution_evidence_with_connection(
+                connection,
+                action_ref_type="chat_send_action",
+                action_ref_id=action_id,
+                evidence_type="protocol_acknowledged",
+                source="executor",
+                source_ref_type="chat_send_result",
+                source_ref_id=f"{action_id}:{payload['execution_epoch']}:failed",
+                observed_at=now,
+                confidence=1.0,
+                evidence_level="direct",
+                payload={
+                    "confirmed": False,
+                    "status_code": str(payload.get("status_code") or ""),
+                },
+                dedupe_key=f"chat_send:{action_id}:epoch:{payload['execution_epoch']}:failed_ack",
+            )
+        else:
+            record_execution_evidence_with_connection(
+                connection,
+                action_ref_type="chat_send_action",
+                action_ref_id=action_id,
+                evidence_type="page_state_confirmed",
+                source="executor",
+                source_ref_type="chat_send_result",
+                source_ref_id=f"{action_id}:{payload['execution_epoch']}:unknown",
+                observed_at=now,
+                confidence=0.5,
+                evidence_level="weak_inferred",
+                payload={"confirmed": False, "status_code": str(payload.get("status_code") or "")},
+                dedupe_key=f"chat_send:{action_id}:epoch:{payload['execution_epoch']}:unknown_observation",
+            )
         if outcome == "accepted":
             session = _session_or_404(connection, str(action["session_id"]))
             platform_message_id = payload.get("platform_message_id") or f"assistant:{action_id}"
@@ -1930,11 +2090,13 @@ def _sweep_stale_send_actions(connection: sqlite3.Connection) -> int:
         UPDATE fj_chat_send_actions
         SET status = 'unknown', outcome = 'unknown', status_code = 'dispatch_result_timeout',
             error_message = '页面发送结果超过截止时间，请人工核对',
-            completed_at = ?, updated_at = ?, lease_expires_at = NULL
+            completed_at = ?, updated_at = ?, lease_expires_at = NULL,
+            canonical_status = 'unknown', canonical_updated_at = ?,
+            canonical_reason = 'dispatch result timeout'
         WHERE status = 'dispatching' AND dispatch_deadline_at IS NOT NULL
           AND dispatch_deadline_at <= ?
         """,
-        (now, now, now),
+        (now, now, now, now),
     )
     return int(cursor.rowcount)
 

@@ -644,6 +644,11 @@ export class FineJobExecutorClient {
   }
 
   private startDefaultGreetingAfterMatch(tabId: string, task: FineJobQueueAction): void {
+    if (!this.sendControlMessage({
+      type: "task_dispatch_started",
+      task_id: task.id,
+      execution_epoch: task.execution_epoch
+    })) return;
     this.state.detail = `正在执行任务：${task.job_title}`;
     this.startExecutionTimeout(task);
     void browser.tabs.query({ url: ["*://zhipin.com/*", "*://*.zhipin.com/*"] }).then(async (tabs) => {

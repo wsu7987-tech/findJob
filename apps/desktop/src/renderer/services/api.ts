@@ -46,6 +46,7 @@
   FineJobBossHistoryQuery,
   FineJobBossHistoryJob,
   FineJobBossHistoryResponse,
+  FineJobJobJourney,
   FineJobBossSearchPageRequest,
   FineJobBossSearchPageResponse,
   FineJobReviewBatchResponse,
@@ -1092,6 +1093,11 @@ export const api = {
   async getFineJobBossCaptureHistoryJob(historyJobId: string) {
     return request<FineJobBossHistoryJob>(
       `/api/fine-job/boss-capture/history/${encodeURIComponent(historyJobId)}`
+    );
+  },
+  async getFineJobJobJourney(jobId: string) {
+    return request<FineJobJobJourney>(
+      `/api/fine-job/jobs/${encodeURIComponent(jobId)}/journey`
     );
   },
   async updateFineJobChatJob(sessionId: string) {

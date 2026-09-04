@@ -10,6 +10,11 @@ from urllib.parse import urlparse
 from backend.app.db import Database
 from backend.app.errors import AppError
 from backend.app.services.fine_job.boss_scraper.service import boss_scraper_service
+from backend.app.services.fine_job.execution_reconciliation import (
+    record_execution_evidence_with_connection,
+    set_canonical_from_raw,
+)
+from backend.app.services.fine_job.job_activity import append_job_activity_with_connection
 from backend.app.utils import new_id, utc_now
 
 
@@ -258,6 +263,18 @@ async def _handle_executor_channel_message(db: Database, executor_id: str, messa
             "task": result["task"],
             "queue": result["queue"],
         })
+        await notify_queue_changed(db)
+        return
+    if message_type == "task_dispatch_started":
+        task_id = str(message.get("task_id") or "")
+        if not task_id:
+            return
+        mark_task_dispatch_started(
+            db,
+            executor_id,
+            task_id,
+            int(message.get("execution_epoch") or 0),
+        )
         await notify_queue_changed(db)
         return
     if message_type == "task_succeeded":
@@ -680,15 +697,48 @@ def match_task(
             connection.execute(
                 """
                 UPDATE fj_automation_actions
-                SET status = ?, execution_state = 'running', updated_at = ?
+                SET status = ?, execution_state = 'running', executor_id = ?,
+                    started_at = COALESCE(started_at, ?), attempt_count = attempt_count + 1,
+                    canonical_status = 'pending', canonical_updated_at = ?,
+                    canonical_reason = '岗位页面已匹配，等待 dispatch', updated_at = ?
                 WHERE id = ?
                 """,
-                (running_status, now, task_id),
+                (running_status, executor_id, now, now, now, task_id),
             )
     if not already_locked:
         _update_runtime_state(db, executor_id, "idle")
         _audit(db, "boss_task_matched", "岗位页面已匹配执行任务。", {"task_id": task_id})
     return {"task": _serialize_action(_require_action(db, task_id), include_payload=False), "queue": list_queue(db)}
+
+
+def mark_task_dispatch_started(
+    db: Database,
+    executor_id: str,
+    task_id: str,
+    execution_epoch: int,
+) -> None:
+    now = utc_now()
+    with db.connect() as connection:
+        task = connection.execute(
+            "SELECT * FROM fj_automation_actions WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            raise AppError(404, "NOT_FOUND", "执行任务不存在。")
+        if task["executor_id"] != executor_id or int(task["execution_epoch"] or 0) != execution_epoch:
+            raise AppError(409, "STALE_EXECUTION_EPOCH", "该任务执行轮次已经失效。")
+        if task["status"] not in {"running", "leased"}:
+            raise AppError(409, "INVALID_TASK_STATE", "任务当前状态不能开始 dispatch。")
+        connection.execute(
+            """
+            UPDATE fj_automation_actions
+            SET dispatch_started_at = COALESCE(dispatch_started_at, ?),
+                canonical_status = 'dispatching', canonical_updated_at = ?,
+                canonical_reason = '插件已进入平台请求边界', updated_at = ?
+            WHERE id = ?
+            """,
+            (now, now, now, task_id),
+        )
 
 
 def complete_task(
@@ -741,6 +791,93 @@ def complete_task(
                 task_id,
             ),
         )
+        if task["action_type"] == "BOSS_DEFAULT_GREETING":
+            if status == "succeeded" and bool(payload.get("contacted")):
+                evidence, _, _ = record_execution_evidence_with_connection(
+                    connection,
+                    action_ref_type="automation_action",
+                    action_ref_id=task_id,
+                    evidence_type="protocol_acknowledged",
+                    source="executor",
+                    source_ref_type="automation_result",
+                    source_ref_id=f"{task_id}:{execution_epoch}",
+                    observed_at=now,
+                    confidence=1.0,
+                    evidence_level="direct",
+                    payload={
+                        "confirmed": True,
+                        "status_code": str(payload.get("status_code") or ""),
+                    },
+                    dedupe_key=f"automation_action:{task_id}:epoch:{execution_epoch}:protocol_ack",
+                )
+                append_job_activity_with_connection(
+                    connection,
+                    job_id=str(task["job_id"]),
+                    event_type="greeting_sent",
+                    occurred_at=now,
+                    source="executor",
+                    source_ref_type="automation_action",
+                    source_ref_id=task_id,
+                    confidence=1.0,
+                    evidence_level="direct",
+                    payload={"evidence_id": evidence["id"]},
+                    dedupe_key=f"automation_action:{task_id}:epoch:{execution_epoch}:greeting_sent",
+                )
+            else:
+                set_canonical_from_raw(
+                    connection,
+                    action_ref_type="automation_action",
+                    action_ref_id=task_id,
+                    raw_status="unknown" if status == "succeeded" else status,
+                    updated_at=now,
+                    reason=(
+                        "raw succeeded 缺少 contacted 平台确认"
+                        if status == "succeeded"
+                        else message or str(payload.get("status_code") or status)
+                    ),
+                )
+                if status == "failed":
+                    failure_evidence, _, _ = record_execution_evidence_with_connection(
+                        connection,
+                        action_ref_type="automation_action",
+                        action_ref_id=task_id,
+                        evidence_type="protocol_acknowledged",
+                        source="executor",
+                        source_ref_type="automation_result",
+                        source_ref_id=f"{task_id}:{execution_epoch}:failed",
+                        observed_at=now,
+                        confidence=1.0,
+                        evidence_level="direct",
+                        payload={
+                            "confirmed": False,
+                            "status_code": str(payload.get("status_code") or ""),
+                        },
+                        dedupe_key=f"automation_action:{task_id}:epoch:{execution_epoch}:failed_ack",
+                    )
+                    append_job_activity_with_connection(
+                        connection,
+                        job_id=str(task["job_id"]),
+                        event_type="greeting_failed",
+                        occurred_at=now,
+                        source="executor",
+                        source_ref_type="automation_action",
+                        source_ref_id=task_id,
+                        evidence_level="direct",
+                        payload={
+                            "status_code": str(payload.get("status_code") or ""),
+                            "evidence_id": failure_evidence["id"],
+                        },
+                        dedupe_key=f"automation_action:{task_id}:epoch:{execution_epoch}:greeting_failed",
+                    )
+        else:
+            set_canonical_from_raw(
+                connection,
+                action_ref_type="automation_action",
+                action_ref_id=task_id,
+                raw_status=status,
+                updated_at=now,
+                reason=message or str(payload.get("status_code") or status),
+            )
     _audit(
         db,
         "boss_task_completed",
@@ -1196,6 +1333,44 @@ def _record_task_match_failure(db: Database, task_id: str, message: str) -> None
     )
 
 
+def _record_greeting_failure_observation(
+    connection,
+    task,
+    *,
+    status_code: str,
+    message: str,
+    observed_at: str,
+) -> None:
+    if task["action_type"] != "BOSS_DEFAULT_GREETING":
+        return
+    evidence, _, _ = record_execution_evidence_with_connection(
+        connection,
+        action_ref_type="automation_action",
+        action_ref_id=str(task["id"]),
+        evidence_type="page_state_confirmed",
+        source="executor",
+        source_ref_type="automation_failure",
+        source_ref_id=f"{task['id']}:{task['execution_epoch']}:{status_code}",
+        observed_at=observed_at,
+        confidence=1.0,
+        evidence_level="direct",
+        payload={"confirmed": False, "status_code": status_code},
+        dedupe_key=f"automation_action:{task['id']}:epoch:{task['execution_epoch']}:{status_code}:evidence",
+    )
+    append_job_activity_with_connection(
+        connection,
+        job_id=str(task["job_id"]),
+        event_type="greeting_failed",
+        occurred_at=observed_at,
+        source="executor",
+        source_ref_type="automation_action",
+        source_ref_id=str(task["id"]),
+        evidence_level="direct",
+        payload={"status_code": status_code, "evidence_id": evidence["id"], "message": message},
+        dedupe_key=f"automation_action:{task['id']}:epoch:{task['execution_epoch']}:greeting_failed",
+    )
+
+
 def _record_retriable_task_failure(
     db: Database,
     task_id: str,
@@ -1223,7 +1398,8 @@ def _record_retriable_task_failure(
                 """
                 UPDATE fj_automation_actions
                 SET status = 'failed', execution_state = 'failed', last_status_code = ?,
-                    last_error = ?, payload_json = ?, result_json = ?, updated_at = ?, completed_at = ?
+                    last_error = ?, payload_json = ?, result_json = ?, updated_at = ?, completed_at = ?,
+                    canonical_status = 'failed', canonical_updated_at = ?, canonical_reason = ?
                 WHERE id = ?
                 """,
                 (
@@ -1233,26 +1409,43 @@ def _record_retriable_task_failure(
                     json.dumps(result, ensure_ascii=False),
                     now,
                     now,
+                    now,
+                    message,
                     task_id,
                 ),
+            )
+            _record_greeting_failure_observation(
+                connection,
+                task,
+                status_code=final_status_code,
+                message=message,
+                observed_at=now,
             )
         _audit(db, "boss_task_retry_failed", "任务页面连续失败，已标记任务失败。", {"task_id": task_id, "status_code": final_status_code}, level="warning")
         return
     created_at_sql = ", created_at = ?" if move_to_tail else ""
-    params: tuple[object, ...]
-    if move_to_tail:
-        params = (status_code, message, json.dumps(payload, ensure_ascii=False), now, now, task_id)
-    else:
-        params = (status_code, message, json.dumps(payload, ensure_ascii=False), now, task_id)
     with db.connect() as connection:
         connection.execute(
             f"""
             UPDATE fj_automation_actions
             SET status = 'queued', execution_state = 'queued', execution_epoch = execution_epoch + 1,
-                last_status_code = ?, last_error = ?, payload_json = ?, updated_at = ?{created_at_sql}
+                last_status_code = ?, last_error = ?, payload_json = ?,
+                canonical_status = 'pending', canonical_updated_at = ?,
+                canonical_reason = '页面准备失败，按既有预 dispatch 规则重新排队',
+                updated_at = ?{created_at_sql}
             WHERE id = ?
             """,
-            params,
+            (
+                status_code,
+                message,
+                json.dumps(payload, ensure_ascii=False),
+                now,
+                *(
+                    (now, now, task_id)
+                    if move_to_tail
+                    else (now, task_id)
+                ),
+            ),
         )
 
 
@@ -1280,12 +1473,13 @@ def _finish_active_tasks_as_unknown(db: Database, message: str, status_code: str
             UPDATE fj_automation_actions
             SET status = 'unknown', execution_state = 'unknown',
                 last_status_code = ?, last_error = ?, result_json = ?,
-                updated_at = ?, completed_at = ?
+                updated_at = ?, completed_at = ?, canonical_status = 'unknown',
+                canonical_updated_at = ?, canonical_reason = ?
             WHERE task_type IN ('BOSS_DEFAULT_GREETING', 'TEST_DELAY')
               AND status IN ('running', 'leased')
               AND execution_state = 'running'
             """,
-            (status_code, message, json.dumps(result, ensure_ascii=False), now, now),
+            (status_code, message, json.dumps(result, ensure_ascii=False), now, now, now, message),
         )
     _audit(
         db,
@@ -1306,10 +1500,19 @@ def _record_execution_error(db: Database, task_id: str, message: str) -> None:
         connection.execute(
             """
             UPDATE fj_automation_actions
-            SET status = 'failed', execution_state = 'failed', last_error = ?, updated_at = ?, completed_at = ?
+            SET status = 'failed', execution_state = 'failed', last_error = ?,
+                updated_at = ?, completed_at = ?, canonical_status = 'failed',
+                canonical_updated_at = ?, canonical_reason = ?
             WHERE id = ?
             """,
-            (message, now, now, task_id),
+            (message, now, now, now, message, task_id),
+        )
+        _record_greeting_failure_observation(
+            connection,
+            task,
+            status_code="EXECUTION_ERROR",
+            message=message,
+            observed_at=now,
         )
 
 

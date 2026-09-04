@@ -1476,6 +1476,116 @@ CREATE TABLE IF NOT EXISTS fj_chat_events (
 CREATE INDEX IF NOT EXISTS idx_fj_chat_events_created_at
   ON fj_chat_events(created_at DESC);
 
+-- 求职活动是后续统计与阶段投影共同使用的不可变事实流。
+CREATE TABLE IF NOT EXISTS fj_job_activity_events (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  company_id TEXT,
+  chat_session_id TEXT,
+  event_type TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  source TEXT NOT NULL,
+  source_ref_type TEXT NOT NULL,
+  source_ref_id TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 1,
+  evidence_level TEXT NOT NULL DEFAULT 'direct',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  dedupe_key TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+  FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE SET NULL,
+  FOREIGN KEY (chat_session_id) REFERENCES fj_chat_sessions(id) ON DELETE SET NULL,
+  CHECK (event_type IN (
+    'job_discovered', 'job_shortlisted',
+    'greeting_requested', 'greeting_sent', 'greeting_failed',
+    'recruiter_replied', 'candidate_replied',
+    'resume_requested', 'resume_submitted',
+    'interview_intent_detected', 'interview_invited', 'interview_scheduled',
+    'rejected', 'followup_recommended', 'no_response_detected',
+    'offer_received', 'conversation_closed', 'manual_stage_changed'
+  )),
+  CHECK (confidence >= 0 AND confidence <= 1),
+  CHECK (evidence_level IN ('direct', 'strong_inferred', 'weak_inferred'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_job_activity_job_time
+  ON fj_job_activity_events(job_id, occurred_at DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fj_job_activity_type_time
+  ON fj_job_activity_events(event_type, occurred_at DESC);
+
+-- Pipeline 是 Activity 的可重放投影，第一阶段与旧 application 状态并行存在。
+CREATE TABLE IF NOT EXISTS fj_job_pipeline_snapshots (
+  job_id TEXT PRIMARY KEY,
+  company_id TEXT,
+  stage TEXT NOT NULL,
+  stage_source TEXT NOT NULL,
+  stage_event_id TEXT NOT NULL,
+  stage_updated_at TEXT NOT NULL,
+  projection_version INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+  FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE SET NULL,
+  FOREIGN KEY (stage_event_id) REFERENCES fj_job_activity_events(id) ON DELETE CASCADE,
+  CHECK (stage IN (
+    'discovered', 'shortlisted', 'greeted', 'communicating',
+    'resume_requested', 'resume_submitted', 'interviewing',
+    'offer', 'rejected', 'closed'
+  ))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_pipeline_stage_time
+  ON fj_job_pipeline_snapshots(stage, stage_updated_at DESC);
+
+-- Evidence 保存平台或协议层实际观察，action_ref_type 防止不同动作表的同名 ID 串联。
+CREATE TABLE IF NOT EXISTS fj_execution_evidence (
+  id TEXT PRIMARY KEY,
+  action_ref_type TEXT NOT NULL,
+  action_ref_id TEXT NOT NULL,
+  evidence_type TEXT NOT NULL,
+  source TEXT NOT NULL,
+  source_ref_type TEXT NOT NULL,
+  source_ref_id TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 1,
+  evidence_level TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  dedupe_key TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  CHECK (action_ref_type IN ('automation_action', 'chat_send_action')),
+  CHECK (evidence_type IN (
+    'outbound_message_observed', 'inbound_reply_observed',
+    'conversation_created', 'greeting_state_changed',
+    'page_state_confirmed', 'protocol_acknowledged'
+  )),
+  CHECK (confidence >= 0 AND confidence <= 1),
+  CHECK (evidence_level IN ('direct', 'strong_inferred', 'weak_inferred'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_execution_evidence_action
+  ON fj_execution_evidence(action_ref_type, action_ref_id, observed_at DESC);
+
+-- 每次 canonical meaning 变化均保留依据，raw action status 保持原样。
+CREATE TABLE IF NOT EXISTS fj_execution_reconciliations (
+  id TEXT PRIMARY KEY,
+  action_ref_type TEXT NOT NULL,
+  action_ref_id TEXT NOT NULL,
+  previous_status TEXT NOT NULL,
+  new_status TEXT NOT NULL,
+  reconciled_at TEXT NOT NULL,
+  reconciliation_reason TEXT NOT NULL,
+  evidence_id TEXT NOT NULL,
+  evidence_level TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (evidence_id) REFERENCES fj_execution_evidence(id) ON DELETE CASCADE,
+  UNIQUE (action_ref_type, action_ref_id, evidence_id, new_status),
+  CHECK (action_ref_type IN ('automation_action', 'chat_send_action')),
+  CHECK (evidence_level IN ('direct', 'strong_inferred', 'weak_inferred'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_execution_reconciliation_action
+  ON fj_execution_reconciliations(action_ref_type, action_ref_id, reconciled_at DESC);
+
 CREATE TABLE IF NOT EXISTS fj_codex_sessions (
   id TEXT PRIMARY KEY,
   status TEXT NOT NULL DEFAULT 'stopped',
@@ -1728,9 +1838,52 @@ class Database:
             self._ensure_fj_delivery_strategy_columns(connection)
             self._ensure_fj_boss_executor_schema(connection)
             self._ensure_fj_company_governance_schema(connection)
+            self._ensure_fj_execution_observability_schema(connection)
             self._ensure_codex_integration_schema(connection)
             self._ensure_resume_analysis_v2_schema(connection)
             self._ensure_resume_analysis_v3_schema(connection)
+            # 兼容升级只从可靠旧事实追加事件，并按完整事件流重放 shadow Pipeline。
+            from backend.app.services.fine_job.job_activity import migrate_legacy_job_activity
+            from backend.app.services.fine_job.execution_reconciliation import (
+                initialize_execution_observability,
+            )
+
+            migrate_legacy_job_activity(connection)
+            initialize_execution_observability(connection)
+
+    def _ensure_fj_execution_observability_schema(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        automation_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(fj_automation_actions)")
+        }
+        for column, definition in (
+            ("executor_id", "TEXT"),
+            ("started_at", "TEXT"),
+            ("dispatch_started_at", "TEXT"),
+            ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("canonical_status", "TEXT"),
+            ("canonical_updated_at", "TEXT"),
+            ("canonical_reason", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in automation_columns:
+                connection.execute(
+                    f"ALTER TABLE fj_automation_actions ADD COLUMN {column} {definition}"
+                )
+
+        chat_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(fj_chat_send_actions)")
+        }
+        for column, definition in (
+            ("canonical_status", "TEXT"),
+            ("canonical_updated_at", "TEXT"),
+            ("canonical_reason", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in chat_columns:
+                connection.execute(
+                    f"ALTER TABLE fj_chat_send_actions ADD COLUMN {column} {definition}"
+                )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:

@@ -132,6 +132,31 @@ def test_capture_history_filters_sorts_paginates_and_saves_detail(test_db) -> No
     assert completed["detail_status"] == "completed"
 
 
+def test_capture_history_excludes_executor_test_jobs(test_db) -> None:
+    _create_batch(test_db, "capture-test-filter", "2026-08-18T10:00:00Z")
+    recorded = record_capture_jobs(
+        test_db,
+        capture_id="capture-test-filter",
+        jobs=[
+            {"job_id": "real-job", "title": "真实岗位", "boss_name": "甲公司"},
+            {"job_id": "test-job", "title": "执行器测试岗位", "boss_name": "测试公司"},
+        ],
+        collected_at="2026-08-18T10:01:00Z",
+    )
+    test_job_id = next(
+        str(item["history_record_id"])
+        for item in recorded
+        if item["job_id"] == "test-job"
+    )
+    with test_db.connect() as connection:
+        connection.execute("UPDATE fj_boss_jobs SET is_test = 1 WHERE id = ?", (test_job_id,))
+
+    history = list_capture_history(test_db)
+
+    assert history["total"] == 1
+    assert [item["title"] for item in history["items"]] == ["真实岗位"]
+
+
 def test_capture_history_saves_latest_search_keyword_and_filter_result(test_db) -> None:
     _create_batch(test_db, "capture-1", "2026-08-18T10:00:00Z")
     _create_batch(test_db, "capture-2", "2026-08-19T10:00:00Z")

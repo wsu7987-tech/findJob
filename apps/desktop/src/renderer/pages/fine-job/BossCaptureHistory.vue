@@ -9,7 +9,7 @@ import { useFineJobBossCaptureStore } from "@/stores/fineJobBossCapture";
 import { useFineJobBossExecutorStore } from "@/stores/fineJobBossExecutor";
 import { useFineJobBossHistoryStore } from "@/stores/fineJobBossHistory";
 import { useFineJobStrategiesStore } from "@/stores/fineJobStrategies";
-import type { FineJobBossHistoryJob, FineJobBossHistorySortField } from "@/types";
+import type { FineJobBossHistoryJob, FineJobBossHistorySortField, FineJobJobJourney } from "@/types";
 
 const captureStore = useFineJobBossCaptureStore();
 const executorStore = useFineJobBossExecutorStore();
@@ -18,6 +18,9 @@ const strategiesStore = useFineJobStrategiesStore();
 const route = useRoute();
 const selectedJob = ref<FineJobBossHistoryJob | null>(null);
 const detailDrawerOpen = ref(false);
+const selectedJourney = ref<FineJobJobJourney | null>(null);
+const journeyLoading = ref(false);
+const expandedJourneySections = ref<string[]>([]);
 const recommendationStrategyId = ref<string | null>(null);
 const dateRange = ref<string[]>([]);
 const filters = reactive({
@@ -190,9 +193,24 @@ const evaluateHistoryDelivery = async (
 const detailActionLabel = (job: FineJobBossHistoryJob) =>
   job.detail_status === "completed" || Boolean(job.detail) ? "重新采集" : "采集";
 
+const loadJourney = async (jobId: string) => {
+  journeyLoading.value = true;
+  try {
+    selectedJourney.value = await api.getFineJobJobJourney(jobId);
+  } catch (error) {
+    selectedJourney.value = null;
+    ElMessage.error((error as Error).message || "求职链路加载失败");
+  } finally {
+    journeyLoading.value = false;
+  }
+};
+
 const openDetail = (job: FineJobBossHistoryJob) => {
   selectedJob.value = job;
+  selectedJourney.value = null;
+  expandedJourneySections.value = [];
   detailDrawerOpen.value = true;
+  void loadJourney(job.id);
 };
 
 const openInDedicatedBrowser = async (job: FineJobBossHistoryJob) => {
@@ -248,6 +266,46 @@ const applicationStatusType = (status?: string | null) => {
   return "info";
 };
 
+const pipelineStageLabel = (stage?: string | null) => ({
+  discovered: "已发现",
+  shortlisted: "已筛选",
+  greeted: "已打招呼",
+  communicating: "沟通中",
+  resume_requested: "已请求简历",
+  resume_submitted: "已投递简历",
+  interviewing: "面试中",
+  offer: "Offer",
+  rejected: "已拒绝",
+  closed: "已关闭"
+}[stage || ""] || "暂无");
+
+const activityTypeLabel = (type: string) => ({
+  job_discovered: "发现岗位",
+  job_shortlisted: "岗位已筛选",
+  greeting_requested: "请求打招呼",
+  greeting_sent: "已打招呼",
+  greeting_failed: "打招呼失败",
+  recruiter_replied: "HR 回复",
+  candidate_replied: "候选人回复",
+  resume_requested: "HR 请求简历",
+  resume_submitted: "已投递简历",
+  interview_intent_detected: "检测到面试意向",
+  interview_invited: "收到面试邀请",
+  interview_scheduled: "面试已安排",
+  rejected: "已拒绝",
+  followup_recommended: "建议跟进",
+  no_response_detected: "检测到未回复",
+  offer_received: "收到 Offer",
+  conversation_closed: "沟通已关闭",
+  manual_stage_changed: "手动调整阶段"
+}[type] || type);
+
+const evidenceLevelLabel = (level: string) => ({
+  direct: "直接",
+  strong_inferred: "强推断",
+  weak_inferred: "弱推断"
+}[level] || level);
+
 const filterStrategyName = (strategyId?: string | null) => {
   if (!strategyId) return "未关联";
   return strategiesStore.filters.find((item) => item.id === strategyId)?.name || strategyId;
@@ -279,6 +337,7 @@ onMounted(async () => {
     try {
       selectedJob.value = await api.getFineJobBossCaptureHistoryJob(historyId);
       detailDrawerOpen.value = true;
+      await loadJourney(historyId);
     } catch (error) {
       ElMessage.error((error as Error).message || "历史岗位详情加载失败");
     }
@@ -551,6 +610,92 @@ watch(
           </div>
         </div>
         <el-divider />
+        <section v-loading="journeyLoading" class="journey-panel">
+          <el-collapse v-model="expandedJourneySections" class="journey-collapse">
+            <el-collapse-item name="journey">
+              <template #title>
+                <div class="journey-title-row">
+                  <strong>求职链路</strong>
+                  <el-tag v-if="selectedJourney?.pipeline" type="success" size="small">
+                    {{ pipelineStageLabel(selectedJourney.pipeline.stage) }}
+                  </el-tag>
+                </div>
+              </template>
+          <template v-if="selectedJourney && (selectedJourney.pipeline || selectedJourney.activities.length || selectedJourney.executions.length)">
+            <div class="journey-stage-grid">
+              <div>
+                <span class="secondary-text">Legacy Status</span>
+                <strong>{{ selectedJourney.legacy_application?.status || "未设置" }}</strong>
+              </div>
+              <div>
+                <span class="secondary-text">New Pipeline</span>
+                <strong>{{ pipelineStageLabel(selectedJourney.pipeline?.stage) }}</strong>
+              </div>
+              <div>
+                <span class="secondary-text">Stage Source</span>
+                <strong>{{ selectedJourney.pipeline?.stage_source || "暂无" }}</strong>
+              </div>
+              <div>
+                <span class="secondary-text">Stage Updated</span>
+                <strong>{{ selectedJourney.pipeline ? formatDateTime(selectedJourney.pipeline.stage_updated_at) : "暂无" }}</strong>
+              </div>
+            </div>
+
+            <h4>Activity Timeline</h4>
+            <el-timeline v-if="selectedJourney.activities.length">
+              <el-timeline-item
+                v-for="activity in selectedJourney.activities"
+                :key="activity.id"
+                :timestamp="formatDateTime(activity.occurred_at)"
+                placement="top"
+              >
+                <strong>{{ activityTypeLabel(activity.event_type) }}</strong>
+                <p class="journey-meta">
+                  source: {{ activity.source }} · ref: {{ activity.source_ref_type }} / {{ activity.source_ref_id }}
+                  · confidence: {{ Math.round(activity.confidence * 100) }}%
+                  · {{ evidenceLevelLabel(activity.evidence_level) }}
+                </p>
+              </el-timeline-item>
+            </el-timeline>
+            <p v-else class="secondary-text">暂无 Activity。</p>
+
+            <h4>Execution Evidence</h4>
+            <el-collapse v-if="selectedJourney.executions.length">
+              <el-collapse-item
+                v-for="execution in selectedJourney.executions"
+                :key="`${execution.action_ref_type}:${execution.action_ref_id}`"
+                :title="`${execution.action_type} · ${execution.raw_status} → ${execution.canonical_status}`"
+              >
+                <div class="journey-stage-grid">
+                  <div><span class="secondary-text">Action</span><strong>{{ execution.action_ref_type }} / {{ execution.action_ref_id }}</strong></div>
+                  <div><span class="secondary-text">Raw status</span><strong>{{ execution.raw_status }}</strong></div>
+                  <div><span class="secondary-text">Canonical result</span><strong>{{ execution.canonical_status }}</strong></div>
+                  <div><span class="secondary-text">Status code</span><strong>{{ execution.status_code || "暂无" }}</strong></div>
+                  <div><span class="secondary-text">Executor / Tab</span><strong>{{ execution.executor_id || "暂无" }} / {{ execution.leader_tab_id || "暂无" }}</strong></div>
+                  <div><span class="secondary-text">Dispatch</span><strong>{{ execution.dispatch_started_at ? formatDateTime(execution.dispatch_started_at) : "未记录" }}</strong></div>
+                  <div><span class="secondary-text">Attempt / Epoch</span><strong>{{ execution.attempt_count }} / {{ execution.execution_epoch }}</strong></div>
+                  <div><span class="secondary-text">Dedupe Identity</span><strong>{{ execution.dedupe_identity }}</strong></div>
+                  <div><span class="secondary-text">Reason</span><strong>{{ execution.canonical_reason || execution.error_message || "暂无" }}</strong></div>
+                </div>
+                <div v-for="evidence in execution.evidence" :key="evidence.id" class="evidence-row">
+                  <strong>{{ evidence.evidence_type }}</strong>
+                  <span>{{ evidenceLevelLabel(evidence.evidence_level) }} · {{ formatDateTime(evidence.observed_at) }}</span>
+                  <span>source/ref: {{ evidence.source }} · {{ evidence.source_ref_type }} / {{ evidence.source_ref_id }}</span>
+                </div>
+                <div v-for="record in execution.reconciliations" :key="record.id" class="reconciliation-row">
+                  <strong>{{ record.previous_status }} → {{ record.new_status }}</strong>
+                  <span>{{ formatDateTime(record.reconciled_at) }} · {{ record.reconciliation_reason }}</span>
+                  <span>Evidence: {{ record.evidence_id }} · {{ evidenceLevelLabel(record.evidence_level) }}</span>
+                </div>
+              </el-collapse-item>
+            </el-collapse>
+            <p v-else class="secondary-text">暂无关联 Execution Evidence。</p>
+          </template>
+          <p v-else-if="!journeyLoading" class="secondary-text">暂无新链路数据。</p>
+            </el-collapse-item>
+          </el-collapse>
+        </section>
+        <el-divider />
         <h3>采集记录</h3>
         <p>最近搜索词：{{ selectedJob.search_keyword || "未记录" }}</p>
         <p>首次采集：{{ formatDateTime(selectedJob.first_collected_at) }}</p>
@@ -703,5 +848,54 @@ watch(
 .job-description {
   line-height: 1.8;
   white-space: pre-wrap;
+}
+
+.journey-panel {
+  min-height: 96px;
+}
+
+.journey-title-row,
+.journey-stage-grid > div,
+.evidence-row,
+.reconciliation-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.journey-title-row {
+  align-items: center;
+  width: 100%;
+  padding-right: 12px;
+}
+
+.journey-collapse {
+  border-top: 0;
+}
+
+.journey-stage-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 18px;
+  margin: 12px 0 20px;
+}
+
+.journey-stage-grid > div,
+.evidence-row,
+.reconciliation-row {
+  flex-direction: column;
+}
+
+.journey-meta,
+.evidence-row span,
+.reconciliation-row span {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
+.evidence-row,
+.reconciliation-row {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--el-border-color-lighter);
 }
 </style>

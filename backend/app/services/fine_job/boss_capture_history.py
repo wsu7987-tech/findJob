@@ -9,6 +9,7 @@ from backend.app.db import Database
 from backend.app.errors import AppError
 from backend.app.utils import new_id, utc_now
 from backend.app.services.fine_job.companies import resolve_company
+from backend.app.services.fine_job.job_activity import append_job_activity_with_connection
 
 
 HistorySortField = Literal[
@@ -167,6 +168,18 @@ def record_capture_jobs(
                         collect_count,
                         capture_id,
                     ),
+                )
+                append_job_activity_with_connection(
+                    connection,
+                    job_id=history_job_id,
+                    company_id=company_id,
+                    event_type="job_discovered",
+                    occurred_at=now,
+                    source="capture",
+                    source_ref_type="boss_capture_batch",
+                    source_ref_id=capture_id,
+                    evidence_level="direct",
+                    dedupe_key=f"job:{history_job_id}:discovered",
                 )
             else:
                 history_job_id = str(existing["id"])
@@ -410,6 +423,29 @@ def update_capture_job_filter_result(
             f"UPDATE fj_boss_jobs SET payload_json = ? WHERE {identity_column} = ?",
             (_json(payload), identity_value),
         )
+        final_status = str(
+            result.get("final_filter_status") or result.get("status") or ""
+        )
+        if final_status in {"pass", "pass_for_human"}:
+            job_row = connection.execute(
+                f"SELECT id, company_id FROM fj_boss_jobs WHERE {identity_column} = ?",
+                (identity_value,),
+            ).fetchone()
+            if job_row is not None:
+                append_job_activity_with_connection(
+                    connection,
+                    job_id=str(job_row["id"]),
+                    company_id=str(job_row["company_id"]) if job_row["company_id"] else None,
+                    event_type="job_shortlisted",
+                    occurred_at=utc_now(),
+                    source="workflow",
+                    source_ref_type="job_filter_result",
+                    source_ref_id=str(result.get("strategy_id") or job_row["id"]),
+                    confidence=1.0,
+                    evidence_level="strong_inferred",
+                    payload={"filter_status": final_status},
+                    dedupe_key=f"job:{job_row['id']}:shortlisted",
+                )
 
 
 def update_capture_job_detail(
@@ -600,7 +636,8 @@ def list_capture_history(
     from backend.app.services.fine_job.job_applications import sync_succeeded_applications
 
     sync_succeeded_applications(db)
-    conditions: list[str] = []
+    # 执行器验证岗位只通过专用测试接口读取，不进入用户历史采集列表。
+    conditions: list[str] = ["is_test = 0"]
     values: list[object] = []
     if query.strip():
         like = f"%{query.strip()}%"
