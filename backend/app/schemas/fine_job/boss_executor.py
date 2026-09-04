@@ -29,40 +29,29 @@ class BossExecutorHeartbeatRequest(BaseModel):
     plugin_version: str = Field(max_length=40)
     capabilities: list[str] = Field(default_factory=list, max_length=20)
     browser_connected: bool = True
-    current_action_id: str | None = None
-    current_epoch: int | None = Field(default=None, ge=0)
-    page_kind: str = "other"
-    page_state: str = "waiting"
-    logged_in: bool = False
     risk_state: str = "none"
 
 
 class BossExecutorControlRequest(BaseModel):
-    command: Literal["allow", "pause", "resume", "emergency_stop"]
+    command: Literal["start", "pause"]
+
+
+class BossExecutorSettingsRequest(BaseModel):
+    task_cooldown_max_seconds: int = Field(ge=4, le=600)
+    page_load_wait_max_seconds: int = Field(ge=3, le=600)
 
 
 class BossNavigationOpenRequest(BaseModel):
     job_id: str = Field(min_length=1, max_length=160)
-    source_context: Literal["capture", "history", "review"]
+    source_context: Literal["capture", "history", "review", "queue"]
 
 
-class BossPageStatusRequest(BaseModel):
-    execution_epoch: int = Field(ge=1)
-    state: Literal["ready", "waiting", "unsupported", "mismatch", "unavailable"]
-    logged_in: bool
-    page_kind: str
-    encrypt_job_id: str = ""
-    contacted: bool | None = None
-    observed_at: int | None = Field(default=None, ge=0)
-    reason: str = Field(default="", max_length=500)
+class BossTaskMatchRequest(BaseModel):
+    execution_epoch: int = Field(ge=0)
 
 
-class BossDispatchStartedRequest(BaseModel):
-    execution_epoch: int = Field(ge=1)
-
-
-class BossActionCompleteRequest(BaseModel):
-    execution_epoch: int = Field(ge=1)
+class BossTaskCompleteRequest(BaseModel):
+    execution_epoch: int = Field(ge=0)
     outcome: Literal["accepted", "succeeded", "failed", "unknown"]
     contacted: bool | None = None
     status_code: str = Field(default="", max_length=100)
@@ -70,10 +59,16 @@ class BossActionCompleteRequest(BaseModel):
     evidence: dict[str, Any] = Field(default_factory=dict)
 
 
+class BossTestTaskCreateRequest(BaseModel):
+    job_id: str = Field(min_length=1, max_length=160)
+    close_page_after_completion: bool = False
+    delay_seconds: int = Field(default=3, ge=1, le=600)
+
+
+class BossTestJobUpdateRequest(BaseModel):
+    encrypt_job_id: str = Field(default="", max_length=160)
+    job_link: str = Field(min_length=8, max_length=1000)
+
+
 class BossReturnToReviewRequest(BaseModel):
     reason: str = Field(default="用户退回待确认", max_length=300)
-
-
-class BossManualVerifyUnknownRequest(BaseModel):
-    contacted: bool
-    note: str = Field(default="用户人工核验BOSS岗位页面", max_length=300)

@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
+import { CopyDocument } from "@element-plus/icons-vue";
 
 import { formatDateTime } from "@/services/format";
 import { useFineJobBossExecutorStore } from "@/stores/fineJobBossExecutor";
@@ -15,11 +16,18 @@ const issueQuery = ref("");
 const issueLevel = ref("");
 const legacyQuery = ref("");
 const legacyStatus = ref("");
-let pollTimer: number | null = null;
+const testTaskDrawerOpen = ref(false);
+const testTaskSubmitting = ref(false);
+const testJobDialogOpen = ref(false);
+const testJobSaving = ref(false);
+const executorSettingsSaving = ref(false);
+const testTaskForm = reactive({ jobId: "", closePageAfterCompletion: false, delaySeconds: 3 });
+const testJobForm = reactive({ id: "", encryptJobId: "", jobLink: "" });
+const executorSettingsForm = reactive({ taskCooldownMaxSeconds: 4, pageLoadWaitMaxSeconds: 3 });
 
 const dashboard = computed(() => runsStore.dashboard);
 const executor = computed(() => dashboard.value?.executor ?? null);
-const currentAction = computed(() => dashboard.value?.current_action ?? null);
+const currentTask = computed(() => dashboard.value?.current_task ?? null);
 const filteredQueue = computed(() => (dashboard.value?.queue.actions ?? []).filter((item) => {
   const keyword = queueQuery.value.trim().toLowerCase();
   const matchesKeyword = !keyword || `${item.job_title} ${item.company_name}`.toLowerCase().includes(keyword);
@@ -39,7 +47,7 @@ const filteredLegacyRuns = computed(() => (dashboard.value?.legacy_runs ?? []).f
 
 const load = async () => {
   try {
-    await runsStore.loadDashboard();
+    await Promise.all([runsStore.loadDashboard(), executorStore.loadTestJobs()]);
   } catch {
     ElMessage.error(runsStore.error ?? "运行状态加载失败");
   }
@@ -56,32 +64,34 @@ const executorStatusType = computed(() =>
   executorStatusLabel.value === "运行中" ? "success" : executorStatusLabel.value === "风险暂停" ? "danger" : "warning"
 );
 
+const executorProgressText = computed(() => {
+  if (executor.value?.runtime_phase === "task_cooldown") {
+    return executor.value.runtime_detail || "任务间隔冷却等待";
+  }
+  if (currentTask.value) return `正在执行：${currentTask.value.job_title} · ${currentTask.value.company_name}`;
+  if ((dashboard.value?.queue.total ?? 0) === 0) return "当前没有待执行任务";
+  return "正在等待插件匹配任务页面";
+});
+const showPairingCode = computed(() =>
+  Boolean(executorStore.pairingCode && !executor.value?.browser_connected)
+);
+
 const executionLabel = (state: string) => ({
-  queued: "排队中", opening_page: "正在打开岗位", waiting_page_ready: "等待页面就绪",
-  page_verified: "页面已核对", ready_to_dispatch: "等待发送", dispatch_started: "正在发送",
-  request_accepted: "平台已受理", succeeded: "已确认沟通", cancellation_requested: "正在取消",
-  cancelled: "已取消", blocked: "已阻断", failed_before_dispatch: "发送前失败",
-  failed_after_dispatch: "发送后失败", unknown_after_dispatch: "结果未知"
+  queued: "待处理", running: "执行中", succeeded: "已完成", cancelled: "已取消",
+  blocked: "已阻断", failed: "执行失败", unknown: "结果未知"
 } as Record<string, string>)[state] ?? state;
 
-const verificationLabel = (action: FineJobBossExecutorQueueAction) => ({
-  not_required: "无需核验", waiting_refresh: "等待刷新核验", refreshing: "正在刷新",
-  waiting_snapshot: "等待页面快照", page_confirmed: "页面已确认", manual_confirmed: "人工已确认",
-  pending: "待后续确认", chat_confirmed: "聊天已确认"
-} as Record<string, string>)[action.verification_state] ?? action.verification_state;
-
-const control = async (command: "allow" | "pause" | "resume" | "emergency_stop") => {
+const control = async (command: "start" | "pause") => {
   try {
-    if (["allow", "resume", "emergency_stop"].includes(command)) {
+    if (command === "start") {
       await ElMessageBox.confirm(
-        command === "emergency_stop" ? "确认立即停止自动打招呼队列？" : "确认允许执行器继续串行处理已批准队列？",
-        command === "emergency_stop" ? "紧急停止" : "恢复执行",
+        "确认让插件开始处理执行队列？",
+        "开始运行",
         { type: "warning" }
       );
     }
     await executorStore.control(command);
-    await load();
-    ElMessage.success(command === "pause" ? "执行器已暂停" : "执行器状态已更新");
+    ElMessage.success(command === "pause" ? "插件已暂停" : "插件已开始运行");
   } catch (value) {
     if (value !== "cancel" && value !== "close") ElMessage.error(executorStore.error ?? "执行器控制失败");
   }
@@ -92,6 +102,36 @@ const createPairingCode = async () => {
     await executorStore.createPairingCode();
   } catch {
     ElMessage.error(executorStore.error ?? "生成配对码失败");
+  }
+};
+
+const copyPairingCode = async () => {
+  if (!executorStore.pairingCode) return;
+  try {
+    await navigator.clipboard.writeText(executorStore.pairingCode);
+    ElMessage.success("配对码已复制");
+  } catch {
+    ElMessage.error("配对码复制失败");
+  }
+};
+
+const normalizeSettingSeconds = (value: number, minSeconds: number) =>
+  Math.min(600, Math.max(minSeconds, Math.floor(Number(value) || minSeconds)));
+
+const saveExecutorSettings = async () => {
+  executorSettingsSaving.value = true;
+  executorSettingsForm.taskCooldownMaxSeconds = normalizeSettingSeconds(executorSettingsForm.taskCooldownMaxSeconds, 4);
+  executorSettingsForm.pageLoadWaitMaxSeconds = normalizeSettingSeconds(executorSettingsForm.pageLoadWaitMaxSeconds, 3);
+  try {
+    await executorStore.updateSettings({
+      task_cooldown_max_seconds: executorSettingsForm.taskCooldownMaxSeconds,
+      page_load_wait_max_seconds: executorSettingsForm.pageLoadWaitMaxSeconds
+    });
+    ElMessage.success("执行器配置已保存");
+  } catch {
+    ElMessage.error(executorStore.error ?? "执行器配置保存失败");
+  } finally {
+    executorSettingsSaving.value = false;
   }
 };
 
@@ -142,26 +182,60 @@ const returnToReview = async (action: FineJobBossExecutorQueueAction) => {
   }
 };
 
-const manualVerify = async (action: FineJobBossExecutorQueueAction) => {
-  await openActionJob(action);
-  try {
-    await ElMessageBox.confirm(
-      "请在岗位页面核对：显示“继续沟通”表示已经沟通。",
-      "人工核验",
-      { confirmButtonText: "确认已沟通", cancelButtonText: "确认未沟通", distinguishCancelAndClose: true }
-    );
-    await executorStore.manualVerifyUnknown(action.id, true);
-  } catch (value) {
-    if (value !== "cancel") return;
-    await executorStore.manualVerifyUnknown(action.id, false);
-  }
-  await load();
-  ElMessage.success("人工核验结果已保存");
+const canReturn = (action: FineJobBossExecutorQueueAction) =>
+  !["running", "succeeded"].includes(action.execution_state);
+
+const openCreateTestTask = () => {
+  testTaskForm.jobId = executorStore.testJobs[0]?.id ?? "";
+  testTaskForm.closePageAfterCompletion = false;
+  testTaskForm.delaySeconds = 3;
+  testTaskDrawerOpen.value = true;
 };
 
-const canReturn = (action: FineJobBossExecutorQueueAction) => ![
-  "dispatch_started", "request_accepted", "succeeded", "failed_after_dispatch", "unknown_after_dispatch"
-].includes(action.execution_state);
+const createTestTask = async () => {
+  if (!testTaskForm.jobId) {
+    ElMessage.warning("请选择关联测试岗位");
+    return;
+  }
+  testTaskSubmitting.value = true;
+  try {
+    await executorStore.createTestTask({
+      job_id: testTaskForm.jobId,
+      close_page_after_completion: testTaskForm.closePageAfterCompletion,
+      delay_seconds: testTaskForm.delaySeconds
+    });
+    testTaskDrawerOpen.value = false;
+    await load();
+    ElMessage.success("测试任务已加入执行队列");
+  } catch {
+    ElMessage.error(executorStore.error ?? "新建测试任务失败");
+  } finally {
+    testTaskSubmitting.value = false;
+  }
+};
+
+const openEditTestJob = (job: typeof executorStore.testJobs[number]) => {
+  testJobForm.id = job.id;
+  testJobForm.encryptJobId = job.encrypt_job_id;
+  testJobForm.jobLink = job.job_link;
+  testJobDialogOpen.value = true;
+};
+
+const saveTestJob = async () => {
+  testJobSaving.value = true;
+  try {
+    await executorStore.updateTestJob(testJobForm.id, {
+      encrypt_job_id: testJobForm.encryptJobId,
+      job_link: testJobForm.jobLink
+    });
+    testJobDialogOpen.value = false;
+    ElMessage.success("测试岗位已保存");
+  } catch {
+    ElMessage.error(executorStore.error ?? "保存测试岗位失败");
+  } finally {
+    testJobSaving.value = false;
+  }
+};
 
 const deleteLegacyRun = async (run: FineJobDeliveryRun) => {
   try {
@@ -177,12 +251,36 @@ const deleteLegacyRun = async (run: FineJobDeliveryRun) => {
   }
 };
 
+watch(
+  () => executorStore.dashboard,
+  (runtime) => {
+    if (!runtime || !runsStore.dashboard) return;
+    runsStore.dashboard = {
+      ...runsStore.dashboard,
+      executor: runtime.executor,
+      current_task: runtime.current_task ?? null,
+      queue: runtime.queue
+    };
+  },
+  { deep: true }
+);
+
+watch(
+  executor,
+  (value) => {
+    if (!value) return;
+    executorSettingsForm.taskCooldownMaxSeconds = value.task_cooldown_max_seconds ?? 4;
+    executorSettingsForm.pageLoadWaitMaxSeconds = value.page_load_wait_max_seconds ?? 3;
+  },
+  { immediate: true }
+);
+
 onMounted(() => {
+  executorStore.startStatusSync();
   void load();
-  pollTimer = window.setInterval(() => void load(), 5000);
 });
 onBeforeUnmount(() => {
-  if (pollTimer !== null) window.clearInterval(pollTimer);
+  executorStore.stopStatusSync();
 });
 </script>
 
@@ -203,7 +301,7 @@ onBeforeUnmount(() => {
       <article class="metric-card"><span>岗位总数</span><strong>{{ dashboard?.metrics.jobs ?? 0 }}</strong><p>历史采集主数据</p></article>
       <article class="metric-card"><span>已完成评估</span><strong>{{ dashboard?.metrics.evaluated_jobs ?? 0 }}</strong><p>按岗位去重</p></article>
       <article class="metric-card"><span>待确认</span><strong>{{ dashboard?.metrics.pending_reviews ?? 0 }}</strong><p>等待用户决策</p></article>
-      <article class="metric-card"><span>排队动作</span><strong>{{ dashboard?.metrics.queued_actions ?? 0 }}</strong><p>等待执行器处理</p></article>
+      <article class="metric-card"><span>待处理任务</span><strong>{{ dashboard?.metrics.queued_actions ?? 0 }}</strong><p>等待执行器处理</p></article>
       <article class="metric-card"><span>已确认成功</span><strong>{{ dashboard?.metrics.successful_actions ?? 0 }}</strong><p>建立沟通结果</p></article>
       <article class="metric-card"><span>需要处理</span><strong>{{ dashboard?.metrics.issue_actions ?? 0 }}</strong><p>失败、阻断或未知</p></article>
     </div>
@@ -213,43 +311,92 @@ onBeforeUnmount(() => {
         <div><p class="panel-eyebrow">BOSS Executor</p><h2>BOSS 执行器</h2></div>
         <el-tag :type="executorStatusType">{{ executorStatusLabel }}</el-tag>
       </div>
-      <el-empty v-if="!executor || !executor.browser_connected" description="等待BOSS执行器心跳连接">
-        <el-button :loading="executorStore.heartbeatTesting" @click="testHeartbeat">心跳测试</el-button>
-        <el-button v-if="executor" @click="disconnect">断开连接</el-button>
-        <el-button type="primary" @click="createPairingCode">生成插件配对码</el-button>
-      </el-empty>
-      <template v-else>
-        <el-descriptions :column="4" border>
-          <el-descriptions-item label="自动权限">{{ executor.permission_state }}</el-descriptions-item>
-          <el-descriptions-item label="队列状态">{{ executor.queue_state }}</el-descriptions-item>
-          <el-descriptions-item label="风险状态">{{ executor.risk_state }}</el-descriptions-item>
-          <el-descriptions-item label="最近心跳">{{ formatDateTime(executor.last_heartbeat_at || '') }}</el-descriptions-item>
-        </el-descriptions>
-        <div class="executor-actions">
-          <el-button :loading="executorStore.heartbeatTesting" @click="testHeartbeat">心跳测试</el-button>
-          <el-button @click="disconnect">断开连接</el-button>
-          <el-button type="primary" @click="control(executor.permission_state === 'allowed' ? 'resume' : 'allow')">允许并运行</el-button>
-          <el-button @click="control('pause')">暂停</el-button>
-          <el-button type="danger" plain @click="control('emergency_stop')">紧急停止</el-button>
+      <div class="executor-layout">
+        <div class="executor-main">
+          <div v-if="!executor || !executor.browser_connected" class="connection-box">
+            <div>
+              <strong>{{ executor ? "等待插件控制通道" : "尚未配对插件" }}</strong>
+              <p class="secondary-text">
+                {{ executor ? "插件配对后会自动建立连接；也可以手动发起心跳测试。" : "先生成配对码，再到 BOSS 插件面板输入。" }}
+              </p>
+            </div>
+            <div class="connection-actions">
+              <el-button :loading="executorStore.heartbeatTesting" @click="testHeartbeat">心跳测试</el-button>
+              <el-button v-if="executor" @click="disconnect">断开连接</el-button>
+              <el-button type="primary" @click="createPairingCode">生成配对码</el-button>
+            </div>
+          </div>
+          <template v-else>
+            <el-descriptions :column="3" border>
+              <el-descriptions-item label="队列状态">{{ executor.queue_state }}</el-descriptions-item>
+              <el-descriptions-item label="风险状态">{{ executor.risk_state }}</el-descriptions-item>
+              <el-descriptions-item label="最近心跳">{{ formatDateTime(executor.last_heartbeat_at || '') }}</el-descriptions-item>
+            </el-descriptions>
+            <el-alert
+              :title="executorProgressText"
+              type="info"
+              :closable="false"
+              show-icon
+              class="current-task-alert"
+            />
+            <div class="executor-actions">
+              <el-button :loading="executorStore.heartbeatTesting" @click="testHeartbeat">心跳测试</el-button>
+              <el-button @click="disconnect">断开连接</el-button>
+              <el-button
+                :type="executor.queue_state === 'running' ? 'warning' : 'primary'"
+                @click="control(executor.queue_state === 'running' ? 'pause' : 'start')"
+              >{{ executor.queue_state === 'running' ? '暂停' : '开始运行' }}</el-button>
+            </div>
+          </template>
+          <div v-if="showPairingCode" class="pairing-code-box">
+            <div>
+              <span class="pairing-label">插件配对码</span>
+              <strong>{{ executorStore.pairingCode }}</strong>
+              <p class="secondary-text">有效期至 {{ formatDateTime(executorStore.pairingExpiresAt || '') }}</p>
+            </div>
+            <el-button :icon="CopyDocument" @click="copyPairingCode">复制</el-button>
+          </div>
         </div>
-      </template>
-      <el-alert
-        v-if="executorStore.pairingCode"
-        type="warning"
-        :closable="false"
-        :title="`配对码：${executorStore.pairingCode}`"
-        :description="`有效期至 ${formatDateTime(executorStore.pairingExpiresAt || '')}`"
-        show-icon
-      />
+        <div v-if="executor" class="executor-settings">
+          <div>
+            <span>任务间隔上限</span>
+            <el-input-number
+              v-model="executorSettingsForm.taskCooldownMaxSeconds"
+              :min="4"
+              :max="600"
+              :step="1"
+              controls-position="right"
+            />
+          </div>
+          <div>
+            <span>页面加载等待上限</span>
+            <el-input-number
+              v-model="executorSettingsForm.pageLoadWaitMaxSeconds"
+              :min="3"
+              :max="600"
+              :step="1"
+              controls-position="right"
+            />
+          </div>
+          <el-button type="primary" plain :loading="executorSettingsSaving" @click="saveExecutorSettings">保存配置</el-button>
+        </div>
+      </div>
     </section>
 
-    <section v-if="currentAction" class="page-panel current-action">
-      <div><p class="panel-eyebrow">Current Action</p><h2>{{ currentAction.job_title }}</h2><p>{{ currentAction.company_name }}</p></div>
-      <div class="current-action__status">
-        <el-tag type="warning">{{ executionLabel(currentAction.execution_state) }}</el-tag>
-        <span>{{ verificationLabel(currentAction) }}</span>
-        <span v-if="currentAction.last_error" class="row-error">{{ currentAction.last_error }}</span>
+    <section class="table-panel">
+      <div class="panel-title-row">
+        <div><p class="panel-eyebrow">Test Jobs</p><h2>测试岗位</h2></div>
+        <el-button type="primary" @click="openCreateTestTask">新建测试任务</el-button>
       </div>
+      <el-table :data="executorStore.testJobs" empty-text="正在初始化测试岗位">
+        <el-table-column prop="title" label="岗位" min-width="150" />
+        <el-table-column prop="id" label="岗位 ID" min-width="220" show-overflow-tooltip />
+        <el-table-column prop="encrypt_job_id" label="encrypt_job_id" min-width="190" show-overflow-tooltip />
+        <el-table-column prop="job_link" label="job_link" min-width="300" show-overflow-tooltip />
+        <el-table-column label="操作" width="100" fixed="right">
+          <template #default="{ row }"><el-button link type="primary" @click="openEditTestJob(row)">编辑测试岗位</el-button></template>
+        </el-table-column>
+      </el-table>
     </section>
 
     <section class="table-panel">
@@ -257,27 +404,57 @@ onBeforeUnmount(() => {
       <div class="inline-filters">
         <el-input v-model="queueQuery" clearable placeholder="筛选岗位或公司" />
         <el-select v-model="queueState" clearable placeholder="全部执行状态">
-          <el-option label="排队中" value="queued" /><el-option label="正在发送" value="dispatch_started" />
-          <el-option label="平台已受理" value="request_accepted" /><el-option label="结果未知" value="unknown_after_dispatch" />
+          <el-option label="待处理" value="queued" /><el-option label="执行中" value="running" />
+          <el-option label="结果未知" value="unknown" />
           <el-option label="已阻断" value="blocked" />
         </el-select>
       </div>
       <el-table :data="filteredQueue" empty-text="当前筛选条件下暂无动作">
-        <el-table-column prop="queue_position" label="#" width="60" />
         <el-table-column prop="job_title" label="岗位" min-width="200" />
         <el-table-column prop="company_name" label="公司" min-width="150" />
         <el-table-column label="执行状态" min-width="150"><template #default="{ row }">{{ executionLabel(row.execution_state) }}</template></el-table-column>
-        <el-table-column label="核验状态" min-width="150"><template #default="{ row }">{{ verificationLabel(row) }}</template></el-table-column>
         <el-table-column prop="last_error" label="最近错误" min-width="220" show-overflow-tooltip />
         <el-table-column label="操作" width="190" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="openActionJob(row)">打开岗位</el-button>
             <el-button v-if="canReturn(row)" link @click="returnToReview(row)">退回</el-button>
-            <el-button v-if="row.execution_state === 'unknown_after_dispatch'" link type="warning" @click="manualVerify(row)">人工核验</el-button>
           </template>
         </el-table-column>
       </el-table>
     </section>
+
+    <el-drawer v-model="testTaskDrawerOpen" title="新建测试任务" size="440px">
+      <el-form label-position="top">
+        <el-form-item label="关联测试岗位">
+          <el-select v-model="testTaskForm.jobId" placeholder="选择测试岗位" class="form-full-width">
+            <el-option v-for="job in executorStore.testJobs" :key="job.id" :label="`${job.title} · ${job.id}`" :value="job.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="执行完成后关闭页面">
+          <el-switch v-model="testTaskForm.closePageAfterCompletion" />
+          <p class="secondary-text">该开关只影响当前任务。</p>
+        </el-form-item>
+        <el-form-item label="运行时间（秒）">
+          <el-input-number
+            v-model="testTaskForm.delaySeconds"
+            :min="1"
+            :max="600"
+            :step="1"
+            controls-position="right"
+          />
+        </el-form-item>
+        <el-button type="primary" :loading="testTaskSubmitting" @click="createTestTask">创建测试任务</el-button>
+      </el-form>
+    </el-drawer>
+
+    <el-dialog v-model="testJobDialogOpen" title="编辑测试岗位" width="560px">
+      <el-form label-position="top">
+        <el-form-item label="岗位 ID"><el-input :model-value="testJobForm.id" disabled /></el-form-item>
+        <el-form-item label="encrypt_job_id"><el-input v-model="testJobForm.encryptJobId" /></el-form-item>
+        <el-form-item label="job_link"><el-input v-model="testJobForm.jobLink" /></el-form-item>
+      </el-form>
+      <template #footer><el-button @click="testJobDialogOpen = false">取消</el-button><el-button type="primary" :loading="testJobSaving" @click="saveTestJob">保存</el-button></template>
+    </el-dialog>
 
     <section class="table-panel">
       <div class="panel-title-row"><div><p class="panel-eyebrow">Issues</p><h2>最近异常与警告</h2></div></div>
@@ -318,12 +495,95 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.executor-actions, .inline-filters, .current-action, .current-action__status { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.executor-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  gap: 18px;
+  align-items: start;
+}
+.executor-main {
+  min-width: 0;
+}
+.connection-box,
+.pairing-code-box,
+.executor-settings {
+  border: 1px solid var(--el-border-color-light);
+  border-radius: 8px;
+  background: var(--el-fill-color-extra-light);
+}
+.connection-box,
+.pairing-code-box {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px;
+}
+.connection-box strong {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--el-text-color-primary);
+}
+.connection-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.pairing-code-box {
+  margin-top: 14px;
+  border-color: var(--el-color-warning-light-5);
+  background: var(--el-color-warning-light-9);
+}
+.pairing-label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+.pairing-code-box strong {
+  display: block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 30px;
+  line-height: 1.1;
+  letter-spacing: 0;
+  color: var(--el-text-color-primary);
+}
+.executor-settings {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+.executor-settings > div {
+  display: grid;
+  gap: 6px;
+}
+.executor-settings span {
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+}
+.executor-settings :deep(.el-input-number) {
+  width: 100%;
+}
+.executor-actions, .inline-filters { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .executor-actions { justify-content: flex-end; margin-top: 16px; }
+.current-task-alert { margin-top: 12px; }
+.form-full-width { width: 100%; }
 .inline-filters { margin-bottom: 16px; }
 .inline-filters > * { width: min(320px, 100%); }
-.current-action { justify-content: space-between; }
-.current-action__status { justify-content: flex-end; }
 .row-error { color: var(--el-color-danger); }
 .legacy-panel { margin-top: 8px; }
+@media (max-width: 900px) {
+  .executor-layout {
+    grid-template-columns: 1fr;
+  }
+  .connection-box,
+  .pairing-code-box {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .connection-actions {
+    justify-content: flex-start;
+  }
+}
 </style>

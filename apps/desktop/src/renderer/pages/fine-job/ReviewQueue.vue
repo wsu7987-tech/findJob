@@ -17,13 +17,24 @@ const detailDrawerOpen = ref(false);
 const navigationErrors = ref<Record<string, string>>({});
 let executorPollTimer: number | null = null;
 
-const pageDescription = computed(() => ({
-  pending: "集中审核推荐岗位和需要判断的岗位，批准后进入默认招呼队列。",
+const reviewTabs: Array<{ label: string; name: FineJobReviewTab }> = [
+  { label: "待确认", name: "pending" },
+  { label: "不建议/已拒绝", name: "rejected" },
+  { label: "待执行", name: "running" },
+  { label: "已执行", name: "executed" },
+  { label: "已归档", name: "dismissed" }
+];
+
+const reviewPageDescriptions: Record<FineJobReviewTab, string> = {
+  pending: "集中审核推荐岗位和需要判断的岗位，批准后创建默认招呼执行任务。",
+  approved: "查看已经批准的岗位和执行任务。",
   rejected: "查看 AI 不建议或用户拒绝的岗位，可明确覆盖结论。",
   running: "查看已经批准、等待执行或正在推进的岗位。",
   executed: "查看已经完成沟通、发送后失败或结果未知的岗位。",
   dismissed: "保存用户主动归档和被新评估替代的历史事项。"
-})[workflowStore.selectedStatus]);
+};
+
+const pageDescription = computed(() => reviewPageDescriptions[workflowStore.selectedStatus]);
 
 const executorLabel = computed(() => {
   const executor = executorStore.dashboard?.executor;
@@ -65,9 +76,9 @@ const approve = async (item: FineJobReviewItem) => {
   if (item.status === "rejected") {
     try {
       await ElMessageBox.confirm(
-        "该岗位原结论为不建议。确认后会加入 BOSS 默认招呼队列。",
+        "该岗位原结论为不建议。确认后会创建 BOSS 默认招呼执行任务。",
         "仍要沟通",
-        { type: "warning", confirmButtonText: "确认加入队列" }
+        { type: "warning", confirmButtonText: "确认创建任务" }
       );
     } catch {
       return;
@@ -76,7 +87,7 @@ const approve = async (item: FineJobReviewItem) => {
   try {
     await workflowStore.approve(item, "", item.status === "rejected");
     await executorStore.load();
-    ElMessage.success("已加入 BOSS 默认招呼队列");
+    ElMessage.success("已创建 BOSS 默认招呼执行任务");
   } catch {
     ElMessage.error(workflowStore.error ?? "批准失败");
   }
@@ -131,7 +142,7 @@ const openChat = (sessionId: string) => router.push({
 
 const runBatch = async (operation: "approve" | "reject" | "archive") => {
   if (!selectedRows.value.length) return;
-  const labels = { approve: "批准并加入队列", reject: "拒绝", archive: "归档" };
+  const labels = { approve: "批准并创建任务", reject: "拒绝", archive: "归档" };
   const hasRejected = selectedRows.value.some((item) => item.status === "rejected");
   try {
     await ElMessageBox.confirm(
@@ -179,9 +190,7 @@ const returnToReview = async (item: FineJobReviewItem) => {
 };
 
 const canReturnToReview = (item: FineJobReviewItem) => Boolean(
-  item.action_id && ![
-    "dispatch_started", "request_accepted", "succeeded", "failed_after_dispatch", "unknown_after_dispatch"
-  ].includes(item.execution_state ?? "")
+  item.action_id && !["running", "succeeded"].includes(item.execution_state ?? "")
 );
 
 const showDetail = (item: FineJobReviewItem) => {
@@ -196,14 +205,28 @@ const decisionType = (decision: FineJobReviewItem["ai_decision"]) =>
 const executionLabel = (item: FineJobReviewItem) => {
   if (!item.action_id) return item.status === "approved" ? "已批准" : "未入队";
   return ({
-    queued: "排队中", opening_page: "正在打开岗位", waiting_page_ready: "等待页面就绪",
-    page_verified: "页面已核对", ready_to_dispatch: "等待发送", dispatch_started: "正在发送",
-    request_accepted: "平台已受理", succeeded: "已确认沟通", cancellation_requested: "正在取消",
-    cancelled: "已取消", blocked: "已阻断", failed_before_dispatch: "发送前失败",
-    failed_after_dispatch: "发送后失败", unknown_after_dispatch: "结果未知"
+    queued: "待处理", running: "执行中", succeeded: "已完成",
+    cancelled: "已取消", blocked: "已阻断", failed: "执行失败", unknown: "结果未知"
   } as Record<string, string>)[item.execution_state ?? ""] ?? item.execution_state ?? "未知";
 };
-const gapSummary = (item: FineJobReviewItem) => item.evaluation.gaps.map((gap) => gap.item).join("；");
+const evaluationReasons = (evaluation: FineJobReviewItem["evaluation"]) =>
+  Array.isArray(evaluation?.reasons) ? evaluation.reasons : [];
+const evaluationStrengths = (evaluation: FineJobReviewItem["evaluation"]) =>
+  Array.isArray(evaluation?.strengths) ? evaluation.strengths : [];
+const evaluationGaps = (evaluation: FineJobReviewItem["evaluation"]) =>
+  Array.isArray(evaluation?.gaps) ? evaluation.gaps : [];
+const evaluationRisks = (evaluation: FineJobReviewItem["evaluation"]) =>
+  Array.isArray(evaluation?.risks) ? evaluation.risks : [];
+const evaluationHardRequirements = (evaluation: FineJobReviewItem["evaluation"]) =>
+  Array.isArray(evaluation?.hard_requirements) ? evaluation.hard_requirements : [];
+const evaluationSummary = (evaluation: FineJobReviewItem["evaluation"]) =>
+  (typeof evaluation?.summary === "string" && evaluation.summary) || evaluationReasons(evaluation).join("；") || "-";
+const confidencePercent = (evaluation: FineJobReviewItem["evaluation"]) => {
+  const confidence = Number(evaluation?.confidence);
+  return Number.isFinite(confidence) ? Math.round(confidence * 100) : 0;
+};
+const gapSummary = (item: FineJobReviewItem) =>
+  evaluationGaps(item.evaluation).map((gap) => gap.item).join("；");
 
 const createPairingCode = async () => {
   try {
@@ -277,11 +300,11 @@ onBeforeUnmount(() => {
           </el-form-item>
           <el-form-item label="执行状态">
             <el-select v-model="workflowStore.executionState" clearable placeholder="全部状态">
-              <el-option label="排队中" value="queued" />
-              <el-option label="正在发送" value="dispatch_started" />
-              <el-option label="平台已受理" value="request_accepted" />
+              <el-option label="待处理" value="queued" />
+              <el-option label="执行中" value="running" />
               <el-option label="执行成功" value="succeeded" />
-              <el-option label="结果未知" value="unknown_after_dispatch" />
+              <el-option label="执行失败" value="failed" />
+              <el-option label="结果未知" value="unknown" />
               <el-option label="已阻断" value="blocked" />
             </el-select>
           </el-form-item>
@@ -303,13 +326,20 @@ onBeforeUnmount(() => {
     </section>
 
     <section class="page-panel">
-      <el-tabs v-model="workflowStore.selectedStatus" @tab-change="handleTabChange">
-        <el-tab-pane label="待确认" name="pending" />
-        <el-tab-pane label="不建议/已拒绝" name="rejected" />
-        <el-tab-pane label="待执行" name="running" />
-        <el-tab-pane label="已执行" name="executed" />
-        <el-tab-pane label="已归档" name="dismissed" />
-      </el-tabs>
+      <el-radio-group
+        v-model="workflowStore.selectedStatus"
+        class="review-status-tabs"
+        data-testid="review-status-filter"
+        @change="handleTabChange"
+      >
+        <el-radio-button
+          v-for="tab in reviewTabs"
+          :key="tab.name"
+          :value="tab.name"
+        >
+          {{ tab.label }}
+        </el-radio-button>
+      </el-radio-group>
 
       <div v-if="selectedRows.length" class="batch-toolbar">
         <strong>已选择 {{ selectedRows.length }} 项</strong>
@@ -361,10 +391,10 @@ onBeforeUnmount(() => {
           <template #default="{ row }"><el-tag :type="decisionType(row.ai_decision)">{{ decisionLabel(row.ai_decision) }}</el-tag></template>
         </el-table-column>
         <el-table-column label="置信度" width="90">
-          <template #default="{ row }">{{ Math.round(row.evaluation.confidence * 100) }}%</template>
+          <template #default="{ row }">{{ confidencePercent(row.evaluation) }}%</template>
         </el-table-column>
         <el-table-column label="关键判断" min-width="240" show-overflow-tooltip>
-          <template #default="{ row }">{{ row.evaluation.summary || row.evaluation.reasons.join("；") || "-" }}</template>
+          <template #default="{ row }">{{ evaluationSummary(row.evaluation) }}</template>
         </el-table-column>
         <el-table-column label="执行状态" width="140">
           <template #default="{ row }">{{ executionLabel(row) }}</template>
@@ -411,21 +441,21 @@ onBeforeUnmount(() => {
         <el-descriptions :column="2" border>
           <el-descriptions-item label="AI 结论">{{ decisionLabel(detailItem.ai_decision) }}</el-descriptions-item>
           <el-descriptions-item label="执行状态">{{ executionLabel(detailItem) }}</el-descriptions-item>
-          <el-descriptions-item label="置信度">{{ Math.round(detailItem.evaluation.confidence * 100) }}%</el-descriptions-item>
+          <el-descriptions-item label="置信度">{{ confidencePercent(detailItem.evaluation) }}%</el-descriptions-item>
           <el-descriptions-item label="创建时间">{{ formatDateTime(detailItem.created_at) }}</el-descriptions-item>
         </el-descriptions>
         <div class="review-detail">
           <h3>评估摘要</h3>
-          <p>{{ detailItem.evaluation.summary || detailItem.evaluation.reasons.join("；") }}</p>
-          <h3 v-if="detailItem.evaluation.strengths.length">优势</h3>
-          <p v-if="detailItem.evaluation.strengths.length">{{ detailItem.evaluation.strengths.join("；") }}</p>
-          <h3 v-if="detailItem.evaluation.gaps.length">差距</h3>
-          <p v-if="detailItem.evaluation.gaps.length">{{ gapSummary(detailItem) }}</p>
-          <h3 v-if="detailItem.evaluation.risks.length">风险</h3>
-          <p v-if="detailItem.evaluation.risks.length" class="evaluation-warning">{{ detailItem.evaluation.risks.join("；") }}</p>
-          <h3 v-if="detailItem.evaluation.hard_requirements.length">硬性条件</h3>
-          <div v-if="detailItem.evaluation.hard_requirements.length" class="tag-list">
-            <el-tag v-for="item in detailItem.evaluation.hard_requirements" :key="item.name">{{ item.name }} · {{ item.status }}</el-tag>
+          <p>{{ evaluationSummary(detailItem.evaluation) }}</p>
+          <h3 v-if="evaluationStrengths(detailItem.evaluation).length">优势</h3>
+          <p v-if="evaluationStrengths(detailItem.evaluation).length">{{ evaluationStrengths(detailItem.evaluation).join("；") }}</p>
+          <h3 v-if="evaluationGaps(detailItem.evaluation).length">差距</h3>
+          <p v-if="evaluationGaps(detailItem.evaluation).length">{{ gapSummary(detailItem) }}</p>
+          <h3 v-if="evaluationRisks(detailItem.evaluation).length">风险</h3>
+          <p v-if="evaluationRisks(detailItem.evaluation).length" class="evaluation-warning">{{ evaluationRisks(detailItem.evaluation).join("；") }}</p>
+          <h3 v-if="evaluationHardRequirements(detailItem.evaluation).length">硬性条件</h3>
+          <div v-if="evaluationHardRequirements(detailItem.evaluation).length" class="tag-list">
+            <el-tag v-for="item in evaluationHardRequirements(detailItem.evaluation)" :key="item.name">{{ item.name }} · {{ item.status }}</el-tag>
           </div>
           <h3>招呼语草稿</h3>
           <p>{{ detailItem.draft_message || "暂无招呼语草稿" }}</p>
@@ -445,6 +475,7 @@ onBeforeUnmount(() => {
 }
 .executor-summary, .detail-heading { justify-content: space-between; }
 .executor-summary__main { margin-top: 8px; }
+.review-status-tabs { margin-bottom: 14px; }
 .review-filter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 4px 16px; }
 .batch-toolbar { padding: 10px 0 14px; }
 .review-pagination { display: flex; justify-content: flex-end; padding-top: 18px; }

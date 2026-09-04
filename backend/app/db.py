@@ -1055,6 +1055,7 @@ CREATE TABLE IF NOT EXISTS fj_boss_jobs (
   skills TEXT NOT NULL DEFAULT '',
   job_labels TEXT NOT NULL DEFAULT '',
   search_keyword TEXT NOT NULL DEFAULT '',
+  is_test INTEGER NOT NULL DEFAULT 0,
   payload_json TEXT NOT NULL DEFAULT '{}',
   detail_json TEXT,
   detail_status TEXT NOT NULL DEFAULT 'not_collected',
@@ -1068,6 +1069,7 @@ CREATE TABLE IF NOT EXISTS fj_boss_jobs (
   FOREIGN KEY (latest_batch_id) REFERENCES fj_boss_capture_batches(id),
   FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE SET NULL,
   CHECK (detail_status IN ('not_collected', 'queued', 'collecting', 'completed', 'failed')),
+  CHECK (is_test IN (0, 1)),
   CHECK (collect_count > 0)
 );
 
@@ -1173,6 +1175,7 @@ CREATE TABLE IF NOT EXISTS fj_review_items (
   job_id TEXT NOT NULL,
   evaluation_id TEXT NOT NULL,
   action_type TEXT NOT NULL DEFAULT 'start_conversation',
+  task_type TEXT NOT NULL DEFAULT 'BOSS_DEFAULT_GREETING',
   status TEXT NOT NULL DEFAULT 'pending',
   ai_decision TEXT NOT NULL,
   draft_message TEXT NOT NULL DEFAULT '',
@@ -1203,43 +1206,20 @@ CREATE TABLE IF NOT EXISTS fj_automation_actions (
   status TEXT NOT NULL DEFAULT 'queued',
   idempotency_key TEXT NOT NULL UNIQUE,
   payload_json TEXT NOT NULL DEFAULT '{}',
-  lease_owner TEXT,
-  lease_expires_at TEXT,
-  attempt_count INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   completed_at TEXT,
   execution_state TEXT NOT NULL DEFAULT 'queued',
   execution_epoch INTEGER NOT NULL DEFAULT 0,
-  queue_position INTEGER NOT NULL DEFAULT 0,
-  page_open_attempts INTEGER NOT NULL DEFAULT 0,
-  page_deadline_at TEXT,
-  dispatch_started_at TEXT,
-  cooldown_seconds INTEGER,
-  next_eligible_at TEXT,
   last_status_code TEXT,
   result_json TEXT NOT NULL DEFAULT '{}',
-  navigation_task_id TEXT,
-  request_accepted_at TEXT,
-  verification_state TEXT NOT NULL DEFAULT 'not_required',
-  verification_method TEXT NOT NULL DEFAULT 'none',
-  verification_delay_seconds INTEGER,
-  verification_due_at TEXT,
-  verification_started_at TEXT,
-  verification_completed_at TEXT,
-  verification_attempts INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
   FOREIGN KEY (evaluation_id) REFERENCES fj_job_evaluations(id) ON DELETE CASCADE,
   FOREIGN KEY (review_item_id) REFERENCES fj_review_items(id) ON DELETE CASCADE,
   CHECK (action_type IN ('start_conversation', 'BOSS_DEFAULT_GREETING')),
-  CHECK (status IN ('queued', 'leased', 'succeeded', 'failed', 'blocked', 'unknown', 'cancelled')),
-  CHECK (attempt_count >= 0),
-  CHECK (execution_epoch >= 0),
-  CHECK (page_open_attempts >= 0),
-  CHECK (verification_attempts >= 0),
-  CHECK (verification_delay_seconds IS NULL OR verification_delay_seconds BETWEEN 10 AND 30),
-  CHECK (cooldown_seconds IS NULL OR cooldown_seconds IN (1, 2, 3))
+  CHECK (status IN ('queued', 'running', 'leased', 'succeeded', 'failed', 'blocked', 'unknown', 'cancelled')),
+  CHECK (execution_epoch >= 0)
 );
 
 CREATE INDEX IF NOT EXISTS idx_fj_automation_actions_status_created_at
@@ -1251,21 +1231,19 @@ CREATE TABLE IF NOT EXISTS fj_boss_executor_instances (
   protocol_version TEXT NOT NULL,
   plugin_version TEXT NOT NULL,
   capabilities_json TEXT NOT NULL DEFAULT '[]',
-  permission_state TEXT NOT NULL DEFAULT 'not_authorized',
   queue_state TEXT NOT NULL DEFAULT 'paused',
   risk_state TEXT NOT NULL DEFAULT 'none',
   browser_connected INTEGER NOT NULL DEFAULT 0,
-  current_action_id TEXT,
-  current_epoch INTEGER,
-  cooldown_seconds INTEGER,
-  next_eligible_at TEXT,
   last_heartbeat_at TEXT,
+  task_cooldown_max_seconds INTEGER NOT NULL DEFAULT 4,
+  page_load_wait_max_seconds INTEGER NOT NULL DEFAULT 3,
+  runtime_phase TEXT NOT NULL DEFAULT 'idle',
+  runtime_detail TEXT NOT NULL DEFAULT '',
+  runtime_until_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  CHECK (permission_state IN ('not_authorized', 'allowed', 'paused', 'risk_paused')),
-  CHECK (queue_state IN ('running', 'paused', 'emergency_stopped', 'risk_paused')),
-  CHECK (browser_connected IN (0, 1)),
-  CHECK (cooldown_seconds IS NULL OR cooldown_seconds IN (1, 2, 3))
+  CHECK (queue_state IN ('running', 'paused', 'risk_paused')),
+  CHECK (browser_connected IN (0, 1))
 );
 
 CREATE INDEX IF NOT EXISTS idx_fj_boss_executor_heartbeat
@@ -1956,6 +1934,7 @@ class Database:
                 "ALTER TABLE fj_boss_jobs ADD COLUMN search_keyword TEXT NOT NULL DEFAULT ''"
             ),
             "company_id": "ALTER TABLE fj_boss_jobs ADD COLUMN company_id TEXT",
+            "is_test": "ALTER TABLE fj_boss_jobs ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0",
         }
         for column, ddl in migrations.items():
             if column not in columns:
@@ -2186,132 +2165,36 @@ class Database:
         self,
         connection: sqlite3.Connection,
     ) -> None:
-        """兼容阶段一数据库，并明确取消尚未发送的旧自定义消息动作。"""
+        """补齐执行任务需要的状态字段。"""
         columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(fj_automation_actions)")
         }
         migrations = {
             "execution_state": "ALTER TABLE fj_automation_actions ADD COLUMN execution_state TEXT NOT NULL DEFAULT 'queued'",
             "execution_epoch": "ALTER TABLE fj_automation_actions ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0",
-            "queue_position": "ALTER TABLE fj_automation_actions ADD COLUMN queue_position INTEGER NOT NULL DEFAULT 0",
-            "page_open_attempts": "ALTER TABLE fj_automation_actions ADD COLUMN page_open_attempts INTEGER NOT NULL DEFAULT 0",
-            "page_deadline_at": "ALTER TABLE fj_automation_actions ADD COLUMN page_deadline_at TEXT",
-            "dispatch_started_at": "ALTER TABLE fj_automation_actions ADD COLUMN dispatch_started_at TEXT",
-            "cooldown_seconds": "ALTER TABLE fj_automation_actions ADD COLUMN cooldown_seconds INTEGER",
-            "next_eligible_at": "ALTER TABLE fj_automation_actions ADD COLUMN next_eligible_at TEXT",
             "last_status_code": "ALTER TABLE fj_automation_actions ADD COLUMN last_status_code TEXT",
             "result_json": "ALTER TABLE fj_automation_actions ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}'",
-            "navigation_task_id": "ALTER TABLE fj_automation_actions ADD COLUMN navigation_task_id TEXT",
-            "request_accepted_at": "ALTER TABLE fj_automation_actions ADD COLUMN request_accepted_at TEXT",
-            "verification_state": "ALTER TABLE fj_automation_actions ADD COLUMN verification_state TEXT NOT NULL DEFAULT 'not_required'",
-            "verification_method": "ALTER TABLE fj_automation_actions ADD COLUMN verification_method TEXT NOT NULL DEFAULT 'none'",
-            "verification_delay_seconds": "ALTER TABLE fj_automation_actions ADD COLUMN verification_delay_seconds INTEGER",
-            "verification_due_at": "ALTER TABLE fj_automation_actions ADD COLUMN verification_due_at TEXT",
-            "verification_started_at": "ALTER TABLE fj_automation_actions ADD COLUMN verification_started_at TEXT",
-            "verification_completed_at": "ALTER TABLE fj_automation_actions ADD COLUMN verification_completed_at TEXT",
-            "verification_attempts": "ALTER TABLE fj_automation_actions ADD COLUMN verification_attempts INTEGER NOT NULL DEFAULT 0",
+            "task_type": "ALTER TABLE fj_automation_actions ADD COLUMN task_type TEXT NOT NULL DEFAULT 'BOSS_DEFAULT_GREETING'",
         }
         for column, ddl in migrations.items():
             if column not in columns:
                 connection.execute(ddl)
 
-        # 旧 CHECK 约束不接受 BOSS_DEFAULT_GREETING。仅在检测到旧表定义时重建；
-        # 新执行器表不对动作表建立外键，因此重建不会改写其它表的引用目标。
-        table_sql = str(
-            connection.execute(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fj_automation_actions'"
-            ).fetchone()[0]
-        )
-        if "BOSS_DEFAULT_GREETING" not in table_sql:
-            connection.execute("ALTER TABLE fj_automation_actions RENAME TO fj_automation_actions_legacy")
-            connection.execute(
-                """
-                CREATE TABLE fj_automation_actions (
-                  id TEXT PRIMARY KEY, job_id TEXT NOT NULL, evaluation_id TEXT NOT NULL,
-                  review_item_id TEXT NOT NULL, action_type TEXT NOT NULL DEFAULT 'BOSS_DEFAULT_GREETING',
-                  status TEXT NOT NULL DEFAULT 'queued', idempotency_key TEXT NOT NULL UNIQUE,
-                  payload_json TEXT NOT NULL DEFAULT '{}', lease_owner TEXT, lease_expires_at TEXT,
-                  attempt_count INTEGER NOT NULL DEFAULT 0, last_error TEXT, created_at TEXT NOT NULL,
-                  updated_at TEXT NOT NULL, completed_at TEXT, execution_state TEXT NOT NULL DEFAULT 'queued',
-                  execution_epoch INTEGER NOT NULL DEFAULT 0, queue_position INTEGER NOT NULL DEFAULT 0,
-                  page_open_attempts INTEGER NOT NULL DEFAULT 0, page_deadline_at TEXT,
-                  dispatch_started_at TEXT, cooldown_seconds INTEGER, next_eligible_at TEXT,
-                  last_status_code TEXT, result_json TEXT NOT NULL DEFAULT '{}', navigation_task_id TEXT,
-                  request_accepted_at TEXT, verification_state TEXT NOT NULL DEFAULT 'not_required',
-                  verification_method TEXT NOT NULL DEFAULT 'none', verification_delay_seconds INTEGER,
-                  verification_due_at TEXT, verification_started_at TEXT,
-                  verification_completed_at TEXT, verification_attempts INTEGER NOT NULL DEFAULT 0,
-                  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
-                  FOREIGN KEY (evaluation_id) REFERENCES fj_job_evaluations(id) ON DELETE CASCADE,
-                  FOREIGN KEY (review_item_id) REFERENCES fj_review_items(id) ON DELETE CASCADE,
-                  CHECK (action_type IN ('start_conversation', 'BOSS_DEFAULT_GREETING')),
-                  CHECK (status IN ('queued', 'leased', 'succeeded', 'failed', 'blocked', 'unknown', 'cancelled')),
-                  CHECK (attempt_count >= 0), CHECK (execution_epoch >= 0),
-                  CHECK (page_open_attempts >= 0), CHECK (verification_attempts >= 0),
-                  CHECK (verification_delay_seconds IS NULL OR verification_delay_seconds BETWEEN 10 AND 30),
-                  CHECK (cooldown_seconds IS NULL OR cooldown_seconds IN (1, 2, 3))
-                )
-                """
-            )
-            connection.execute(
-                """
-                INSERT INTO fj_automation_actions (
-                  id, job_id, evaluation_id, review_item_id, action_type, status,
-                  idempotency_key, payload_json, lease_owner, lease_expires_at,
-                  attempt_count, last_error, created_at, updated_at, completed_at,
-                  execution_state, execution_epoch, queue_position, page_open_attempts,
-                  page_deadline_at, dispatch_started_at, cooldown_seconds, next_eligible_at,
-                  last_status_code, result_json, navigation_task_id, request_accepted_at,
-                  verification_state, verification_method, verification_delay_seconds,
-                  verification_due_at, verification_started_at, verification_completed_at,
-                  verification_attempts
-                )
-                SELECT id, job_id, evaluation_id, review_item_id, action_type,
-                  CASE WHEN status IN ('queued', 'leased') THEN 'cancelled' ELSE status END,
-                  idempotency_key, payload_json, NULL, NULL, attempt_count,
-                  CASE WHEN status IN ('queued', 'leased')
-                    THEN '旧自定义招呼动作已取消，请重新批准默认招呼动作' ELSE last_error END,
-                  created_at, updated_at,
-                  CASE WHEN status IN ('queued', 'leased') THEN updated_at ELSE completed_at END,
-                  CASE WHEN status IN ('queued', 'leased') THEN 'cancelled' ELSE status END,
-                  execution_epoch, queue_position, page_open_attempts, page_deadline_at,
-                  dispatch_started_at, cooldown_seconds, next_eligible_at, last_status_code,
-                  result_json, navigation_task_id, request_accepted_at, verification_state,
-                  verification_method, verification_delay_seconds, verification_due_at,
-                  verification_started_at, verification_completed_at, verification_attempts
-                FROM fj_automation_actions_legacy
-                """
-            )
-            connection.execute(
-                """
-                UPDATE fj_review_items SET status = 'pending', resolved_at = NULL,
-                  resolution_note = '旧自定义招呼动作已取消，等待重新批准默认招呼动作'
-                WHERE id IN (
-                  SELECT review_item_id FROM fj_automation_actions
-                  WHERE action_type = 'start_conversation' AND status = 'cancelled'
-                )
-                """
-            )
-            connection.execute("DROP TABLE fj_automation_actions_legacy")
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_fj_automation_actions_status_created_at ON fj_automation_actions(status, created_at ASC)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_fj_automation_actions_execution_queue ON fj_automation_actions(execution_state, queue_position, created_at ASC)"
-            )
+        executor_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(fj_boss_executor_instances)")
+        }
+        executor_migrations = {
+            "task_cooldown_max_seconds": "ALTER TABLE fj_boss_executor_instances ADD COLUMN task_cooldown_max_seconds INTEGER NOT NULL DEFAULT 4",
+            "page_load_wait_max_seconds": "ALTER TABLE fj_boss_executor_instances ADD COLUMN page_load_wait_max_seconds INTEGER NOT NULL DEFAULT 3",
+            "runtime_phase": "ALTER TABLE fj_boss_executor_instances ADD COLUMN runtime_phase TEXT NOT NULL DEFAULT 'idle'",
+            "runtime_detail": "ALTER TABLE fj_boss_executor_instances ADD COLUMN runtime_detail TEXT NOT NULL DEFAULT ''",
+            "runtime_until_at": "ALTER TABLE fj_boss_executor_instances ADD COLUMN runtime_until_at TEXT",
+        }
+        for column, ddl in executor_migrations.items():
+            if column not in executor_columns:
+                connection.execute(ddl)
 
-        connection.execute(
-            """
-            UPDATE fj_automation_actions
-            SET queue_position = rowid
-            WHERE queue_position = 0
-            """
-        )
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_fj_automation_actions_execution_queue ON fj_automation_actions(execution_state, queue_position, created_at ASC)"
-        )
-
-        # 兼容早期已经写入 payload_json 的投递评估结果。
+        # 兼容早期已经写入岗位评估结果的数据。
         evaluation_rows = connection.execute(
             "SELECT id, payload_json FROM fj_boss_jobs WHERE delivery_evaluation_json IS NULL"
         ).fetchall()

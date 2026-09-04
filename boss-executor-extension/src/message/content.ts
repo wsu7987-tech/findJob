@@ -5,7 +5,7 @@ import {
   type FrameworkStatus,
   type MainWorldStatus
 } from "../executor/framework-mode";
-import { isBossReadOnlySnapshot } from "../platform/boss/types";
+import { isBossPageIdentity } from "../platform/boss/types";
 import type {
   ChatIdentity,
   ChatObservedMessage,
@@ -55,21 +55,24 @@ export class ContentService {
     return { accepted: true };
   }
 
-  async reportBossSnapshot(value: unknown): Promise<{ accepted: true }> {
-    if (!isBossReadOnlySnapshot(value)) {
+  async reportBossPageIdentity(value: unknown): Promise<{ accepted: true }> {
+    if (!isBossPageIdentity(value)) {
       this.status.bossProbe = "unavailable";
-      this.status.bossSnapshot = null;
       throw new Error("BOSS 岗位识别载荷无效");
     }
 
     this.status.bossProbe = value.state;
-    this.status.bossSnapshot = value;
     this.status.page = value.pathname;
-    await this.background.reportBossSnapshot(value);
+    await this.background.reportBossPageIdentity(this.tabId, value);
     return { accepted: true };
   }
 
   async enqueueMainCommand(command: MainWorldCommand): Promise<{ accepted: boolean }> {
+    if (command.type === "BOSS_PAGE_PROBE") {
+      const alreadyQueued = this.mainCommands.some((item) => item.type === "BOSS_PAGE_PROBE");
+      if (!alreadyQueued) this.mainCommands.push(command);
+      return { accepted: true };
+    }
     if (command.type === "BOSS_CHAT_SEND") {
       if (command.targetTabId !== this.tabId) return { accepted: false };
       if (command.leaderEpoch !== this.chatLeaderEpoch) return { accepted: false };
@@ -77,14 +80,17 @@ export class ContentService {
         throw new Error("聊天发送命令载荷无效");
       }
     } else if (
-      !command.actionId || command.executionEpoch < 1 || !command.encryptJobId
+      !command.taskId || command.executionEpoch < 0 || !command.encryptJobId
     ) throw new Error("执行命令载荷无效");
+    if (command.type === "BOSS_DEFAULT_GREETING" && command.targetTabId && command.targetTabId !== this.tabId) {
+      return { accepted: false };
+    }
     const duplicate = this.mainCommands.some(
       (item) => item.type === command.type && (
         item.type === "BOSS_CHAT_SEND" && command.type === "BOSS_CHAT_SEND"
           ? item.action.id === command.action.id && item.action.execution_epoch === command.action.execution_epoch
           : item.type === "BOSS_DEFAULT_GREETING" && command.type === "BOSS_DEFAULT_GREETING"
-            && item.actionId === command.actionId && item.executionEpoch === command.executionEpoch
+            && item.taskId === command.taskId && item.executionEpoch === command.executionEpoch
       )
     );
     if (!duplicate) this.mainCommands.push(command);

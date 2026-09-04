@@ -90,18 +90,12 @@ describe("fineJobWorkflow store", () => {
         status: "queued",
         idempotency_key: "boss:history-job-1:start_conversation",
         payload: { message: "" },
-        attempt_count: 0,
         job_title: "Python 开发",
         company_name: "示例科技",
         created_at: "2026-08-21T10:00:00Z",
         updated_at: "2026-08-21T10:00:00Z",
         execution_state: "queued",
         execution_epoch: 0,
-        queue_position: 1,
-        page_open_attempts: 0,
-        verification_state: "not_required",
-        verification_method: "none",
-        verification_attempts: 0,
         result: {}
       }
     });

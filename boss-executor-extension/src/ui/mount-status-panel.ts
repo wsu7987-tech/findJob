@@ -49,12 +49,6 @@ export const mountStatusPanel = (
     .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
     .inline-actions { display: inline-flex; gap: 4px; margin-left: 6px; vertical-align: middle; }
     .inline-actions button { padding: 2px 5px; }
-    .queue-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-    .queue-header .inline-actions { margin-left: auto; }
-    .failed-item { padding: 5px 0; border-bottom: 1px solid rgba(156,163,175,.16); }
-    .failed-item:last-child { border-bottom: 0; }
-    .failed-item .inline-actions { margin: 4px 0 0; }
-    .page-status { margin-top: 10px; }
     button { padding: 5px 8px; border: 1px solid #4b5563; border-radius: 6px;
       color: #e5e7eb; background: #1f2937; cursor: pointer; }
     button.icon-button { margin-left: auto; padding: 3px 7px; color: #99f6e4;

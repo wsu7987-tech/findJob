@@ -1,8 +1,8 @@
-import type { BossProbeState, BossReadOnlySnapshot } from "../platform/boss/types";
+import type { BossProbeState } from "../platform/boss/types";
 import type { ExecutorRuntimeState } from "../finejob/types";
 
 export const FRAMEWORK_MODE = Object.freeze({
-  name: "FineJob串行执行器",
+  name: "FineJob任务执行器",
   realActionsEnabled: true,
   fineJobConnected: true
 });
@@ -24,7 +24,6 @@ export type FrameworkStatus = {
   content: ComponentState;
   mainWorld: ComponentState;
   bossProbe: BossProbeState;
-  bossSnapshot: BossReadOnlySnapshot | null;
   page: string;
   detail: string;
   executor: ExecutorRuntimeState;
@@ -35,7 +34,6 @@ export const createFrameworkStatus = (pathname: string): FrameworkStatus => ({
   content: "ready",
   mainWorld: "checking",
   bossProbe: "waiting",
-  bossSnapshot: null,
   page: pathname,
   detail: `正在检查三层扩展上下文；模式：${FRAMEWORK_MODE.name}`,
   executor: {
@@ -44,8 +42,6 @@ export const createFrameworkStatus = (pathname: string): FrameworkStatus => ({
     detail: "尚未与FineJob配对",
     executor: null,
     queue: [],
-    failedQueue: [],
-    currentAction: null,
     lastResult: ""
   }
 });

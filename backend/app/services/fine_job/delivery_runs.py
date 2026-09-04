@@ -490,7 +490,7 @@ def delete_delivery_run(db: Database, run_id: str) -> dict[str, object]:
 
 
 def get_operations_dashboard(db: Database) -> dict[str, object]:
-    from backend.app.services.fine_job.boss_executor import executor_snapshot
+    from backend.app.services.fine_job.boss_executor import executor_status
 
     # 看板只读取当前岗位、评估、确认和动作表，旧 dry-run 单独作为历史数据展示。
     with db.connect() as connection:
@@ -510,18 +510,13 @@ def get_operations_dashboard(db: Database) -> dict[str, object]:
             "queued_actions": action_counts.get("queued", 0),
             "active_actions": sum(
                 execution_counts.get(state, 0)
-                for state in (
-                    "opening_page", "waiting_page_ready", "page_verified",
-                    "ready_to_dispatch", "dispatch_started", "request_accepted",
-                )
+                for state in ("running",)
             ),
             "successful_actions": action_counts.get("succeeded", 0),
             "issue_actions": sum(action_counts.get(state, 0) for state in ("failed", "blocked", "unknown")),
         }
-    snapshot = executor_snapshot(db)
-    queue = snapshot.get("queue") if isinstance(snapshot.get("queue"), dict) else {"actions": [], "total": 0}
-    actions = queue.get("actions") if isinstance(queue, dict) else []
-    current_action = actions[0] if isinstance(actions, list) and actions else None
+    runtime = executor_status(db)
+    queue = runtime.get("queue") if isinstance(runtime.get("queue"), dict) else {"actions": [], "total": 0}
     warnings = query_action_logs(db, level="warning", page_size=8)["logs"]
     errors = query_action_logs(db, level="error", page_size=8)["logs"]
     recent_issues = sorted(
@@ -534,9 +529,9 @@ def get_operations_dashboard(db: Database) -> dict[str, object]:
         "action_counts": action_counts,
         "execution_counts": execution_counts,
         "capture_counts": capture_counts,
-        "executor": snapshot.get("executor"),
+        "executor": runtime.get("executor"),
+        "current_task": runtime.get("current_task"),
         "queue": queue,
-        "current_action": current_action,
         "recent_issues": recent_issues,
         "legacy_runs": list_delivery_runs(db, limit=20),
     }

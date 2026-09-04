@@ -6,11 +6,8 @@ from backend.app.db import Database
 from backend.app.dependencies import get_database
 from backend.app.schemas.fine_job.workflow import (
     ActionStatus,
-    FineJobActionClaimRequest,
-    FineJobActionCompleteRequest,
     FineJobAutomationActionEnvelope,
     FineJobAutomationActionListEnvelope,
-    FineJobOptionalAutomationActionEnvelope,
     FineJobReviewApproveRequest,
     FineJobReviewArchiveRequest,
     FineJobReviewBatchRequest,
@@ -24,13 +21,12 @@ from backend.app.schemas.fine_job.workflow import (
     ReviewExecutionView,
     ReviewStatus,
 )
+from backend.app.services.fine_job import boss_executor
 from backend.app.services.fine_job.workflow import (
     approve_review_item,
     archive_review_item,
     batch_review_items,
     link_review_items_chat,
-    claim_next_action,
-    complete_action,
     list_automation_actions,
     list_review_items,
     reject_review_item,
@@ -72,7 +68,7 @@ def get_fine_job_review_items(
     "/review-items/{review_item_id}/approve",
     response_model=FineJobAutomationActionEnvelope,
 )
-def approve_fine_job_review_item(
+async def approve_fine_job_review_item(
     review_item_id: str,
     payload: FineJobReviewApproveRequest,
     db: Database = Depends(get_database),
@@ -83,6 +79,7 @@ def approve_fine_job_review_item(
         message=payload.message,
         allow_override=payload.allow_override,
     )
+    await boss_executor.notify_queue_changed(db)
     return FineJobAutomationActionEnvelope(action=action)
 
 
@@ -146,17 +143,20 @@ def restore_fine_job_review_item(
 
 
 @router.post("/review-items/batch", response_model=FineJobReviewBatchResponse)
-def batch_fine_job_review_items(
+async def batch_fine_job_review_items(
     payload: FineJobReviewBatchRequest,
     db: Database = Depends(get_database),
 ) -> FineJobReviewBatchResponse:
-    return FineJobReviewBatchResponse(**batch_review_items(
+    result = batch_review_items(
         db,
         review_item_ids=payload.review_item_ids,
         operation=payload.operation,
         note=payload.note,
         allow_override=payload.allow_override,
-    ))
+    )
+    if payload.operation == "approve" and int(result.get("succeeded") or 0) > 0:
+        await boss_executor.notify_queue_changed(db)
+    return FineJobReviewBatchResponse(**result)
 
 
 @router.get("/automation-actions", response_model=FineJobAutomationActionListEnvelope)
@@ -170,38 +170,3 @@ def get_fine_job_automation_actions(
     )
 
 
-@router.post(
-    "/automation-actions/claim",
-    response_model=FineJobOptionalAutomationActionEnvelope,
-)
-def claim_fine_job_automation_action(
-    payload: FineJobActionClaimRequest,
-    db: Database = Depends(get_database),
-) -> FineJobOptionalAutomationActionEnvelope:
-    return FineJobOptionalAutomationActionEnvelope(
-        action=claim_next_action(
-            db,
-            worker_id=payload.worker_id,
-            lease_seconds=payload.lease_seconds,
-        )
-    )
-
-
-@router.post(
-    "/automation-actions/{action_id}/complete",
-    response_model=FineJobAutomationActionEnvelope,
-)
-def complete_fine_job_automation_action(
-    action_id: str,
-    payload: FineJobActionCompleteRequest,
-    db: Database = Depends(get_database),
-) -> FineJobAutomationActionEnvelope:
-    return FineJobAutomationActionEnvelope(
-        action=complete_action(
-            db,
-            action_id,
-            worker_id=payload.worker_id,
-            status=payload.status,
-            message=payload.message,
-        )
-    )

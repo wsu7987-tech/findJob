@@ -12,7 +12,6 @@ const createBackground = (ok = true): BackgroundService =>
       frameworkMode: false,
       realActionsEnabled: true
     }),
-    reportBossSnapshot: vi.fn().mockResolvedValue({ accepted: true }),
     reportExecutionResult: vi.fn().mockResolvedValue({ accepted: true }),
     reportChatTabHeartbeat: vi.fn().mockResolvedValue({ isLeader: true, leaderEpoch: 1 })
   }) as unknown as BackgroundService;
@@ -46,57 +45,6 @@ describe("Content 服务", () => {
     expect(status.mainWorld).toBe("error");
   });
 
-  it("只接受校验通过的岗位只读快照", async () => {
-    const status = createFrameworkStatus("/");
-    const service = new ContentService(createBackground(), status);
-    await service.reportBossSnapshot({
-      component: "boss-read-only-probe",
-      readOnly: true,
-      pathname: "/web/geek/jobs",
-      pageKind: "search",
-      state: "waiting",
-      loggedIn: true,
-      jobCount: 10,
-      job: null,
-      reason: "等待当前岗位详情",
-      observedAt: 1
-    });
-
-    expect(status.bossProbe).toBe("waiting");
-    expect(status.bossSnapshot?.jobCount).toBe(10);
-
-    await expect(service.reportBossSnapshot({ readOnly: true })).rejects.toThrow(
-      "岗位识别载荷无效"
-    );
-    expect(status.bossProbe).toBe("unavailable");
-
-    await expect(
-      service.reportBossSnapshot({
-        component: "boss-read-only-probe",
-        readOnly: true,
-        pathname: "/web/geek/jobs",
-        pageKind: "search",
-        state: "waiting",
-        loggedIn: true,
-        jobCount: 1,
-        job: {
-          encryptJobId: "job-1",
-          securityId: "security-1",
-          encryptBossId: "boss-1",
-          jobName: "前端工程师",
-          bossName: "王经理",
-          bossTitle: "招聘经理",
-          lid: "lid-1",
-          contacted: false,
-          identitySource: "vue-list-detail",
-          bossIdentifierVerified: true
-        },
-        reason: "等待状态不应携带岗位",
-        observedAt: 2
-      })
-    ).rejects.toThrow("岗位识别载荷无效");
-  });
-
   it("自动打招呼与自动代聊命令保持独立并按原顺序交给 Main World", async () => {
     const status = createFrameworkStatus("/web/geek/chat");
     const background = createBackground();
@@ -112,7 +60,7 @@ describe("Content 服务", () => {
 
     const greeting = {
       type: "BOSS_DEFAULT_GREETING" as const,
-      actionId: "greeting-1",
+      taskId: "greeting-1",
       executionEpoch: 1,
       encryptJobId: "job-1"
     };
@@ -123,7 +71,7 @@ describe("Content 服务", () => {
       action: {
         id: "chat-1",
         session_id: "session-1",
-        status: "leased",
+        status: "running",
         text: "您好",
         execution_epoch: 1,
         account_uid: "account-1",
@@ -162,7 +110,7 @@ describe("Content 服务", () => {
       action: {
         id: "chat-old-leader",
         session_id: "session-1",
-        status: "leased",
+        status: "running",
         text: "您好",
         execution_epoch: 1,
         account_uid: "account-1",

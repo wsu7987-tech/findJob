@@ -88,18 +88,11 @@ def test_evaluation_v2_routes_to_review_and_persistent_action_queue(
     assert action["payload"]["message"].startswith("您好")
     assert action["payload"]["encrypt_job_id"] == "workflow-python"
 
-    # 队列来自 SQLite；重新查询仍然存在，而不是只保存在进程内存。
+    # 持久化任务记录可重新查询。
     queued = configured_client.get(
         "/api/fine-job/automation-actions", params={"status": "queued"}
     ).json()["actions"]
     assert [item["id"] for item in queued] == [action["id"]]
-
-    # 新默认招呼动作不能被旧通用租约接口领取，必须走BOSS执行器协议。
-    claimed = configured_client.post(
-        "/api/fine-job/automation-actions/claim",
-        json={"worker_id": "test-extension", "lease_seconds": 60},
-    ).json()["action"]
-    assert claimed is None
 
 
 def test_rejected_evaluation_requires_explicit_override(configured_client) -> None:

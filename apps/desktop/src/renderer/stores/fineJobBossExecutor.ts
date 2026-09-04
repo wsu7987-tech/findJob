@@ -4,7 +4,8 @@ import { ref } from "vue";
 import { ApiError, NetworkError, api } from "@/services/api";
 import type {
   FineJobBossExecutorDashboard,
-  FineJobBossNavigationTask
+  FineJobBossNavigationTask,
+  FineJobBossExecutorTestJob
 } from "@/types";
 
 export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", () => {
@@ -15,13 +16,25 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
   const loading = ref(false);
   const heartbeatTesting = ref(false);
   const error = ref<string | null>(null);
+  const testJobs = ref<FineJobBossExecutorTestJob[]>([]);
+  let statusSocket: WebSocket | null = null;
+  let statusSocketReconnectTimer: number | null = null;
+  let statusChannelUsers = 0;
+
+  const setDashboard = (value: FineJobBossExecutorDashboard) => {
+    dashboard.value = value;
+    if (value.executor?.browser_connected) {
+      pairingCode.value = null;
+      pairingExpiresAt.value = null;
+    }
+    return value;
+  };
 
   const load = async () => {
     loading.value = true;
     error.value = null;
     try {
-      dashboard.value = await api.getFineJobBossExecutorStatus();
-      return dashboard.value;
+      return setDashboard(await api.getFineJobBossExecutorStatus());
     } catch (value) {
       error.value = mapError(value);
       throw value;
@@ -43,23 +56,61 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
     }
   };
 
-  const control = async (command: "allow" | "pause" | "resume" | "emergency_stop") => {
+  const control = async (command: "start" | "pause") => {
     error.value = null;
     try {
-      dashboard.value = await api.controlFineJobBossExecutor(command);
-      return dashboard.value;
+      return setDashboard(await api.controlFineJobBossExecutor(command));
     } catch (value) {
       error.value = mapError(value);
       throw value;
     }
   };
 
+  const startStatusSync = () => {
+    statusChannelUsers += 1;
+    connectStatusChannel();
+  };
+
+  const stopStatusSync = () => {
+    statusChannelUsers = Math.max(0, statusChannelUsers - 1);
+    if (statusChannelUsers > 0) return;
+    if (statusSocketReconnectTimer !== null) {
+      window.clearTimeout(statusSocketReconnectTimer);
+      statusSocketReconnectTimer = null;
+    }
+    statusSocket?.close();
+    statusSocket = null;
+  };
+
+  const connectStatusChannel = () => {
+    if (statusChannelUsers === 0 || statusSocket) return;
+    const socket = new WebSocket("ws://127.0.0.1:8000/api/fine-job/boss-executor/desktop-channel");
+    statusSocket = socket;
+    socket.addEventListener("message", (event) => {
+      try {
+        const message = JSON.parse(String(event.data)) as { type?: string; runtime?: FineJobBossExecutorDashboard };
+        if (message.type === "executor_state" && message.runtime) setDashboard(message.runtime);
+      } catch {
+        // 控制通道消息无效时等待下一条状态同步消息。
+      }
+    });
+    socket.addEventListener("close", () => {
+      if (statusSocket !== socket) return;
+      statusSocket = null;
+      if (statusChannelUsers === 0 || statusSocketReconnectTimer !== null) return;
+      // 桌面状态通道断开后自动重连，持续接收插件的状态变更。
+      statusSocketReconnectTimer = window.setTimeout(() => {
+        statusSocketReconnectTimer = null;
+        connectStatusChannel();
+      }, 1000);
+    });
+  };
+
   const testHeartbeat = async () => {
     heartbeatTesting.value = true;
     error.value = null;
     try {
-      dashboard.value = await api.testFineJobBossExecutorHeartbeat();
-      return dashboard.value;
+      return setDashboard(await api.testFineJobBossExecutorHeartbeat());
     } catch (value) {
       error.value = mapError(value);
       // 心跳失败时立即给桌面端提供新的配对入口。
@@ -79,7 +130,7 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
   const disconnect = async () => {
     error.value = null;
     try {
-      dashboard.value = await api.disconnectFineJobBossExecutor();
+      setDashboard(await api.disconnectFineJobBossExecutor());
       pairingCode.value = null;
       pairingExpiresAt.value = null;
       return dashboard.value;
@@ -117,12 +168,53 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
     }
   };
 
-  const manualVerifyUnknown = async (actionId: string, contacted: boolean) => {
+  const loadTestJobs = async () => {
     error.value = null;
     try {
-      const result = await api.manualVerifyFineJobBossUnknownAction(actionId, contacted);
+      const result = await api.listFineJobBossExecutorTestJobs();
+      testJobs.value = result.jobs;
+      return result.jobs;
+    } catch (value) {
+      error.value = mapError(value);
+      throw value;
+    }
+  };
+
+  const updateTestJob = async (jobId: string, payload: { encrypt_job_id: string; job_link: string }) => {
+    error.value = null;
+    try {
+      const result = await api.updateFineJobBossExecutorTestJob(jobId, payload);
+      testJobs.value = testJobs.value.map((job) => job.id === jobId ? result.job : job);
+      return result.job;
+    } catch (value) {
+      error.value = mapError(value);
+      throw value;
+    }
+  };
+
+  const updateSettings = async (payload: {
+    task_cooldown_max_seconds: number;
+    page_load_wait_max_seconds: number;
+  }) => {
+    error.value = null;
+    try {
+      return setDashboard(await api.updateFineJobBossExecutorSettings(payload));
+    } catch (value) {
+      error.value = mapError(value);
+      throw value;
+    }
+  };
+
+  const createTestTask = async (payload: {
+    job_id: string;
+    close_page_after_completion: boolean;
+    delay_seconds: number;
+  }) => {
+    error.value = null;
+    try {
+      const result = await api.createFineJobBossExecutorTestTask(payload);
       await load();
-      return result.action;
+      return result.task;
     } catch (value) {
       error.value = mapError(value);
       throw value;
@@ -137,6 +229,7 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
     loading,
     heartbeatTesting,
     error,
+    testJobs,
     load,
     createPairingCode,
     control,
@@ -144,7 +237,12 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
     disconnect,
     openJob,
     returnToReview,
-    manualVerifyUnknown
+    loadTestJobs,
+    updateTestJob,
+    updateSettings,
+    createTestTask,
+    startStatusSync,
+    stopStatusSync
   };
 });
 

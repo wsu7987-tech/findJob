@@ -387,6 +387,51 @@ class BossScraperService:
         finally:
             cdp.close()
 
+    def close_job_page(
+        self,
+        target_id: str,
+        *,
+        cdp_port: int = engine.DEFAULT_CDP_PORT,
+    ) -> None:
+        """发起关闭指定岗位标签页动作，不读取页面后续状态。"""
+        if not target_id:
+            raise ValueError("关闭岗位页面缺少浏览器目标标识。")
+        if not engine.is_cdp_ready(cdp_port):
+            raise RuntimeError("FineJob 专用 Chrome 未启动，请先打开浏览器。")
+        cdp = engine.CDPSession(cdp_port)
+        try:
+            cdp.send("Target.closeTarget", {"targetId": target_id})
+        finally:
+            cdp.close()
+
+    def open_test_page(
+        self,
+        url: str,
+        *,
+        cdp_port: int = engine.DEFAULT_CDP_PORT,
+    ) -> str:
+        """在交互标签页打开测试任务配置的 HTTPS 页面。"""
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError("测试任务页面必须是 HTTPS 地址。")
+        if not engine.is_cdp_ready(cdp_port):
+            raise RuntimeError("FineJob 专用 Chrome 未启动，请先打开浏览器。")
+        cdp = engine.CDPSession(cdp_port)
+        try:
+            target = self._find_interactive_target(cdp_port)
+            if target:
+                target_id = str(target["targetId"])
+                session_id = engine.attach_page_session(cdp, target_id)
+                cdp.send("Page.navigate", {"url": url}, session_id)
+                cdp.send("Target.activateTarget", {"targetId": target_id})
+            else:
+                created = cdp.send("Target.createTarget", {"url": url, "background": False})
+                target_id = str(created["result"]["targetId"])
+            self._interactive_target_id = target_id
+            return target_id
+        finally:
+            cdp.close()
+
     def reload_job_page(
         self,
         target_id: str,

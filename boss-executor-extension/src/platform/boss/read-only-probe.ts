@@ -2,31 +2,21 @@ import type {
   BossJobDetailSubset,
   BossJobIdentity,
   BossJobItemSubset,
+  BossPageIdentity,
   BossPageKind,
-  BossReadOnlySnapshot
 } from "./types";
 
 const PAGE_CONTAINER_SELECTORS = [
   "#wrap .page-job-wrapper",
   ".job-recommend-main",
-  ".page-jobs-main"
+  ".page-jobs-main",
 ] as const;
 
-type ProbeInput = {
+type IdentityInput = {
   pathname: string;
   loggedIn: boolean;
   pageVue: unknown;
   standaloneJobInfo?: unknown;
-  standaloneDetailEvidence?: StandaloneDetailEvidence;
-  observedAt?: number;
-};
-
-type StandaloneDetailEvidence = {
-  state: "ready" | "waiting" | "mismatch";
-  bossName: string;
-  contacted: boolean | null;
-  lid: string;
-  reason: string;
 };
 
 const asRecord = (value: unknown): Record<string, unknown> | null =>
@@ -45,13 +35,11 @@ const readString = (record: Record<string, unknown> | null, key: string): string
 const readStandaloneJobIdentity = (value: unknown): BossJobIdentity | null => {
   const jobInfo = asRecord(value);
   if (!jobInfo) return null;
-
   const encryptJobId = readString(jobInfo, "job_id");
   const securityId = readString(jobInfo, "securityId");
   const encryptBossId = readString(jobInfo, "user_id");
   const jobName = readString(jobInfo, "job_name");
   if (!encryptJobId || !securityId || !encryptBossId || !jobName) return null;
-
   return {
     encryptJobId,
     securityId,
@@ -62,27 +50,19 @@ const readStandaloneJobIdentity = (value: unknown): BossJobIdentity | null => {
     lid: "",
     contacted: null,
     identitySource: "standalone-job-info",
-    bossIdentifierVerified: false
+    bossIdentifierVerified: false,
   };
 };
 
-const readJobIdFromDetailPath = (pathname: string): string => {
-  const matched = pathname.match(/\/job_detail\/([^/]+?)\.html(?:\/|$)/);
-  return matched?.[1] ?? "";
-};
+const readJobIdFromDetailPath = (pathname: string): string =>
+  pathname.match(/\/job_detail\/([^/]+?)\.html(?:\/|$)/)?.[1] ?? "";
 
 const communicationStateFromButton = (button: Element): boolean | null | "conflict" => {
   const text = button.textContent?.replace(/\s+/g, " ").trim() ?? "";
-  const textState = text.includes("继续沟通")
-    ? true
-    : text.includes("立即沟通")
-      ? false
-      : null;
+  const textState = text.includes("继续沟通") ? true : text.includes("立即沟通") ? false : null;
   const friendValue = button.getAttribute("data-isfriend");
   const attributeState = friendValue === "true" ? true : friendValue === "false" ? false : null;
-  if (textState !== null && attributeState !== null && textState !== attributeState) {
-    return "conflict";
-  }
+  if (textState !== null && attributeState !== null && textState !== attributeState) return "conflict";
   return textState ?? attributeState;
 };
 
@@ -91,109 +71,33 @@ const readButtonTarget = (button: Element): { jobId: string; securityId: string 
   if (!dataUrl) return null;
   try {
     const url = new URL(dataUrl, "https://www.zhipin.com");
-    return {
-      jobId: url.searchParams.get("jobId") ?? "",
-      securityId: url.searchParams.get("securityId") ?? ""
-    };
+    return { jobId: url.searchParams.get("jobId") ?? "", securityId: url.searchParams.get("securityId") ?? "" };
   } catch {
     return null;
   }
 };
 
-export const readStandaloneDetailDomEvidence = (
-  job: BossJobIdentity,
-  root: ParentNode = document
-): StandaloneDetailEvidence => {
-  const bossNames = Array.from(
-    root.querySelectorAll(".job-detail .job-boss-info h2.name")
-  )
-    .map((element) => element.textContent?.replace(/\s+/g, " ").trim() ?? "")
-    .filter(Boolean);
-  const uniqueBossNames = [...new Set(bossNames)];
-  if (uniqueBossNames.length === 0) {
-    return {
-      state: "waiting",
-      bossName: "",
-      contacted: null,
-      lid: "",
-      reason: "等待详情页 HR 姓名"
-    };
-  }
-  if (uniqueBossNames.length !== 1) {
-    return {
-      state: "mismatch",
-      bossName: "",
-      contacted: null,
-      lid: "",
-      reason: "详情页出现多个不同 HR 姓名，禁止执行"
-    };
-  }
-  const bossName = uniqueBossNames[0] ?? "";
-
-  const buttons = Array.from(
-    root.querySelectorAll(".job-op a.btn-startchat")
-  );
-  if (buttons.length === 0) {
-    return {
-      state: "waiting",
-      bossName,
-      contacted: null,
-      lid: "",
-      reason: "等待详情页沟通按钮状态"
-    };
-  }
-
+const readDetailContact = (job: BossJobIdentity): boolean | null | "mismatch" => {
+  const buttons = Array.from(document.querySelectorAll(".job-op a.btn-startchat"));
+  if (buttons.length === 0) return null;
   const states = new Set<boolean>();
-  const lids = new Set<string>();
   for (const button of buttons) {
     const state = communicationStateFromButton(button);
     const target = readButtonTarget(button);
     if (
-      state === "conflict" ||
-      state === null ||
-      !target?.jobId ||
-      !target.securityId ||
-      target.jobId !== job.encryptJobId ||
-      target.securityId !== job.securityId
-    ) {
-      return {
-        state: "mismatch",
-        bossName: "",
-        contacted: null,
-        lid: "",
-        reason: "详情页沟通按钮与当前岗位身份不一致，禁止执行"
-      };
-    }
+      state === "conflict" || state === null ||
+      !target?.jobId || !target.securityId ||
+      target.jobId !== job.encryptJobId || target.securityId !== job.securityId
+    ) return "mismatch";
     states.add(state);
-    const lid = button.getAttribute("lid") ?? "";
-    if (lid) lids.add(lid);
   }
-
-  if (states.size !== 1 || lids.size > 1) {
-    return {
-      state: "mismatch",
-      bossName: "",
-      contacted: null,
-      lid: "",
-      reason: "详情页重复沟通按钮状态不一致，禁止执行"
-    };
-  }
-
-  return {
-    state: "ready",
-    bossName,
-    contacted: states.values().next().value ?? null,
-    lid: [...lids][0] ?? "",
-    reason: "详情页 HR 与沟通状态只读识别完成"
-  };
+  return states.size === 1 ? states.values().next().value ?? null : "mismatch";
 };
 
 export const detectBossPageKind = (pathname: string): BossPageKind => {
   if (pathname.includes("/web/geek/job-recommend")) return "recommend";
   if (pathname.includes("/web/geek/jobs")) return "search";
-  if (pathname.includes("/job_detail/") || pathname.includes("/web/geek/job-detail")) {
-    return "detail";
-  }
+  if (pathname.includes("/job_detail/") || pathname.includes("/web/geek/job-detail")) return "detail";
   return "other";
 };
 
@@ -211,7 +115,7 @@ const readJobItem = (value: unknown): BossJobItemSubset | null => {
     bossTitle: readString(item, "bossTitle"),
     jobName: readString(item, "jobName"),
     lid: readString(item, "lid"),
-    contact: typeof item.contact === "boolean" ? item.contact : null
+    contact: typeof item.contact === "boolean" ? item.contact : null,
   };
 };
 
@@ -229,23 +133,14 @@ const readJobDetail = (value: unknown): BossJobDetailSubset | null => {
     jobInfo: {
       encryptId,
       encryptUserId: readString(jobInfo, "encryptUserId"),
-      jobName: readString(jobInfo, "jobName")
+      jobName: readString(jobInfo, "jobName"),
     },
-    bossInfo: {
-      name: readString(bossInfo, "name"),
-      title: readString(bossInfo, "title")
-    },
-    relationInfo: {
-      beFriend:
-        typeof relationInfo?.beFriend === "boolean" ? relationInfo.beFriend : null
-    }
+    bossInfo: { name: readString(bossInfo, "name"), title: readString(bossInfo, "title") },
+    relationInfo: { beFriend: typeof relationInfo?.beFriend === "boolean" ? relationInfo.beFriend : null },
   };
 };
 
-const createIdentity = (
-  detail: BossJobDetailSubset,
-  item: BossJobItemSubset | null
-): BossJobIdentity => ({
+const createIdentity = (detail: BossJobDetailSubset, item: BossJobItemSubset | null): BossJobIdentity => ({
   encryptJobId: detail.jobInfo.encryptId,
   securityId: detail.securityId || item?.securityId || "",
   encryptBossId: item?.encryptBossId || detail.jobInfo.encryptUserId,
@@ -255,159 +150,61 @@ const createIdentity = (
   lid: detail.lid || item?.lid || "",
   contacted: item ? item.contact : detail.relationInfo.beFriend,
   identitySource: "vue-list-detail",
-  bossIdentifierVerified: true
+  bossIdentifierVerified: true,
 });
 
-export const extractBossReadOnlySnapshot = ({
+export const extractBossPageIdentity = ({
   pathname,
   loggedIn,
   pageVue,
   standaloneJobInfo,
-  standaloneDetailEvidence,
-  observedAt = Date.now()
-}: ProbeInput): BossReadOnlySnapshot => {
+}: IdentityInput): BossPageIdentity => {
   const pageKind = detectBossPageKind(pathname);
-  const base = {
-    component: "boss-read-only-probe" as const,
-    readOnly: true as const,
-    pathname,
-    pageKind,
-    loggedIn,
-    observedAt
-  };
-
+  const base = { component: "boss-page-identity" as const, pathname, pageKind, loggedIn };
   if (pageKind === "other") {
-    return {
-      ...base,
-      state: "unsupported",
-      jobCount: 0,
-      job: null,
-      reason: "当前页面不是已支持的 BOSS 岗位页面"
-    };
+    return { ...base, state: "unsupported", job: null, reason: "当前页面不是已支持的 BOSS 岗位页面" };
   }
 
-  if (pageKind === "detail") {
-    const standaloneJob = readStandaloneJobIdentity(standaloneJobInfo);
-    if (standaloneJob) {
-      const pathJobId = readJobIdFromDetailPath(pathname);
-      if (!pathJobId || pathJobId !== standaloneJob.encryptJobId) {
-        return {
-          ...base,
-          state: "mismatch",
-          jobCount: 0,
-          job: null,
-          reason: "详情页 URL 与 _jobInfo 岗位 ID 不匹配，禁止执行"
-        };
-      }
-
-      if (!standaloneDetailEvidence || standaloneDetailEvidence.state === "waiting") {
-        return {
-          ...base,
-          state: "waiting",
-          jobCount: 1,
-          job: null,
-          reason: standaloneDetailEvidence?.reason ?? "等待详情页 HR 与沟通状态"
-        };
-      }
-      if (standaloneDetailEvidence.state === "mismatch") {
-        return {
-          ...base,
-          state: "mismatch",
-          jobCount: 1,
-          job: null,
-          reason: standaloneDetailEvidence.reason
-        };
-      }
-
-      const verifiedJob = {
-        ...standaloneJob,
-        bossName: standaloneDetailEvidence.bossName,
-        contacted: standaloneDetailEvidence.contacted,
-        lid: standaloneDetailEvidence.lid
-      };
-
-      return {
-        ...base,
-        state: "ready",
-        jobCount: 1,
-        job: verifiedJob,
-        reason: "详情页岗位、HR 与沟通状态已识别；_jobInfo.user_id 语义仍待验证"
-      };
+  const standaloneJob = readStandaloneJobIdentity(standaloneJobInfo);
+  if (pageKind === "detail" && standaloneJob) {
+    const pathJobId = readJobIdFromDetailPath(pathname);
+    if (!pathJobId || pathJobId !== standaloneJob.encryptJobId) {
+      return { ...base, state: "mismatch", job: null, reason: "详情页 URL 与岗位 ID 不匹配" };
     }
+    const contacted = readDetailContact(standaloneJob);
+    if (contacted === "mismatch") {
+      return { ...base, state: "mismatch", job: null, reason: "详情页沟通按钮与岗位身份不一致" };
+    }
+    return {
+      ...base,
+      state: "ready",
+      job: { ...standaloneJob, contacted },
+      reason: "详情页岗位身份已识别",
+    };
   }
 
   const pageRecord = asRecord(pageVue);
-  if (!pageRecord) {
-    return {
-      ...base,
-      state: "waiting",
-      jobCount: 0,
-      job: null,
-      reason:
-        pageKind === "detail"
-          ? "等待详情页 _jobInfo 或 BOSS Vue 岗位容器"
-          : "等待 BOSS Vue 岗位容器"
-    };
-  }
-
+  if (!pageRecord) return { ...base, state: "waiting", job: null, reason: "等待 BOSS 岗位容器" };
   const rawList = unwrap(pageRecord.jobList);
   const items = Array.isArray(rawList)
     ? rawList.map(readJobItem).filter((item): item is BossJobItemSubset => item !== null)
     : [];
   const detail = readJobDetail(pageRecord.jobDetail);
-  if (!detail) {
-    return {
-      ...base,
-      state: "waiting",
-      jobCount: items.length,
-      job: null,
-      reason: "等待当前岗位详情"
-    };
-  }
-
+  if (!detail) return { ...base, state: "waiting", job: null, reason: "等待当前岗位详情" };
   if (pageKind !== "detail" && items.length === 0) {
-    return {
-      ...base,
-      state: "waiting",
-      jobCount: 0,
-      job: null,
-      reason: "等待当前页面岗位列表，禁止仅凭详情执行"
-    };
+    return { ...base, state: "waiting", job: null, reason: "等待当前页面岗位列表" };
   }
-
-  const matchedItem =
-    items.find((item) => item.lid !== "" && item.lid === detail.lid) ??
-    items.find((item) => item.encryptJobId === detail.jobInfo.encryptId) ??
-    null;
-
+  const matchedItem = items.find((item) => item.lid && item.lid === detail.lid)
+    ?? items.find((item) => item.encryptJobId === detail.jobInfo.encryptId)
+    ?? null;
   if (pageKind !== "detail" && !matchedItem) {
-    return {
-      ...base,
-      state: "mismatch",
-      jobCount: items.length,
-      job: null,
-      reason: "岗位详情与当前岗位列表不匹配，禁止执行"
-    };
+    return { ...base, state: "mismatch", job: null, reason: "岗位详情与当前列表不匹配" };
   }
-
   const job = createIdentity(detail, matchedItem);
   if (!job.encryptJobId || !job.securityId || !job.encryptBossId || !job.jobName) {
-    return {
-      ...base,
-      state: "unavailable",
-      jobCount: items.length,
-      job: null,
-      reason: "岗位身份字段不完整，禁止执行"
-    };
+    return { ...base, state: "unavailable", job: null, reason: "岗位身份字段不完整" };
   }
-
-  return {
-    ...base,
-    state: "ready",
-    jobCount: items.length,
-    job,
-    reason: loggedIn ? "岗位身份只读识别完成" : "岗位已识别，但登录状态未确认"
-  };
+  return { ...base, state: "ready", job, reason: loggedIn ? "岗位身份已识别" : "岗位已识别，但登录状态未确认" };
 };
 
 const findPageVue = (): unknown => {
@@ -420,33 +217,14 @@ const findPageVue = (): unknown => {
 
 const detectLoggedIn = (): boolean => {
   const page = asRecord((window as unknown as { _PAGE?: unknown })._PAGE);
-  if (readString(page, "encryptUserId").length > 0) return true;
+  if (readString(page, "encryptUserId")) return true;
   const userInfo = asRecord((window as unknown as { _userInfo?: unknown })._userInfo);
   return userInfo?.isLogin === true;
 };
 
-export const readBossPageSnapshot = (): BossReadOnlySnapshot =>
-  (() => {
-    const standaloneJobInfo = (window as unknown as { _jobInfo?: unknown })._jobInfo;
-    const standaloneJob = readStandaloneJobIdentity(standaloneJobInfo);
-    return extractBossReadOnlySnapshot({
-      pathname: window.location.pathname,
-      loggedIn: detectLoggedIn(),
-      pageVue: findPageVue(),
-      standaloneJobInfo,
-      ...(standaloneJob
-        ? { standaloneDetailEvidence: readStandaloneDetailDomEvidence(standaloneJob) }
-        : {})
-    });
-  })();
-
-export const snapshotFingerprint = (snapshot: BossReadOnlySnapshot): string =>
-  JSON.stringify({
-    pathname: snapshot.pathname,
-    pageKind: snapshot.pageKind,
-    state: snapshot.state,
-    loggedIn: snapshot.loggedIn,
-    jobCount: snapshot.jobCount,
-    job: snapshot.job,
-    reason: snapshot.reason
-  });
+export const readBossPageIdentity = (): BossPageIdentity => extractBossPageIdentity({
+  pathname: window.location.pathname,
+  loggedIn: detectLoggedIn(),
+  pageVue: findPageVue(),
+  standaloneJobInfo: (window as unknown as { _jobInfo?: unknown })._jobInfo,
+});

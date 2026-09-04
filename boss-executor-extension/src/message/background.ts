@@ -11,7 +11,7 @@ import type {
   ExecutorRuntimeState,
   MainWorldExecutionResult
 } from "../finejob/types";
-import type { BossReadOnlySnapshot } from "../platform/boss/types";
+import type { BossPageIdentity } from "../platform/boss/types";
 
 export const BACKGROUND_NAMESPACE = "fine-job:boss-executor:background:v1";
 
@@ -54,43 +54,18 @@ export class BackgroundService {
     return { accepted: true };
   }
 
-  async control(command: "allow" | "pause" | "resume" | "emergency_stop"): Promise<{ accepted: true }> {
+  async control(command: "start" | "pause"): Promise<{ accepted: true }> {
     await fineJobExecutorClient.control(command);
-    return { accepted: true };
-  }
-
-  async returnToReview(actionId: string): Promise<{ accepted: true }> {
-    await fineJobExecutorClient.returnToReview(actionId);
-    return { accepted: true };
-  }
-
-  async retryFailedAction(actionId: string): Promise<{ accepted: true }> {
-    await fineJobExecutorClient.retryFailedAction(actionId);
-    return { accepted: true };
-  }
-
-  async cancelFailedAction(actionId: string): Promise<{ accepted: true }> {
-    await fineJobExecutorClient.cancelFailedAction(actionId);
-    return { accepted: true };
-  }
-
-  async retryAllFailed(): Promise<{ accepted: true }> {
-    await fineJobExecutorClient.retryAllFailed();
-    return { accepted: true };
-  }
-
-  async cancelAllFailed(): Promise<{ accepted: true }> {
-    await fineJobExecutorClient.cancelAllFailed();
-    return { accepted: true };
-  }
-
-  async reportBossSnapshot(snapshot: BossReadOnlySnapshot): Promise<{ accepted: true }> {
-    await fineJobExecutorClient.reportSnapshot(snapshot);
     return { accepted: true };
   }
 
   async reportExecutionResult(result: MainWorldExecutionResult): Promise<{ accepted: true }> {
     await fineJobExecutorClient.reportExecutionResult(result);
+    return { accepted: true };
+  }
+
+  async reportBossPageIdentity(tabId: string, identity: BossPageIdentity): Promise<{ accepted: true }> {
+    await fineJobExecutorClient.reportBossPageIdentity(tabId, identity);
     return { accepted: true };
   }
 

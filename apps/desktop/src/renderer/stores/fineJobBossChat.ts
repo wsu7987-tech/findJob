@@ -170,14 +170,16 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
 
   const refreshHistory = async () => mutate(async () => {
     if (!selectedSessionId.value) throw new Error("请先选择聊天会话");
+    // 固定当前详情引用，避免响应式状态变化后再次读取为空。
+    const currentDetail = detail.value;
     // 本地已有消息且平台没有新消息时，直接复用本地记录。
-    if ((detail.value?.message_count ?? 0) > 0 && !detail.value?.session.message_update_required) {
+    if ((currentDetail?.message_count ?? 0) > 0 && !currentDetail?.session.message_update_required) {
       return {
         session_id: selectedSessionId.value,
         fetched_count: 0,
         inserted_count: 0,
         message_update_required: false,
-        has_more: Boolean(detail.value.session.history_has_more)
+        has_more: Boolean(currentDetail?.session.history_has_more)
       };
     }
     const result = await api.refreshFineJobChatHistory(selectedSessionId.value);

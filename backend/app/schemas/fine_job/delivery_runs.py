@@ -112,7 +112,7 @@ class FineJobOperationsDashboardResponse(BaseModel):
     execution_counts: dict[str, int]
     capture_counts: dict[str, int]
     executor: dict[str, Any] | None = None
+    current_task: dict[str, Any] | None = None
     queue: dict[str, Any]
-    current_action: dict[str, Any] | None = None
     recent_issues: list[FineJobActionLogResponse]
     legacy_runs: list[FineJobDeliveryRunResponse]

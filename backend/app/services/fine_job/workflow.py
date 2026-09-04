@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timedelta, timezone
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -15,7 +14,7 @@ from backend.app.utils import new_id, utc_now
 ReviewStatus = Literal["pending", "approved", "rejected", "dismissed"]
 ReviewExecutionView = Literal["running", "executed"]
 ActionStatus = Literal[
-    "queued", "leased", "succeeded", "failed", "blocked", "unknown", "cancelled"
+    "queued", "running", "leased", "succeeded", "failed", "blocked", "unknown", "cancelled"
 ]
 
 
@@ -33,7 +32,7 @@ def record_evaluation_and_route(
     context_revision_id: str | None = None,
     context_dependency_versions: dict[str, object] | None = None,
 ) -> dict[str, object] | None:
-    """保存不可变评估，并按已确认的自动化策略路由到审批或执行队列。"""
+    """保存不可变评估，并按已确认的自动化策略路由到审批或执行任务。"""
     job_id = _resolve_history_job_id(db, job)
     if not job_id:
         # 单元测试或未持久化的临时岗位仍可返回评估，但不创建悬空审批记录。
@@ -196,7 +195,8 @@ def list_review_items(
     page: int = 1,
     page_size: int = 50,
 ) -> dict[str, object]:
-    conditions: list[str] = []
+    # 测试岗位仅服务于运行状态页的任务验证，不进入人工待确认流程。
+    conditions: list[str] = ["j.is_test = 0"]
     values: list[object] = []
     if status:
         conditions.append("r.status = ?")
@@ -205,16 +205,9 @@ def list_review_items(
         # 执行视图只呈现已批准且已经创建动作的事项，避免和待确认、归档状态混在一起。
         conditions.append("r.status = 'approved'")
         if execution_view == "running":
-            conditions.append(
-                "a.execution_state IN ('queued', 'opening_page', 'waiting_page_ready', "
-                "'page_verified', 'ready_to_dispatch', 'dispatch_started', "
-                "'request_accepted', 'cancellation_requested')"
-            )
+            conditions.append("a.execution_state IN ('queued', 'running')")
         else:
-            conditions.append(
-                "a.execution_state IN ('succeeded', 'failed_after_dispatch', "
-                "'unknown_after_dispatch')"
-            )
+            conditions.append("a.execution_state IN ('succeeded', 'failed', 'blocked', 'unknown', 'cancelled')")
     if decision:
         conditions.append("r.ai_decision = ?")
         values.append(decision)
@@ -310,7 +303,7 @@ def approve_review_item(
         raise AppError(
             status_code=409,
             error_category="CONFIRMATION_REQUIRED",
-            error_message="该岗位原结论为不建议；确认仍要沟通后才能加入动作队列。",
+            error_message="该岗位原结论为不建议；确认仍要沟通后才能创建执行任务。",
         )
     if row["status"] not in {"pending", "rejected"}:
         raise AppError(
@@ -479,26 +472,16 @@ def _confirm_running_action_from_chat(db: Database, row) -> str | None:
             UPDATE fj_automation_actions
             SET status = 'succeeded', execution_state = 'succeeded',
                 execution_epoch = execution_epoch + 1,
-                verification_state = 'chat_confirmed', verification_method = 'chat_session',
-                verification_completed_at = ?, last_status_code = 'CHAT_SESSION_MATCHED',
+                last_status_code = 'CHAT_SESSION_MATCHED',
                 last_error = NULL, result_json = ?, updated_at = ?, completed_at = ?
             WHERE id = ?
             """,
             (
-                now,
-                _json({"contacted": True, "verificationMethod": "chat_session", "chatSessionId": session_id}),
+                _json({"contacted": True, "chatSessionId": session_id}),
                 now,
                 now,
                 row["action_id"],
             ),
-        )
-        connection.execute(
-            """
-            UPDATE fj_boss_executor_instances
-            SET current_action_id = NULL, current_epoch = NULL, updated_at = ?
-            WHERE current_action_id = ?
-            """,
-            (now, row["action_id"]),
         )
     _log(
         db,
@@ -524,11 +507,7 @@ def link_review_items_chat(
     conditions = ["r.status = ?"]
     values: list[object] = [status]
     if execution_view == "running":
-        conditions.append(
-            "a.execution_state IN ('queued', 'opening_page', 'waiting_page_ready', "
-            "'page_verified', 'ready_to_dispatch', 'dispatch_started', "
-            "'request_accepted', 'cancellation_requested')"
-        )
+        conditions.append("a.execution_state IN ('queued', 'running')")
     if decision:
         conditions.append("r.ai_decision = ?")
         values.append(decision)
@@ -672,89 +651,6 @@ def list_automation_actions(
     return {"actions": [_serialize_action(row) for row in rows], "total": total}
 
 
-def claim_next_action(
-    db: Database,
-    *,
-    worker_id: str,
-    lease_seconds: int,
-) -> dict[str, object] | None:
-    now = utc_now()
-    lease_expires_at = (
-        datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
-    ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    with db.connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        row = connection.execute(
-            """
-            SELECT id
-            FROM fj_automation_actions
-            WHERE action_type = 'start_conversation'
-              AND (
-                status = 'queued'
-                OR (status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
-              )
-            ORDER BY created_at ASC, id ASC
-            LIMIT 1
-            """,
-            (now,),
-        ).fetchone()
-        if row is None:
-            return None
-        connection.execute(
-            """
-            UPDATE fj_automation_actions
-            SET status = 'leased', lease_owner = ?, lease_expires_at = ?,
-                attempt_count = attempt_count + 1, updated_at = ?
-            WHERE id = ?
-            """,
-            (worker_id.strip(), lease_expires_at, now, row["id"]),
-        )
-    return _get_action(db, str(row["id"]))
-
-
-def complete_action(
-    db: Database,
-    action_id: str,
-    *,
-    worker_id: str,
-    status: Literal["succeeded", "failed", "blocked", "unknown"],
-    message: str,
-) -> dict[str, object]:
-    action = _get_action(db, action_id)
-    if action["status"] != "leased" or action.get("lease_owner") != worker_id.strip():
-        raise AppError(
-            status_code=409,
-            error_category="INVALID_LEASE",
-            error_message="动作租约已失效或不属于当前执行器。",
-        )
-    now = utc_now()
-    with db.connect() as connection:
-        connection.execute(
-            """
-            UPDATE fj_automation_actions
-            SET status = ?, last_error = ?, lease_owner = NULL,
-                lease_expires_at = NULL, updated_at = ?, completed_at = ?
-            WHERE id = ?
-            """,
-            (
-                status,
-                None if status == "succeeded" else (message.strip() or None),
-                now,
-                now,
-                action_id,
-            ),
-        )
-    level = "info" if status == "succeeded" else "warning"
-    _log(
-        db,
-        f"action_{status}",
-        message.strip() or f"动作状态更新为 {status}。",
-        level=level,
-        detail={"job_id": action["job_id"], "action_id": action_id},
-    )
-    return _get_action(db, action_id)
-
-
 def _enqueue_action(
     db: Database,
     *,
@@ -779,7 +675,7 @@ def _enqueue_action(
             raise AppError(
                 status_code=409,
                 error_category="JOB_ID_MISSING",
-                error_message="岗位缺少可验证的BOSS加密岗位标识，不能加入打招呼队列。",
+                error_message="岗位缺少可验证的BOSS加密岗位标识，不能创建打招呼执行任务。",
             )
         if not str(job["encrypt_job_id"] or ""):
             # 兼容早期仅保存详情页链接的岗位，提取后回填正式身份列。
@@ -813,9 +709,8 @@ def _enqueue_action(
                 INSERT INTO fj_automation_actions (
                   id, job_id, evaluation_id, review_item_id, action_type,
                   status, idempotency_key, payload_json, execution_state,
-                  queue_position, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'BOSS_DEFAULT_GREETING', 'queued', ?, ?, 'queued',
-                  COALESCE((SELECT MAX(queue_position) + 1 FROM fj_automation_actions), 1), ?, ?)
+                  created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'BOSS_DEFAULT_GREETING', 'queued', ?, ?, 'queued', ?, ?)
                 """,
                 (
                     action_id,
@@ -831,7 +726,7 @@ def _enqueue_action(
         else:
             action_id = str(existing["id"])
             if existing["status"] == "queued":
-                # 尚未执行时允许用用户最新确认的话术更新动作快照。
+                # 尚未执行时允许用用户最新确认的话术更新任务内容。
                 connection.execute(
                     """
                     UPDATE fj_automation_actions
@@ -841,22 +736,14 @@ def _enqueue_action(
                     (evaluation_id, review_item_id, _json(payload), now, action_id),
                 )
             elif existing["status"] == "cancelled":
-                # 当前事项再次获得批准后，统一恢复对应动作进入队列。
-                # 重新批准只恢复队列状态，不会在本事务内发起任何 BOSS 请求。
+                # 当前事项再次获得批准后，统一恢复对应任务状态。
+                # 重新批准只恢复任务状态，不会在本事务内发起任何 BOSS 请求。
                 connection.execute(
                     """
                     UPDATE fj_automation_actions
                     SET evaluation_id = ?, review_item_id = ?, payload_json = ?,
                         status = 'queued', execution_state = 'queued',
                         execution_epoch = execution_epoch + 1,
-                        queue_position = COALESCE((SELECT MAX(queue_position) + 1 FROM fj_automation_actions), 1),
-                        lease_owner = NULL, lease_expires_at = NULL,
-                        page_deadline_at = NULL, dispatch_started_at = NULL,
-                        request_accepted_at = NULL, verification_state = 'not_required',
-                        verification_method = 'none', verification_delay_seconds = NULL,
-                        verification_due_at = NULL, verification_started_at = NULL,
-                        verification_completed_at = NULL, verification_attempts = 0,
-                        cooldown_seconds = NULL, next_eligible_at = NULL,
                         last_status_code = 'REAPPROVED',
                         last_error = NULL, result_json = '{}', completed_at = NULL,
                         updated_at = ?
@@ -947,7 +834,7 @@ def _serialize_review(row) -> dict[str, object]:
         "job_link": row["job_link"],
         "company_id": row["company_id"] if "company_id" in row.keys() else None,
         "company_type": row["company_type"] if "company_type" in row.keys() else None,
-        "evaluation": _load_json(row["evaluation_json"]),
+        "evaluation": _normalize_evaluation(_load_json(row["evaluation_json"])),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "resolved_at": row["resolved_at"],
@@ -970,9 +857,6 @@ def _serialize_action(row) -> dict[str, object]:
         "status": row["status"],
         "idempotency_key": row["idempotency_key"],
         "payload": _load_json(row["payload_json"]),
-        "lease_owner": row["lease_owner"],
-        "lease_expires_at": row["lease_expires_at"],
-        "attempt_count": row["attempt_count"],
         "last_error": row["last_error"],
         "job_title": row["job_title"],
         "company_name": row["company_name"],
@@ -981,23 +865,8 @@ def _serialize_action(row) -> dict[str, object]:
         "completed_at": row["completed_at"],
         "execution_state": row["execution_state"],
         "execution_epoch": row["execution_epoch"],
-        "queue_position": row["queue_position"],
-        "page_open_attempts": row["page_open_attempts"],
-        "page_deadline_at": row["page_deadline_at"],
-        "dispatch_started_at": row["dispatch_started_at"],
-        "request_accepted_at": row["request_accepted_at"],
-        "verification_state": row["verification_state"],
-        "verification_method": row["verification_method"],
-        "verification_delay_seconds": row["verification_delay_seconds"],
-        "verification_due_at": row["verification_due_at"],
-        "verification_started_at": row["verification_started_at"],
-        "verification_completed_at": row["verification_completed_at"],
-        "verification_attempts": row["verification_attempts"],
-        "cooldown_seconds": row["cooldown_seconds"],
-        "next_eligible_at": row["next_eligible_at"],
         "last_status_code": row["last_status_code"],
         "result": _load_json(row["result_json"]),
-        "navigation_task_id": row["navigation_task_id"],
     }
 
 
@@ -1061,3 +930,16 @@ def _load_json(value: object) -> dict[str, object]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _normalize_evaluation(value: dict[str, object]) -> dict[str, object]:
+    """补齐历史评估记录缺失的列表字段，保持待确认接口契约稳定。"""
+    evaluation = dict(value)
+    for field in ("reasons", "strengths", "gaps", "risks", "hard_requirements"):
+        if not isinstance(evaluation.get(field), list):
+            evaluation[field] = []
+    if not isinstance(evaluation.get("summary"), str):
+        evaluation["summary"] = ""
+    if not isinstance(evaluation.get("confidence"), (int, float)):
+        evaluation["confidence"] = 0
+    return evaluation

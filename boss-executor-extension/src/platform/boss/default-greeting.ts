@@ -1,5 +1,5 @@
 import type { DefaultGreetingCommand, MainWorldExecutionResult } from "../../finejob/types";
-import { readBossPageSnapshot } from "./read-only-probe";
+import { readBossPageIdentity } from "./read-only-probe";
 
 type BossCookieApi = { get(name: string): string | undefined };
 
@@ -14,28 +14,28 @@ const readBossToken = (): string => {
 export const executeDefaultGreeting = async (
   command: DefaultGreetingCommand
 ): Promise<MainWorldExecutionResult> => {
-  const snapshot = readBossPageSnapshot();
+  const identity = readBossPageIdentity();
   if (
-    snapshot.state !== "ready" ||
-    !snapshot.loggedIn ||
-    snapshot.job?.encryptJobId !== command.encryptJobId ||
-    snapshot.job.contacted !== false
+    identity.state !== "ready" ||
+    !identity.loggedIn ||
+    identity.job?.encryptJobId !== command.encryptJobId ||
+    identity.job.contacted !== false
   ) {
     return {
-      actionId: command.actionId,
+      taskId: command.taskId,
       executionEpoch: command.executionEpoch,
       outcome: "failed",
-      contacted: snapshot.job?.contacted ?? null,
+      contacted: identity.job?.contacted ?? null,
       statusCode: "PRE_DISPATCH_PAGE_MISMATCH",
       message: "真实请求前页面身份或沟通状态发生变化",
-      evidence: { pageState: snapshot.state, pageKind: snapshot.pageKind }
+      evidence: { pageState: identity.state, pageKind: identity.pageKind }
     };
   }
 
   const token = readBossToken();
   if (!token) {
     return {
-      actionId: command.actionId,
+      taskId: command.taskId,
       executionEpoch: command.executionEpoch,
       outcome: "failed",
       contacted: false,
@@ -46,7 +46,7 @@ export const executeDefaultGreeting = async (
   }
 
   const url = new URL("https://www.zhipin.com/wapi/zpgeek/friend/add.json");
-  url.searchParams.set("securityId", snapshot.job.securityId);
+  url.searchParams.set("securityId", identity.job.securityId);
   url.searchParams.set("jobId", command.encryptJobId);
 
   try {
@@ -65,7 +65,7 @@ export const executeDefaultGreeting = async (
         ? "BOSS_RATE_LIMIT"
         : message.includes("沟通") ? "BOSS_GREETING_LIMIT" : "BOSS_REQUEST_REJECTED";
       return {
-        actionId: command.actionId,
+        taskId: command.taskId,
         executionEpoch: command.executionEpoch,
         outcome: "failed",
         contacted: false,
@@ -76,7 +76,7 @@ export const executeDefaultGreeting = async (
     }
 
     return {
-      actionId: command.actionId,
+      taskId: command.taskId,
       executionEpoch: command.executionEpoch,
       outcome: "accepted",
       contacted: null,
@@ -86,7 +86,7 @@ export const executeDefaultGreeting = async (
     };
   } catch (error) {
     return {
-      actionId: command.actionId,
+      taskId: command.taskId,
       executionEpoch: command.executionEpoch,
       outcome: "unknown",
       contacted: null,

@@ -56,6 +56,8 @@
   FineJobAutomationActionListEnvelope,
   FineJobAutomationActionStatus,
   FineJobBossExecutorDashboard,
+  FineJobBossExecutorQueueAction,
+  FineJobBossExecutorTestJob,
   FineJobBossNavigationTask,
   FineJobOperationsDashboard,
   FineJobChatRuntime,
@@ -934,10 +936,41 @@ export const api = {
   async getFineJobBossExecutorStatus() {
     return request<FineJobBossExecutorDashboard>("/api/fine-job/boss-executor/status");
   },
-  async controlFineJobBossExecutor(command: "allow" | "pause" | "resume" | "emergency_stop") {
+  async controlFineJobBossExecutor(command: "start" | "pause") {
     return request<FineJobBossExecutorDashboard>("/api/fine-job/boss-executor/desktop-control", {
       method: "POST",
       body: JSON.stringify({ command })
+    });
+  },
+  async updateFineJobBossExecutorSettings(payload: {
+    task_cooldown_max_seconds: number;
+    page_load_wait_max_seconds: number;
+  }) {
+    return request<FineJobBossExecutorDashboard>("/api/fine-job/boss-executor/settings", {
+      method: "PATCH",
+      body: JSON.stringify(payload)
+    });
+  },
+  async listFineJobBossExecutorTestJobs() {
+    return request<{ jobs: FineJobBossExecutorTestJob[] }>("/api/fine-job/boss-executor/test-jobs");
+  },
+  async updateFineJobBossExecutorTestJob(jobId: string, payload: {
+    encrypt_job_id: string;
+    job_link: string;
+  }) {
+    return request<{ job: FineJobBossExecutorTestJob }>(
+      `/api/fine-job/boss-executor/test-jobs/${encodeURIComponent(jobId)}`,
+      { method: "PUT", body: JSON.stringify(payload) }
+    );
+  },
+  async createFineJobBossExecutorTestTask(payload: {
+    job_id: string;
+    close_page_after_completion: boolean;
+    delay_seconds: number;
+  }) {
+    return request<{ task: FineJobBossExecutorQueueAction }>("/api/fine-job/boss-executor/test-tasks", {
+      method: "POST",
+      body: JSON.stringify(payload)
     });
   },
   async testFineJobBossExecutorHeartbeat() {
@@ -972,18 +1005,6 @@ export const api = {
     return request<FineJobAutomationActionEnvelope>(
       `/api/fine-job/automation-actions/${actionId}/return-to-review`,
       { method: "POST", body: JSON.stringify({ reason }) }
-    );
-  },
-  async manualVerifyFineJobBossUnknownAction(actionId: string, contacted: boolean) {
-    return request<FineJobAutomationActionEnvelope>(
-      `/api/fine-job/automation-actions/${actionId}/manual-verify`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          contacted,
-          note: contacted ? "用户人工确认岗位已经沟通" : "用户人工确认岗位尚未沟通"
-        })
-      }
     );
   },
   async getFineJobChatRuntime() {

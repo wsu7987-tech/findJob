@@ -88,8 +88,8 @@ const outcomeLabel = (value?: string) => ({
 const outcomeType = (value?: string) => value === "failed" ? "danger" : value === "warning" ? "warning" : value === "succeeded" ? "success" : "info";
 const actionLabel = (value: string) => ({
   review_approved: "批准岗位", review_rejected: "拒绝岗位", review_archived: "归档事项",
-  review_restored: "恢复事项", boss_page_opened: "打开岗位页面", boss_dispatch_started: "开始发送",
-  boss_request_accepted_released: "平台受理", boss_unknown_after_dispatch: "发送结果未知",
+  review_restored: "恢复事项", boss_page_opened: "打开岗位页面",
+  boss_task_matched: "匹配执行任务", boss_task_completed: "任务完成",
   boss_return_to_review: "退回待确认", executor_control: "执行器控制", boss_executor_risk: "执行器风险",
   run_created: "创建旧任务", boss_search_started: "开始采集", boss_search_finished: "完成采集",
   boss_collection_paused: "采集暂停", dry_run_guard: "旧任务保护"

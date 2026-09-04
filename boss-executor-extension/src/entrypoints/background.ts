@@ -12,7 +12,7 @@ import { bossChatCoordinator } from "../finejob/chat-coordinator";
 
 export default defineBackground({
   main() {
-    // Background 负责服务入口、执行凭证和 FineJob 队列。
+    // Background 负责服务入口、执行凭证和 FineJob 任务列表。
     const [provideBackgroundService] = defineProxy(() => new BackgroundService(), {
       namespace: BACKGROUND_NAMESPACE
     });

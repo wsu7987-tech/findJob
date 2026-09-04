@@ -7,7 +7,7 @@ import {
   refreshFrameworkDetail
 } from "../src/executor/framework-mode";
 
-describe("串行执行器状态", () => {
+describe("任务执行器状态", () => {
   it("启用受控真实动作和FineJob连接", () => {
     expect(FRAMEWORK_MODE.realActionsEnabled).toBe(true);
     expect(FRAMEWORK_MODE.fineJobConnected).toBe(true);

@@ -2,8 +2,8 @@ import { defineUnlistedScript } from "#imports";
 
 import type { MainWorldStatus } from "../../executor/framework-mode";
 import { contentService, initContentService } from "../../message";
-import { readBossPageSnapshot, snapshotFingerprint } from "../../platform/boss/read-only-probe";
 import { executeDefaultGreeting } from "../../platform/boss/default-greeting";
+import { readBossPageIdentity } from "../../platform/boss/read-only-probe";
 import {
   installBossChatObserver,
   readBossChatIdentity
@@ -40,37 +40,15 @@ export default defineUnlistedScript(async () => {
       void reportChatIdentity().catch(() => undefined);
     }, 5_000);
 
-    let previousFingerprint = "";
-    let reportRunning = false;
-    const reportSnapshot = async () => {
-      if (reportRunning) return;
-      reportRunning = true;
-      try {
-        const snapshot = readBossPageSnapshot();
-        const fingerprint = snapshotFingerprint(snapshot);
-        if (fingerprint !== previousFingerprint) {
-          await contentService.reportBossSnapshot(snapshot);
-          previousFingerprint = fingerprint;
-        }
-      } finally {
-        reportRunning = false;
-      }
-    };
-
-    // 不 Hook BOSS Vue setter；仅按固定间隔读取快照，页面卸载时立即停止。
-    await reportSnapshot();
-    const probeTimer = window.setInterval(() => {
-      void reportSnapshot().catch((error) => {
-        console.error("[FineJob BOSS 执行器] 岗位只读识别失败", error);
-      });
-    }, 1000);
     let commandRunning = false;
     const commandTimer = window.setInterval(() => {
       if (commandRunning) return;
       commandRunning = true;
       void contentService.takeMainCommand().then(async (command) => {
         if (!command) return;
-        if (command.type === "BOSS_DEFAULT_GREETING") {
+        if (command.type === "BOSS_PAGE_PROBE") {
+          await contentService.reportBossPageIdentity(readBossPageIdentity());
+        } else if (command.type === "BOSS_DEFAULT_GREETING") {
           const result = await executeDefaultGreeting(command);
           await contentService.reportExecutionResult(result);
         } else {
@@ -83,7 +61,6 @@ export default defineUnlistedScript(async () => {
         commandRunning = false;
       });
     }, 250);
-    window.addEventListener("pagehide", () => window.clearInterval(probeTimer), { once: true });
     window.addEventListener("pagehide", () => window.clearInterval(commandTimer), { once: true });
     window.addEventListener("pagehide", () => {
       window.clearInterval(chatIdentityTimer);

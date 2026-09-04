@@ -1,55 +1,37 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
-import secrets
 import re
-from datetime import datetime, timedelta, timezone
+import secrets
 from typing import Any, Callable
 from urllib.parse import urlparse
 
 from backend.app.db import Database
 from backend.app.errors import AppError
 from backend.app.services.fine_job.boss_scraper.service import boss_scraper_service
-from backend.app.services.fine_job.delivery_strategies import get_delivery_strategy
 from backend.app.utils import new_id, utc_now
 
 
 PROTOCOL_VERSION = "1.1"
-HEARTBEAT_TTL_SECONDS = 12
-PAGE_STATUS_TIMEOUT_SECONDS = 30
-DISPATCH_RESULT_TIMEOUT_SECONDS = 20
 PAIRING_CODE_TTL_SECONDS = 300
-VERIFICATION_DELAY_MIN_SECONDS = 10
-VERIFICATION_DELAY_MAX_SECONDS = 30
-ACTIVE_VERIFICATION_STATES = {"waiting_refresh", "refreshing", "waiting_snapshot"}
-FAILED_QUEUE_STATES = {"failed_before_dispatch", "failed_after_dispatch"}
-TERMINAL_EXECUTION_STATES = {
-    "succeeded", "cancelled", "blocked", "failed_before_dispatch", "failed_after_dispatch",
-    "unknown_after_dispatch",
-}
+TEST_JOB_COUNT = 5
+TEST_JOB_LINK_DEFAULT = "https://www.zhipin.com/"
 
-# 控制通道只在当前后端进程内保存连接和等待中的一次性请求，不增加数据库字段。
+# 控制通道只保存当前进程中的连接和一次性心跳请求。
 _executor_channels: dict[str, Any] = {}
 _heartbeat_requests: dict[str, tuple[str, asyncio.Future[dict[str, object]]]] = {}
+_control_requests: dict[str, tuple[str, asyncio.Future[dict[str, object]]]] = {}
+_desktop_channels: set[Any] = set()
 
 
 def _hash(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def _parse_time(value: object) -> datetime | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
+    return value
 
 
 def _iso_after(seconds: int) -> str:
+    from datetime import datetime, timedelta, timezone
+
     return (
         datetime.now(timezone.utc) + timedelta(seconds=seconds)
     ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -60,7 +42,10 @@ def create_pairing_code(db: Database) -> dict[str, str]:
     now = utc_now()
     expires_at = _iso_after(PAIRING_CODE_TTL_SECONDS)
     with db.connect() as connection:
-        connection.execute("DELETE FROM fj_boss_pairing_codes WHERE used_at IS NOT NULL OR expires_at <= ?", (now,))
+        connection.execute(
+            "DELETE FROM fj_boss_pairing_codes WHERE used_at IS NOT NULL OR expires_at <= ?",
+            (now,),
+        )
         connection.execute(
             "INSERT INTO fj_boss_pairing_codes (id, code_hash, expires_at, created_at) VALUES (?, ?, ?, ?)",
             (new_id(), _hash(code), expires_at, now),
@@ -69,10 +54,14 @@ def create_pairing_code(db: Database) -> dict[str, str]:
 
 
 def reset_executor_connections(db: Database) -> None:
-    """后端重启后由插件的下一次单次心跳重新确认连接。"""
+    _finish_active_tasks_as_unknown(db, "服务启动时发现遗留执行中任务，已结束为结果未知。", "EXECUTOR_STARTUP_RESET")
     with db.connect() as connection:
         connection.execute(
-            "UPDATE fj_boss_executor_instances SET browser_connected = 0, updated_at = ?",
+            """
+            UPDATE fj_boss_executor_instances
+            SET browser_connected = 0, runtime_phase = 'idle', runtime_detail = '',
+                runtime_until_at = NULL, updated_at = ?
+            """,
             (utc_now(),),
         )
 
@@ -87,7 +76,7 @@ def pair_executor(
     capabilities: list[str],
 ) -> dict[str, str]:
     if protocol_version != PROTOCOL_VERSION:
-        raise AppError(status_code=409, error_category="PROTOCOL_MISMATCH", error_message="插件通信协议版本不兼容。")
+        raise AppError(409, "PROTOCOL_MISMATCH", "插件通信协议版本不兼容。")
     now = utc_now()
     token = secrets.token_urlsafe(32)
     executor_id = new_id()
@@ -98,53 +87,86 @@ def pair_executor(
             (_hash(code.strip()),),
         ).fetchone()
         if row is None or row["used_at"] is not None or str(row["expires_at"]) <= now:
-            raise AppError(status_code=401, error_category="INVALID_PAIRING_CODE", error_message="配对码无效或已经过期。")
-        connection.execute("UPDATE fj_boss_pairing_codes SET used_at = ? WHERE id = ?", (now, row["id"]))
-        # 当前版本明确只允许一个插件执行器，新的配对会暂停旧实例。
+            raise AppError(401, "INVALID_PAIRING_CODE", "配对码无效或已经过期。")
         connection.execute(
-            "UPDATE fj_boss_executor_instances SET permission_state = 'not_authorized', queue_state = 'paused', updated_at = ?",
+            "UPDATE fj_boss_pairing_codes SET used_at = ? WHERE id = ?",
+            (now, row["id"]),
+        )
+        connection.execute(
+            "UPDATE fj_boss_executor_instances SET queue_state = 'paused', updated_at = ?",
             (now,),
         )
         connection.execute(
             """
             INSERT INTO fj_boss_executor_instances (
               id, label, token_hash, protocol_version, plugin_version, capabilities_json,
-              permission_state, queue_state, risk_state, browser_connected, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'not_authorized', 'paused', 'none', 0, ?, ?)
+              queue_state, risk_state, browser_connected, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'paused', 'none', 0, ?, ?)
             """,
-            (executor_id, label.strip(), _hash(token), protocol_version, plugin_version, json.dumps(capabilities), now, now),
+            (
+                executor_id,
+                label.strip(),
+                _hash(token),
+                protocol_version,
+                plugin_version,
+                json.dumps(capabilities, ensure_ascii=False),
+                now,
+                now,
+            ),
         )
     return {"executor_id": executor_id, "token": token, "protocol_version": PROTOCOL_VERSION}
 
 
 def authenticate_executor(db: Database, token: str) -> dict[str, object]:
     if not token:
-        raise AppError(status_code=401, error_category="EXECUTOR_UNAUTHORIZED", error_message="缺少执行器令牌。")
+        raise AppError(401, "EXECUTOR_UNAUTHORIZED", "缺少执行器令牌。")
     with db.connect() as connection:
         row = connection.execute(
-            "SELECT * FROM fj_boss_executor_instances WHERE token_hash = ?", (_hash(token),)
+            "SELECT * FROM fj_boss_executor_instances WHERE token_hash = ?",
+            (_hash(token),),
         ).fetchone()
     if row is None:
-        raise AppError(status_code=401, error_category="EXECUTOR_UNAUTHORIZED", error_message="执行器令牌无效。")
+        raise AppError(401, "EXECUTOR_UNAUTHORIZED", "执行器令牌无效。")
     return dict(row)
 
 
-async def register_executor_channel(executor_id: str, websocket: Any) -> None:
+async def register_executor_channel(db: Database, executor_id: str, websocket: Any) -> None:
     previous = _executor_channels.get(executor_id)
     if previous is not None and previous is not websocket:
         await previous.close(code=1000)
     _executor_channels[executor_id] = websocket
+    _finish_active_tasks_as_unknown(db, "插件重新连接后清理遗留执行中任务，已结束为结果未知。", "EXECUTOR_RECONNECTED_RESET")
+    _record_channel_heartbeat(db, executor_id)
+    await _send_queue(db, executor_id)
+    await _broadcast_executor_state(db)
 
 
-async def unregister_executor_channel(executor_id: str, websocket: Any) -> None:
+async def unregister_executor_channel(db: Database, executor_id: str, websocket: Any) -> None:
     if _executor_channels.get(executor_id) is websocket:
         _executor_channels.pop(executor_id, None)
+        mark_executor_disconnected(db, executor_id)
+        await _broadcast_executor_state(db)
     for request_id, (owner_id, future) in list(_heartbeat_requests.items()):
         if owner_id != executor_id:
             continue
         _heartbeat_requests.pop(request_id, None)
         if not future.done():
             future.set_result({"ok": False, "message": "插件控制通道已断开。"})
+    for request_id, (owner_id, future) in list(_control_requests.items()):
+        if owner_id != executor_id:
+            continue
+        _control_requests.pop(request_id, None)
+        if not future.done():
+            future.set_exception(AppError(409, "EXECUTOR_NOT_CONNECTED", "插件控制通道已断开。"))
+
+
+async def register_desktop_channel(db: Database, websocket: Any) -> None:
+    _desktop_channels.add(websocket)
+    await _send_desktop_state(db, websocket)
+
+
+async def unregister_desktop_channel(websocket: Any) -> None:
+    _desktop_channels.discard(websocket)
 
 
 async def close_executor_channel(executor_id: str) -> None:
@@ -157,26 +179,117 @@ async def close_executor_channel(executor_id: str) -> None:
         pass
 
 
-async def handle_executor_channel_message(executor_id: str, message: object) -> None:
-    if not isinstance(message, dict) or message.get("type") != "heartbeat_test_result":
+async def handle_executor_channel_message(db: Database, executor_id: str, message: object) -> None:
+    if not isinstance(message, dict):
         return
-    request_id = str(message.get("request_id") or "")
-    pending = _heartbeat_requests.pop(request_id, None)
-    if pending is None or pending[0] != executor_id:
+    try:
+        await _handle_executor_channel_message(db, executor_id, message)
+    except AppError as exc:
+        await _report_executor_channel_error(
+            db,
+            executor_id,
+            message,
+            code=exc.error_category,
+            error_message=exc.error_message,
+        )
+    except Exception as exc:
+        await _report_executor_channel_error(
+            db,
+            executor_id,
+            message,
+            code="EXECUTOR_MESSAGE_FAILED",
+            error_message=str(exc) or "插件运行消息处理失败。",
+        )
+
+
+async def _handle_executor_channel_message(db: Database, executor_id: str, message: dict[str, object]) -> None:
+    message_type = str(message.get("type") or "")
+    if message_type == "heartbeat_test_result":
+        request_id = str(message.get("request_id") or "")
+        pending = _heartbeat_requests.pop(request_id, None)
+        if pending is None or pending[0] != executor_id:
+            return
+        future = pending[1]
+        if not future.done():
+            future.set_result({"ok": bool(message.get("ok")), "message": str(message.get("message") or "")})
         return
-    future = pending[1]
-    if not future.done():
-        future.set_result({
-            "ok": bool(message.get("ok")),
-            "message": str(message.get("message") or ""),
+    if message_type == "heartbeat":
+        _record_channel_heartbeat(db, executor_id)
+        await _broadcast_executor_state(db)
+        return
+    if message_type == "runtime_state":
+        phase = str(message.get("phase") or "idle")
+        if phase not in {"idle", "task_cooldown"}:
+            return
+        detail = str(message.get("detail") or "")
+        until_at = str(message.get("until_at") or "") or None
+        _update_runtime_state(db, executor_id, phase, detail=detail, until_at=until_at)
+        await _broadcast_executor_state(db)
+        return
+    if message_type == "executor_state_changed":
+        queue_state = str(message.get("queue_state") or "")
+        if queue_state not in {"running", "paused"}:
+            return
+        _update_queue_state(db, executor_id, queue_state)
+        request_id = str(message.get("request_id") or "")
+        pending = _control_requests.pop(request_id, None)
+        if pending is not None and pending[0] == executor_id and not pending[1].done():
+            pending[1].set_result(executor_status(db, executor_id))
+        await notify_queue_changed(db)
+        return
+    if message_type == "open_task_page":
+        await _open_and_notify_task_page(db, executor_id)
+        return
+    if message_type == "match_task":
+        task_id = str(message.get("task_id") or "")
+        if not task_id:
+            return
+        task = _require_action(db, task_id)
+        execution_epoch = int(
+            message.get("execution_epoch")
+            if message.get("execution_epoch") is not None
+            else task["execution_epoch"] or 0
+        )
+        result = match_task(db, executor_id, task_id, execution_epoch)
+        await _send_executor_message(executor_id, {
+            "type": "task_match_synced",
+            "task_id": task_id,
+            "execution_epoch": execution_epoch,
+            "task": result["task"],
+            "queue": result["queue"],
         })
+        await notify_queue_changed(db)
+        return
+    if message_type == "task_succeeded":
+        await _handle_task_completion_message(db, executor_id, message, succeeded=True)
+        return
+    if message_type == "task_failed":
+        await _handle_task_completion_message(db, executor_id, message, succeeded=False)
+        return
+    if message_type == "execution_error":
+        task_id = str(message.get("task_id") or "")
+        failure_kind = str(message.get("failure_kind") or "")
+        if task_id and failure_kind == "page_match_failed":
+            _record_task_match_failure(db, task_id, str(message.get("error_message") or "页面匹配失败"))
+            await notify_queue_changed(db)
+            if bool(message.get("disconnect")):
+                await close_executor_channel(executor_id)
+                mark_executor_disconnected(db, executor_id)
+                await _broadcast_executor_state(db)
+            return
+        if task_id:
+            _record_execution_error(db, task_id, str(message.get("error_message") or "页面检查失败"))
+            await notify_queue_changed(db)
+        await close_executor_channel(executor_id)
+        mark_executor_disconnected(db, executor_id)
+        await _broadcast_executor_state(db)
 
 
 async def request_heartbeat_test(db: Database, executor_id: str) -> dict[str, object]:
     websocket = _executor_channels.get(executor_id)
     if websocket is None:
         mark_executor_disconnected(db, executor_id)
-        raise AppError(status_code=409, error_category="EXECUTOR_NOT_CONNECTED", error_message="插件未连接，无法进行心跳测试。")
+        raise AppError(409, "EXECUTOR_NOT_CONNECTED", "插件未连接，无法进行心跳测试。")
     request_id = new_id()
     future = asyncio.get_running_loop().create_future()
     _heartbeat_requests[request_id] = (executor_id, future)
@@ -186,45 +299,53 @@ async def request_heartbeat_test(db: Database, executor_id: str) -> dict[str, ob
     except asyncio.TimeoutError as exc:
         _heartbeat_requests.pop(request_id, None)
         mark_executor_disconnected(db, executor_id)
-        raise AppError(status_code=504, error_category="HEARTBEAT_TIMEOUT", error_message="插件未在规定时间内返回心跳。") from exc
+        raise AppError(504, "HEARTBEAT_TIMEOUT", "插件未在规定时间内返回心跳。") from exc
     except Exception as exc:
         _heartbeat_requests.pop(request_id, None)
         mark_executor_disconnected(db, executor_id)
-        raise AppError(status_code=409, error_category="EXECUTOR_NOT_CONNECTED", error_message="插件控制通道不可用。") from exc
+        raise AppError(409, "EXECUTOR_NOT_CONNECTED", "插件控制通道不可用。") from exc
     if not result.get("ok"):
         mark_executor_disconnected(db, executor_id)
-        raise AppError(status_code=502, error_category="HEARTBEAT_FAILED", error_message=str(result.get("message") or "插件心跳失败。"))
-    return executor_snapshot(db, executor_id)
+        raise AppError(502, "HEARTBEAT_FAILED", str(result.get("message") or "插件心跳失败。"))
+    return executor_status(db, executor_id)
 
 
 def mark_executor_disconnected(db: Database, executor_id: str) -> None:
+    _finish_active_tasks_as_unknown(db, "插件连接已断开，执行中任务已结束为结果未知。", "EXECUTOR_DISCONNECTED")
     with db.connect() as connection:
         connection.execute(
-            "UPDATE fj_boss_executor_instances SET browser_connected = 0, updated_at = ? WHERE id = ?",
+            """
+            UPDATE fj_boss_executor_instances
+            SET browser_connected = 0, runtime_phase = 'idle', runtime_detail = '',
+                runtime_until_at = NULL, updated_at = ?
+            WHERE id = ?
+            """,
             (utc_now(), executor_id),
         )
 
 
 async def disconnect_executor(db: Database, executor_id: str) -> dict[str, object]:
+    _finish_active_tasks_as_unknown(db, "执行器断开连接，执行中任务已结束为结果未知。", "EXECUTOR_DISCONNECTED")
     with db.connect() as connection:
         connection.execute(
             """
             UPDATE fj_boss_executor_instances
             SET token_hash = 'revoked:' || id, browser_connected = 0,
-                permission_state = 'not_authorized', queue_state = 'paused',
-                updated_at = ?
+                queue_state = 'paused', runtime_phase = 'idle', runtime_detail = '',
+                runtime_until_at = NULL, updated_at = ?
             WHERE id = ?
             """,
             (utc_now(), executor_id),
         )
     await close_executor_channel(executor_id)
-    return executor_snapshot(db, executor_id)
+    await _broadcast_executor_state(db)
+    return executor_status(db, executor_id)
 
 
 def heartbeat(db: Database, executor_id: str, payload: dict[str, object]) -> dict[str, object]:
-    now = utc_now()
     if str(payload.get("protocol_version") or "") != PROTOCOL_VERSION:
-        raise AppError(status_code=409, error_category="PROTOCOL_MISMATCH", error_message="插件通信协议版本不兼容。")
+        raise AppError(409, "PROTOCOL_MISMATCH", "插件通信协议版本不兼容。")
+    now = utc_now()
     risk_state = str(payload.get("risk_state") or "none")
     if risk_state not in {"none", "login", "captcha", "rate_limit", "unknown"}:
         risk_state = "unknown"
@@ -233,221 +354,145 @@ def heartbeat(db: Database, executor_id: str, payload: dict[str, object]) -> dic
             """
             UPDATE fj_boss_executor_instances
             SET protocol_version = ?, plugin_version = ?, capabilities_json = ?,
-                browser_connected = ?,
-                risk_state = CASE
-                  WHEN risk_state = 'consecutive_unknown_after_dispatch' THEN risk_state
-                  ELSE ?
-                END,
-                last_heartbeat_at = ?, updated_at = ?
+                browser_connected = ?, risk_state = ?, last_heartbeat_at = ?, updated_at = ?
             WHERE id = ?
             """,
             (
-                PROTOCOL_VERSION, str(payload.get("plugin_version") or ""),
+                PROTOCOL_VERSION,
+                str(payload.get("plugin_version") or ""),
                 json.dumps(payload.get("capabilities") or [], ensure_ascii=False),
-                int(bool(payload.get("browser_connected"))), risk_state, now, now, executor_id,
+                int(bool(payload.get("browser_connected"))),
+                risk_state,
+                now,
+                now,
+                executor_id,
             ),
         )
         if risk_state != "none":
             connection.execute(
-                "UPDATE fj_boss_executor_instances SET permission_state = 'risk_paused', queue_state = 'risk_paused' WHERE id = ?",
+                "UPDATE fj_boss_executor_instances SET queue_state = 'risk_paused' WHERE id = ?",
                 (executor_id,),
             )
-    sweep_page_timeout(db, executor_id)
-    return executor_snapshot(db, executor_id)
+    return executor_status(db, executor_id)
 
 
-def set_control(db: Database, executor_id: str, command: str) -> dict[str, object]:
-    now = utc_now()
-    mapping = {
-        "allow": ("allowed", "running"),
-        "resume": ("allowed", "running"),
-        "pause": ("paused", "paused"),
-        "emergency_stop": ("paused", "emergency_stopped"),
-    }
-    permission, queue_state = mapping[command]
-    if command in {"allow", "resume"} and _consecutive_unknown_count(db) >= 3:
-        raise AppError(
-            status_code=409,
-            error_category="CONSECUTIVE_UNKNOWN_LIMIT",
-            error_message="连续3个不同岗位出现未知错误，请先人工核验执行环境和未知岗位。",
+def update_executor_settings(db: Database, payload: dict[str, object]) -> dict[str, object]:
+    runtime = executor_status(db)
+    executor = runtime.get("executor")
+    if not isinstance(executor, dict):
+        raise AppError(409, "EXECUTOR_NOT_PAIRED", "尚未配对BOSS执行器。")
+    task_cooldown = min(600, max(4, int(payload.get("task_cooldown_max_seconds") or 4)))
+    page_load_wait = min(600, max(3, int(payload.get("page_load_wait_max_seconds") or 3)))
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_boss_executor_instances
+            SET task_cooldown_max_seconds = ?, page_load_wait_max_seconds = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (task_cooldown, page_load_wait, utc_now(), executor["id"]),
         )
+    return executor_status(db, str(executor["id"]))
+
+
+def _update_queue_state(db: Database, executor_id: str, queue_state: str) -> None:
+    if queue_state == "running":
+        _finish_active_tasks_as_unknown(db, "开始执行前清理遗留执行中任务，已结束为结果未知。", "EXECUTOR_START_RESET")
     with db.connect() as connection:
         current = connection.execute(
-            "SELECT risk_state FROM fj_boss_executor_instances WHERE id = ?", (executor_id,)
+            "SELECT risk_state FROM fj_boss_executor_instances WHERE id = ?",
+            (executor_id,),
         ).fetchone()
         if current is None:
-            raise AppError(status_code=404, error_category="NOT_FOUND", error_message="执行器不存在。")
-        current_risk = str(current["risk_state"])
-        if command in {"allow", "resume"} and current_risk not in {"none", "unknown_after_dispatch"}:
-            raise AppError(status_code=409, error_category="RISK_NOT_CLEARED", error_message="插件仍报告登录、验证码或频控风险，不能恢复。")
+            raise AppError(404, "NOT_FOUND", "执行器不存在。")
+        if queue_state == "running" and current["risk_state"] != "none":
+            raise AppError(409, "RISK_NOT_CLEARED", "插件仍报告风险，不能恢复。")
         connection.execute(
-            "UPDATE fj_boss_executor_instances SET permission_state = ?, queue_state = ?, risk_state = CASE WHEN risk_state = 'unknown_after_dispatch' THEN 'none' ELSE risk_state END, updated_at = ? WHERE id = ?",
-            (permission, queue_state, now, executor_id),
+            "UPDATE fj_boss_executor_instances SET queue_state = ?, updated_at = ? WHERE id = ?",
+            (queue_state, utc_now(), executor_id),
         )
-    _audit(db, "executor_control", f"执行器控制状态更新为 {command}", {"executor_id": executor_id})
-    return executor_snapshot(db, executor_id)
 
 
-def executor_snapshot(db: Database, executor_id: str | None = None) -> dict[str, object]:
+def _update_runtime_state(
+    db: Database,
+    executor_id: str,
+    phase: str,
+    *,
+    detail: str = "",
+    until_at: str | None = None,
+) -> None:
     with db.connect() as connection:
-        if executor_id:
-            executor = connection.execute("SELECT * FROM fj_boss_executor_instances WHERE id = ?", (executor_id,)).fetchone()
-        else:
-            executor = connection.execute(
-                "SELECT * FROM fj_boss_executor_instances ORDER BY updated_at DESC LIMIT 1"
-            ).fetchone()
-    queue = list_queue(db)
-    data = _serialize_executor(executor) if executor else None
-    return {"executor": data, "queue": queue, "protocol_version": PROTOCOL_VERSION}
+        connection.execute(
+            """
+            UPDATE fj_boss_executor_instances
+            SET runtime_phase = ?, runtime_detail = ?, runtime_until_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (phase, detail[:300], until_at, utc_now(), executor_id),
+        )
+
+
+async def request_control(db: Database, executor_id: str, command: str) -> dict[str, object]:
+    websocket = _executor_channels.get(executor_id)
+    if websocket is None:
+        mark_executor_disconnected(db, executor_id)
+        await _broadcast_executor_state(db)
+        raise AppError(409, "EXECUTOR_NOT_CONNECTED", "插件未连接，无法同步执行状态。")
+    request_id = new_id()
+    future = asyncio.get_running_loop().create_future()
+    _control_requests[request_id] = (executor_id, future)
+    try:
+        await websocket.send_json({"type": "executor_control", "command": command, "request_id": request_id})
+        result = await asyncio.wait_for(future, timeout=6)
+    except asyncio.TimeoutError as exc:
+        _control_requests.pop(request_id, None)
+        raise AppError(504, "CONTROL_SYNC_TIMEOUT", "插件未确认执行状态变更。") from exc
+    except Exception:
+        _control_requests.pop(request_id, None)
+        raise
+    _audit(db, "executor_control", f"插件已同步执行状态：{command}", {"executor_id": executor_id})
+    return result
+
+
+async def set_plugin_control(db: Database, executor_id: str, command: str) -> dict[str, object]:
+    queue_state = "running" if command == "start" else "paused"
+    _update_queue_state(db, executor_id, queue_state)
+    await _send_queue(db, executor_id)
+    await _broadcast_executor_state(db)
+    return executor_status(db, executor_id)
+
+
+def executor_status(db: Database, executor_id: str | None = None) -> dict[str, object]:
+    with db.connect() as connection:
+        executor = (
+            connection.execute("SELECT * FROM fj_boss_executor_instances WHERE id = ?", (executor_id,)).fetchone()
+            if executor_id
+            else connection.execute("SELECT * FROM fj_boss_executor_instances ORDER BY updated_at DESC LIMIT 1").fetchone()
+        )
+    return {
+        "executor": _serialize_executor(executor) if executor else None,
+        "current_task": _current_task(db),
+        "queue": list_queue(db),
+        "protocol_version": PROTOCOL_VERSION,
+    }
 
 
 def list_queue(db: Database) -> dict[str, object]:
+    # 插件只保留待执行与执行中的任务；终态任务通过桌面端结果展示。
     with db.connect() as connection:
-        pending_rows = connection.execute(
-            """
-            SELECT a.*, j.title AS job_title, j.company_name, j.encrypt_job_id, j.job_link
-            FROM fj_automation_actions a JOIN fj_boss_jobs j ON j.id = a.job_id
-            WHERE a.action_type = 'BOSS_DEFAULT_GREETING'
-              AND a.execution_state IN (
-                'queued', 'opening_page', 'waiting_page_ready', 'page_verified',
-                'ready_to_dispatch', 'dispatch_started'
-              )
-            ORDER BY CASE
-              WHEN a.execution_state IN (
-                'opening_page','waiting_page_ready','page_verified','ready_to_dispatch','dispatch_started'
-              ) THEN 0
-              WHEN a.execution_state = 'unknown_after_dispatch' THEN 2
-              ELSE 1
-            END,
-              a.queue_position ASC, a.created_at ASC
-            """
-        ).fetchall()
-        failed_rows = connection.execute(
-            """
-            SELECT a.*, j.title AS job_title, j.company_name, j.encrypt_job_id, j.job_link
-            FROM fj_automation_actions a JOIN fj_boss_jobs j ON j.id = a.job_id
-            WHERE a.action_type = 'BOSS_DEFAULT_GREETING'
-              AND a.execution_state IN ('failed_before_dispatch', 'failed_after_dispatch')
-            ORDER BY a.updated_at DESC, a.created_at DESC
-            """
-        ).fetchall()
-    actions = [_serialize_action(row, include_payload=False) for row in pending_rows]
-    failed_actions = [_serialize_action(row, include_payload=False) for row in failed_rows]
-    return {
-        "actions": actions,
-        "total": len(actions),
-        "failed_actions": failed_actions,
-        "failed_total": len(failed_actions),
-    }
-
-
-def _reset_failed_action(connection, action_id: str, queue_position: int, now: str) -> None:
-    # 重试动作重新进入待执行队列，并让旧执行轮次立即失效。
-    connection.execute(
-        """
-        UPDATE fj_automation_actions
-        SET status = 'queued', execution_state = 'queued', queue_position = ?,
-            execution_epoch = execution_epoch + 1, lease_owner = NULL,
-            lease_expires_at = NULL, page_open_attempts = 0, page_deadline_at = NULL,
-            dispatch_started_at = NULL, request_accepted_at = NULL,
-            verification_state = 'not_required', verification_method = 'none',
-            verification_delay_seconds = NULL, verification_due_at = NULL,
-            verification_started_at = NULL, verification_completed_at = NULL,
-            verification_attempts = 0, cooldown_seconds = NULL, next_eligible_at = NULL,
-            last_status_code = 'RETRY_QUEUED', last_error = NULL,
-            result_json = '{}', completed_at = NULL, updated_at = ?
-        WHERE id = ?
-        """,
-        (queue_position, now, action_id),
-    )
-
-
-def retry_failed_action(db: Database, action_id: str) -> dict[str, object]:
-    action = _require_action(db, action_id)
-    if action["execution_state"] not in FAILED_QUEUE_STATES:
-        raise AppError(status_code=409, error_category="RETRY_NOT_ALLOWED", error_message="当前动作不在执行失败队列。")
-    now = utc_now()
-    with db.connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        max_position = int(connection.execute(
-            "SELECT COALESCE(MAX(queue_position), 0) FROM fj_automation_actions"
-        ).fetchone()[0])
-        _reset_failed_action(connection, action_id, max_position + 1, now)
-    _audit(db, "boss_failed_action_retried", "执行失败动作已重新加入待执行队列。", {"action_id": action_id})
-    return {"action": _serialize_action(_require_action(db, action_id)), "queue": list_queue(db)}
-
-
-def retry_all_failed_actions(db: Database) -> dict[str, object]:
-    now = utc_now()
-    retried_ids: list[str] = []
-    with db.connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
         rows = connection.execute(
             """
-            SELECT id FROM fj_automation_actions
-            WHERE action_type = 'BOSS_DEFAULT_GREETING'
-              AND execution_state IN ('failed_before_dispatch', 'failed_after_dispatch')
-            ORDER BY updated_at ASC, created_at ASC
+            SELECT a.*, j.title AS job_title, j.company_name, j.encrypt_job_id, j.job_link
+            FROM fj_automation_actions a
+            JOIN fj_boss_jobs j ON j.id = a.job_id
+            WHERE a.task_type IN ('BOSS_DEFAULT_GREETING', 'TEST_DELAY')
+              AND a.status IN ('queued', 'running', 'leased')
+              AND a.execution_state IN ('queued', 'running')
+            ORDER BY a.created_at ASC, a.id ASC
             """
         ).fetchall()
-        max_position = int(connection.execute(
-            "SELECT COALESCE(MAX(queue_position), 0) FROM fj_automation_actions"
-        ).fetchone()[0])
-        for offset, row in enumerate(rows, start=1):
-            action_id = str(row["id"])
-            _reset_failed_action(connection, action_id, max_position + offset, now)
-            retried_ids.append(action_id)
-    _audit(db, "boss_failed_actions_retried", "执行失败动作已全部重新加入待执行队列。", {"action_ids": retried_ids})
-    return {"action_ids": retried_ids, "queue": list_queue(db)}
-
-
-def cancel_failed_action(db: Database, action_id: str) -> dict[str, object]:
-    action = _require_action(db, action_id)
-    if action["execution_state"] not in FAILED_QUEUE_STATES:
-        raise AppError(status_code=409, error_category="CANCEL_NOT_ALLOWED", error_message="当前动作不在执行失败队列。")
-    now = utc_now()
-    with db.connect() as connection:
-        connection.execute(
-            """
-            UPDATE fj_automation_actions
-            SET status = 'cancelled', execution_state = 'cancelled', lease_owner = NULL,
-                lease_expires_at = NULL, page_deadline_at = NULL,
-                last_status_code = 'FAILURE_CANCELLED', updated_at = ?, completed_at = ?
-            WHERE id = ?
-            """,
-            (now, now, action_id),
-        )
-    _audit(db, "boss_failed_action_cancelled", "执行失败动作已撤销。", {"action_id": action_id})
-    return {"action": _serialize_action(_require_action(db, action_id)), "queue": list_queue(db)}
-
-
-def cancel_all_failed_actions(db: Database) -> dict[str, object]:
-    now = utc_now()
-    with db.connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        rows = connection.execute(
-            """
-            SELECT id FROM fj_automation_actions
-            WHERE action_type = 'BOSS_DEFAULT_GREETING'
-              AND execution_state IN ('failed_before_dispatch', 'failed_after_dispatch')
-            ORDER BY updated_at ASC, created_at ASC
-            """
-        ).fetchall()
-        action_ids = [str(row["id"]) for row in rows]
-        if action_ids:
-            connection.execute(
-                """
-                UPDATE fj_automation_actions
-                SET status = 'cancelled', execution_state = 'cancelled', lease_owner = NULL,
-                    lease_expires_at = NULL, page_deadline_at = NULL,
-                    last_status_code = 'FAILURE_CANCELLED', updated_at = ?, completed_at = ?
-                WHERE action_type = 'BOSS_DEFAULT_GREETING'
-                  AND execution_state IN ('failed_before_dispatch', 'failed_after_dispatch')
-                """,
-                (now, now),
-            )
-    _audit(db, "boss_failed_actions_cancelled", "执行失败动作已全部撤销。", {"action_ids": action_ids})
-    return {"action_ids": action_ids, "queue": list_queue(db)}
+    actions = [_serialize_action(row, include_payload=False) for row in rows]
+    return {"actions": actions, "total": len(actions)}
 
 
 def open_navigation(
@@ -460,7 +505,7 @@ def open_navigation(
 ) -> dict[str, object]:
     job = _resolve_job(db, job_identifier, source_context)
     target_url = _target_job_url(job)
-    task_id = new_id()
+    navigation_id = new_id()
     now = utc_now()
     with db.connect() as connection:
         connection.execute(
@@ -470,7 +515,16 @@ def open_navigation(
               status, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)
             """,
-            (task_id, action_id, job["id"], source_context, target_url, job["encrypt_job_id"], now, now),
+            (
+                navigation_id,
+                action_id,
+                job["id"],
+                source_context,
+                target_url,
+                job["encrypt_job_id"],
+                now,
+                now,
+            ),
         )
     try:
         target_id = (open_page or boss_scraper_service.open_job_page)(target_url)
@@ -478,863 +532,826 @@ def open_navigation(
         with db.connect() as connection:
             connection.execute(
                 "UPDATE fj_boss_navigation_tasks SET status = 'failed', error_code = 'PAGE_OPEN_FAILED', error_message = ?, updated_at = ? WHERE id = ?",
-                (str(exc), utc_now(), task_id),
+                (str(exc), utc_now(), navigation_id),
             )
-        raise AppError(status_code=409, error_category="PAGE_OPEN_FAILED", error_message=str(exc)) from exc
+        raise AppError(409, "PAGE_OPEN_FAILED", str(exc)) from exc
     opened_at = utc_now()
     with db.connect() as connection:
         connection.execute(
             "UPDATE fj_boss_navigation_tasks SET status = 'opened', browser_target_id = ?, opened_at = ?, updated_at = ? WHERE id = ?",
-            (target_id, opened_at, opened_at, task_id),
+            (target_id, opened_at, opened_at, navigation_id),
         )
-    return get_navigation(db, task_id)
+    return get_navigation(db, navigation_id)
+
+
+def open_task_page(
+    db: Database,
+    executor_id: str,
+    *,
+    open_page: Callable[[str], str] | None = None,
+) -> dict[str, object]:
+    executor = _executor_row(db, executor_id)
+    if executor["queue_state"] != "running":
+        return {"task": None, "navigation": None, "queue": list_queue(db)}
+    with db.connect() as connection:
+        active = connection.execute(
+            """
+            SELECT id FROM fj_automation_actions
+            WHERE task_type IN ('BOSS_DEFAULT_GREETING', 'TEST_DELAY')
+              AND status IN ('running', 'leased')
+              AND execution_state = 'running'
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        queued_total = int(connection.execute(
+            """
+            SELECT COUNT(*) AS total FROM fj_automation_actions
+            WHERE task_type IN ('BOSS_DEFAULT_GREETING', 'TEST_DELAY') AND status = 'queued'
+            """
+        ).fetchone()["total"])
+    if active is not None:
+        active_task_id = str(active["id"])
+        return {
+            "task": _serialize_action(_require_action(db, active_task_id), include_payload=False),
+            "navigation": None,
+            "busy": True,
+            "queue": list_queue(db),
+        }
+    if queued_total <= 0:
+        return {"task": None, "navigation": None, "queue": list_queue(db)}
+    last_error: dict[str, str] | None = None
+    queue_changed = False
+    for _index in range(max(queued_total, 0)):
+        with db.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, job_id, task_type FROM fj_automation_actions
+                WHERE task_type IN ('BOSS_DEFAULT_GREETING', 'TEST_DELAY') AND status = 'queued'
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                """
+            ).fetchone()
+        if row is None:
+            return {"task": None, "navigation": None, "queue": list_queue(db)}
+        task_id = str(row["id"])
+        try:
+            if row["task_type"] == "TEST_DELAY":
+                navigation = _open_test_task_page(db, task_id, open_page=open_page)
+            else:
+                navigation = open_navigation(
+                    db,
+                    job_identifier=str(row["job_id"]),
+                    source_context="queue",
+                    action_id=task_id,
+                    open_page=open_page,
+                )
+        except AppError as exc:
+            last_error = {"code": exc.error_category, "message": exc.error_message}
+            _record_task_open_failure(db, task_id, exc.error_message)
+            queue_changed = True
+            continue
+        return {
+            "task": _serialize_action(_require_action(db, task_id), include_payload=False),
+            "navigation": navigation,
+            "queue": list_queue(db),
+            "queue_changed": queue_changed,
+        }
+    return {
+        "task": None,
+        "navigation": None,
+        "error": last_error or {"code": "PAGE_OPEN_FAILED", "message": "任务页面打开失败。"},
+        "queue": list_queue(db),
+        "queue_changed": queue_changed,
+    }
+
+
+def match_task(
+    db: Database,
+    executor_id: str,
+    task_id: str,
+    execution_epoch: int,
+) -> dict[str, object]:
+    _executor_row(db, executor_id)
+    task = _require_action(db, task_id)
+    if task["task_type"] not in {"BOSS_DEFAULT_GREETING", "TEST_DELAY"}:
+        raise AppError(409, "INVALID_TASK", "任务类型不支持当前执行器。")
+    if int(task["execution_epoch"] or 0) != execution_epoch:
+        raise AppError(409, "STALE_EXECUTION_EPOCH", "该任务执行轮次已经失效。")
+    if task["status"] in {"running", "leased", "succeeded"}:
+        return {"task": _serialize_action(task, include_payload=False), "queue": list_queue(db)}
+    if task["status"] != "queued" or task["execution_state"] != "queued":
+        raise AppError(409, "INVALID_TASK_STATE", "任务当前状态不能匹配执行。")
+    now = utc_now()
+    running_status = _running_action_status(db)
+    already_locked = False
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        active = connection.execute(
+            """
+            SELECT id FROM fj_automation_actions
+            WHERE task_type IN ('BOSS_DEFAULT_GREETING', 'TEST_DELAY')
+              AND status IN ('running', 'leased')
+              AND execution_state = 'running'
+              AND id != ?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        if active is not None:
+            raise AppError(409, "EXECUTOR_BUSY", "已有任务正在执行，等待当前任务完成后再匹配。")
+        current = connection.execute(
+            """
+            SELECT status, execution_state, execution_epoch FROM fj_automation_actions
+            WHERE id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if current is None:
+            raise AppError(404, "NOT_FOUND", "执行任务不存在。")
+        if int(current["execution_epoch"] or 0) != execution_epoch:
+            raise AppError(409, "STALE_EXECUTION_EPOCH", "该任务执行轮次已经失效。")
+        if current["status"] in {"running", "leased", "succeeded"}:
+            already_locked = True
+        elif current["status"] != "queued" or current["execution_state"] != "queued":
+            raise AppError(409, "INVALID_TASK_STATE", "任务当前状态不能匹配执行。")
+        if not already_locked:
+            connection.execute(
+                """
+                UPDATE fj_automation_actions
+                SET status = ?, execution_state = 'running', updated_at = ?
+                WHERE id = ?
+                """,
+                (running_status, now, task_id),
+            )
+    if not already_locked:
+        _update_runtime_state(db, executor_id, "idle")
+        _audit(db, "boss_task_matched", "岗位页面已匹配执行任务。", {"task_id": task_id})
+    return {"task": _serialize_action(_require_action(db, task_id), include_payload=False), "queue": list_queue(db)}
+
+
+def complete_task(
+    db: Database,
+    executor_id: str,
+    task_id: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    execution_epoch = int(payload["execution_epoch"])
+    _executor_row(db, executor_id)
+    task = _require_action(db, task_id)
+    if int(task["execution_epoch"] or 0) != execution_epoch:
+        raise AppError(409, "STALE_EXECUTION_EPOCH", "该任务执行轮次已经失效。")
+    outcome = str(payload.get("outcome") or "unknown")
+    status = "succeeded" if outcome in {"accepted", "succeeded"} else outcome
+    if status not in {"succeeded", "failed", "unknown"}:
+        status = "unknown"
+    if task["status"] not in {"queued", "running", "leased"}:
+        if task["status"] == status:
+            return {
+                "task": _serialize_action(task, include_payload=False),
+                "queue": list_queue(db),
+            }
+        raise AppError(409, "INVALID_TASK_ASSIGNMENT", "任务当前状态不能回写执行结果。")
+    now = utc_now()
+    message = str(payload.get("message") or "")
+    result = {
+        "outcome": outcome,
+        "contacted": payload.get("contacted"),
+        "statusCode": str(payload.get("status_code") or ""),
+        "message": message,
+        "evidence": payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {},
+    }
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_automation_actions
+            SET status = ?, execution_state = ?,
+                last_status_code = ?, last_error = ?, result_json = ?, updated_at = ?, completed_at = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                status,
+                str(payload.get("status_code") or "") or None,
+                None if status == "succeeded" else (message or None),
+                json.dumps(result, ensure_ascii=False),
+                now,
+                now,
+                task_id,
+            ),
+        )
+    _audit(
+        db,
+        "boss_task_completed",
+        "默认招呼任务已回写执行结果。",
+        {"task_id": task_id, "status": status},
+        level="info" if status == "succeeded" else "warning",
+    )
+    return {
+        "task": _serialize_action(_require_action(db, task_id), include_payload=False),
+        "queue": list_queue(db),
+    }
+
+
+def list_test_jobs(db: Database) -> dict[str, object]:
+    _ensure_test_jobs(db)
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, encrypt_job_id, title, company_name, job_link,
+                   first_collected_at AS created_at, last_collected_at AS updated_at
+            FROM fj_boss_jobs WHERE is_test = 1 ORDER BY first_collected_at ASC, id ASC
+            """
+        ).fetchall()
+    return {"jobs": [dict(row) for row in rows]}
+
+
+def update_test_job(db: Database, job_id: str, *, encrypt_job_id: str, job_link: str) -> dict[str, object]:
+    _ensure_test_jobs(db)
+    _validate_test_job_link(job_link)
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT id FROM fj_boss_jobs WHERE id = ? AND is_test = 1", (job_id,)
+        ).fetchone()
+        if row is None:
+            raise AppError(404, "TEST_JOB_NOT_FOUND", "测试岗位不存在。")
+        connection.execute(
+            "UPDATE fj_boss_jobs SET encrypt_job_id = ?, job_link = ?, last_collected_at = ? WHERE id = ?",
+            (encrypt_job_id.strip(), job_link.strip(), utc_now(), job_id),
+        )
+        updated = connection.execute(
+            """
+            SELECT id, encrypt_job_id, title, company_name, job_link,
+                   first_collected_at AS created_at, last_collected_at AS updated_at
+            FROM fj_boss_jobs WHERE id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+    return dict(updated)
+
+
+def create_test_task(
+    db: Database,
+    *,
+    job_id: str,
+    close_page_after_completion: bool,
+    delay_seconds: int = 3,
+) -> dict[str, object]:
+    _ensure_test_jobs(db)
+    delay_seconds = min(600, max(1, int(delay_seconds)))
+    now = utc_now()
+    with db.connect() as connection:
+        job = connection.execute(
+            "SELECT id, title, company_name, job_link FROM fj_boss_jobs WHERE id = ? AND is_test = 1",
+            (job_id,),
+        ).fetchone()
+        if job is None:
+            raise AppError(404, "TEST_JOB_NOT_FOUND", "请选择一个测试岗位。")
+        evaluation = connection.execute(
+            "SELECT id FROM fj_job_evaluations WHERE job_id = ? ORDER BY created_at ASC LIMIT 1", (job_id,)
+        ).fetchone()
+        review = connection.execute(
+            "SELECT id FROM fj_review_items WHERE job_id = ? ORDER BY created_at ASC LIMIT 1", (job_id,)
+        ).fetchone()
+        if evaluation is None or review is None:
+            raise AppError(409, "TEST_JOB_INCOMPLETE", "测试岗位关联数据不完整。")
+        task_id = new_id()
+        payload = {
+            "task_type": "TEST_DELAY",
+            "delay_seconds": delay_seconds,
+            "close_page_after_completion": close_page_after_completion,
+            "job_link": job["job_link"],
+        }
+        connection.execute(
+            """
+            INSERT INTO fj_automation_actions (
+              id, job_id, evaluation_id, review_item_id, action_type, task_type,
+              status, idempotency_key, payload_json, execution_state, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'start_conversation', 'TEST_DELAY', 'queued', ?, ?, 'queued', ?, ?)
+            """,
+            (
+                task_id,
+                job_id,
+                evaluation["id"],
+                review["id"],
+                f"test-delay:{task_id}",
+                json.dumps(payload, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+    return _serialize_action(_require_action(db, task_id), include_payload=False)
+
+
+def _ensure_test_jobs(db: Database) -> None:
+    now = utc_now()
+    with db.connect() as connection:
+        capture_id = "system-test-capture-batch"
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO fj_boss_capture_batches (
+              id, keyword, city, pages, auto_details, status, jobs_collected, details_completed,
+              details_failed, created_at, updated_at, finished_at
+            ) VALUES (?, '系统测试', '系统测试', 1, 0, 'completed', ?, 0, 0, ?, ?, ?)
+            """,
+            (capture_id, TEST_JOB_COUNT, now, now, now),
+        )
+        for number in range(1, TEST_JOB_COUNT + 1):
+            job_id = f"system-test-job-{number}"
+            evaluation_id = f"system-test-evaluation-{number}"
+            review_id = f"system-test-review-{number}"
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO fj_boss_jobs (
+                  id, dedupe_key, source_job_id, encrypt_job_id, title, company_name, job_link,
+                  is_test, payload_json, detail_status, first_collected_at, last_collected_at,
+                  collect_count, latest_batch_id
+                ) VALUES (?, ?, ?, ?, ?, 'FineJob 系统测试', ?, 1, '{}', 'completed', ?, ?, 1, ?)
+                """,
+                (
+                    job_id,
+                    job_id,
+                    f"test-job-{number}",
+                    f"test-encrypt-job-{number}",
+                    f"测试岗位 {number}",
+                    TEST_JOB_LINK_DEFAULT,
+                    now,
+                    now,
+                    capture_id,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO fj_job_evaluations (
+                  id, job_id, source, decision, confidence, evaluation_json, created_at
+                ) VALUES (?, ?, 'rules', 'recommend', 1, '{}', ?)
+                """,
+                (evaluation_id, job_id, now),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO fj_review_items (
+                  id, job_id, evaluation_id, action_type, status, ai_decision, created_at, updated_at, resolved_at
+                ) VALUES (?, ?, ?, 'start_conversation', 'approved', 'recommend', ?, ?, ?)
+                """,
+                (review_id, job_id, evaluation_id, now, now, now),
+            )
+
+
+def _validate_test_job_link(job_link: str) -> None:
+    parsed = urlparse(job_link.strip())
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise AppError(422, "INVALID_TEST_JOB_LINK", "测试岗位链接必须是 HTTPS 页面地址。")
+
+
+def _open_test_task_page(
+    db: Database,
+    task_id: str,
+    *,
+    open_page: Callable[[str], str] | None = None,
+) -> dict[str, object]:
+    task = _require_action(db, task_id)
+    job = _resolve_job(db, str(task["job_id"]), "queue")
+    target_url = str(job.get("job_link") or "").strip()
+    _validate_test_job_link(target_url)
+    navigation_id = new_id()
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO fj_boss_navigation_tasks (
+              id, action_id, job_id, source_context, target_url, target_encrypt_job_id,
+              status, created_at, updated_at
+            ) VALUES (?, ?, ?, 'queue', ?, ?, 'queued', ?, ?)
+            """,
+            (navigation_id, task_id, job["id"], target_url, str(job.get("encrypt_job_id") or ""), now, now),
+        )
+    try:
+        target_id = (open_page or boss_scraper_service.open_test_page)(target_url)
+    except (ValueError, RuntimeError, TimeoutError, OSError) as exc:
+        with db.connect() as connection:
+            connection.execute(
+                "UPDATE fj_boss_navigation_tasks SET status = 'failed', error_code = 'PAGE_OPEN_FAILED', error_message = ?, updated_at = ? WHERE id = ?",
+                (str(exc), utc_now(), navigation_id),
+            )
+        raise AppError(409, "PAGE_OPEN_FAILED", str(exc)) from exc
+    opened_at = utc_now()
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_boss_navigation_tasks SET status = 'opened', browser_target_id = ?, opened_at = ?, updated_at = ? WHERE id = ?",
+            (target_id, opened_at, opened_at, navigation_id),
+        )
+    return get_navigation(db, navigation_id)
+
+
+def _should_close_task(task) -> bool:
+    if task["task_type"] != "TEST_DELAY":
+        return True
+    try:
+        payload = json.loads(task["payload_json"] or "{}")
+    except json.JSONDecodeError:
+        return False
+    return bool(payload.get("close_page_after_completion"))
+
+
+async def _send_executor_message(executor_id: str, message: dict[str, object]) -> bool:
+    websocket = _executor_channels.get(executor_id)
+    if websocket is None:
+        return False
+    try:
+        await websocket.send_json(message)
+    except Exception:
+        return False
+    return True
+
+
+async def _report_executor_channel_error(
+    db: Database,
+    executor_id: str,
+    message: dict[str, object],
+    *,
+    code: str,
+    error_message: str,
+) -> None:
+    message_type = str(message.get("type") or "")
+    task_id = str(message.get("task_id") or "")
+    execution_epoch = message.get("execution_epoch")
+    # 单条消息失败只回传错误并保留控制通道，避免状态类消息中断后续结果回写。
+    try:
+        _audit(
+            db,
+            "boss_executor_message_failed",
+            "插件运行消息处理失败。",
+            {
+                "executor_id": executor_id,
+                "message_type": message_type,
+                "task_id": task_id,
+                "execution_epoch": execution_epoch,
+                "code": code,
+                "message": error_message,
+            },
+            level="error",
+        )
+    except Exception:
+        pass
+    await _send_executor_message(executor_id, {
+        "type": "task_sync_failed",
+        "message_type": message_type,
+        "task_id": task_id,
+        "execution_epoch": execution_epoch,
+        "code": code,
+        "message": error_message,
+    })
+    await _broadcast_executor_state(db)
+
+
+async def _send_queue(db: Database, executor_id: str) -> None:
+    queue = list_queue(db)
+    executor = _serialize_executor(_executor_row(db, executor_id))
+    await _send_executor_message(executor_id, {
+        "type": "task_queue",
+        "tasks": queue["actions"],
+        "executor": executor,
+    })
+
+
+async def _send_queue_to_connected_executors(db: Database) -> None:
+    for executor_id in list(_executor_channels):
+        await _send_queue(db, executor_id)
+
+
+async def notify_queue_changed(db: Database) -> None:
+    # 队列变更统一从这里推送，保证已连接插件无需等下一次心跳或页面刷新。
+    await _send_queue_to_connected_executors(db)
+    await _broadcast_executor_state(db)
+
+
+async def _send_desktop_state(db: Database, websocket: Any) -> bool:
+    try:
+        await websocket.send_json({"type": "executor_state", "runtime": executor_status(db)})
+    except Exception:
+        return False
+    return True
+
+
+async def _broadcast_executor_state(db: Database) -> None:
+    for websocket in list(_desktop_channels):
+        if not await _send_desktop_state(db, websocket):
+            _desktop_channels.discard(websocket)
+
+
+async def broadcast_executor_state(db: Database) -> None:
+    await _broadcast_executor_state(db)
+
+
+async def _open_and_notify_task_page(db: Database, executor_id: str) -> None:
+    opened = open_task_page(db, executor_id)
+    await _broadcast_executor_state(db)
+    if opened.get("queue_changed") is True:
+        await _send_queue(db, executor_id)
+    if opened.get("busy") is True:
+        task = opened.get("task")
+        await _send_executor_message(executor_id, {
+            "type": "page_opened",
+            "task_id": task.get("id") if isinstance(task, dict) else "",
+            "success": False,
+            "busy": True,
+            "message": "已有任务正在执行，等待当前任务完成。",
+        })
+        return
+    task = opened.get("task")
+    error = opened.get("error")
+    if not isinstance(task, dict):
+        await _send_executor_message(executor_id, {
+            "type": "page_opened",
+            "task_id": "",
+            "success": False,
+            "queue_empty": not isinstance(error, dict),
+            "message": error.get("message") if isinstance(error, dict) else "当前没有待执行任务。",
+        })
+        return
+    navigation = opened.get("navigation")
+    if isinstance(navigation, dict):
+        await _send_executor_message(executor_id, {
+            "type": "page_opened",
+            "task_id": task["id"],
+            "success": True,
+            "page": navigation,
+        })
+        return
+    await _send_executor_message(executor_id, {
+        "type": "page_opened",
+        "task_id": task["id"],
+        "success": False,
+        "message": error.get("message") if isinstance(error, dict) else "任务页面打开失败。",
+    })
+
+
+async def _handle_task_completion_message(
+    db: Database,
+    executor_id: str,
+    message: dict[str, object],
+    *,
+    succeeded: bool,
+) -> None:
+    task_id = str(message.get("task_id") or "")
+    if not task_id:
+        return
+    task = _require_action(db, task_id)
+    execution_epoch = int(
+        message.get("execution_epoch")
+        if message.get("execution_epoch") is not None
+        else task["execution_epoch"] or 0
+    )
+    outcome = str(message.get("outcome") or ("succeeded" if succeeded else "failed"))
+    if succeeded and outcome not in {"accepted", "succeeded"}:
+        outcome = "succeeded"
+    if not succeeded and outcome not in {"failed", "unknown"}:
+        outcome = "failed"
+    payload = {
+        "execution_epoch": execution_epoch,
+        "outcome": outcome,
+        "contacted": message.get("contacted"),
+        "status_code": str(message.get("status_code") or ""),
+        "message": str(message.get("execution_result") or message.get("error_message") or message.get("message") or ""),
+        "evidence": {
+            "platform_result": message.get("platform_result"),
+            "completed_at": message.get("completed_at") or message.get("failed_at"),
+        },
+    }
+    result = complete_task(db, executor_id, task_id, payload)
+    if succeeded and _should_close_task(task):
+        # 页面关闭只发起浏览器动作，后续不读取或记录页面是否已关闭。
+        _close_task_page(db, task_id)
+    await _send_executor_message(executor_id, {
+        "type": "task_result_synced",
+        "task_id": task_id,
+        "execution_epoch": payload["execution_epoch"],
+        "succeeded": succeeded,
+        "task": result["task"],
+        "queue": result["queue"],
+    })
+    await notify_queue_changed(db)
+
+
+def _record_channel_heartbeat(db: Database, executor_id: str) -> None:
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_boss_executor_instances SET browser_connected = 1, last_heartbeat_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, executor_id),
+        )
+
+
+def _running_action_status(db: Database) -> str:
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fj_automation_actions'"
+        ).fetchone()
+    table_sql = str(row["sql"] or "") if row is not None else ""
+    # 旧库和新库对执行中状态的 CHECK 枚举不完全一致，写入时按当前库支持值选择。
+    return "leased" if "'leased'" in table_sql else "running"
+
+
+def _close_task_page(db: Database, task_id: str) -> None:
+    with db.connect() as connection:
+        navigation = connection.execute(
+            """
+            SELECT browser_target_id FROM fj_boss_navigation_tasks
+            WHERE action_id = ? AND status = 'opened' AND browser_target_id IS NOT NULL
+            ORDER BY opened_at DESC, id DESC LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+    if navigation is None:
+        return
+    try:
+        boss_scraper_service.close_job_page(str(navigation["browser_target_id"]))
+    except (ValueError, RuntimeError, TimeoutError, OSError):
+        return
+
+
+def _record_task_open_failure(db: Database, task_id: str, message: str) -> None:
+    _record_retriable_task_failure(
+        db,
+        task_id,
+        message,
+        counter_key="page_open_failures",
+        status_code="PAGE_OPEN_FAILED",
+        final_status_code="PAGE_OPEN_FAILED_THREE_TIMES",
+        move_to_tail=True,
+    )
+
+
+def _record_task_match_failure(db: Database, task_id: str, message: str) -> None:
+    _record_retriable_task_failure(
+        db,
+        task_id,
+        message,
+        counter_key="page_match_failures",
+        status_code="PAGE_MATCH_FAILED",
+        final_status_code="PAGE_MATCH_FAILED_THREE_TIMES",
+        move_to_tail=False,
+    )
+
+
+def _record_retriable_task_failure(
+    db: Database,
+    task_id: str,
+    message: str,
+    *,
+    counter_key: str,
+    status_code: str,
+    final_status_code: str,
+    move_to_tail: bool,
+) -> None:
+    task = _require_action(db, task_id)
+    if task["status"] not in {"queued", "running", "leased"}:
+        return
+    try:
+        payload = json.loads(task["payload_json"] or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    failure_count = int(payload.get(counter_key) or 0) + 1
+    payload[counter_key] = failure_count
+    now = utc_now()
+    if failure_count >= 3:
+        result = {"outcome": "failed", "statusCode": final_status_code, "message": message, "evidence": payload}
+        with db.connect() as connection:
+            connection.execute(
+                """
+                UPDATE fj_automation_actions
+                SET status = 'failed', execution_state = 'failed', last_status_code = ?,
+                    last_error = ?, payload_json = ?, result_json = ?, updated_at = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    final_status_code,
+                    message,
+                    json.dumps(payload, ensure_ascii=False),
+                    json.dumps(result, ensure_ascii=False),
+                    now,
+                    now,
+                    task_id,
+                ),
+            )
+        _audit(db, "boss_task_retry_failed", "任务页面连续失败，已标记任务失败。", {"task_id": task_id, "status_code": final_status_code}, level="warning")
+        return
+    created_at_sql = ", created_at = ?" if move_to_tail else ""
+    params: tuple[object, ...]
+    if move_to_tail:
+        params = (status_code, message, json.dumps(payload, ensure_ascii=False), now, now, task_id)
+    else:
+        params = (status_code, message, json.dumps(payload, ensure_ascii=False), now, task_id)
+    with db.connect() as connection:
+        connection.execute(
+            f"""
+            UPDATE fj_automation_actions
+            SET status = 'queued', execution_state = 'queued', execution_epoch = execution_epoch + 1,
+                last_status_code = ?, last_error = ?, payload_json = ?, updated_at = ?{created_at_sql}
+            WHERE id = ?
+            """,
+            params,
+        )
+
+
+def _finish_active_tasks_as_unknown(db: Database, message: str, status_code: str) -> int:
+    now = utc_now()
+    result = {
+        "outcome": "unknown",
+        "statusCode": status_code,
+        "message": message,
+        "evidence": {},
+    }
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT id FROM fj_automation_actions
+            WHERE task_type IN ('BOSS_DEFAULT_GREETING', 'TEST_DELAY')
+              AND status IN ('running', 'leased')
+              AND execution_state = 'running'
+            """
+        ).fetchall()
+        if not rows:
+            return 0
+        connection.execute(
+            """
+            UPDATE fj_automation_actions
+            SET status = 'unknown', execution_state = 'unknown',
+                last_status_code = ?, last_error = ?, result_json = ?,
+                updated_at = ?, completed_at = ?
+            WHERE task_type IN ('BOSS_DEFAULT_GREETING', 'TEST_DELAY')
+              AND status IN ('running', 'leased')
+              AND execution_state = 'running'
+            """,
+            (status_code, message, json.dumps(result, ensure_ascii=False), now, now),
+        )
+    _audit(
+        db,
+        "boss_active_tasks_finished_unknown",
+        "遗留执行中任务已结束为结果未知。",
+        {"count": len(rows), "status_code": status_code},
+        level="warning",
+    )
+    return len(rows)
+
+
+def _record_execution_error(db: Database, task_id: str, message: str) -> None:
+    task = _require_action(db, task_id)
+    if task["status"] not in {"queued", "running", "leased"}:
+        return
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_automation_actions
+            SET status = 'failed', execution_state = 'failed', last_error = ?, updated_at = ?, completed_at = ?
+            WHERE id = ?
+            """,
+            (message, now, now, task_id),
+        )
+
+
+def _current_task(db: Database) -> dict[str, object] | None:
+    with db.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT a.*, j.title AS job_title, j.company_name, j.encrypt_job_id, j.job_link
+            FROM fj_automation_actions a JOIN fj_boss_jobs j ON j.id = a.job_id
+            WHERE a.task_type IN ('BOSS_DEFAULT_GREETING', 'TEST_DELAY')
+              AND a.status IN ('running', 'leased')
+              AND a.execution_state = 'running'
+            ORDER BY a.updated_at DESC, a.id DESC LIMIT 1
+            """
+        ).fetchone()
+    return _serialize_action(row, include_payload=False) if row is not None else None
+
+
+def return_to_review(db: Database, action_id: str, *, reason: str, executor_id: str | None = None) -> dict[str, object]:
+    task = _require_action(db, action_id)
+    if task["status"] in {"running", "leased", "succeeded"}:
+        raise AppError(409, "RETURN_FORBIDDEN", "任务已经开始执行或已完成，不能退回待确认。")
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_automation_actions SET status = 'cancelled', execution_state = 'cancelled', last_status_code = 'RETURNED_TO_REVIEW', last_error = ?, updated_at = ?, completed_at = ? WHERE id = ?",
+            (reason.strip(), now, now, action_id),
+        )
+        connection.execute(
+            "UPDATE fj_review_items SET status = 'pending', resolved_at = NULL, resolution_note = ?, updated_at = ? WHERE id = ?",
+            (reason.strip(), now, task["review_item_id"]),
+        )
+    _audit(db, "boss_return_to_review", "未执行岗位已退回待确认。", {"task_id": action_id})
+    return _serialize_action(_require_action(db, action_id))
 
 
 def get_navigation(db: Database, task_id: str) -> dict[str, object]:
     with db.connect() as connection:
         row = connection.execute("SELECT * FROM fj_boss_navigation_tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None:
-        raise AppError(status_code=404, error_category="NOT_FOUND", error_message="岗位页面打开任务不存在。")
+        raise AppError(404, "NOT_FOUND", "岗位页面打开任务不存在。")
     return dict(row)
-
-
-def claim_next_action(
-    db: Database,
-    executor_id: str,
-    *,
-    open_page: Callable[[str], str] | None = None,
-) -> dict[str, object] | None:
-    sweep_page_timeout(db, executor_id)
-    executor = _executor_row(db, executor_id)
-    if executor["permission_state"] != "allowed" or executor["queue_state"] != "running":
-        return None
-    if executor["risk_state"] != "none":
-        return None
-    next_eligible = _parse_time(executor["next_eligible_at"])
-    if next_eligible and next_eligible > datetime.now(timezone.utc):
-        return None
-
-    current_id = str(executor["current_action_id"] or "")
-    if current_id:
-        current = _action_row(db, current_id)
-        if current and current["execution_state"] not in TERMINAL_EXECUTION_STATES:
-            return _serialize_action(current)
-
-    now = utc_now()
-    with db.connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        row = connection.execute(
-            """
-            SELECT a.id FROM fj_automation_actions a
-            WHERE a.action_type = 'BOSS_DEFAULT_GREETING'
-              AND a.status = 'queued' AND a.execution_state = 'queued'
-            ORDER BY a.queue_position ASC, a.created_at ASC LIMIT 1
-            """
-        ).fetchone()
-        if row is None:
-            connection.execute(
-                "UPDATE fj_boss_executor_instances SET current_action_id = NULL, current_epoch = NULL, updated_at = ? WHERE id = ?",
-                (now, executor_id),
-            )
-            return None
-        action_id = str(row["id"])
-        connection.execute(
-            """
-            UPDATE fj_automation_actions
-            SET status = 'leased', execution_state = 'opening_page', lease_owner = ?,
-                lease_expires_at = NULL, execution_epoch = execution_epoch + 1,
-                attempt_count = attempt_count + 1, updated_at = ?
-            WHERE id = ?
-            """,
-            (executor_id, now, action_id),
-        )
-        epoch = int(connection.execute("SELECT execution_epoch FROM fj_automation_actions WHERE id = ?", (action_id,)).fetchone()[0])
-        connection.execute(
-            "UPDATE fj_boss_executor_instances SET current_action_id = ?, current_epoch = ?, cooldown_seconds = NULL, next_eligible_at = NULL, updated_at = ? WHERE id = ?",
-            (action_id, epoch, now, executor_id),
-        )
-
-    action = _action_row(db, action_id)
-    assert action is not None
-    try:
-        navigation = open_navigation(
-            db, job_identifier=str(action["job_id"]), source_context="queue",
-            action_id=action_id, open_page=open_page,
-        )
-    except AppError:
-        with db.connect() as connection:
-            connection.execute(
-                "UPDATE fj_automation_actions SET status = 'blocked', execution_state = 'blocked', last_status_code = 'PAGE_OPEN_FAILED', updated_at = ? WHERE id = ?",
-                (utc_now(), action_id),
-            )
-            connection.execute(
-                "UPDATE fj_boss_executor_instances SET permission_state = 'risk_paused', queue_state = 'risk_paused', risk_state = 'browser', updated_at = ? WHERE id = ?",
-                (utc_now(), executor_id),
-            )
-        raise
-
-    deadline = _iso_after(PAGE_STATUS_TIMEOUT_SECONDS)
-    with db.connect() as connection:
-        connection.execute(
-            """
-            UPDATE fj_automation_actions
-            SET execution_state = 'waiting_page_ready', page_open_attempts = page_open_attempts + 1,
-                page_deadline_at = ?, navigation_task_id = ?, last_status_code = 'PAGE_OPENED', updated_at = ?
-            WHERE id = ?
-            """,
-            (deadline, navigation["id"], utc_now(), action_id),
-        )
-    _audit(db, "boss_page_opened", "FineJob 已打开队首岗位详情页。", {"action_id": action_id, "execution_epoch": epoch})
-    row = _action_row(db, action_id)
-    assert row is not None
-    return _serialize_action(row)
-
-
-def report_page_status(
-    db: Database,
-    executor_id: str,
-    action_id: str,
-    payload: dict[str, object],
-) -> dict[str, object]:
-    action = _require_owned_action(db, executor_id, action_id, int(payload["execution_epoch"]))
-    if action["execution_state"] == "request_accepted":
-        # 兼容历史待验证动作，收到页面状态时保持成功结果，不再恢复验证流程。
-        return _finish_action(
-            db,
-            executor_id,
-            action_id,
-            "succeeded",
-            "BOSS_REQUEST_ACCEPTED_LEGACY_COMPLETED",
-            {"legacy_verification_removed": True},
-        )
-    if action["execution_state"] not in {"waiting_page_ready", "page_verified", "ready_to_dispatch"}:
-        raise AppError(status_code=409, error_category="INVALID_STATE", error_message="当前动作不再等待页面状态。")
-    state = str(payload.get("state") or "waiting")
-    if state == "waiting":
-        return _serialize_action(action)
-    if state != "ready" or not bool(payload.get("logged_in")):
-        reason = str(payload.get("reason") or "页面状态不可执行")
-        _pause_for_risk(db, executor_id, action_id, "PAGE_NOT_EXECUTABLE", reason)
-        return _serialize_action(_require_action(db, action_id))
-    if str(payload.get("encrypt_job_id") or "") != str(action["encrypt_job_id"] or ""):
-        _pause_for_risk(db, executor_id, action_id, "JOB_ID_MISMATCH", "插件识别岗位与队列目标不一致。")
-        return _serialize_action(_require_action(db, action_id))
-
-    if payload.get("contacted") is True:
-        # 已沟通岗位不再发送，按安全跳过完成并进入随机冷却。
-        return _finish_action(db, executor_id, action_id, "succeeded", "ALREADY_CONTACTED", {"already_contacted": True})
-
-    with db.connect() as connection:
-        connection.execute(
-            "UPDATE fj_automation_actions SET execution_state = 'ready_to_dispatch', last_status_code = 'PAGE_VERIFIED', updated_at = ? WHERE id = ?",
-            (utc_now(), action_id),
-        )
-    return _serialize_action(_require_action(db, action_id))
-
-
-def mark_dispatch_started(db: Database, executor_id: str, action_id: str, execution_epoch: int) -> dict[str, object]:
-    action = _require_owned_action(db, executor_id, action_id, execution_epoch)
-    if action["execution_state"] != "ready_to_dispatch":
-        raise AppError(status_code=409, error_category="INVALID_STATE", error_message="页面尚未通过验证，不能执行真实打招呼。")
-    executor = _executor_row(db, executor_id)
-    if executor["permission_state"] != "allowed" or executor["queue_state"] != "running" or executor["risk_state"] != "none":
-        raise AppError(status_code=409, error_category="EXECUTION_NOT_ALLOWED", error_message="插件权限或队列状态不允许真实执行。")
-    now = utc_now()
-    with db.connect() as connection:
-        connection.execute(
-            "UPDATE fj_automation_actions SET execution_state = 'dispatch_started', dispatch_started_at = ?, last_status_code = 'DISPATCH_STARTED', updated_at = ? WHERE id = ?",
-            (now, now, action_id),
-        )
-    _audit(db, "boss_dispatch_started", "插件已进入单次默认招呼请求。", {"action_id": action_id, "execution_epoch": execution_epoch})
-    return _serialize_action(_require_action(db, action_id))
-
-
-def complete_executor_action(
-    db: Database,
-    executor_id: str,
-    action_id: str,
-    payload: dict[str, object],
-) -> dict[str, object]:
-    epoch = int(payload["execution_epoch"])
-    action = _require_action(db, action_id)
-    if int(action["execution_epoch"]) != epoch:
-        raise AppError(status_code=409, error_category="STALE_EXECUTION_EPOCH", error_message="该状态属于已经失效的执行轮次。")
-    action = _require_owned_action(db, executor_id, action_id, epoch)
-    if action["execution_state"] != "dispatch_started":
-        raise AppError(status_code=409, error_category="INVALID_STATE", error_message="动作尚未进入真实发送阶段。")
-    evidence = _sanitize_execution_evidence(payload.get("evidence"))
-    evidence.update({"message": str(payload.get("message") or ""), "contacted": payload.get("contacted")})
-    if payload.get("outcome") == "accepted":
-        # 平台明确受理后立即完成动作，成功结果不再进入页面验证状态。
-        return _finish_action(
-            db,
-            executor_id,
-            action_id,
-            "succeeded",
-            str(payload.get("status_code") or "BOSS_REQUEST_ACCEPTED"),
-            evidence,
-        )
-    if payload.get("outcome") == "succeeded" and payload.get("contacted") is True:
-        return _finish_action(db, executor_id, action_id, "succeeded", str(payload.get("status_code") or "SUCCESS"), evidence)
-
-    if payload.get("outcome") == "failed":
-        status_code = str(payload.get("status_code") or "BOSS_REQUEST_REJECTED")
-        message = str(payload.get("message") or "平台明确拒绝建立沟通请求")
-        if status_code in {
-            "BOSS_RATE_LIMIT", "BOSS_GREETING_LIMIT", "BOSS_TOKEN_MISSING",
-            "PRE_DISPATCH_PAGE_MISMATCH",
-        }:
-            _pause_for_risk(db, executor_id, action_id, status_code, message)
-            return _serialize_action(_require_action(db, action_id))
-        return _finish_failed_action(db, executor_id, action_id, status_code, message, evidence)
-
-    return _mark_unknown_after_dispatch(
-        db,
-        executor_id,
-        action_id,
-        str(payload.get("status_code") or "UNKNOWN_AFTER_DISPATCH"),
-        str(payload.get("message") or "真实请求后结果未知"),
-        evidence,
-    )
-
-
-def return_to_review(db: Database, action_id: str, *, reason: str, executor_id: str | None = None) -> dict[str, object]:
-    action = _require_action(db, action_id)
-    if action["execution_state"] in {"dispatch_started", "request_accepted", "succeeded", "failed_after_dispatch", "unknown_after_dispatch"}:
-        raise AppError(status_code=409, error_category="RETURN_FORBIDDEN", error_message="真实请求已经发出或可能发出，不能退回待确认。")
-    now = utc_now()
-    with db.connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            "UPDATE fj_automation_actions SET status = 'cancelled', execution_state = 'cancelled', last_status_code = 'RETURNED_TO_REVIEW', last_error = ?, lease_owner = NULL, page_deadline_at = NULL, updated_at = ?, completed_at = ? WHERE id = ?",
-            (reason.strip(), now, now, action_id),
-        )
-        connection.execute(
-            "UPDATE fj_review_items SET status = 'pending', resolved_at = NULL, resolution_note = ?, updated_at = ? WHERE id = ?",
-            (reason.strip(), now, action["review_item_id"]),
-        )
-        if executor_id:
-            connection.execute(
-                "UPDATE fj_boss_executor_instances SET current_action_id = NULL, current_epoch = NULL, updated_at = ? WHERE id = ? AND current_action_id = ?",
-                (now, executor_id, action_id),
-            )
-    _audit(db, "boss_return_to_review", "未发送岗位已退回待确认。", {"action_id": action_id})
-    return _serialize_action(_require_action(db, action_id))
-
-
-def manual_verify_unknown_action(
-    db: Database,
-    action_id: str,
-    *,
-    contacted: bool,
-    note: str,
-) -> dict[str, object]:
-    """只处理已经停止执行的未知动作，人工结论不会直接触发新的BOSS请求。"""
-    action = _require_action(db, action_id)
-    if action["execution_state"] != "unknown_after_dispatch":
-        raise AppError(
-            status_code=409,
-            error_category="MANUAL_VERIFY_NOT_ALLOWED",
-            error_message="只有未知错误岗位可以人工核验。",
-        )
-    now = utc_now()
-    normalized_note = note.strip() or "用户人工核验BOSS岗位页面"
-    with db.connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        if contacted:
-            connection.execute(
-                """
-                UPDATE fj_automation_actions
-                SET status = 'succeeded', execution_state = 'succeeded',
-                    verification_state = 'manual_confirmed', verification_method = 'manual',
-                    verification_completed_at = ?, last_status_code = 'MANUAL_CONFIRMED_CONTACTED',
-                    last_error = NULL, result_json = ?, updated_at = ?, completed_at = ?
-                WHERE id = ?
-                """,
-                (
-                    now,
-                    json.dumps({"contacted": True, "verificationMethod": "manual", "note": normalized_note}, ensure_ascii=False),
-                    now,
-                    now,
-                    action_id,
-                ),
-            )
-        else:
-            connection.execute(
-                """
-                UPDATE fj_automation_actions
-                SET status = 'cancelled', execution_state = 'cancelled',
-                    verification_state = 'manual_confirmed', verification_method = 'manual',
-                    verification_completed_at = ?, last_status_code = 'MANUAL_CONFIRMED_NOT_CONTACTED',
-                    last_error = ?, result_json = ?, updated_at = ?, completed_at = ?
-                WHERE id = ?
-                """,
-                (
-                    now,
-                    normalized_note,
-                    json.dumps({"contacted": False, "verificationMethod": "manual", "note": normalized_note}, ensure_ascii=False),
-                    now,
-                    now,
-                    action_id,
-                ),
-            )
-            connection.execute(
-                """
-                UPDATE fj_review_items
-                SET status = 'pending', resolved_at = NULL,
-                    resolution_note = '人工确认尚未建立沟通，等待重新批准', updated_at = ?
-                WHERE id = ?
-                """,
-                (now, action["review_item_id"]),
-            )
-    _clear_unknown_limit_after_manual_verification(db)
-    _audit(
-        db,
-        "boss_unknown_manually_verified",
-        "未知错误岗位已人工确认已沟通。" if contacted else "未知错误岗位已人工确认未沟通并返回待确认。",
-        {"action_id": action_id, "contacted": contacted},
-    )
-    return _serialize_action(_require_action(db, action_id))
-
-
-def sweep_page_timeout(
-    db: Database,
-    executor_id: str,
-    *,
-    browser_status_provider: Callable[[], object] | None = None,
-    random_seconds: Callable[[], int] | None = None,
-    verification_reload_provider: Callable[[str, str], str] | None = None,
-) -> None:
-    executor = _executor_row(db, executor_id)
-    action_id = str(executor["current_action_id"] or "")
-    if not action_id:
-        return
-    action = _action_row(db, action_id)
-    if not action:
-        return
-    if action["execution_state"] == "request_accepted":
-        # 兼容历史待验证动作，后续心跳将其直接收敛为成功。
-        _finish_action(
-            db,
-            executor_id,
-            action_id,
-            "succeeded",
-            "BOSS_REQUEST_ACCEPTED_LEGACY_COMPLETED",
-            {"legacy_verification_removed": True},
-        )
-        return
-    if action["execution_state"] == "dispatch_started":
-        dispatch_started_at = _parse_time(action["dispatch_started_at"])
-        if (
-            dispatch_started_at
-            and (datetime.now(timezone.utc) - dispatch_started_at).total_seconds()
-            >= DISPATCH_RESULT_TIMEOUT_SECONDS
-        ):
-            heartbeat_at = _parse_time(executor["last_heartbeat_at"])
-            heartbeat_ok = bool(
-                heartbeat_at
-                and (datetime.now(timezone.utc) - heartbeat_at).total_seconds() <= HEARTBEAT_TTL_SECONDS
-            )
-            if not heartbeat_ok:
-                with db.connect() as connection:
-                    connection.execute(
-                        "UPDATE fj_boss_executor_instances SET browser_connected = 0, updated_at = ? WHERE id = ?",
-                        (utc_now(), executor_id),
-                    )
-            _mark_unknown_after_dispatch(
-                db,
-                executor_id,
-                action_id,
-                "DISPATCH_RESULT_TIMEOUT",
-                "真实请求开始后未收到明确结果",
-                {},
-            )
-        return
-    if action["execution_state"] != "waiting_page_ready":
-        return
-    deadline = _parse_time(action["page_deadline_at"])
-    if not deadline or deadline > datetime.now(timezone.utc):
-        return
-
-    heartbeat_at = _parse_time(executor["last_heartbeat_at"])
-    heartbeat_ok = bool(heartbeat_at and (datetime.now(timezone.utc) - heartbeat_at).total_seconds() <= HEARTBEAT_TTL_SECONDS)
-    try:
-        browser = (browser_status_provider or boss_scraper_service.get_browser_status)()
-        browser_running = bool(getattr(browser, "running", False))
-        current_url = str(getattr(browser, "current_url", "") or "")
-        browser_ok = browser_running and _is_boss_url(current_url)
-    except Exception:
-        browser_ok = False
-
-    normal = (
-        heartbeat_ok and executor["permission_state"] == "allowed"
-        and executor["queue_state"] == "running" and executor["risk_state"] == "none"
-        and bool(executor["browser_connected"]) and browser_ok
-    )
-    if not normal:
-        with db.connect() as connection:
-            connection.execute(
-                "UPDATE fj_boss_executor_instances SET permission_state = 'risk_paused', queue_state = 'risk_paused', risk_state = 'page_timeout_environment', updated_at = ? WHERE id = ?",
-                (utc_now(), executor_id),
-            )
-        _audit(db, "boss_page_timeout_paused", "页面30秒无状态且插件或浏览器异常，已暂停队列。", {"action_id": action_id}, level="warning")
-        return
-
-    cooldown = _choose_cooldown(random_seconds)
-    next_eligible = _iso_after(cooldown)
-    now = utc_now()
-    attempts = int(action["page_open_attempts"])
-    with db.connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        if attempts >= 2:
-            connection.execute(
-                "UPDATE fj_automation_actions SET status = 'blocked', execution_state = 'blocked', page_deadline_at = NULL, last_status_code = 'PAGE_STATUS_TIMEOUT_LIMIT', last_error = '第二次页面状态超时', cooldown_seconds = ?, next_eligible_at = ?, updated_at = ? WHERE id = ?",
-                (cooldown, next_eligible, now, action_id),
-            )
-        else:
-            max_position = int(connection.execute("SELECT COALESCE(MAX(queue_position), 0) FROM fj_automation_actions").fetchone()[0])
-            connection.execute(
-                "UPDATE fj_automation_actions SET status = 'queued', execution_state = 'queued', queue_position = ?, execution_epoch = execution_epoch + 1, page_deadline_at = NULL, lease_owner = NULL, last_status_code = 'PAGE_STATUS_TIMEOUT', cooldown_seconds = ?, next_eligible_at = ?, updated_at = ? WHERE id = ?",
-                (max_position + 1, cooldown, next_eligible, now, action_id),
-            )
-        connection.execute(
-            "UPDATE fj_boss_executor_instances SET current_action_id = NULL, current_epoch = NULL, cooldown_seconds = ?, next_eligible_at = ?, updated_at = ? WHERE id = ?",
-            (cooldown, next_eligible, now, executor_id),
-        )
-    _audit(db, "boss_page_timeout", "页面30秒无状态，岗位已按规则处理。", {"action_id": action_id, "attempts": attempts, "cooldown_seconds": cooldown})
-
-
-def _report_verification_snapshot(
-    db: Database,
-    executor_id: str,
-    action,
-    payload: dict[str, object],
-) -> dict[str, object]:
-    if str(action["verification_state"] or "") != "waiting_snapshot":
-        return _serialize_action(action)
-    started_at = _parse_time(action["verification_started_at"])
-    observed_at = payload.get("observed_at")
-    if started_at:
-        if observed_at is None:
-            return _serialize_action(action)
-        observed = datetime.fromtimestamp(int(observed_at) / 1000, tz=timezone.utc)
-        if observed < started_at:
-            return _serialize_action(action)
-
-    state = str(payload.get("state") or "waiting")
-    if state == "waiting":
-        return _serialize_action(action)
-    if state != "ready" or not bool(payload.get("logged_in")):
-        reason = str(payload.get("reason") or "刷新后的页面状态不可验证")
-        _pause_for_risk(db, executor_id, str(action["id"]), "VERIFICATION_PAGE_NOT_EXECUTABLE", reason)
-        return _serialize_action(_require_action(db, str(action["id"])))
-    if str(payload.get("encrypt_job_id") or "") != str(action["encrypt_job_id"] or ""):
-        _pause_for_risk(db, executor_id, str(action["id"]), "VERIFICATION_JOB_ID_MISMATCH", "刷新后识别到的岗位与原动作不一致。")
-        return _serialize_action(_require_action(db, str(action["id"])))
-    if payload.get("contacted") is True:
-        return _finish_verified_action(
-            db,
-            executor_id,
-            str(action["id"]),
-            {"contacted": True, "verificationMethod": "page_refresh"},
-        )
-    return _release_accepted_action(
-        db,
-        executor_id,
-        str(action["id"]),
-        verification_state="pending",
-        status_code="BOSS_REQUEST_ACCEPTED_PAGE_PENDING",
-        evidence={"contacted": False, "verificationMethod": "page_refresh"},
-    )
-
-
-def _accept_action(
-    db: Database,
-    executor_id: str,
-    action_id: str,
-    status_code: str,
-    evidence: dict[str, object],
-    *,
-    verification_delay_provider: Callable[[], int] | None = None,
-) -> dict[str, object]:
-    strategy = get_delivery_strategy(db) or {}
-    force_verification = bool(strategy.get("force_contact_verification_enabled"))
-    now = utc_now()
-    if not force_verification:
-        return _release_accepted_action(
-            db,
-            executor_id,
-            action_id,
-            verification_state="not_required",
-            status_code=status_code,
-            evidence=evidence,
-        )
-
-    delay = _choose_verification_delay(verification_delay_provider)
-    due_at = _iso_after(delay)
-    with db.connect() as connection:
-        connection.execute(
-            """
-            UPDATE fj_automation_actions
-            SET status = 'succeeded', execution_state = 'request_accepted',
-                request_accepted_at = ?, verification_state = 'waiting_refresh',
-                verification_method = 'page_refresh', verification_delay_seconds = ?,
-                verification_due_at = ?, page_deadline_at = NULL,
-                last_status_code = ?, last_error = NULL, result_json = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (now, delay, due_at, status_code, json.dumps(evidence, ensure_ascii=False), now, action_id),
-        )
-    _audit(
-        db,
-        "boss_request_accepted",
-        "平台已受理建立沟通请求，正在等待单次页面刷新验证。",
-        {"action_id": action_id, "verification_delay_seconds": delay},
-    )
-    return _serialize_action(_require_action(db, action_id))
-
-
-def _release_accepted_action(
-    db: Database,
-    executor_id: str,
-    action_id: str,
-    *,
-    verification_state: str,
-    status_code: str,
-    evidence: dict[str, object],
-    random_seconds: Callable[[], int] | None = None,
-) -> dict[str, object]:
-    cooldown = _choose_cooldown(random_seconds)
-    next_eligible = _iso_after(cooldown)
-    now = utc_now()
-    current = _require_action(db, action_id)
-    merged_evidence = _load_result_evidence(current["result_json"])
-    merged_evidence.update(evidence)
-    with db.connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            """
-            UPDATE fj_automation_actions
-            SET status = 'succeeded', execution_state = 'request_accepted',
-                request_accepted_at = COALESCE(request_accepted_at, ?),
-                verification_state = ?, verification_method = CASE
-                  WHEN ? = 'not_required' THEN 'none' ELSE 'page_refresh' END,
-                verification_due_at = NULL, verification_completed_at = ?,
-                lease_owner = NULL, page_deadline_at = NULL, last_status_code = ?,
-                last_error = NULL, result_json = ?, cooldown_seconds = ?,
-                next_eligible_at = ?, updated_at = ?, completed_at = COALESCE(completed_at, ?)
-            WHERE id = ?
-            """,
-            (
-                now, verification_state, verification_state, now, status_code,
-                json.dumps(merged_evidence, ensure_ascii=False), cooldown,
-                next_eligible, now, now, action_id,
-            ),
-        )
-        connection.execute(
-            "UPDATE fj_boss_executor_instances SET current_action_id = NULL, current_epoch = NULL, cooldown_seconds = ?, next_eligible_at = ?, updated_at = ? WHERE id = ?",
-            (cooldown, next_eligible, now, executor_id),
-        )
-    _audit(
-        db,
-        "boss_request_accepted_released",
-        "建立沟通请求已受理，当前执行槽已释放。",
-        {"action_id": action_id, "verification_state": verification_state, "cooldown_seconds": cooldown},
-    )
-    return _serialize_action(_require_action(db, action_id))
-
-
-def _finish_verified_action(
-    db: Database,
-    executor_id: str,
-    action_id: str,
-    evidence: dict[str, object],
-) -> dict[str, object]:
-    cooldown = _choose_cooldown()
-    next_eligible = _iso_after(cooldown)
-    now = utc_now()
-    current = _require_action(db, action_id)
-    merged_evidence = _load_result_evidence(current["result_json"])
-    merged_evidence.update(evidence)
-    with db.connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            """
-            UPDATE fj_automation_actions
-            SET status = 'succeeded', execution_state = 'succeeded',
-                verification_state = 'page_confirmed', verification_method = 'page_refresh',
-                verification_due_at = NULL, verification_completed_at = ?, lease_owner = NULL,
-                page_deadline_at = NULL, last_status_code = 'BOSS_CONTACT_PAGE_CONFIRMED',
-                result_json = ?, cooldown_seconds = ?, next_eligible_at = ?,
-                updated_at = ?, completed_at = ?
-            WHERE id = ?
-            """,
-            (now, json.dumps(merged_evidence, ensure_ascii=False), cooldown, next_eligible, now, now, action_id),
-        )
-        connection.execute(
-            "UPDATE fj_boss_executor_instances SET current_action_id = NULL, current_epoch = NULL, cooldown_seconds = ?, next_eligible_at = ?, updated_at = ? WHERE id = ?",
-            (cooldown, next_eligible, now, executor_id),
-        )
-    _audit(db, "boss_contact_page_confirmed", "刷新岗位页面后已确认建立沟通。", {"action_id": action_id, "cooldown_seconds": cooldown})
-    return _serialize_action(_require_action(db, action_id))
-
-
-def _sweep_contact_verification(
-    db: Database,
-    executor_id: str,
-    action,
-    *,
-    browser_status_provider: Callable[[], object] | None,
-    random_seconds: Callable[[], int] | None,
-    verification_reload_provider: Callable[[str, str], str] | None,
-) -> None:
-    verification_state = str(action["verification_state"] or "not_required")
-    if verification_state == "waiting_refresh":
-        due_at = _parse_time(action["verification_due_at"])
-        if not due_at or due_at > datetime.now(timezone.utc):
-            return
-        if not _verification_environment_ok(db, executor_id, action, browser_status_provider):
-            _pause_for_risk(db, executor_id, str(action["id"]), "VERIFICATION_ENVIRONMENT", "刷新验证前插件、浏览器或岗位页面状态异常。")
-            return
-        with db.connect() as connection:
-            navigation = connection.execute(
-                "SELECT browser_target_id FROM fj_boss_navigation_tasks WHERE id = ?",
-                (action["navigation_task_id"],),
-            ).fetchone()
-        target_id = str(navigation["browser_target_id"] or "") if navigation else ""
-        now = utc_now()
-        deadline = _iso_after(PAGE_STATUS_TIMEOUT_SECONDS)
-        with db.connect() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE fj_automation_actions
-                SET verification_state = 'refreshing', verification_started_at = ?,
-                    verification_attempts = verification_attempts + 1,
-                    page_deadline_at = ?, last_status_code = 'CONTACT_VERIFICATION_REFRESHING',
-                    updated_at = ?
-                WHERE id = ? AND verification_state = 'waiting_refresh'
-                """,
-                (now, deadline, now, action["id"]),
-            )
-        if cursor.rowcount != 1:
-            return
-        try:
-            reload_page = verification_reload_provider or boss_scraper_service.reload_job_page
-            reload_page(target_id, str(action["encrypt_job_id"] or ""))
-        except (ValueError, RuntimeError, TimeoutError, OSError) as exc:
-            _pause_for_risk(db, executor_id, str(action["id"]), "VERIFICATION_REFRESH_FAILED", str(exc))
-            return
-        with db.connect() as connection:
-            connection.execute(
-                "UPDATE fj_automation_actions SET verification_state = 'waiting_snapshot', last_status_code = 'CONTACT_VERIFICATION_WAITING_SNAPSHOT', updated_at = ? WHERE id = ?",
-                (utc_now(), action["id"]),
-            )
-        _audit(db, "boss_contact_verification_refresh", "已刷新当前岗位页一次，等待插件重新识别。", {"action_id": action["id"], "target_id": target_id})
-        return
-
-    if verification_state not in {"refreshing", "waiting_snapshot"}:
-        return
-    deadline = _parse_time(action["page_deadline_at"])
-    if not deadline or deadline > datetime.now(timezone.utc):
-        return
-    if not _verification_environment_ok(db, executor_id, action, browser_status_provider):
-        _pause_for_risk(db, executor_id, str(action["id"]), "VERIFICATION_TIMEOUT_ENVIRONMENT", "刷新验证等待超时且插件或浏览器状态异常。")
-        return
-    _release_accepted_action(
-        db,
-        executor_id,
-        str(action["id"]),
-        verification_state="pending",
-        status_code="BOSS_REQUEST_ACCEPTED_VERIFICATION_TIMEOUT",
-        evidence={"contacted": None, "verificationMethod": "page_refresh"},
-        random_seconds=random_seconds,
-    )
-
-
-def _verification_environment_ok(
-    db: Database,
-    executor_id: str,
-    action,
-    browser_status_provider: Callable[[], object] | None,
-) -> bool:
-    executor = _executor_row(db, executor_id)
-    heartbeat_at = _parse_time(executor["last_heartbeat_at"])
-    heartbeat_ok = bool(
-        heartbeat_at and (datetime.now(timezone.utc) - heartbeat_at).total_seconds() <= HEARTBEAT_TTL_SECONDS
-    )
-    try:
-        browser = (browser_status_provider or boss_scraper_service.get_browser_status)()
-        current_url = str(getattr(browser, "current_url", "") or "")
-        browser_ok = bool(getattr(browser, "running", False)) and _valid_job_url(
-            current_url, str(action["encrypt_job_id"] or "")
-        )
-    except Exception:
-        browser_ok = False
-    return bool(
-        heartbeat_ok
-        and executor["permission_state"] == "allowed"
-        and executor["queue_state"] == "running"
-        and executor["risk_state"] == "none"
-        and bool(executor["browser_connected"])
-        and browser_ok
-    )
-
-
-def _finish_failed_action(
-    db: Database,
-    executor_id: str,
-    action_id: str,
-    status_code: str,
-    message: str,
-    evidence: dict[str, object],
-) -> dict[str, object]:
-    cooldown = _choose_cooldown()
-    next_eligible = _iso_after(cooldown)
-    now = utc_now()
-    with db.connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            "UPDATE fj_automation_actions SET status = 'failed', execution_state = 'failed_after_dispatch', lease_owner = NULL, page_deadline_at = NULL, last_status_code = ?, last_error = ?, result_json = ?, cooldown_seconds = ?, next_eligible_at = ?, updated_at = ?, completed_at = ? WHERE id = ?",
-            (status_code, message, json.dumps(evidence, ensure_ascii=False), cooldown, next_eligible, now, now, action_id),
-        )
-        connection.execute(
-            "UPDATE fj_boss_executor_instances SET current_action_id = NULL, current_epoch = NULL, cooldown_seconds = ?, next_eligible_at = ?, updated_at = ? WHERE id = ?",
-            (cooldown, next_eligible, now, executor_id),
-        )
-    _audit(db, "boss_request_rejected", "平台明确拒绝建立沟通请求。", {"action_id": action_id, "status_code": status_code}, level="warning")
-    return _serialize_action(_require_action(db, action_id))
-
-
-def _mark_unknown_after_dispatch(
-    db: Database,
-    executor_id: str,
-    action_id: str,
-    status_code: str,
-    message: str,
-    evidence: dict[str, object],
-) -> dict[str, object]:
-    cooldown = _choose_cooldown()
-    next_eligible = _iso_after(cooldown)
-    now = utc_now()
-    with db.connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        max_position = int(connection.execute(
-            "SELECT COALESCE(MAX(queue_position), 0) FROM fj_automation_actions"
-        ).fetchone()[0])
-        connection.execute(
-            """
-            UPDATE fj_automation_actions
-            SET status = 'unknown', execution_state = 'unknown_after_dispatch',
-                queue_position = ?, lease_owner = NULL, page_deadline_at = NULL,
-                last_status_code = ?, last_error = ?, result_json = ?,
-                cooldown_seconds = ?, next_eligible_at = ?, updated_at = ?, completed_at = ?
-            WHERE id = ?
-            """,
-            (
-                max_position + 1, status_code, message,
-                json.dumps(evidence, ensure_ascii=False), cooldown,
-                next_eligible, now, now, action_id,
-            ),
-        )
-        connection.execute(
-            """
-            UPDATE fj_boss_executor_instances
-            SET current_action_id = NULL, current_epoch = NULL,
-                cooldown_seconds = ?, next_eligible_at = ?,
-                risk_state = CASE WHEN risk_state = 'unknown_after_dispatch' THEN 'none' ELSE risk_state END,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (cooldown, next_eligible, now, executor_id),
-        )
-    consecutive_unknowns = _consecutive_unknown_count(db)
-    if consecutive_unknowns >= 3:
-        with db.connect() as connection:
-            connection.execute(
-                """
-                UPDATE fj_boss_executor_instances
-                SET permission_state = 'risk_paused', queue_state = 'risk_paused',
-                    risk_state = 'consecutive_unknown_after_dispatch', updated_at = ?
-                WHERE id = ?
-                """,
-                (utc_now(), executor_id),
-            )
-    _audit(
-        db,
-        "boss_unknown_after_dispatch",
-        "真实请求后出现未知错误，已移到队尾。" if consecutive_unknowns < 3 else "连续3个不同岗位出现未知错误，已暂停队列。",
-        {"action_id": action_id, "consecutive_unknowns": consecutive_unknowns, "cooldown_seconds": cooldown},
-        level="warning",
-    )
-    return _serialize_action(_require_action(db, action_id))
-
-
-def _sanitize_execution_evidence(value: object) -> dict[str, object]:
-    source = value if isinstance(value, dict) else {}
-    return {
-        key: source[key]
-        for key in ("responseCode", "httpStatus")
-        if key in source and isinstance(source[key], (str, int, float, bool, type(None)))
-    }
-
-
-def _load_result_evidence(value: object) -> dict[str, object]:
-    try:
-        parsed = json.loads(str(value or "{}"))
-    except json.JSONDecodeError:
-        return {}
-    return dict(parsed) if isinstance(parsed, dict) else {}
-
-
-def _finish_action(db: Database, executor_id: str, action_id: str, state: str, status_code: str, evidence: dict[str, object]) -> dict[str, object]:
-    cooldown = _choose_cooldown()
-    next_eligible = _iso_after(cooldown)
-    now = utc_now()
-    with db.connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            "UPDATE fj_automation_actions SET status = 'succeeded', execution_state = ?, lease_owner = NULL, page_deadline_at = NULL, last_status_code = ?, result_json = ?, cooldown_seconds = ?, next_eligible_at = ?, updated_at = ?, completed_at = ? WHERE id = ?",
-            (state, status_code, json.dumps(evidence, ensure_ascii=False), cooldown, next_eligible, now, now, action_id),
-        )
-        connection.execute(
-            "UPDATE fj_boss_executor_instances SET current_action_id = NULL, current_epoch = NULL, cooldown_seconds = ?, next_eligible_at = ?, updated_at = ? WHERE id = ?",
-            (cooldown, next_eligible, now, executor_id),
-        )
-    _audit(db, "boss_action_finished", "默认招呼动作已完成。", {"action_id": action_id, "status_code": status_code, "cooldown_seconds": cooldown})
-    return _serialize_action(_require_action(db, action_id))
-
-
-def _pause_for_risk(db: Database, executor_id: str, action_id: str, code: str, reason: str) -> None:
-    now = utc_now()
-    with db.connect() as connection:
-        connection.execute(
-            "UPDATE fj_automation_actions SET status = 'blocked', execution_state = 'blocked', last_status_code = ?, last_error = ?, updated_at = ? WHERE id = ?",
-            (code, reason, now, action_id),
-        )
-        connection.execute(
-            "UPDATE fj_boss_executor_instances SET permission_state = 'risk_paused', queue_state = 'risk_paused', risk_state = ?, updated_at = ? WHERE id = ?",
-            (code.lower(), now, executor_id),
-        )
-    _audit(db, "boss_executor_risk", reason, {"action_id": action_id, "code": code}, level="warning")
-
-
-def _choose_cooldown(provider: Callable[[], int] | None = None) -> int:
-    value = int(provider() if provider else secrets.randbelow(3) + 1)
-    if value not in {1, 2, 3}:
-        raise ValueError("随机等待只能是1、2或3秒")
-    return value
-
-
-def _choose_verification_delay(provider: Callable[[], int] | None = None) -> int:
-    value = int(
-        provider()
-        if provider
-        else secrets.randbelow(VERIFICATION_DELAY_MAX_SECONDS - VERIFICATION_DELAY_MIN_SECONDS + 1)
-        + VERIFICATION_DELAY_MIN_SECONDS
-    )
-    if not VERIFICATION_DELAY_MIN_SECONDS <= value <= VERIFICATION_DELAY_MAX_SECONDS:
-        raise ValueError("刷新验证随机等待只能在10～30秒之间")
-    return value
 
 
 def _resolve_job(db: Database, identifier: str, source_context: str) -> dict[str, object]:
@@ -1345,7 +1362,8 @@ def _resolve_job(db: Database, identifier: str, source_context: str) -> dict[str
                 """
                 SELECT j.* FROM fj_review_items r JOIN fj_boss_jobs j ON j.id = r.job_id
                 WHERE r.id = ? OR j.id = ? LIMIT 1
-                """, (identifier, identifier),
+                """,
+                (identifier, identifier),
             ).fetchone()
         else:
             row = connection.execute(
@@ -1353,7 +1371,7 @@ def _resolve_job(db: Database, identifier: str, source_context: str) -> dict[str
                 (identifier, identifier, identifier),
             ).fetchone()
     if row is None:
-        raise AppError(status_code=404, error_category="JOB_NOT_FOUND", error_message="找不到要打开的岗位记录。")
+        raise AppError(404, "JOB_NOT_FOUND", "找不到要打开的岗位记录。")
     return dict(row)
 
 
@@ -1365,7 +1383,7 @@ def _target_job_url(job: dict[str, object]) -> str:
         return stored
     if expected:
         return f"https://www.zhipin.com/job_detail/{expected}.html"
-    raise AppError(status_code=409, error_category="JOB_ID_MISSING", error_message="岗位缺少可验证的BOSS岗位标识，不能打开详情页。")
+    raise AppError(409, "JOB_ID_MISSING", "岗位缺少可验证的BOSS岗位标识，不能打开详情页。")
 
 
 def _job_id_from_url(url: str) -> str:
@@ -1379,70 +1397,19 @@ def _job_id_from_url(url: str) -> str:
 def _valid_job_url(url: str, expected: str) -> bool:
     parsed = urlparse(url)
     return (
-        parsed.scheme == "https" and parsed.hostname in {"www.zhipin.com", "zhipin.com"}
+        parsed.scheme == "https"
+        and parsed.hostname in {"www.zhipin.com", "zhipin.com"}
         and "/job_detail/" in parsed.path
         and (not expected or expected in parsed.path)
     )
-
-
-def _is_boss_url(url: str) -> bool:
-    parsed = urlparse(url)
-    return parsed.scheme in {"http", "https"} and parsed.hostname in {"www.zhipin.com", "zhipin.com"}
 
 
 def _executor_row(db: Database, executor_id: str):
     with db.connect() as connection:
         row = connection.execute("SELECT * FROM fj_boss_executor_instances WHERE id = ?", (executor_id,)).fetchone()
     if row is None:
-        raise AppError(status_code=404, error_category="NOT_FOUND", error_message="执行器不存在。")
+        raise AppError(404, "NOT_FOUND", "执行器不存在。")
     return row
-
-
-def _consecutive_unknown_count(db: Database) -> int:
-    """统计最近连续的不同未知岗位；任一明确执行结果都会把计数清零。"""
-    with db.connect() as connection:
-        rows = connection.execute(
-            """
-            SELECT execution_state, job_id
-            FROM fj_automation_actions
-            WHERE action_type = 'BOSS_DEFAULT_GREETING'
-              AND dispatch_started_at IS NOT NULL
-              AND execution_state IN (
-                'request_accepted', 'succeeded', 'failed_after_dispatch',
-                'unknown_after_dispatch', 'cancelled'
-              )
-            ORDER BY COALESCE(completed_at, updated_at) DESC, updated_at DESC, id DESC
-            """
-        ).fetchall()
-    unknown_jobs: set[str] = set()
-    for row in rows:
-        if row["execution_state"] != "unknown_after_dispatch":
-            break
-        unknown_jobs.add(str(row["job_id"]))
-    return len(unknown_jobs)
-
-
-def _clear_unknown_limit_after_manual_verification(db: Database) -> None:
-    if _consecutive_unknown_count(db) >= 3:
-        return
-    now = utc_now()
-    with db.connect() as connection:
-        connection.execute(
-            """
-            UPDATE fj_boss_executor_instances
-            SET permission_state = CASE
-                  WHEN risk_state = 'consecutive_unknown_after_dispatch' THEN 'paused'
-                  ELSE permission_state END,
-                queue_state = CASE
-                  WHEN risk_state = 'consecutive_unknown_after_dispatch' THEN 'paused'
-                  ELSE queue_state END,
-                risk_state = CASE
-                  WHEN risk_state IN ('unknown_after_dispatch', 'consecutive_unknown_after_dispatch') THEN 'none'
-                  ELSE risk_state END,
-                updated_at = ?
-            """,
-            (now,),
-        )
 
 
 def _action_row(db: Database, action_id: str):
@@ -1456,60 +1423,70 @@ def _action_row(db: Database, action_id: str):
 def _require_action(db: Database, action_id: str):
     row = _action_row(db, action_id)
     if row is None:
-        raise AppError(status_code=404, error_category="NOT_FOUND", error_message="打招呼动作不存在。")
-    return row
-
-
-def _require_owned_action(db: Database, executor_id: str, action_id: str, epoch: int):
-    row = _require_action(db, action_id)
-    if str(row["lease_owner"] or "") != executor_id:
-        raise AppError(status_code=409, error_category="INVALID_LEASE", error_message="动作不属于当前执行器。")
-    if int(row["execution_epoch"]) != epoch:
-        raise AppError(status_code=409, error_category="STALE_EXECUTION_EPOCH", error_message="该状态属于已经失效的执行轮次。")
+        raise AppError(404, "NOT_FOUND", "执行任务不存在。")
     return row
 
 
 def _serialize_action(row, *, include_payload: bool = True) -> dict[str, object]:
+    payload = json.loads(row["payload_json"] or "{}")
+    delay_seconds = int(payload.get("delay_seconds") or (3 if row["task_type"] == "TEST_DELAY" else 0))
     data = {
-        "id": row["id"], "job_id": row["job_id"], "review_item_id": row["review_item_id"],
-        "action_type": row["action_type"], "status": row["status"],
-        "execution_state": row["execution_state"], "execution_epoch": row["execution_epoch"],
-        "queue_position": row["queue_position"], "page_open_attempts": row["page_open_attempts"],
-        "page_deadline_at": row["page_deadline_at"], "dispatch_started_at": row["dispatch_started_at"],
-        "request_accepted_at": row["request_accepted_at"],
-        "verification_state": row["verification_state"],
-        "verification_method": row["verification_method"],
-        "verification_delay_seconds": row["verification_delay_seconds"],
-        "verification_due_at": row["verification_due_at"],
-        "verification_started_at": row["verification_started_at"],
-        "verification_completed_at": row["verification_completed_at"],
-        "verification_attempts": row["verification_attempts"],
-        "cooldown_seconds": row["cooldown_seconds"], "next_eligible_at": row["next_eligible_at"],
-        "last_status_code": row["last_status_code"], "last_error": row["last_error"],
-        "job_title": row["job_title"], "company_name": row["company_name"],
-        "encrypt_job_id": row["encrypt_job_id"], "job_link": row["job_link"],
-        "created_at": row["created_at"], "updated_at": row["updated_at"],
+        "id": row["id"],
+        "job_id": row["job_id"],
+        "evaluation_id": row["evaluation_id"],
+        "review_item_id": row["review_item_id"],
+        "action_type": row["action_type"],
+        "task_type": row["task_type"],
+        "status": row["status"],
+        "execution_state": row["execution_state"],
+        "execution_epoch": row["execution_epoch"],
+        "last_error": row["last_error"],
+        "last_status_code": row["last_status_code"],
+        "job_title": row["job_title"],
+        "company_name": row["company_name"],
+        "encrypt_job_id": row["encrypt_job_id"],
+        "job_link": row["job_link"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "completed_at": row["completed_at"],
+        "close_page_after_completion": bool(payload.get("close_page_after_completion", row["task_type"] != "TEST_DELAY")),
+        "delay_seconds": delay_seconds,
     }
     if include_payload:
-        payload = json.loads(row["payload_json"] or "{}")
         payload.pop("message", None)
         data["payload"] = payload
     return data
 
 
 def _serialize_executor(row) -> dict[str, object]:
+    keys = set(row.keys())
     return {
-        "id": row["id"], "label": row["label"], "protocol_version": row["protocol_version"],
-        "plugin_version": row["plugin_version"], "capabilities": json.loads(row["capabilities_json"] or "[]"),
-        "permission_state": row["permission_state"], "queue_state": row["queue_state"],
-        "risk_state": row["risk_state"], "browser_connected": bool(row["browser_connected"]),
-        "current_action_id": row["current_action_id"], "current_epoch": row["current_epoch"],
-        "cooldown_seconds": row["cooldown_seconds"], "next_eligible_at": row["next_eligible_at"],
-        "last_heartbeat_at": row["last_heartbeat_at"], "updated_at": row["updated_at"],
+        "id": row["id"],
+        "label": row["label"],
+        "protocol_version": row["protocol_version"],
+        "plugin_version": row["plugin_version"],
+        "capabilities": json.loads(row["capabilities_json"] or "[]"),
+        "queue_state": row["queue_state"],
+        "risk_state": row["risk_state"],
+        "browser_connected": bool(row["browser_connected"]),
+        "last_heartbeat_at": row["last_heartbeat_at"],
+        "task_cooldown_max_seconds": int(row["task_cooldown_max_seconds"]) if "task_cooldown_max_seconds" in keys else 4,
+        "page_load_wait_max_seconds": int(row["page_load_wait_max_seconds"]) if "page_load_wait_max_seconds" in keys else 3,
+        "runtime_phase": row["runtime_phase"] if "runtime_phase" in keys else "idle",
+        "runtime_detail": row["runtime_detail"] if "runtime_detail" in keys else "",
+        "runtime_until_at": row["runtime_until_at"] if "runtime_until_at" in keys else None,
+        "updated_at": row["updated_at"],
     }
 
 
-def _audit(db: Database, action_type: str, message: str, detail: dict[str, object], *, level: str = "info") -> None:
+def _audit(
+    db: Database,
+    action_type: str,
+    message: str,
+    detail: dict[str, object],
+    *,
+    level: str = "info",
+) -> None:
     with db.connect() as connection:
         connection.execute(
             "INSERT INTO fj_action_logs (id, run_id, level, action_type, message, detail_json, created_at) VALUES (?, NULL, ?, ?, ?, ?, ?)",

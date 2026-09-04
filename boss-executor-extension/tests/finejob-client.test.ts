@@ -19,7 +19,7 @@ const { storageData, browser } = vi.hoisted(() => {
 });
 
 import { FineJobExecutorClient } from "../src/finejob/client";
-import type { MainWorldExecutionResult } from "../src/finejob/types";
+import type { FineJobQueueAction, MainWorldExecutionResult } from "../src/finejob/types";
 
 const response = (body: unknown) => ({
   ok: true,
@@ -32,6 +32,7 @@ class TestWebSocket {
   static readonly CONNECTING = 0;
   readonly url: string;
   readyState = TestWebSocket.CONNECTING;
+  readonly sent: string[] = [];
   private readonly listeners = new Map<string, Array<(event: unknown) => void>>();
 
   constructor(url: string) {
@@ -48,9 +49,18 @@ class TestWebSocket {
     this.readyState = 3;
   }
 
+  send(data: string): void {
+    this.sent.push(data);
+  }
+
   open(): void {
     this.readyState = TestWebSocket.OPEN;
     for (const listener of this.listeners.get("open") ?? []) listener({});
+  }
+
+  message(data: unknown): void {
+    const event = { data: JSON.stringify(data) };
+    for (const listener of this.listeners.get("message") ?? []) listener(event);
   }
 }
 
@@ -85,7 +95,8 @@ describe("FineJob执行结果可靠回写", () => {
         executor: {
           id: "executor-1", plugin_version: "0.1.0", protocol_version: "1.1",
           permission_state: "paused", queue_state: "paused", risk_state: "none",
-          browser_connected: true
+          browser_connected: true, task_cooldown_max_seconds: 4, page_load_wait_max_seconds: 3,
+          runtime_phase: "idle"
         },
         queue: { actions: [] }
       }));
@@ -115,7 +126,8 @@ describe("FineJob执行结果可靠回写", () => {
         executor: {
           id: "executor-1", plugin_version: "0.1.0", protocol_version: "1.1",
           permission_state: "paused", queue_state: "paused", risk_state: "none",
-          browser_connected: true
+          browser_connected: true, task_cooldown_max_seconds: 4, page_load_wait_max_seconds: 3,
+          runtime_phase: "idle"
         },
         queue: { actions: [] }
       }));
@@ -140,7 +152,8 @@ describe("FineJob执行结果可靠回写", () => {
       executor: {
         id: "executor-1", plugin_version: "0.1.0", protocol_version: "1.1",
         permission_state: "paused", queue_state: "paused", risk_state: "none",
-        browser_connected: true
+        browser_connected: true, task_cooldown_max_seconds: 4, page_load_wait_max_seconds: 3,
+        runtime_phase: "idle"
       },
       queue: { actions: [] }
     };
@@ -156,6 +169,7 @@ describe("FineJob执行结果可靠回写", () => {
     socket.open();
     await Promise.resolve();
     await Promise.resolve();
+    await Promise.resolve();
 
     expect(fetchSpy.mock.calls.filter(([url]) => String(url).endsWith("/heartbeat"))).toHaveLength(2);
   });
@@ -165,7 +179,8 @@ describe("FineJob执行结果可靠回写", () => {
       executor: {
         id: "executor-1", plugin_version: "0.1.0", protocol_version: "1.1",
         permission_state: "paused", queue_state: "paused", risk_state: "none",
-        browser_connected: true
+        browser_connected: true, task_cooldown_max_seconds: 4, page_load_wait_max_seconds: 3,
+        runtime_phase: "idle"
       },
       queue: { actions: [] }
     };
@@ -174,7 +189,7 @@ describe("FineJob执行结果可靠回写", () => {
     await client.start();
 
     const result: MainWorldExecutionResult = {
-      actionId: "action-1",
+      taskId: "task-1",
       executionEpoch: 1,
       outcome: "accepted",
       contacted: null,
@@ -186,24 +201,283 @@ describe("FineJob执行结果可靠回写", () => {
     await client.reportExecutionResult(result);
 
     expect(storageData.finejobBossExecutorPendingResultsV1).toEqual({
-      "action-1:1": result
+      "task-1:1": result
     });
 
     fetchSpy.mockResolvedValueOnce(response({
-      action: {
-        id: "action-1", job_id: "job-1", review_item_id: "review-1",
+      task: {
+        id: "task-1", job_id: "job-1", review_item_id: "review-1",
         action_type: "BOSS_DEFAULT_GREETING", status: "succeeded",
-        execution_state: "request_accepted", execution_epoch: 1,
-        queue_position: 1, page_open_attempts: 1, job_title: "测试岗位",
-        company_name: "测试公司", encrypt_job_id: "encrypt-1",
-        verification_state: "not_required", verification_method: "none",
-        verification_attempts: 0
-      }
+        execution_state: "succeeded", execution_epoch: 1,
+        job_title: "测试岗位", company_name: "测试公司",
+        encrypt_job_id: "encrypt-1"
+      },
+      queue: { actions: [] }
     }));
     await client.reportExecutionResult(result);
 
     expect(storageData.finejobBossExecutorPendingResultsV1).toEqual({});
     const completeCalls = fetchSpy.mock.calls.filter(([url]) => String(url).includes("/complete"));
     expect(completeCalls).toHaveLength(2);
+  });
+
+  it("运行通道确认结果后清理本地待同步结果", async () => {
+    const heartbeatBody = {
+      executor: {
+        id: "executor-1", plugin_version: "0.1.0", protocol_version: "1.1",
+        permission_state: "paused", queue_state: "running", risk_state: "none",
+        browser_connected: true, task_cooldown_max_seconds: 4, page_load_wait_max_seconds: 3,
+        runtime_phase: "idle"
+      },
+      queue: { actions: [] }
+    };
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(response(heartbeatBody));
+    const client = new FineJobExecutorClient();
+    await client.start();
+    const socket = sockets[0];
+    if (!socket) throw new Error("测试 WebSocket 未建立");
+    socket.readyState = TestWebSocket.OPEN;
+
+    const result: MainWorldExecutionResult = {
+      taskId: "task-1",
+      executionEpoch: 1,
+      outcome: "succeeded",
+      contacted: null,
+      statusCode: "TEST_DELAY_COMPLETED",
+      message: "测试完成",
+      evidence: { delaySeconds: 3 }
+    };
+    await client.reportExecutionResult(result);
+
+    expect(storageData.finejobBossExecutorPendingResultsV1).toEqual({ "task-1:1": result });
+    expect(JSON.parse(socket.sent.at(-1) ?? "{}")).toMatchObject({
+      type: "task_succeeded",
+      task_id: "task-1",
+      execution_epoch: 1
+    });
+
+    socket.message({
+      type: "task_result_synced",
+      task_id: "task-1",
+      execution_epoch: 1,
+      queue: { actions: [] }
+    });
+    await Promise.resolve();
+
+    expect(storageData.finejobBossExecutorPendingResultsV1).toEqual({});
+    await vi.advanceTimersByTimeAsync(5_000);
+    const completeCalls = fetchSpy.mock.calls.filter(([url]) => String(url).includes("/complete"));
+    expect(completeCalls).toHaveLength(0);
+  });
+
+  it("运行通道未回执时使用补偿接口同步结果", async () => {
+    const heartbeatBody = {
+      executor: {
+        id: "executor-1", plugin_version: "0.1.0", protocol_version: "1.1",
+        permission_state: "paused", queue_state: "running", risk_state: "none",
+        browser_connected: true, task_cooldown_max_seconds: 4, page_load_wait_max_seconds: 3,
+        runtime_phase: "idle"
+      },
+      queue: { actions: [] }
+    };
+    const fetchSpy = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(response(heartbeatBody))
+      .mockResolvedValueOnce(response(heartbeatBody))
+      .mockResolvedValueOnce(response({
+        task: {
+          id: "task-1", job_id: "job-1", review_item_id: "review-1",
+          action_type: "BOSS_DEFAULT_GREETING", status: "succeeded",
+          execution_state: "succeeded", execution_epoch: 1,
+          job_title: "测试岗位", company_name: "测试公司",
+          encrypt_job_id: "encrypt-1"
+        },
+        queue: { actions: [] }
+      }));
+    const client = new FineJobExecutorClient();
+    await client.start();
+    const socket = sockets[0];
+    if (!socket) throw new Error("测试 WebSocket 未建立");
+    socket.readyState = TestWebSocket.OPEN;
+
+    const result: MainWorldExecutionResult = {
+      taskId: "task-1",
+      executionEpoch: 1,
+      outcome: "succeeded",
+      contacted: null,
+      statusCode: "TEST_DELAY_COMPLETED",
+      message: "测试完成",
+      evidence: { delaySeconds: 3 }
+    };
+    await client.reportExecutionResult(result);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(storageData.finejobBossExecutorPendingResultsV1).toEqual({});
+    const completeCalls = fetchSpy.mock.calls.filter(([url]) => String(url).includes("/complete"));
+    expect(completeCalls).toHaveLength(1);
+  });
+
+  it("收到运行中队列且没有可用BOSS标签页时请求打开任务页", async () => {
+    const task: FineJobQueueAction = {
+      id: "task-queue-1",
+      job_id: "job-1",
+      review_item_id: "review-1",
+      action_type: "start_conversation",
+      task_type: "TEST_DELAY",
+      status: "queued",
+      execution_state: "queued",
+      execution_epoch: 0,
+      job_title: "测试岗位",
+      company_name: "测试公司",
+      encrypt_job_id: "encrypt-1",
+      close_page_after_completion: false,
+      delay_seconds: 5
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response({
+      executor: {
+        id: "executor-1", plugin_version: "0.1.0", protocol_version: "1.1",
+        permission_state: "paused", queue_state: "running", risk_state: "none",
+        browser_connected: true, task_cooldown_max_seconds: 4, page_load_wait_max_seconds: 3,
+        runtime_phase: "idle"
+      },
+      queue: { actions: [] }
+    }));
+    browser.tabs.query.mockResolvedValueOnce([]);
+    const client = new FineJobExecutorClient();
+    await client.start();
+    const socket = sockets[0];
+    if (!socket) throw new Error("测试 WebSocket 未建立");
+    socket.readyState = TestWebSocket.OPEN;
+    socket.sent.length = 0;
+
+    socket.message({ type: "task_queue", tasks: [task] });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(socket.sent.map((item) => JSON.parse(item))).toContainEqual(
+      expect.objectContaining({ type: "open_task_page" })
+    );
+  });
+
+  it("任务回写确认后先进入任务间隔冷却再请求下一页", async () => {
+    const nextTask: FineJobQueueAction = {
+      id: "task-next-1",
+      job_id: "job-1",
+      review_item_id: "review-1",
+      action_type: "start_conversation",
+      task_type: "TEST_DELAY",
+      status: "queued",
+      execution_state: "queued",
+      execution_epoch: 0,
+      job_title: "下一个测试岗位",
+      company_name: "测试公司",
+      encrypt_job_id: "encrypt-1",
+      close_page_after_completion: false,
+      delay_seconds: 5
+    };
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response({
+      executor: {
+        id: "executor-1", plugin_version: "0.1.0", protocol_version: "1.1",
+        permission_state: "paused", queue_state: "running", risk_state: "none",
+        browser_connected: true, task_cooldown_max_seconds: 8, page_load_wait_max_seconds: 3,
+        runtime_phase: "idle"
+      },
+      queue: { actions: [] }
+    }));
+    browser.tabs.query.mockResolvedValue([]);
+    const client = new FineJobExecutorClient();
+    await client.start();
+    const socket = sockets[0];
+    if (!socket) throw new Error("测试 WebSocket 未建立");
+    socket.readyState = TestWebSocket.OPEN;
+    socket.sent.length = 0;
+
+    socket.message({
+      type: "task_result_synced",
+      task_id: "task-done-1",
+      execution_epoch: 1,
+      queue: { actions: [nextTask] }
+    });
+    await Promise.resolve();
+
+    expect(socket.sent.map((item) => JSON.parse(item))).toContainEqual(expect.objectContaining({
+      type: "runtime_state",
+      phase: "task_cooldown",
+      detail: "任务间隔冷却等待 6 秒"
+    }));
+
+    await vi.advanceTimersByTimeAsync(5_999);
+    expect(socket.sent.map((item) => JSON.parse(item))).not.toContainEqual(
+      expect.objectContaining({ type: "open_task_page" })
+    );
+
+    await vi.advanceTimersByTimeAsync(1);
+    await Promise.resolve();
+    const sentMessages = socket.sent.map((item) => JSON.parse(item));
+    expect(sentMessages).toContainEqual(expect.objectContaining({ type: "runtime_state", phase: "idle" }));
+    expect(sentMessages).toContainEqual(expect.objectContaining({ type: "open_task_page" }));
+  });
+
+  it("测试任务按队列下发的运行时间延迟回传成功", async () => {
+    const task: FineJobQueueAction = {
+      id: "task-delay-1",
+      job_id: "job-1",
+      review_item_id: "review-1",
+      action_type: "start_conversation",
+      task_type: "TEST_DELAY",
+      status: "queued",
+      execution_state: "queued",
+      execution_epoch: 2,
+      job_title: "测试岗位",
+      company_name: "测试公司",
+      encrypt_job_id: "encrypt-1",
+      close_page_after_completion: true,
+      delay_seconds: 7
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response({
+      executor: {
+        id: "executor-1", plugin_version: "0.1.0", protocol_version: "1.1",
+        permission_state: "paused", queue_state: "running", risk_state: "none",
+        browser_connected: true, task_cooldown_max_seconds: 4, page_load_wait_max_seconds: 3,
+        runtime_phase: "idle"
+      },
+      queue: { actions: [task] }
+    }));
+    const client = new FineJobExecutorClient();
+    await client.start();
+    const socket = sockets[0];
+    if (!socket) throw new Error("测试 WebSocket 未建立");
+    socket.readyState = TestWebSocket.OPEN;
+    socket.sent.length = 0;
+
+    socket.message({ type: "page_opened", task_id: task.id, success: true, page: {} });
+    await Promise.resolve();
+    expect(socket.sent.map((item) => JSON.parse(item))).toContainEqual(
+      expect.objectContaining({ type: "match_task", task_id: task.id })
+    );
+    socket.message({
+      type: "task_match_synced",
+      task_id: task.id,
+      execution_epoch: task.execution_epoch,
+      task: { ...task, status: "leased", execution_state: "running" },
+      queue: { actions: [{ ...task, status: "leased", execution_state: "running" }] }
+    });
+    await Promise.resolve();
+
+    await vi.advanceTimersByTimeAsync(6_999);
+    expect(socket.sent.map((item) => JSON.parse(item))).not.toContainEqual(
+      expect.objectContaining({ type: "task_succeeded", task_id: task.id })
+    );
+
+    await vi.advanceTimersByTimeAsync(1);
+    await Promise.resolve();
+    const sentMessages = socket.sent.map((item) => JSON.parse(item));
+    expect(sentMessages).toContainEqual(expect.objectContaining({
+      type: "task_succeeded",
+      task_id: task.id,
+      execution_epoch: 2,
+      execution_result: "测试任务已等待 7 秒并完成",
+      platform_result: { delaySeconds: 7, closePageAfterCompletion: true }
+    }));
   });
 });

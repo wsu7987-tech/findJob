@@ -50,7 +50,7 @@ from backend.app.services.fine_job.job_evaluation import (
     evaluate_filter_strategy,
 )
 from backend.app.services.fine_job.resumes import list_resume_facts
-from backend.app.services.fine_job import profile_store, profile_v3
+from backend.app.services.fine_job import boss_executor, profile_store, profile_v3
 from backend.app.services.fine_job.strategies import (
     get_filter_strategy,
     get_recommendation_strategy,
@@ -470,7 +470,7 @@ def suggest_boss_details(
     "/tasks/{task_id}/delivery-evaluations",
     response_model=BossDeliveryEvaluationResponse,
 )
-def evaluate_boss_deliveries(
+async def evaluate_boss_deliveries(
     task_id: str,
     payload: BossDeliveryEvaluationRequest,
     db: Database = Depends(get_database),
@@ -540,10 +540,11 @@ def evaluate_boss_deliveries(
     completed_by_id = {
         str(job.get("job_id") or ""): job for job in completed_jobs
     }
+    queue_changed = False
     for evaluation in evaluations:
         job = completed_by_id.get(str(evaluation.get("job_id") or ""))
         if job:
-            record_evaluation_and_route(
+            route_result = record_evaluation_and_route(
                 db,
                 job=job,
                 evaluation=evaluation,
@@ -556,6 +557,11 @@ def evaluate_boss_deliveries(
                 context_revision_id=_context_revision_id(evaluation_context),
                 context_dependency_versions=_context_dependencies(evaluation_context),
             )
+            queue_changed = queue_changed or (
+                route_result is not None and route_result.get("action") is not None
+            )
+    if queue_changed:
+        await boss_executor.notify_queue_changed(db)
     return BossDeliveryEvaluationResponse(
         evaluations=evaluations,
         task=BossCaptureTaskResponse(**updated),
@@ -566,7 +572,7 @@ def evaluate_boss_deliveries(
     "/history/{history_job_id}/delivery-evaluations",
     response_model=BossHistoryDeliveryEvaluationResponse,
 )
-def evaluate_history_job_delivery(
+async def evaluate_history_job_delivery(
     history_job_id: str,
     payload: BossDeliveryEvaluationRequest,
     db: Database = Depends(get_database),
@@ -614,7 +620,7 @@ def evaluate_history_job_delivery(
         candidate_context=_context_content(evaluation_context),
     )[0]
     update_capture_job_delivery_evaluation(db, job=job, evaluation=evaluation)
-    record_evaluation_and_route(
+    route_result = record_evaluation_and_route(
         db,
         job=job,
         evaluation=evaluation,
@@ -627,6 +633,8 @@ def evaluate_history_job_delivery(
         context_revision_id=_context_revision_id(evaluation_context),
         context_dependency_versions=_context_dependencies(evaluation_context),
     )
+    if route_result is not None and route_result.get("action") is not None:
+        await boss_executor.notify_queue_changed(db)
     return BossHistoryDeliveryEvaluationResponse(
         evaluation=evaluation,
         job=get_capture_history_job(db, history_job_id),

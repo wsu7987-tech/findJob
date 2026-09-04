@@ -14,6 +14,7 @@ from backend.app.schemas.fine_job.codex import (
 )
 from backend.app.services.config import persist_config_updates
 from backend.app.services.fine_job.codex_authorization import SENSITIVE_OPERATION_KEYS
+from backend.app.services.fine_job import boss_executor
 from backend.app.services.fine_job.codex_tools import (
     approve_pending,
     list_pending_work,
@@ -67,13 +68,13 @@ def pending(db: Database = Depends(get_database)):
 
 
 @router.post("/pending/{resource_type}/{resource_id}/approve")
-def approve(
+async def approve(
     resource_type: str,
     resource_id: str,
     payload: CodexPendingDecisionRequest,
     db: Database = Depends(get_database),
 ):
-    return approve_pending(
+    result = approve_pending(
         db,
         resource_type=resource_type,
         resource_id=resource_id,
@@ -81,6 +82,9 @@ def approve(
         final_text=payload.final_text,
         allow_override=payload.allow_override,
     )
+    if isinstance(result.get("action"), dict):
+        await boss_executor.notify_queue_changed(db)
+    return result
 
 
 @router.post("/pending/{resource_type}/{resource_id}/reject")
@@ -91,4 +95,3 @@ def reject(
     db: Database = Depends(get_database),
 ):
     return reject_pending(db, resource_type=resource_type, resource_id=resource_id, note=payload.note)
-

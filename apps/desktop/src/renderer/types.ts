@@ -745,6 +745,7 @@ export type FineJobReviewStatus = "pending" | "approved" | "rejected" | "dismiss
 export type FineJobReviewTab = FineJobReviewStatus | "running" | "executed";
 export type FineJobAutomationActionStatus =
   | "queued"
+  | "running"
   | "leased"
   | "succeeded"
   | "failed"
@@ -754,29 +755,12 @@ export type FineJobAutomationActionStatus =
 
 export type FineJobBossExecutionState =
   | "queued"
-  | "opening_page"
-  | "waiting_page_ready"
-  | "page_verified"
-  | "ready_to_dispatch"
-  | "dispatch_started"
-  | "request_accepted"
+  | "running"
   | "succeeded"
-  | "cancellation_requested"
   | "cancelled"
   | "blocked"
-  | "failed_before_dispatch"
-  | "failed_after_dispatch"
-  | "unknown_after_dispatch";
-
-export type FineJobBossVerificationState =
-  | "not_required"
-  | "waiting_refresh"
-  | "refreshing"
-  | "waiting_snapshot"
-  | "page_confirmed"
-  | "manual_confirmed"
-  | "pending"
-  | "chat_confirmed";
+  | "failed"
+  | "unknown";
 
 export interface FineJobReviewItem {
   id: string;
@@ -840,9 +824,6 @@ export interface FineJobAutomationAction {
   status: FineJobAutomationActionStatus;
   idempotency_key: string;
   payload: Record<string, unknown>;
-  lease_owner?: string | null;
-  lease_expires_at?: string | null;
-  attempt_count: number;
   last_error?: string | null;
   job_title: string;
   company_name: string;
@@ -851,23 +832,8 @@ export interface FineJobAutomationAction {
   completed_at?: string | null;
   execution_state: FineJobBossExecutionState;
   execution_epoch: number;
-  queue_position: number;
-  page_open_attempts: number;
-  page_deadline_at?: string | null;
-  dispatch_started_at?: string | null;
-  request_accepted_at?: string | null;
-  verification_state: FineJobBossVerificationState;
-  verification_method: "none" | "page_refresh" | "manual" | "chat";
-  verification_delay_seconds?: number | null;
-  verification_due_at?: string | null;
-  verification_started_at?: string | null;
-  verification_completed_at?: string | null;
-  verification_attempts: number;
-  cooldown_seconds?: number | null;
-  next_eligible_at?: string | null;
   last_status_code?: string | null;
   result: Record<string, unknown>;
-  navigation_task_id?: string | null;
 }
 
 export interface FineJobAutomationActionEnvelope {
@@ -885,15 +851,15 @@ export interface FineJobBossExecutorInstance {
   protocol_version: string;
   plugin_version: string;
   capabilities: string[];
-  permission_state: "not_authorized" | "allowed" | "paused" | "risk_paused";
-  queue_state: "running" | "paused" | "emergency_stopped" | "risk_paused";
+  queue_state: "running" | "paused" | "risk_paused";
   risk_state: string;
   browser_connected: boolean;
-  current_action_id?: string | null;
-  current_epoch?: number | null;
-  cooldown_seconds?: number | null;
-  next_eligible_at?: string | null;
   last_heartbeat_at?: string | null;
+  task_cooldown_max_seconds: number;
+  page_load_wait_max_seconds: number;
+  runtime_phase?: "idle" | "task_cooldown";
+  runtime_detail?: string;
+  runtime_until_at?: string | null;
   updated_at: string;
 }
 
@@ -901,29 +867,33 @@ export interface FineJobBossExecutorQueueAction {
   id: string;
   job_id: string;
   review_item_id: string;
-  action_type: "BOSS_DEFAULT_GREETING";
+  action_type: string;
+  task_type: "BOSS_DEFAULT_GREETING" | "TEST_DELAY";
   status: FineJobAutomationActionStatus;
   execution_state: FineJobBossExecutionState;
   execution_epoch: number;
-  queue_position: number;
-  page_open_attempts: number;
-  request_accepted_at?: string | null;
-  verification_state: FineJobBossVerificationState;
-  verification_method: "none" | "page_refresh" | "manual" | "chat";
-  verification_delay_seconds?: number | null;
-  verification_due_at?: string | null;
-  verification_started_at?: string | null;
-  verification_completed_at?: string | null;
-  verification_attempts: number;
   job_title: string;
   company_name: string;
   encrypt_job_id: string;
   last_status_code?: string | null;
   last_error?: string | null;
+  close_page_after_completion: boolean;
+  delay_seconds: number;
+}
+
+export interface FineJobBossExecutorTestJob {
+  id: string;
+  encrypt_job_id: string;
+  title: string;
+  company_name: string;
+  job_link: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface FineJobBossExecutorDashboard {
   executor: FineJobBossExecutorInstance | null;
+  current_task?: FineJobBossExecutorQueueAction | null;
   queue: { actions: FineJobBossExecutorQueueAction[]; total: number };
   protocol_version: string;
 }
@@ -936,8 +906,8 @@ export interface FineJobOperationsDashboard {
   execution_counts: Record<string, number>;
   capture_counts: Record<string, number>;
   executor: FineJobBossExecutorInstance | null;
+  current_task?: FineJobBossExecutorQueueAction | null;
   queue: { actions: FineJobBossExecutorQueueAction[]; total: number };
-  current_action?: FineJobBossExecutorQueueAction | null;
   recent_issues: FineJobActionLog[];
   legacy_runs: FineJobDeliveryRun[];
 }

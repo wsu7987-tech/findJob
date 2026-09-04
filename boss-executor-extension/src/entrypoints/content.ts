@@ -33,14 +33,9 @@ export default defineContentScript({
       pair: async (code: string) => { await background.pair(code); },
       testHeartbeat: async () => { await background.testHeartbeat(); },
       disconnect: async () => { await background.disconnect(); },
-      control: async (command: "allow" | "pause" | "resume" | "emergency_stop") => {
+      control: async (command: "start" | "pause") => {
         await background.control(command);
-      },
-      returnToReview: async (actionId: string) => { await background.returnToReview(actionId); },
-      retryFailedAction: async (actionId: string) => { await background.retryFailedAction(actionId); },
-      cancelFailedAction: async (actionId: string) => { await background.cancelFailedAction(actionId); },
-      retryAllFailed: async () => { await background.retryAllFailed(); },
-      cancelAllFailed: async () => { await background.cancelAllFailed(); }
+      }
     };
     const unmountPanel = mountStatusPanel(status, controller);
     window.addEventListener("pagehide", unmountPanel, { once: true });
@@ -52,6 +47,9 @@ export default defineContentScript({
     await contentService.refreshBackground();
 
     const runtimeHandler = (message?: { type?: string; command?: MainWorldCommand }) => {
+      if (message?.type === "finejob:boss-executor:probe:v1") {
+        return contentService.enqueueMainCommand({ type: "BOSS_PAGE_PROBE" });
+      }
       if (![
         "finejob:boss-executor:execute:v1",
         "finejob:boss-chat:execute:v1"

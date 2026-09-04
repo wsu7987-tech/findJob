@@ -48,7 +48,6 @@ describe("fineJobDeliveryRuns store", () => {
       capture_counts: {},
       executor: null,
       queue: { actions: [], total: 0 },
-      current_action: null,
       recent_issues: [],
       legacy_runs: []
     };

@@ -18,6 +18,7 @@ from backend.app.services.fine_job.codex_runtime import (
     MCP_CONTRACT_VERSION,
     CodexRuntimeRegistry,
 )
+from backend.app.services.fine_job import boss_executor
 from backend.app.services.fine_job.codex_tools import CodexToolService
 from backend.app.utils import utc_now
 
@@ -134,7 +135,7 @@ def capabilities(
 
 
 @router.post("/tools/{tool_name}")
-def invoke_tool(
+async def invoke_tool(
     tool_name: str,
     payload: CodexToolRequest,
     request: Request,
@@ -145,7 +146,17 @@ def invoke_tool(
     config: AppConfig = Depends(get_config),
 ):
     _authorize(request, authorization, contract, api_version)
-    return CodexToolService(db, config).call(f"finejob.{tool_name}", payload.arguments)
+    result = CodexToolService(db, config).call(f"finejob.{tool_name}", payload.arguments)
+    if _result_changes_boss_queue(result):
+        await boss_executor.notify_queue_changed(db)
+    return result
+
+
+def _result_changes_boss_queue(result: dict[str, object]) -> bool:
+    resource = result.get("resource")
+    if not isinstance(resource, dict):
+        return False
+    return result.get("result_type") == "action" and resource.get("type") == "automation_action"
 
 
 @router.get("/operations/{resource_type}/{resource_id}")

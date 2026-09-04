@@ -9,7 +9,7 @@ ReviewStatus = Literal["pending", "approved", "rejected", "dismissed"]
 ReviewExecutionView = Literal["running", "executed"]
 ReviewDecision = Literal["recommend", "review", "reject"]
 ActionStatus = Literal[
-    "queued", "leased", "succeeded", "failed", "blocked", "unknown", "cancelled"
+    "queued", "running", "leased", "succeeded", "failed", "blocked", "unknown", "cancelled"
 ]
 
 
@@ -106,9 +106,6 @@ class FineJobAutomationActionResponse(BaseModel):
     status: ActionStatus
     idempotency_key: str
     payload: dict[str, Any]
-    lease_owner: str | None = None
-    lease_expires_at: str | None = None
-    attempt_count: int
     last_error: str | None = None
     job_title: str
     company_name: str
@@ -117,31 +114,12 @@ class FineJobAutomationActionResponse(BaseModel):
     completed_at: str | None = None
     execution_state: str = "queued"
     execution_epoch: int = 0
-    queue_position: int = 0
-    page_open_attempts: int = 0
-    page_deadline_at: str | None = None
-    dispatch_started_at: str | None = None
-    request_accepted_at: str | None = None
-    verification_state: str = "not_required"
-    verification_method: str = "none"
-    verification_delay_seconds: int | None = None
-    verification_due_at: str | None = None
-    verification_started_at: str | None = None
-    verification_completed_at: str | None = None
-    verification_attempts: int = 0
-    cooldown_seconds: int | None = None
-    next_eligible_at: str | None = None
     last_status_code: str | None = None
     result: dict[str, Any] = Field(default_factory=dict)
-    navigation_task_id: str | None = None
 
 
 class FineJobAutomationActionEnvelope(BaseModel):
     action: FineJobAutomationActionResponse
-
-
-class FineJobOptionalAutomationActionEnvelope(BaseModel):
-    action: FineJobAutomationActionResponse | None = None
 
 
 class FineJobAutomationActionListEnvelope(BaseModel):
@@ -149,12 +127,3 @@ class FineJobAutomationActionListEnvelope(BaseModel):
     total: int
 
 
-class FineJobActionClaimRequest(BaseModel):
-    worker_id: str = Field(min_length=1, max_length=120)
-    lease_seconds: int = Field(default=60, ge=15, le=600)
-
-
-class FineJobActionCompleteRequest(BaseModel):
-    worker_id: str = Field(min_length=1, max_length=120)
-    status: Literal["succeeded", "failed", "blocked", "unknown"]
-    message: str = ""

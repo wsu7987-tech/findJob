@@ -6,17 +6,18 @@ from backend.app.db import Database
 from backend.app.dependencies import get_database
 from backend.app.errors import AppError
 from backend.app.schemas.fine_job.boss_executor import (
-    BossActionCompleteRequest,
-    BossDispatchStartedRequest,
     BossExecutorControlRequest,
     BossExecutorHeartbeatRequest,
     BossExecutorPairRequest,
     BossExecutorPairResponse,
-    BossManualVerifyUnknownRequest,
+    BossExecutorSettingsRequest,
     BossNavigationOpenRequest,
-    BossPageStatusRequest,
     BossPairingCodeResponse,
     BossReturnToReviewRequest,
+    BossTaskCompleteRequest,
+    BossTaskMatchRequest,
+    BossTestJobUpdateRequest,
+    BossTestTaskCreateRequest,
 )
 from backend.app.services.fine_job import boss_executor
 
@@ -39,25 +40,26 @@ def create_pairing_code(db: Database = Depends(get_database)):
 
 
 @router.post("/boss-executor/pair", response_model=BossExecutorPairResponse)
-def pair(payload: BossExecutorPairRequest, db: Database = Depends(get_database)):
-    return boss_executor.pair_executor(db, **payload.model_dump())
+async def pair(payload: BossExecutorPairRequest, db: Database = Depends(get_database)):
+    result = boss_executor.pair_executor(db, **payload.model_dump())
+    await boss_executor.broadcast_executor_state(db)
+    return result
 
 
 @router.post("/boss-executor/heartbeat")
-def heartbeat(
+async def heartbeat(
     payload: BossExecutorHeartbeatRequest,
     authorization: str = Header(default=""),
     db: Database = Depends(get_database),
 ):
     executor = _executor(db, authorization)
-    return boss_executor.heartbeat(db, str(executor["id"]), payload.model_dump())
+    result = boss_executor.heartbeat(db, str(executor["id"]), payload.model_dump())
+    await boss_executor.broadcast_executor_state(db)
+    return result
 
 
 @router.websocket("/boss-executor/channel")
-async def executor_channel(
-    websocket: WebSocket,
-    token: str = Query(default=""),
-):
+async def executor_channel(websocket: WebSocket, token: str = Query(default="")):
     db = websocket.app.state.db
     try:
         executor = boss_executor.authenticate_executor(db, token)
@@ -66,15 +68,29 @@ async def executor_channel(
         return
     await websocket.accept()
     executor_id = str(executor["id"])
-    await boss_executor.register_executor_channel(executor_id, websocket)
+    await boss_executor.register_executor_channel(db, executor_id, websocket)
     try:
         while True:
             message = await websocket.receive_json()
-            await boss_executor.handle_executor_channel_message(executor_id, message)
+            await boss_executor.handle_executor_channel_message(db, executor_id, message)
     except WebSocketDisconnect:
         pass
     finally:
-        await boss_executor.unregister_executor_channel(executor_id, websocket)
+        await boss_executor.unregister_executor_channel(db, executor_id, websocket)
+
+
+@router.websocket("/boss-executor/desktop-channel")
+async def desktop_channel(websocket: WebSocket):
+    db = websocket.app.state.db
+    await websocket.accept()
+    await boss_executor.register_desktop_channel(db, websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await boss_executor.unregister_desktop_channel(websocket)
 
 
 @router.get("/boss-executor/queue")
@@ -83,143 +99,116 @@ def queue(authorization: str = Header(default=""), db: Database = Depends(get_da
     return boss_executor.list_queue(db)
 
 
-@router.post("/boss-executor/actions/claim")
-def claim(authorization: str = Header(default=""), db: Database = Depends(get_database)):
+@router.post("/boss-executor/tasks/open-page")
+def open_task_page(authorization: str = Header(default=""), db: Database = Depends(get_database)):
     executor = _executor(db, authorization)
-    return {"action": boss_executor.claim_next_action(db, str(executor["id"]))}
+    return boss_executor.open_task_page(db, str(executor["id"]))
 
 
-@router.post("/boss-executor/actions/{action_id}/page-status")
-def page_status(
-    action_id: str,
-    payload: BossPageStatusRequest,
+@router.post("/boss-executor/tasks/{task_id}/matched")
+async def matched(
+    task_id: str,
+    payload: BossTaskMatchRequest,
     authorization: str = Header(default=""),
     db: Database = Depends(get_database),
 ):
     executor = _executor(db, authorization)
-    return {"action": boss_executor.report_page_status(db, str(executor["id"]), action_id, payload.model_dump())}
+    result = boss_executor.match_task(db, str(executor["id"]), task_id, payload.execution_epoch)
+    await boss_executor.notify_queue_changed(db)
+    return result
 
 
-@router.post("/boss-executor/actions/{action_id}/dispatch-started")
-def dispatch_started(
-    action_id: str,
-    payload: BossDispatchStartedRequest,
+@router.post("/boss-executor/tasks/{task_id}/complete")
+async def complete(
+    task_id: str,
+    payload: BossTaskCompleteRequest,
     authorization: str = Header(default=""),
     db: Database = Depends(get_database),
 ):
     executor = _executor(db, authorization)
-    return {"action": boss_executor.mark_dispatch_started(db, str(executor["id"]), action_id, payload.execution_epoch)}
+    result = boss_executor.complete_task(db, str(executor["id"]), task_id, payload.model_dump())
+    await boss_executor.notify_queue_changed(db)
+    return result
 
 
-@router.post("/boss-executor/actions/{action_id}/complete")
-def complete(
-    action_id: str,
-    payload: BossActionCompleteRequest,
-    authorization: str = Header(default=""),
+@router.get("/boss-executor/test-jobs")
+def test_jobs(db: Database = Depends(get_database)):
+    return boss_executor.list_test_jobs(db)
+
+
+@router.put("/boss-executor/test-jobs/{job_id}")
+def update_test_job(
+    job_id: str,
+    payload: BossTestJobUpdateRequest,
     db: Database = Depends(get_database),
 ):
-    executor = _executor(db, authorization)
-    return {"action": boss_executor.complete_executor_action(db, str(executor["id"]), action_id, payload.model_dump())}
+    return {"job": boss_executor.update_test_job(db, job_id, **payload.model_dump())}
+
+
+@router.post("/boss-executor/test-tasks")
+async def create_test_task(
+    payload: BossTestTaskCreateRequest,
+    db: Database = Depends(get_database),
+):
+    task = boss_executor.create_test_task(db, **payload.model_dump())
+    await boss_executor.notify_queue_changed(db)
+    return {"task": task}
 
 
 @router.post("/boss-executor/actions/{action_id}/return-to-review")
-def executor_return(
+async def executor_return(
     action_id: str,
     payload: BossReturnToReviewRequest,
     authorization: str = Header(default=""),
     db: Database = Depends(get_database),
 ):
     executor = _executor(db, authorization)
-    return {"action": boss_executor.return_to_review(db, action_id, reason=payload.reason, executor_id=str(executor["id"]))}
-
-
-@router.post("/boss-executor/actions/{action_id}/retry-failed")
-def retry_failed_action(
-    action_id: str,
-    authorization: str = Header(default=""),
-    db: Database = Depends(get_database),
-):
-    _executor(db, authorization)
-    return boss_executor.retry_failed_action(db, action_id)
-
-
-@router.post("/boss-executor/actions/{action_id}/cancel-failed")
-def cancel_failed_action(
-    action_id: str,
-    authorization: str = Header(default=""),
-    db: Database = Depends(get_database),
-):
-    _executor(db, authorization)
-    return boss_executor.cancel_failed_action(db, action_id)
-
-
-@router.post("/boss-executor/failed-actions/retry-all")
-def retry_all_failed_actions(
-    authorization: str = Header(default=""),
-    db: Database = Depends(get_database),
-):
-    _executor(db, authorization)
-    return boss_executor.retry_all_failed_actions(db)
-
-
-@router.post("/boss-executor/failed-actions/cancel-all")
-def cancel_all_failed_actions(
-    authorization: str = Header(default=""),
-    db: Database = Depends(get_database),
-):
-    _executor(db, authorization)
-    return boss_executor.cancel_all_failed_actions(db)
-
-
-@router.post("/boss-executor/actions/{action_id}/manual-verify")
-def executor_manual_verify(
-    action_id: str,
-    payload: BossManualVerifyUnknownRequest,
-    authorization: str = Header(default=""),
-    db: Database = Depends(get_database),
-):
-    _executor(db, authorization)
-    return {"action": boss_executor.manual_verify_unknown_action(
-        db, action_id, contacted=payload.contacted, note=payload.note,
-    )}
+    action = boss_executor.return_to_review(db, action_id, reason=payload.reason, executor_id=str(executor["id"]))
+    await boss_executor.notify_queue_changed(db)
+    return {"action": action}
 
 
 @router.post("/boss-executor/control")
-def control(
+async def control(
     payload: BossExecutorControlRequest,
     authorization: str = Header(default=""),
     db: Database = Depends(get_database),
 ):
     executor = _executor(db, authorization)
-    return boss_executor.set_control(db, str(executor["id"]), payload.command)
+    return await boss_executor.set_plugin_control(db, str(executor["id"]), payload.command)
 
 
 @router.get("/boss-executor/status")
 def status(db: Database = Depends(get_database)):
-    snapshot = boss_executor.executor_snapshot(db)
-    executor = snapshot.get("executor")
-    if isinstance(executor, dict):
-        boss_executor.sweep_page_timeout(db, str(executor["id"]))
-        snapshot = boss_executor.executor_snapshot(db, str(executor["id"]))
-    return snapshot
+    return boss_executor.executor_status(db)
 
 
 @router.post("/boss-executor/desktop-control")
-def desktop_control(
+async def desktop_control(
     payload: BossExecutorControlRequest,
     db: Database = Depends(get_database),
 ):
-    snapshot = boss_executor.executor_snapshot(db)
-    executor = snapshot.get("executor")
+    runtime = boss_executor.executor_status(db)
+    executor = runtime.get("executor")
     if not isinstance(executor, dict):
         raise AppError(409, "EXECUTOR_NOT_PAIRED", "尚未配对BOSS执行器。")
-    return boss_executor.set_control(db, str(executor["id"]), payload.command)
+    return await boss_executor.request_control(db, str(executor["id"]), payload.command)
+
+
+@router.patch("/boss-executor/settings")
+async def update_settings(
+    payload: BossExecutorSettingsRequest,
+    db: Database = Depends(get_database),
+):
+    result = boss_executor.update_executor_settings(db, payload.model_dump())
+    await boss_executor.notify_queue_changed(db)
+    return result
 
 
 @router.post("/boss-executor/desktop-heartbeat-test")
 async def desktop_heartbeat_test(db: Database = Depends(get_database)):
-    snapshot = boss_executor.executor_snapshot(db)
-    executor = snapshot.get("executor")
+    runtime = boss_executor.executor_status(db)
+    executor = runtime.get("executor")
     if not isinstance(executor, dict):
         raise AppError(409, "EXECUTOR_NOT_PAIRED", "尚未配对BOSS执行器。")
     return await boss_executor.request_heartbeat_test(db, str(executor["id"]))
@@ -227,8 +216,8 @@ async def desktop_heartbeat_test(db: Database = Depends(get_database)):
 
 @router.post("/boss-executor/desktop-disconnect")
 async def desktop_disconnect(db: Database = Depends(get_database)):
-    snapshot = boss_executor.executor_snapshot(db)
-    executor = snapshot.get("executor")
+    runtime = boss_executor.executor_status(db)
+    executor = runtime.get("executor")
     if not isinstance(executor, dict):
         raise AppError(409, "EXECUTOR_NOT_PAIRED", "尚未配对BOSS执行器。")
     return await boss_executor.disconnect_executor(db, str(executor["id"]))
@@ -245,7 +234,9 @@ async def disconnect(
 
 @router.post("/boss-navigation/open")
 def open_job(payload: BossNavigationOpenRequest, db: Database = Depends(get_database)):
-    return {"navigation": boss_executor.open_navigation(db, job_identifier=payload.job_id, source_context=payload.source_context)}
+    return {"navigation": boss_executor.open_navigation(
+        db, job_identifier=payload.job_id, source_context=payload.source_context
+    )}
 
 
 @router.get("/boss-navigation/{task_id}")
@@ -254,20 +245,11 @@ def navigation(task_id: str, db: Database = Depends(get_database)):
 
 
 @router.post("/automation-actions/{action_id}/return-to-review")
-def desktop_return(
+async def desktop_return(
     action_id: str,
     payload: BossReturnToReviewRequest,
     db: Database = Depends(get_database),
 ):
-    return {"action": boss_executor.return_to_review(db, action_id, reason=payload.reason)}
-
-
-@router.post("/automation-actions/{action_id}/manual-verify")
-def desktop_manual_verify(
-    action_id: str,
-    payload: BossManualVerifyUnknownRequest,
-    db: Database = Depends(get_database),
-):
-    return {"action": boss_executor.manual_verify_unknown_action(
-        db, action_id, contacted=payload.contacted, note=payload.note,
-    )}
+    action = boss_executor.return_to_review(db, action_id, reason=payload.reason)
+    await boss_executor.notify_queue_changed(db)
+    return {"action": action}

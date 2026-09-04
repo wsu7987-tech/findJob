@@ -1,51 +1,36 @@
-import type { BossReadOnlySnapshot } from "../platform/boss/types";
-
-export type ExecutorPermissionState =
-  | "not_authorized"
-  | "allowed"
-  | "paused"
-  | "risk_paused";
-export type ExecutorQueueState = "running" | "paused" | "emergency_stopped" | "risk_paused";
+export type ExecutorQueueState = "running" | "paused" | "risk_paused";
 
 export type FineJobQueueAction = {
   id: string;
   job_id: string;
   review_item_id: string;
-  action_type: "BOSS_DEFAULT_GREETING";
+  action_type: string;
+  task_type: "BOSS_DEFAULT_GREETING" | "TEST_DELAY";
   status: string;
   execution_state: string;
   execution_epoch: number;
-  queue_position: number;
-  page_open_attempts: number;
-  page_deadline_at?: string | null;
-  request_accepted_at?: string | null;
-  verification_state: "not_required" | "waiting_refresh" | "refreshing" | "waiting_snapshot" | "page_confirmed" | "manual_confirmed" | "pending" | "chat_confirmed";
-  verification_method: "none" | "page_refresh" | "manual" | "chat";
-  verification_delay_seconds?: number | null;
-  verification_due_at?: string | null;
-  verification_started_at?: string | null;
-  verification_completed_at?: string | null;
-  verification_attempts: number;
   job_title: string;
   company_name: string;
   encrypt_job_id: string;
   last_status_code?: string | null;
   last_error?: string | null;
+  close_page_after_completion: boolean;
+  delay_seconds: number;
 };
 
 export type FineJobExecutorInstance = {
   id: string;
   plugin_version: string;
   protocol_version: string;
-  permission_state: ExecutorPermissionState;
   queue_state: ExecutorQueueState;
   risk_state: string;
   browser_connected: boolean;
-  current_action_id?: string | null;
-  current_epoch?: number | null;
-  cooldown_seconds?: number | null;
-  next_eligible_at?: string | null;
   last_heartbeat_at?: string | null;
+  task_cooldown_max_seconds: number;
+  page_load_wait_max_seconds: number;
+  runtime_phase?: "idle" | "task_cooldown";
+  runtime_detail?: string;
+  runtime_until_at?: string | null;
 };
 
 export type ExecutorRuntimeState = {
@@ -54,8 +39,6 @@ export type ExecutorRuntimeState = {
   detail: string;
   executor: FineJobExecutorInstance | null;
   queue: FineJobQueueAction[];
-  failedQueue: FineJobQueueAction[];
-  currentAction: FineJobQueueAction | null;
   lastResult: string;
   chat?: BossChatCoordinatorStatus;
 };
@@ -73,9 +56,14 @@ export type BossChatCoordinatorStatus = {
 
 export type DefaultGreetingCommand = {
   type: "BOSS_DEFAULT_GREETING";
-  actionId: string;
+  taskId: string;
   executionEpoch: number;
   encryptJobId: string;
+  targetTabId?: string;
+};
+
+export type BossPageProbeCommand = {
+  type: "BOSS_PAGE_PROBE";
 };
 
 export type ChatObservedMessage = {
@@ -133,7 +121,7 @@ export type ChatSendCommand = {
   action: FineJobChatSendAction;
 };
 
-export type MainWorldCommand = DefaultGreetingCommand | ChatSendCommand;
+export type MainWorldCommand = DefaultGreetingCommand | ChatSendCommand | BossPageProbeCommand;
 
 export type ChatSendExecutionResult = {
   actionId: string;
@@ -147,7 +135,7 @@ export type ChatSendExecutionResult = {
 };
 
 export type MainWorldExecutionResult = {
-  actionId: string;
+  taskId: string;
   executionEpoch: number;
   outcome: "accepted" | "succeeded" | "failed" | "unknown";
   contacted: boolean | null;
@@ -160,15 +148,5 @@ export type ExecutorPanelController = {
   pair(code: string): Promise<void>;
   testHeartbeat(): Promise<void>;
   disconnect(): Promise<void>;
-  control(command: "allow" | "pause" | "resume" | "emergency_stop"): Promise<void>;
-  returnToReview(actionId: string): Promise<void>;
-  retryFailedAction(actionId: string): Promise<void>;
-  cancelFailedAction(actionId: string): Promise<void>;
-  retryAllFailed(): Promise<void>;
-  cancelAllFailed(): Promise<void>;
+  control(command: "start" | "pause"): Promise<void>;
 };
-
-export type SnapshotReport = Pick<
-  BossReadOnlySnapshot,
-  "state" | "loggedIn" | "pageKind" | "job" | "reason"
->;
