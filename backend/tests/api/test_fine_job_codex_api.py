@@ -37,6 +37,12 @@ def test_internal_runtime_handshake_and_capabilities() -> None:
         from backend.app.services.fine_job.codex_tools import CORE_TOOLS
 
         assert len(registered_tools) == len(CORE_TOOLS)
+        assert "finejob.get_job_hunt_refresh_run" in registered_tools
+        assert "finejob.list_job_hunt_refresh_items" in registered_tools
+        assert "finejob.refresh_job_hunt_chat_list" not in registered_tools
+        assert "finejob.refresh_job_hunt_chat_messages" in registered_tools
+        assert "finejob.refresh_job_hunt_related_job" in registered_tools
+        assert "finejob.complete_job_hunt_refresh_run" in registered_tools
         assert "finejob.set_company_type" in registered_tools
         assert "finejob.record_job_application" in registered_tools
         assert "finejob.list_job_strategies" in registered_tools

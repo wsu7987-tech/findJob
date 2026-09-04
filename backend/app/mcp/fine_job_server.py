@@ -139,6 +139,36 @@ async def get_capabilities() -> dict[str, Any]:
     return await _invoke("get_capabilities", {})
 
 
+@server.tool(name="finejob.get_job_hunt_refresh_run", structured_output=True)
+async def get_job_hunt_refresh_run(run_id: str) -> dict[str, Any]:
+    """读取持久化的求职数据更新 Run、工作流选项、进度和摘要。"""
+    return await _invoke("get_job_hunt_refresh_run", locals())
+
+
+@server.tool(name="finejob.list_job_hunt_refresh_items", structured_output=True)
+async def list_job_hunt_refresh_items(run_id: str, item_type: str) -> dict[str, Any]:
+    """读取指定步骤中未完成、中断遗留或可重试的 Run Item。"""
+    return await _invoke("list_job_hunt_refresh_items", locals())
+
+
+@server.tool(name="finejob.refresh_job_hunt_chat_messages", structured_output=True)
+async def refresh_job_hunt_chat_messages(run_id: str, item_id: str) -> dict[str, Any]:
+    """在 Run 时间范围内更新一个持久化聊天会话项。"""
+    return await _invoke("refresh_job_hunt_chat_messages", locals())
+
+
+@server.tool(name="finejob.refresh_job_hunt_related_job", structured_output=True)
+async def refresh_job_hunt_related_job(run_id: str, item_id: str) -> dict[str, Any]:
+    """通过现有关联和详情流程采集或刷新一个岗位项。"""
+    return await _invoke("refresh_job_hunt_related_job", locals())
+
+
+@server.tool(name="finejob.complete_job_hunt_refresh_run", structured_output=True)
+async def complete_job_hunt_refresh_run(run_id: str) -> dict[str, Any]:
+    """在当前批次 Item 完成后持久化 Run 最终状态和摘要。"""
+    return await _invoke("complete_job_hunt_refresh_run", locals())
+
+
 @server.tool(name="finejob.search_jobs", structured_output=True)
 async def search_jobs(
     query: str = "",

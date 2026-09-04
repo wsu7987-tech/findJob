@@ -130,6 +130,7 @@ def test_refresh_friend_list_saves_identity_and_detects_latest_message_change(co
     assert first["count"] == 1
     assert first["created_count"] == 1
     assert first["changed_count"] == 0
+    assert first["created_session_ids"] == first["session_ids"]
 
     session = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]
     assert session["encrypt_peer_uid"] == "enc-peer-200"
@@ -151,6 +152,8 @@ def test_refresh_friend_list_saves_identity_and_detects_latest_message_change(co
     assert second["count"] == 1
     assert second["created_count"] == 0
     assert second["changed_count"] == 1
+    assert second["created_session_ids"] == []
+    assert second["session_ids"] == first["session_ids"]
     updated = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]
     assert updated["latest_platform_msg_id"] == "1002"
     assert updated["message_update_required"] is True

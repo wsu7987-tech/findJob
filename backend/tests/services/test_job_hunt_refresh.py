@@ -1,0 +1,438 @@
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+
+from backend.app.db import Database
+from backend.app.services.fine_job import job_hunt_refresh
+from backend.app.services.fine_job.boss_capture_history import (
+    create_capture_batch,
+    record_capture_jobs,
+    update_capture_job_detail,
+)
+from backend.app.utils import new_id
+
+
+def _insert_session(
+    db: Database,
+    *,
+    session_id: str,
+    peer_uid: str,
+    changed_at: str,
+    encrypt_job_id: str = "",
+) -> None:
+    with db.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO fj_chat_sessions (
+              id, account_uid, peer_uid, encrypt_peer_uid, security_id,
+              encrypt_job_id, platform_latest_message_at, status, created_at, updated_at
+            ) VALUES (?, 'candidate', ?, ?, ?, ?, ?, 'human_takeover', ?, ?)
+            """,
+            (
+                session_id,
+                peer_uid,
+                f"encrypt-{peer_uid}",
+                f"security-{peer_uid}",
+                encrypt_job_id,
+                changed_at,
+                changed_at,
+                changed_at,
+            ),
+        )
+
+
+def _options(**changes: bool) -> dict[str, bool]:
+    options = {
+        "refresh_chat_list": False,
+        "refresh_chat_messages": True,
+        "refresh_related_jobs": True,
+    }
+    options.update(changes)
+    return options
+
+
+def _insert_scope(
+    db: Database,
+    session_ids: list[str],
+    *,
+    include_job_items: bool = False,
+) -> str:
+    scope_id = new_id()
+    now = "2026-09-05T03:00:00Z"
+    with db.connect() as connection:
+        relations = []
+        for session_id in session_ids:
+            session = dict(connection.execute(
+                "SELECT * FROM fj_chat_sessions WHERE id = ?", (session_id,)
+            ).fetchone())
+            identity, job = job_hunt_refresh._related_job_identity(connection, session)
+            if identity:
+                relations.append({
+                    "entity_id": identity,
+                    "session_id": session_id,
+                    "job_id": str(job["id"]) if job else None,
+                    "encrypt_job_id": str(session.get("encrypt_job_id") or "") or None,
+                })
+        jobs_to_collect = relations if include_job_items else []
+        counts = {
+            "refreshed_sessions": len(session_ids),
+            "sessions_to_sync": len(session_ids),
+            "new_sessions_to_sync": 0,
+            "related_jobs": len(relations),
+            "jobs_to_collect": len(jobs_to_collect),
+            "jobs_missing_jd": 0,
+            "jobs_missing_evaluation": 0,
+            "unresolved_relations": len(session_ids) - len(relations),
+        }
+        connection.execute(
+            """
+            INSERT INTO fj_job_hunt_refresh_scopes (
+              id, selected_since_time, account_uid, source_url,
+              friend_list_synced_at, scope_generated_at, session_ids_json,
+              new_session_ids_json, related_jobs_json, jobs_to_collect_json,
+              jobs_missing_jd_json, jobs_missing_evaluation_json,
+              unresolved_session_ids_json, counts_json, friend_list_result_json,
+              created_at
+            ) VALUES (?, '2026-09-04T00:00:00Z', 'candidate', 'test', ?, ?, ?, '[]', ?, ?,
+                      '[]', '[]', '[]', ?, '{}', ?)
+            """,
+            (
+                scope_id,
+                now,
+                now,
+                json.dumps(session_ids),
+                json.dumps(relations),
+                json.dumps(jobs_to_collect),
+                json.dumps(counts),
+                now,
+            ),
+        )
+    return scope_id
+
+
+def test_scope_discovery_uses_friend_refresh_result_and_selected_platform_time(
+    test_db: Database,
+    monkeypatch,
+) -> None:
+    _insert_session(
+        test_db,
+        session_id="existing-session",
+        peer_uid="existing-peer",
+        changed_at="2026-09-05T02:00:00Z",
+        encrypt_job_id="existing-job",
+    )
+    with test_db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_chat_sessions SET platform_latest_msg_id = 'existing-latest' WHERE id = 'existing-session'"
+        )
+    recent_ms = int(datetime(2026, 9, 5, 2, tzinfo=UTC).timestamp() * 1_000)
+    old_ms = int(datetime(2026, 9, 1, 2, tzinfo=UTC).timestamp() * 1_000)
+    response = {"zpData": {"result": [
+        {
+            "uid": "existing-peer", "encryptFriendId": "encrypt-existing-peer",
+            "securityId": "security-existing-peer", "encryptJobId": "existing-job",
+            "lastMessageInfo": {"msgId": "existing-latest", "msgTime": recent_ms},
+        },
+        {
+            "uid": "new-peer", "encryptFriendId": "encrypt-new-peer",
+            "securityId": "security-new-peer", "encryptJobId": "new-job",
+            "lastMessageInfo": {"msgId": "new-latest", "msgTime": recent_ms},
+        },
+        {
+            "uid": "old-peer", "encryptFriendId": "encrypt-old-peer",
+            "securityId": "security-old-peer", "encryptJobId": "old-job",
+            "lastMessageInfo": {"msgId": "old-latest", "msgTime": old_ms},
+        },
+    ]}}
+    monkeypatch.setattr(
+        job_hunt_refresh.boss_scraper_service,
+        "capture_chat_friend_list",
+        lambda: {"account_uid": "candidate", "response": response, "url": "test"},
+    )
+    table_names = (
+        "fj_chat_messages",
+        "fj_boss_jobs",
+        "fj_job_activity_events",
+        "fj_job_pipeline_snapshots",
+        "fj_job_hunt_refresh_runs",
+        "fj_job_hunt_refresh_items",
+    )
+    with test_db.connect() as connection:
+        before = {
+            table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in table_names
+        }
+
+    result = job_hunt_refresh.discover_scope(test_db, "2026-09-04T00:00:00Z")
+
+    with test_db.connect() as connection:
+        after = {
+            table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in table_names
+        }
+    assert result["counts"]["sessions_to_sync"] == 2
+    assert result["counts"]["new_sessions_to_sync"] == 1
+    assert result["session_ids_to_sync"][0] == "existing-session"
+    assert "old-peer" not in result["session_ids_to_sync"]
+    assert len(result["new_session_ids"]) == 2
+    assert before == after
+
+
+def test_run_and_items_survive_database_reinitialization_and_skip_succeeded(
+    test_db: Database,
+) -> None:
+    for index in range(2):
+        _insert_session(
+            test_db,
+            session_id=f"session-{index}",
+            peer_uid=f"peer-{index}",
+            changed_at="2026-09-05T02:00:00Z",
+        )
+    scope_id = _insert_scope(test_db, ["session-0", "session-1"])
+    run = job_hunt_refresh.create_run(
+        test_db,
+        scope_id=scope_id,
+        workflow_options=_options(refresh_related_jobs=False),
+    )
+    succeeded_id = str(run["items"][0]["id"])
+    with test_db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_job_hunt_refresh_items
+            SET status = 'succeeded', retryable = 0, completed_at = updated_at
+            WHERE id = ?
+            """,
+            (succeeded_id,),
+        )
+
+    reopened = Database(test_db.sqlite_path)
+    reopened.initialize()
+    persisted = job_hunt_refresh.get_run(reopened, str(run["id"]))
+    actionable = job_hunt_refresh.list_actionable_items(
+        reopened,
+        str(run["id"]),
+        item_type="chat_session",
+    )
+
+    assert len(persisted["items"]) == 2
+    assert len(actionable) == 1
+    assert actionable[0]["id"] != succeeded_id
+
+
+def test_run_items_are_copied_from_scope_without_recalculating_database(
+    test_db: Database,
+) -> None:
+    _insert_session(
+        test_db,
+        session_id="scope-session",
+        peer_uid="scope-peer",
+        changed_at="2026-09-05T02:00:00Z",
+    )
+    scope_id = _insert_scope(test_db, ["scope-session"])
+    _insert_session(
+        test_db,
+        session_id="later-session",
+        peer_uid="later-peer",
+        changed_at="2026-09-05T02:30:00Z",
+    )
+
+    run = job_hunt_refresh.create_run(
+        test_db,
+        scope_id=scope_id,
+        workflow_options=_options(refresh_related_jobs=False),
+    )
+
+    assert run["scope_id"] == scope_id
+    assert run["scope_generated_at"] == "2026-09-05T03:00:00Z"
+    assert [item["session_id"] for item in run["items"]] == ["scope-session"]
+
+
+def test_completed_with_errors_can_resume_only_retryable_items(test_db: Database) -> None:
+    for index in range(2):
+        _insert_session(
+            test_db,
+            session_id=f"retry-session-{index}",
+            peer_uid=f"retry-peer-{index}",
+            changed_at="2026-09-05T02:00:00Z",
+        )
+    scope_id = _insert_scope(test_db, ["retry-session-0", "retry-session-1"])
+    run = job_hunt_refresh.create_run(
+        test_db,
+        scope_id=scope_id,
+        workflow_options=_options(refresh_related_jobs=False),
+    )
+    succeeded_id = str(run["items"][0]["id"])
+    failed_id = str(run["items"][1]["id"])
+    with test_db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_job_hunt_refresh_items SET status = 'succeeded', retryable = 0 WHERE id = ?",
+            (succeeded_id,),
+        )
+        connection.execute(
+            "UPDATE fj_job_hunt_refresh_items SET status = 'failed', retryable = 1 WHERE id = ?",
+            (failed_id,),
+        )
+
+    completed = job_hunt_refresh.complete_run(test_db, str(run["id"]))
+    resumed = job_hunt_refresh.attach_codex_session(
+        test_db,
+        str(run["id"]),
+        "codex-resume-1",
+    )
+    actionable = job_hunt_refresh.list_actionable_items(
+        test_db,
+        str(run["id"]),
+        item_type="chat_session",
+    )
+
+    assert completed["status"] == "completed_with_errors"
+    assert completed["resume_available"] is True
+    assert resumed["status"] == "running"
+    assert [item["id"] for item in actionable] == [failed_id]
+
+
+def test_message_refresh_writes_only_messages_at_or_after_selected_since(
+    test_db: Database,
+    monkeypatch,
+) -> None:
+    _insert_session(
+        test_db,
+        session_id="scoped-session",
+        peer_uid="scoped-peer",
+        changed_at="2026-09-05T02:00:00Z",
+    )
+    old_time = int(datetime(2026, 9, 3, tzinfo=UTC).timestamp() * 1_000)
+    new_time = int(datetime(2026, 9, 5, tzinfo=UTC).timestamp() * 1_000)
+
+    def capture_chat_history(**_kwargs):
+        return {
+            "messages": [
+                {
+                    "mid": "old-message",
+                    "time": old_time,
+                    "from": {"uid": "scoped-peer"},
+                    "to": {"uid": "candidate"},
+                    "body": {"type": 1, "text": "旧消息"},
+                },
+                {
+                    "mid": "new-message",
+                    "time": new_time,
+                    "from": {"uid": "scoped-peer"},
+                    "to": {"uid": "candidate"},
+                    "body": {"type": 1, "text": "新消息"},
+                },
+            ],
+            "has_more": False,
+            "next_cursor": "",
+        }
+
+    monkeypatch.setattr(
+        job_hunt_refresh.boss_scraper_service,
+        "capture_chat_history",
+        capture_chat_history,
+    )
+    scope_id = _insert_scope(test_db, ["scoped-session"])
+    run = job_hunt_refresh.create_run(
+        test_db,
+        scope_id=scope_id,
+        workflow_options=_options(refresh_related_jobs=False),
+    )
+    item_id = str(run["items"][0]["id"])
+
+    first = job_hunt_refresh.refresh_chat_messages(test_db, str(run["id"]), item_id)
+    second = job_hunt_refresh.refresh_chat_messages(test_db, str(run["id"]), item_id)
+
+    with test_db.connect() as connection:
+        messages = connection.execute(
+            "SELECT platform_message_id FROM fj_chat_messages ORDER BY platform_message_id"
+        ).fetchall()
+    assert first["item"]["result"]["inserted_count"] == 1
+    assert second["reused"] is True
+    assert [row["platform_message_id"] for row in messages] == ["new-message"]
+
+
+def test_related_job_refresh_reuses_existing_session_job_flow(test_db: Database) -> None:
+    create_capture_batch(
+        test_db,
+        capture_id="capture-related",
+        keyword="聊天岗位补录",
+        city="",
+        pages=1,
+        auto_details=False,
+        created_at="2026-09-05T01:00:00Z",
+    )
+    recorded = record_capture_jobs(
+        test_db,
+        capture_id="capture-related",
+        search_keyword="聊天岗位补录",
+        jobs=[{
+            "job_id": "source-related",
+            "encrypt_job_id": "encrypt-related-job",
+            "title": "后端工程师",
+            "boss_name": "示例公司",
+            "salary": "20-30K",
+            "location": "上海",
+        }],
+        collected_at="2026-09-05T01:00:00Z",
+    )[0]
+    update_capture_job_detail(
+        test_db,
+        job={"history_record_id": recorded["history_record_id"]},
+        detail={
+            "title": "后端工程师",
+            "company_name": "示例公司",
+            "salary": "20-30K",
+            "location": "上海",
+            "description": "负责后端服务开发。",
+        },
+        status="completed",
+    )
+    _insert_session(
+        test_db,
+        session_id="related-session",
+        peer_uid="related-peer",
+        changed_at="2026-09-05T02:00:00Z",
+        encrypt_job_id="encrypt-related-job",
+    )
+    scope_id = _insert_scope(test_db, ["related-session"], include_job_items=True)
+    run = job_hunt_refresh.create_run(
+        test_db,
+        scope_id=scope_id,
+        workflow_options=_options(refresh_chat_messages=False),
+    )
+    item_id = str(run["items"][0]["id"])
+
+    result = job_hunt_refresh.refresh_related_job(
+        test_db,
+        object(),  # 已完成岗位不会启动详情任务，因此不会读取 AppConfig。
+        str(run["id"]),
+        item_id,
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["item"]["job_id"] == recorded["history_record_id"]
+    assert result["item"]["result"]["outcome"] == "reused"
+
+
+def test_unresolved_job_relation_stays_in_scope_summary_without_job_item(
+    test_db: Database,
+) -> None:
+    _insert_session(
+        test_db,
+        session_id="unresolved-session",
+        peer_uid="unresolved-peer",
+        changed_at="2026-09-05T02:00:00Z",
+    )
+    scope_id = _insert_scope(test_db, ["unresolved-session"])
+    run = job_hunt_refresh.create_run(
+        test_db,
+        scope_id=scope_id,
+        workflow_options=_options(refresh_chat_messages=False),
+    )
+
+    with test_db.connect() as connection:
+        job_count = connection.execute("SELECT COUNT(*) FROM fj_boss_jobs").fetchone()[0]
+    assert run["items"] == []
+    assert run["summary"]["unresolved_jobs"] == 1
+    assert job_count == 0

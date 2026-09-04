@@ -152,6 +152,20 @@ uv run python -m backend.app.services.fine_job.boss_scraper.boss_cdp_raw --keywo
 实现和限制见《自动代聊功能具体执行方案.md》，扩展安装与验证见
 《boss-executor-extension/README.md》。
 
+## 求职数据更新（阶段 2A）
+
+桌面端“求职数据更新”先按用户选择时间执行 Refresh Scope Discovery。该步骤复用现有
+`capture_chat_friend_list → sync_friend_list`，用刷新后的 `platform_latest_message_at`、
+本次新建 Session 标识、`message_update_required` 和本地最新消息去重状态确定待同步会话，
+并把会话、关联岗位、待采集岗位、缺失 JD 和缺失评估保存为固定 Scope Snapshot。
+页面显示 Scope 生成时间；超过 30 分钟会提示范围可能已变旧，继续执行仍使用原固定 Scope。
+
+用户确认后，页面以 `scope_id` 创建持久化 Refresh Run。Run Item 只从 Scope 复制，Codex/MCP
+从聊天历史同步开始，继续复用 `sync_history_messages`、`prepare_chat_job` 和现有岗位详情采集流程。
+Run 与 Item 状态可在页面关闭、Codex 中断或应用重启后恢复；恢复时只返回未完成和可重试 Item。
+页面在 Run 运行期间每 2 秒读取持久化进度，进入终态或离开页面后停止。阶段 2A 不执行会话洞察、
+AI 状态判断、投递建议生成、AI Reply 或自动发送。
+
 ## 当前状态
 
 当前已完成求职资料 V2 主链路：
@@ -172,3 +186,4 @@ uv run python -m backend.app.services.fine_job.boss_scraper.boss_cdp_raw --keywo
 - `求职资料功能重构方案.md`
 - `Codex与FineJob业务能力集成执行方案.md`
 - `自动代聊功能具体执行方案.md`
+- `阶段二-a.md`

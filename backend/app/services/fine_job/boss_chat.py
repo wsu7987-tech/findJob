@@ -332,6 +332,8 @@ def sync_friend_list(
     created_count = 0
     changed_count = 0
     synced_count = 0
+    synced_session_ids: list[str] = []
+    created_session_ids: list[str] = []
     synced_at = _now()
     with db.connect() as connection:
         # 保存 BOSS 原始数组位置，列表展示和批量队列共用这个顺序。
@@ -428,6 +430,8 @@ def sync_friend_list(
                     ),
                 )
                 created_count += 1
+                synced_session_ids.append(session_id)
+                created_session_ids.append(session_id)
                 continue
 
             next_status = (
@@ -493,6 +497,7 @@ def sync_friend_list(
                     existing["id"],
                 ),
             )
+            synced_session_ids.append(str(existing["id"]))
         return {
             "account_uid": account_uid,
             "count": synced_count,
@@ -500,6 +505,9 @@ def sync_friend_list(
             "changed_count": changed_count,
             "source_url": source_url,
             "synced_at": synced_at,
+            # Scope Discovery 使用本次同步的稳定标识识别新会话和本批会话。
+            "session_ids": synced_session_ids,
+            "created_session_ids": created_session_ids,
         }
 
 

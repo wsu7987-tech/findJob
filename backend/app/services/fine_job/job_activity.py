@@ -246,6 +246,54 @@ def replay_job_pipeline(db: Database, job_id: str) -> dict[str, Any] | None:
         return project_job_pipeline(connection, job_id)
 
 
+def reconcile_chat_session_activity(db: Database, session_id: str) -> int:
+    """在会话完成岗位关联后补齐消息事实，并重放该岗位的 Pipeline。"""
+    created = 0
+    with db.connect() as connection:
+        session = connection.execute(
+            "SELECT job_id FROM fj_chat_sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if session is None or not session["job_id"]:
+            return 0
+        job_id = str(session["job_id"])
+        messages = connection.execute(
+            """
+            SELECT id, direction, sent_at, platform_message_id, source
+            FROM fj_chat_messages
+            WHERE session_id = ?
+              AND NOT (source = 'assistant' AND platform_message_id LIKE 'assistant:%')
+            ORDER BY sent_at, rowid
+            """,
+            (session_id,),
+        ).fetchall()
+        for message in messages:
+            event_type = (
+                "recruiter_replied"
+                if message["direction"] == "inbound"
+                else "candidate_replied"
+            )
+            _activity, inserted = append_job_activity_with_connection(
+                connection,
+                job_id=job_id,
+                chat_session_id=session_id,
+                event_type=event_type,
+                occurred_at=str(message["sent_at"]),
+                source="chat",
+                source_ref_type="chat_message",
+                source_ref_id=str(message["id"]),
+                evidence_level="direct",
+                payload={
+                    "direction": str(message["direction"]),
+                    "platform_message_id": str(message["platform_message_id"]),
+                },
+                dedupe_key=f"chat_message:{message['id']}:{event_type}",
+            )
+            created += int(inserted)
+        project_job_pipeline(connection, job_id)
+    return created
+
+
 def migrate_legacy_job_activity(connection: sqlite3.Connection) -> None:
     # 所有已保存岗位都具有直接的“发现岗位”原始事实。
     for job in connection.execute(

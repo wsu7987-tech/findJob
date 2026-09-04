@@ -56,6 +56,25 @@ description: 通过 FineJob MCP 编排可组合的求职业务节点，完成岗
 4. 使用当前 `session_version` 与 `latest_message_id` 保存草稿。
 5. 用户目标包含真实发送时，再使用草稿文本版本和最新会话版本请求受控发送。
 
+## Job Hunt Refresh Workflow
+
+页面提交求职数据更新任务时，输入只包含已经持久化的 `run_id`。严格执行以下顺序：
+
+1. 调用 `finejob.get_job_hunt_refresh_run`，读取 `scope_id`、`selected_since_time`、`workflow_options`、当前状态和已完成进度。聊天列表已经在 Scope Discovery 阶段同步完成。
+2. 仅当 `refresh_chat_messages=true` 时，调用 `finejob.list_job_hunt_refresh_items(item_type="chat_session")`。按返回顺序对每个 item 调用 `finejob.refresh_job_hunt_chat_messages`；单项失败时记录结果并继续下一项。
+3. 仅当 `refresh_related_jobs=true` 时，调用 `finejob.list_job_hunt_refresh_items(item_type="related_job")`。按返回顺序调用 `finejob.refresh_job_hunt_related_job`。返回非终态 `capture_task` 时，用 `finejob.get_operation_status` 读取权威状态；任务结束后再次调用原岗位 item 工具完成持久化。应用重启后旧任务状态不可读取时，直接再次调用原岗位 item 工具，由 Service 根据持久化岗位状态恢复，再继续下一项。
+4. 当前批次全部处理后调用 `finejob.complete_job_hunt_refresh_run`，再读取一次 Run 并汇总。
+
+恢复同一个 `run_id` 时，列表工具只返回 `pending`、中断遗留的 `running` 和可重试的 `failed` item。不得重新执行 `succeeded` 或不可重试的 `skipped` item。
+
+工作流约束：
+
+- 不修改 `selected_since_time`，不扩大 Run 中已保存的处理范围。
+- 不执行用户未勾选的工作流。
+- 不直接读写数据库；会话去重、消息去重、岗位关联和 JD 写入均交给 FineJob Service。
+- 单个会话或岗位失败后继续处理其他 item，最终由 Run 汇总为完成或部分失败。
+- 不启动 Conversation Insight、AI 状态判断、投递建议生成、AI Reply 或任何自动发送。
+
 ## 边界
 
 - 调用 `finejob.get_capabilities` 返回的已注册工具，不复制 FineJob 已有采集、筛选、评估或路由逻辑。

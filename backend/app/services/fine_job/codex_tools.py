@@ -55,11 +55,17 @@ from backend.app.services.fine_job.filter_exclusions import (
     record_job_event,
 )
 from backend.app.services.fine_job.job_applications import set_job_application
+from backend.app.services.fine_job import job_hunt_refresh
 from backend.app.utils import new_id, utc_now
 
 
 CORE_TOOLS = (
     "finejob.get_capabilities",
+    "finejob.get_job_hunt_refresh_run",
+    "finejob.list_job_hunt_refresh_items",
+    "finejob.refresh_job_hunt_chat_messages",
+    "finejob.refresh_job_hunt_related_job",
+    "finejob.complete_job_hunt_refresh_run",
     "finejob.search_jobs",
     "finejob.list_companies",
     "finejob.set_company_type",
@@ -149,6 +155,11 @@ class CodexToolService:
         self.config = config
         self._handlers: dict[str, Callable[[dict[str, Any]], dict[str, object]]] = {
             "finejob.get_capabilities": self.get_capabilities,
+            "finejob.get_job_hunt_refresh_run": self.get_job_hunt_refresh_run,
+            "finejob.list_job_hunt_refresh_items": self.list_job_hunt_refresh_items,
+            "finejob.refresh_job_hunt_chat_messages": self.refresh_job_hunt_chat_messages,
+            "finejob.refresh_job_hunt_related_job": self.refresh_job_hunt_related_job,
+            "finejob.complete_job_hunt_refresh_run": self.complete_job_hunt_refresh_run,
             "finejob.list_job_strategies": self.list_job_strategies,
             "finejob.get_job_evaluation_context": self.get_job_evaluation_context,
             "finejob.start_job_capture": self.start_job_capture,
@@ -209,7 +220,7 @@ class CodexToolService:
         data = {
             "mcp_contract_version": "v1",
             "finejob_internal_api_version": "v1",
-            "finejob_capabilities_version": "v2",
+            "finejob_capabilities_version": "v3",
             "registered_tools": list(CORE_TOOLS),
             "runtime": {
                 "boss_browser_running": bool(browser.running),
@@ -229,6 +240,78 @@ class CodexToolService:
             },
         }
         return _result(result_type="data", status="succeeded", data=data)
+
+    def get_job_hunt_refresh_run(self, arguments: dict[str, Any]) -> dict[str, object]:
+        run_id = str(arguments.get("run_id") or "").strip()
+        run = job_hunt_refresh.get_run(self.db, run_id)
+        return _result(
+            result_type="data",
+            status=str(run["status"]),
+            resource=_resource("job_hunt_refresh_run", run_id),
+            data=run,
+            terminal=str(run["status"]) in job_hunt_refresh.TERMINAL_RUN_STATUSES,
+        )
+
+    def list_job_hunt_refresh_items(self, arguments: dict[str, Any]) -> dict[str, object]:
+        run_id = str(arguments.get("run_id") or "").strip()
+        item_type = str(arguments.get("item_type") or "").strip()
+        items = job_hunt_refresh.list_actionable_items(
+            self.db,
+            run_id,
+            item_type=item_type,
+        )
+        return _result(
+            result_type="data",
+            status="succeeded",
+            resource=_resource("job_hunt_refresh_run", run_id),
+            data={"run_id": run_id, "item_type": item_type, "items": items},
+        )
+
+    def refresh_job_hunt_chat_messages(self, arguments: dict[str, Any]) -> dict[str, object]:
+        run_id = str(arguments.get("run_id") or "").strip()
+        item_id = str(arguments.get("item_id") or "").strip()
+        data = job_hunt_refresh.refresh_chat_messages(self.db, run_id, item_id)
+        return _result(
+            result_type="data",
+            status=str(data["status"]),
+            resource=_resource("job_hunt_refresh_item", item_id),
+            data=data,
+            terminal=bool(data["terminal"]),
+        )
+
+    def refresh_job_hunt_related_job(self, arguments: dict[str, Any]) -> dict[str, object]:
+        run_id = str(arguments.get("run_id") or "").strip()
+        item_id = str(arguments.get("item_id") or "").strip()
+        data = job_hunt_refresh.refresh_related_job(
+            self.db,
+            self.config,
+            run_id,
+            item_id,
+        )
+        operation = data.get("operation")
+        resource = (
+            _resource(str(operation["type"]), str(operation["id"]))
+            if isinstance(operation, dict)
+            else _resource("job_hunt_refresh_item", item_id)
+        )
+        return _result(
+            result_type="task" if not data["terminal"] else "data",
+            status=str(data["status"]),
+            resource=resource,
+            data=data,
+            terminal=bool(data["terminal"]),
+        )
+
+    def complete_job_hunt_refresh_run(self, arguments: dict[str, Any]) -> dict[str, object]:
+        run_id = str(arguments.get("run_id") or "").strip()
+        run = job_hunt_refresh.complete_run(self.db, run_id)
+        return _result(
+            result_type="data",
+            status=str(run["status"]),
+            resource=_resource("job_hunt_refresh_run", run_id),
+            data=run,
+            terminal=True,
+        )
 
     def list_companies(self, arguments: dict[str, Any]) -> dict[str, object]:
         data = companies.list_companies(

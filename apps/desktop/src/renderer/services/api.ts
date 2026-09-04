@@ -70,6 +70,11 @@
   FineJobChatBatchSummary,
   FineJobChatBatchTask,
   FineJobChatJobUpdateResponse,
+  FineJobJobHuntRefreshContext,
+  FineJobJobHuntRefreshScope,
+  FineJobJobHuntRefreshRun,
+  FineJobJobHuntRefreshRunListEnvelope,
+  FineJobJobHuntRefreshWorkflowOptions,
   FineJobChatReplyEnvelope,
   FineJobChatSendActionEnvelope,
   FineJobCodexPendingWork,
@@ -1104,6 +1109,49 @@ export const api = {
     return request<FineJobChatJobUpdateResponse>(
       `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/job/update`,
       { method: "POST" }
+    );
+  },
+  async getFineJobJobHuntRefreshContext() {
+    return request<FineJobJobHuntRefreshContext>("/api/fine-job/job-hunt-refresh/context");
+  },
+  async discoverFineJobJobHuntRefreshScope(selectedSinceTime: string) {
+    return request<FineJobJobHuntRefreshScope>("/api/fine-job/job-hunt-refresh/scopes", {
+      method: "POST",
+      body: JSON.stringify({ selected_since_time: selectedSinceTime })
+    });
+  },
+  async getFineJobJobHuntRefreshScope(scopeId: string) {
+    return request<FineJobJobHuntRefreshScope>(
+      `/api/fine-job/job-hunt-refresh/scopes/${encodeURIComponent(scopeId)}`
+    );
+  },
+  async createFineJobJobHuntRefreshRun(payload: {
+    scope_id: string;
+    workflow_options: FineJobJobHuntRefreshWorkflowOptions;
+    trigger_source?: string;
+  }) {
+    return request<FineJobJobHuntRefreshRun>("/api/fine-job/job-hunt-refresh/runs", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  },
+  async listFineJobJobHuntRefreshRuns(limit = 10) {
+    return request<FineJobJobHuntRefreshRunListEnvelope>(
+      `/api/fine-job/job-hunt-refresh/runs?limit=${encodeURIComponent(limit)}`
+    );
+  },
+  async getFineJobJobHuntRefreshRun(runId: string) {
+    return request<FineJobJobHuntRefreshRun>(
+      `/api/fine-job/job-hunt-refresh/runs/${encodeURIComponent(runId)}`
+    );
+  },
+  async attachFineJobJobHuntRefreshCodexSession(runId: string, codexSessionRef: string) {
+    return request<FineJobJobHuntRefreshRun>(
+      `/api/fine-job/job-hunt-refresh/runs/${encodeURIComponent(runId)}/codex-session`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ codex_session_ref: codexSessionRef })
+      }
     );
   },
   async setFineJobJobApplicationStatus(

@@ -1217,6 +1217,154 @@ export interface FineJobChatJobUpdateResponse {
   job: FineJobBossHistoryJob;
   task?: FineJobBossCaptureTask | null;
 }
+
+export type FineJobJobHuntRefreshRunStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "completed_with_errors"
+  | "failed"
+  | "cancelled";
+
+export interface FineJobJobHuntRefreshWorkflowOptions {
+  refresh_chat_list: boolean;
+  refresh_chat_messages: boolean;
+  refresh_related_jobs: boolean;
+  analyze_conversations: false;
+  generate_missing_suggestions: false;
+}
+
+export interface FineJobJobHuntRefreshContext {
+  timezone: "Asia/Shanghai";
+  latest_local_message_at?: string | null;
+  last_successful_completed_at?: string | null;
+  default_since_time: string;
+  latest_unconsumed_scope_id?: string | null;
+}
+
+export interface FineJobJobHuntRefreshScopeJobRef {
+  entity_id: string;
+  session_id: string;
+  job_id?: string | null;
+  encrypt_job_id?: string | null;
+}
+
+export interface FineJobJobHuntRefreshScope {
+  id: string;
+  selected_since_time: string;
+  account_uid: string;
+  source_url: string;
+  friend_list_synced_at: string;
+  scope_generated_at: string;
+  latest_local_message_at?: string | null;
+  session_ids_to_sync: string[];
+  new_session_ids: string[];
+  related_jobs: FineJobJobHuntRefreshScopeJobRef[];
+  related_job_ids: string[];
+  encrypt_job_ids: string[];
+  jobs_to_collect: FineJobJobHuntRefreshScopeJobRef[];
+  jobs_missing_jd: FineJobJobHuntRefreshScopeJobRef[];
+  jobs_missing_evaluation: FineJobJobHuntRefreshScopeJobRef[];
+  unresolved_session_ids: string[];
+  counts: {
+    refreshed_sessions: number;
+    sessions_to_sync: number;
+    new_sessions_to_sync: number;
+    related_jobs: number;
+    jobs_to_collect: number;
+    jobs_missing_jd: number;
+    jobs_missing_evaluation: number;
+    unresolved_relations: number;
+  };
+  friend_list_result: FineJobChatFriendListRefreshResponse;
+  created_at: string;
+}
+
+export interface FineJobJobHuntRefreshItem {
+  id: string;
+  run_id: string;
+  item_type: "chat_session" | "related_job";
+  entity_id: string;
+  session_id: string;
+  job_id?: string | null;
+  status: "pending" | "running" | "succeeded" | "failed" | "skipped";
+  step: string;
+  retryable: boolean;
+  operation_ref_type?: string | null;
+  operation_ref_id?: string | null;
+  result: Record<string, unknown>;
+  error_category?: string | null;
+  error_message?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FineJobJobHuntRefreshProgressStep {
+  total: number;
+  completed: number;
+  succeeded: number;
+  failed: number;
+  skipped?: number;
+}
+
+export interface FineJobJobHuntRefreshRun {
+  id: string;
+  scope_id: string;
+  scope_generated_at: string;
+  status: FineJobJobHuntRefreshRunStatus;
+  selected_since_time: string;
+  latest_local_message_at?: string | null;
+  workflow_options: FineJobJobHuntRefreshWorkflowOptions;
+  estimated_sessions: number;
+  estimated_update_sessions: number;
+  estimated_jobs: number;
+  estimated_refresh_jobs: number;
+  estimated_missing_jd: number;
+  estimated_missing_suggestions: number;
+  processed_sessions: number;
+  processed_jobs: number;
+  failed_sessions: number;
+  failed_jobs: number;
+  chat_list_status: "pending" | "running" | "succeeded" | "failed" | "skipped";
+  chat_list_retryable: boolean;
+  current_step: string;
+  trigger_source: string;
+  codex_session_ref?: string | null;
+  summary: {
+    chat_list?: Record<string, unknown>;
+    sessions_total?: number;
+    sessions_succeeded?: number;
+    sessions_failed?: number;
+    new_messages?: number;
+    related_jobs_total?: number;
+    jobs_succeeded?: number;
+    jobs_failed?: number;
+    jobs_created?: number;
+    jobs_refreshed?: number;
+    jobs_reused?: number;
+    unresolved_jobs?: number;
+  };
+  error_summary?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  created_at: string;
+  updated_at: string;
+  items: FineJobJobHuntRefreshItem[];
+  progress: {
+    chat_list: { status: string };
+    chat_messages: FineJobJobHuntRefreshProgressStep;
+    related_jobs: FineJobJobHuntRefreshProgressStep;
+  };
+  resume_available: boolean;
+  scope: FineJobJobHuntRefreshScope;
+}
+
+export interface FineJobJobHuntRefreshRunListEnvelope {
+  runs: FineJobJobHuntRefreshRun[];
+}
+
 export interface FineJobChatReplyEnvelope { reply_task: FineJobChatReplyTask }
 export interface FineJobChatSendActionEnvelope { action: FineJobChatSendAction }
 

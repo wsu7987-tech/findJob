@@ -1597,6 +1597,101 @@ CREATE TABLE IF NOT EXISTS fj_codex_sessions (
   CHECK (status IN ('stopped', 'starting', 'running', 'interrupting', 'exited', 'failed'))
 );
 
+-- 范围快照保存平台列表刷新后确认的固定处理集合，Run 创建后不会重新计算。
+CREATE TABLE IF NOT EXISTS fj_job_hunt_refresh_scopes (
+  id TEXT PRIMARY KEY,
+  selected_since_time TEXT NOT NULL,
+  account_uid TEXT NOT NULL,
+  source_url TEXT NOT NULL DEFAULT '',
+  friend_list_synced_at TEXT NOT NULL,
+  scope_generated_at TEXT NOT NULL,
+  latest_local_message_at TEXT,
+  session_ids_json TEXT NOT NULL DEFAULT '[]',
+  new_session_ids_json TEXT NOT NULL DEFAULT '[]',
+  related_jobs_json TEXT NOT NULL DEFAULT '[]',
+  jobs_to_collect_json TEXT NOT NULL DEFAULT '[]',
+  jobs_missing_jd_json TEXT NOT NULL DEFAULT '[]',
+  jobs_missing_evaluation_json TEXT NOT NULL DEFAULT '[]',
+  unresolved_session_ids_json TEXT NOT NULL DEFAULT '[]',
+  counts_json TEXT NOT NULL DEFAULT '{}',
+  friend_list_result_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_job_hunt_refresh_scopes_generated_at
+  ON fj_job_hunt_refresh_scopes(scope_generated_at DESC);
+
+-- 求职数据更新 Run 保存用户选择、执行进度和最终摘要，可跨页面与应用重启恢复。
+CREATE TABLE IF NOT EXISTS fj_job_hunt_refresh_runs (
+  id TEXT PRIMARY KEY,
+  scope_id TEXT NOT NULL UNIQUE,
+  scope_generated_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  selected_since_time TEXT NOT NULL,
+  latest_local_message_at TEXT,
+  workflow_options_json TEXT NOT NULL DEFAULT '{}',
+  estimated_sessions INTEGER NOT NULL DEFAULT 0,
+  estimated_update_sessions INTEGER NOT NULL DEFAULT 0,
+  estimated_jobs INTEGER NOT NULL DEFAULT 0,
+  estimated_refresh_jobs INTEGER NOT NULL DEFAULT 0,
+  estimated_missing_jd INTEGER NOT NULL DEFAULT 0,
+  estimated_missing_suggestions INTEGER NOT NULL DEFAULT 0,
+  processed_sessions INTEGER NOT NULL DEFAULT 0,
+  processed_jobs INTEGER NOT NULL DEFAULT 0,
+  failed_sessions INTEGER NOT NULL DEFAULT 0,
+  failed_jobs INTEGER NOT NULL DEFAULT 0,
+  chat_list_status TEXT NOT NULL DEFAULT 'skipped',
+  chat_list_retryable INTEGER NOT NULL DEFAULT 0,
+  current_step TEXT NOT NULL DEFAULT 'waiting',
+  trigger_source TEXT NOT NULL DEFAULT 'page',
+  codex_session_ref TEXT,
+  summary_json TEXT NOT NULL DEFAULT '{}',
+  error_summary TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (scope_id) REFERENCES fj_job_hunt_refresh_scopes(id),
+  CHECK (status IN ('pending', 'running', 'completed', 'completed_with_errors', 'failed', 'cancelled')),
+  CHECK (chat_list_status IN ('pending', 'running', 'succeeded', 'failed', 'skipped')),
+  CHECK (chat_list_retryable IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_job_hunt_refresh_runs_created_at
+  ON fj_job_hunt_refresh_runs(created_at DESC);
+
+-- Item 按会话保存聊天同步和关联岗位采集状态，恢复时不会重跑 succeeded 项。
+CREATE TABLE IF NOT EXISTS fj_job_hunt_refresh_items (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  item_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  job_id TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  step TEXT NOT NULL,
+  retryable INTEGER NOT NULL DEFAULT 1,
+  operation_ref_type TEXT,
+  operation_ref_id TEXT,
+  result_json TEXT NOT NULL DEFAULT '{}',
+  error_category TEXT,
+  error_message TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES fj_job_hunt_refresh_runs(id) ON DELETE CASCADE,
+  FOREIGN KEY (session_id) REFERENCES fj_chat_sessions(id) ON DELETE CASCADE,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE SET NULL,
+  UNIQUE (run_id, item_type, entity_id),
+  CHECK (item_type IN ('chat_session', 'related_job')),
+  CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'skipped')),
+  CHECK (retryable IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_job_hunt_refresh_items_run_status
+  ON fj_job_hunt_refresh_items(run_id, item_type, status, created_at);
+
 CREATE INDEX IF NOT EXISTS idx_fj_codex_sessions_updated_at
   ON fj_codex_sessions(updated_at DESC);
 
@@ -1842,6 +1937,7 @@ class Database:
             self._ensure_codex_integration_schema(connection)
             self._ensure_resume_analysis_v2_schema(connection)
             self._ensure_resume_analysis_v3_schema(connection)
+            self._ensure_job_hunt_refresh_schema(connection)
             # 兼容升级只从可靠旧事实追加事件，并按完整事件流重放 shadow Pipeline。
             from backend.app.services.fine_job.job_activity import migrate_legacy_job_activity
             from backend.app.services.fine_job.execution_reconciliation import (
@@ -1850,6 +1946,19 @@ class Database:
 
             migrate_legacy_job_activity(connection)
             initialize_execution_observability(connection)
+
+    def _ensure_job_hunt_refresh_schema(self, connection: sqlite3.Connection) -> None:
+        """为已有数据库补齐 Refresh Scope 与 Run 关联字段。"""
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(fj_job_hunt_refresh_runs)")
+        }
+        if "scope_id" not in columns:
+            connection.execute("ALTER TABLE fj_job_hunt_refresh_runs ADD COLUMN scope_id TEXT")
+        if "scope_generated_at" not in columns:
+            connection.execute(
+                "ALTER TABLE fj_job_hunt_refresh_runs ADD COLUMN scope_generated_at TEXT"
+            )
 
     def _ensure_fj_execution_observability_schema(
         self,

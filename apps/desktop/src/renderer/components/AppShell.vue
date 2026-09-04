@@ -40,6 +40,7 @@ const navigation = [
   { label: "运行状态", routeName: "fine-job-runs", icon: List },
   { label: "待确认", routeName: "fine-job-review", icon: User },
   { label: "自动代聊", routeName: "fine-job-chat", icon: ChatDotRound },
+  { label: "求职数据更新", routeName: "fine-job-refresh", icon: Clock },
   { label: "Codex 工作台", routeName: "fine-job-codex", icon: Cpu },
   { label: "动作日志", routeName: "fine-job-logs", icon: User }
 ];
