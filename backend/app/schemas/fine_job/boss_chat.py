@@ -45,6 +45,7 @@ class BossChatBatchSummaryResponse(BaseModel):
 
 class BossChatBatchStartRequest(BaseModel):
     batch_size: int = Field(default=20, ge=1, le=20)
+    session_ids: list[str] | None = None
 
 
 class BossChatBatchTaskResponse(BaseModel):

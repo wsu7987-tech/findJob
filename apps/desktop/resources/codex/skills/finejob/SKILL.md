@@ -61,11 +61,16 @@ description: 通过 FineJob MCP 编排可组合的求职业务节点，完成岗
 页面提交求职数据更新任务时，输入只包含已经持久化的 `run_id`。严格执行以下顺序：
 
 1. 调用 `finejob.get_job_hunt_refresh_run`，读取 `scope_id`、`selected_since_time`、`workflow_options`、当前状态和已完成进度。聊天列表已经在 Scope Discovery 阶段同步完成。
-2. 仅当 `refresh_chat_messages=true` 时，调用 `finejob.list_job_hunt_refresh_items(item_type="chat_session")`。按返回顺序对每个 item 调用 `finejob.refresh_job_hunt_chat_messages`；单项失败时记录结果并继续下一项。
-3. 仅当 `refresh_related_jobs=true` 时，调用 `finejob.list_job_hunt_refresh_items(item_type="related_job")`。按返回顺序调用 `finejob.refresh_job_hunt_related_job`。返回非终态 `capture_task` 时，用 `finejob.get_operation_status` 读取权威状态；任务结束后再次调用原岗位 item 工具完成持久化。应用重启后旧任务状态不可读取时，直接再次调用原岗位 item 工具，由 Service 根据持久化岗位状态恢复，再继续下一项。
-4. 当前批次全部处理后调用 `finejob.complete_job_hunt_refresh_run`，再读取一次 Run 并汇总。
+2. 仅当 `refresh_chat_messages=true` 时，调用 `finejob.refresh_job_hunt_chat_batch(run_id)`。该工具会先复用自动代聊“更新信息 / 更新聊天列表”能力准备 BOSS 聊天页，再按 Run 中未完成或可重试的 session 范围调用 `BossChatBatchManager`。返回非终态 `chat_batch` 时，用 `finejob.get_operation_status` 读取权威状态；任务结束后再次调用 `finejob.refresh_job_hunt_chat_batch(run_id)` 完成 Run Item 持久化。重复本步骤，直到工具返回已无可处理聊天项。
+3. 聊天批量覆盖的岗位不再逐个调用岗位刷新。仅当 `refresh_related_jobs=true` 且 `scope.counts.extra_jobs > 0` 时，补充处理 `extra_jobs`。调用 `finejob.list_job_hunt_refresh_items(item_type="related_job")`，FineJob Service 会过滤或跳过聊天批量已覆盖的历史岗位 item；按返回顺序调用 `finejob.refresh_job_hunt_related_job`。返回非终态 `capture_task` 时，用 `finejob.get_operation_status` 读取权威状态；任务结束后再次调用原岗位 item 工具完成持久化。应用重启后旧任务状态不可读取时，直接再次调用原岗位 item 工具，由 Service 根据持久化岗位状态恢复，再继续下一项。
+4. 如果 `workflow_options` 中启用了 `analyze_conversations`、`generate_missing_suggestions`、`generate_reply_drafts` 或 `generate_followup_recommendations`，数据补充项全部结束后只调用一次 `finejob.prepare_job_hunt_refresh_analysis(run_id)`。该工具会执行结构化状态读取、确定性事实锚定和旧任务状态同步，并返回本 Run 的统一分析任务清单。
+5. 在同一个 Codex CLI 会话内，按 `prepare` 返回的 `conversation_items` / `job_evaluation_items` 中的 `context_arguments` 调用 `finejob.get_job_hunt_refresh_analysis_item_context` 读取单个 item 上下文。该读取只取资料，不代表第二次 AI 执行。
+6. 基于本次会话读取到的 item 上下文，一次性完成本次勾选的 AI 结果。结果必须按 `session_id` / `job_id` 独立，不交叉使用不同聊天、岗位或 JD 的事实。
+7. 调用 `finejob.save_job_hunt_refresh_analysis(run_id, analysis_result)` 保存同一次分析结果；结果体积过大时可以分批保存，中间批传 `final_batch=false`，最后一批传 `final_batch=true`。不得重新调用 `prepare`，不得把投递建议、回复草稿、跟进建议拆成多次独立 AI 任务。
+8. 如需核对分析保存、跳过和当前正式 evaluation 对应明细，调用 `finejob.list_job_hunt_refresh_analysis_items(run_id, item_type)`。`finejob.list_job_hunt_refresh_items` 只用于聊天和岗位数据补充 item。
+9. 如果未启用分析相关工作流，或分析结果已经保存完成，调用 `finejob.complete_job_hunt_refresh_run`，再读取一次 Run 并汇总。
 
-恢复同一个 `run_id` 时，列表工具只返回 `pending`、中断遗留的 `running` 和可重试的 `failed` item。不得重新执行 `succeeded` 或不可重试的 `skipped` item。
+恢复同一个 `run_id` 时，聊天批量工具和列表工具只处理 `pending`、中断遗留的 `running` 和可重试的 `failed` item。聊天批量已覆盖的 legacy 岗位 item 由 FineJob Service 标记为 skipped，`succeeded` 或不可重试的 `skipped` item 不再执行。
 
 工作流约束：
 
@@ -73,7 +78,9 @@ description: 通过 FineJob MCP 编排可组合的求职业务节点，完成岗
 - 不执行用户未勾选的工作流。
 - 不直接读写数据库；会话去重、消息去重、岗位关联和 JD 写入均交给 FineJob Service。
 - 单个会话或岗位失败后继续处理其他 item，最终由 Run 汇总为完成或部分失败。
-- 不启动 Conversation Insight、AI 状态判断、投递建议生成、AI Reply 或任何自动发送。
+- AI 分析只在当前 Codex CLI 会话中完成；后端工具负责 prepare/save/complete 和代码规则校验。
+- 推进建议只保存为 `attention_status` / recommendation，不创建正式待执行任务。
+- 回复草稿只保存和展示，不发送，不创建发送动作，不调用 BOSS 发送接口。
 
 ## 边界
 

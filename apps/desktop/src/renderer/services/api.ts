@@ -1078,10 +1078,10 @@ export const api = {
   async getFineJobChatBatchSummary() {
     return request<FineJobChatBatchSummary>("/api/fine-job/boss-chat/batch/summary");
   },
-  async startFineJobChatBatch(batchSize: number) {
+  async startFineJobChatBatch(batchSize: number, sessionIds?: string[]) {
     return request<FineJobChatBatchTask>("/api/fine-job/boss-chat/batch", {
       method: "POST",
-      body: JSON.stringify({ batch_size: batchSize })
+      body: JSON.stringify({ batch_size: batchSize, session_ids: sessionIds })
     });
   },
   async getFineJobChatBatch(taskId: string) {

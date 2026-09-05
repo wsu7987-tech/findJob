@@ -30,7 +30,12 @@ server = MCPServer(
         "岗位评估也可继续使用原有岗位上下文和候选人上下文入口，"
         "保存评估后再生成打招呼预览。发送打招呼或代聊回复前必须使用最新资源版本请求执行；"
         "返回 awaiting_confirmation 时等待用户在 FineJob 确认卡片处理，返回任务或动作资源时使用 "
-        "finejob.get_operation_status 查询结果。不得绕过 FineJob 的确认、版本与队列状态。"
+        "finejob.get_operation_status 查询结果。求职数据更新 Run 启用分析时，数据补充完成后只调用一次 "
+        "finejob.prepare_job_hunt_refresh_analysis(run_id)，在当前 Codex CLI 会话基于返回的统一任务清单和 "
+        "finejob.get_job_hunt_refresh_analysis_item_context 按需读取的单 item 上下文，一次完成沟通分析、"
+        "投递建议、回复草稿和跟进建议，再调用 finejob.save_job_hunt_refresh_analysis 保存结果，最后调用 "
+        "finejob.complete_job_hunt_refresh_run 汇总；不得把这些 AI 结果拆成多次 prepare、多次 Codex 执行或多次独立 AI 任务。"
+        "不得绕过 FineJob 的确认、版本与队列状态。"
     ),
     log_level="ERROR",
 )
@@ -151,6 +156,12 @@ async def list_job_hunt_refresh_items(run_id: str, item_type: str) -> dict[str, 
     return await _invoke("list_job_hunt_refresh_items", locals())
 
 
+@server.tool(name="finejob.refresh_job_hunt_chat_batch", structured_output=True)
+async def refresh_job_hunt_chat_batch(run_id: str) -> dict[str, Any]:
+    """按 Run 范围调用自动代聊批量更新聊天记录能力。"""
+    return await _invoke("refresh_job_hunt_chat_batch", locals())
+
+
 @server.tool(name="finejob.refresh_job_hunt_chat_messages", structured_output=True)
 async def refresh_job_hunt_chat_messages(run_id: str, item_id: str) -> dict[str, Any]:
     """在 Run 时间范围内更新一个持久化聊天会话项。"""
@@ -161,6 +172,38 @@ async def refresh_job_hunt_chat_messages(run_id: str, item_id: str) -> dict[str,
 async def refresh_job_hunt_related_job(run_id: str, item_id: str) -> dict[str, Any]:
     """通过现有关联和详情流程采集或刷新一个岗位项。"""
     return await _invoke("refresh_job_hunt_related_job", locals())
+
+
+@server.tool(name="finejob.prepare_job_hunt_refresh_analysis", structured_output=True)
+async def prepare_job_hunt_refresh_analysis(run_id: str) -> dict[str, Any]:
+    """准备本次 Refresh Run 的唯一统一分析任务清单，并执行确定性事实同步。"""
+    return await _invoke("prepare_job_hunt_refresh_analysis", locals())
+
+
+@server.tool(name="finejob.get_job_hunt_refresh_analysis_item_context", structured_output=True)
+async def get_job_hunt_refresh_analysis_item_context(
+    run_id: str,
+    item_type: str,
+    item_id: str,
+) -> dict[str, Any]:
+    """在同一 Codex CLI 任务中按需读取单个聊天或岗位分析上下文。"""
+    return await _invoke("get_job_hunt_refresh_analysis_item_context", locals())
+
+
+@server.tool(name="finejob.list_job_hunt_refresh_analysis_items", structured_output=True)
+async def list_job_hunt_refresh_analysis_items(run_id: str, item_type: str = "") -> dict[str, Any]:
+    """读取 Refresh Run 的分析 item 保存、跳过和当前 evaluation 对应明细。"""
+    return await _invoke("list_job_hunt_refresh_analysis_items", locals())
+
+
+@server.tool(name="finejob.save_job_hunt_refresh_analysis", structured_output=True)
+async def save_job_hunt_refresh_analysis(
+    run_id: str,
+    analysis_result: dict[str, Any],
+    final_batch: bool = True,
+) -> dict[str, Any]:
+    """保存当前 Codex CLI 会话基于统一上下文生成的分析、建议、草稿和投递评估。"""
+    return await _invoke("save_job_hunt_refresh_analysis", locals())
 
 
 @server.tool(name="finejob.complete_job_hunt_refresh_run", structured_output=True)

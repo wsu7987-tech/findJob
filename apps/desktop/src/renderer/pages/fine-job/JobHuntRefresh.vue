@@ -41,12 +41,22 @@ const canStart = computed(() => Boolean(
     && store.hasExecutableWorkflow
     && codexReady.value
     && !runIsActive.value
+    && !store.starting
+    && !submittingCodex.value
 ));
 const canResubmit = computed(() => Boolean(
   run.value
     && !["completed", "failed", "cancelled"].includes(run.value.status)
-    && (run.value.resume_available || run.value.current_step === "waiting_codex")
+    && (
+      run.value.resume_available
+      || run.value.current_step === "waiting_codex"
+      || run.value.current_step === "waiting_analysis_prepare"
+      || run.value.current_step === "waiting_analysis_save"
+      || run.value.current_step === "waiting_completion"
+    )
     && codexReady.value
+    && !store.starting
+    && !submittingCodex.value
 ));
 const canCancel = computed(() => Boolean(
   run.value
@@ -72,6 +82,13 @@ const statusType = (value?: string) => ({
   running: "primary"
 }[value ?? ""] ?? "info") as "success" | "warning" | "danger" | "primary" | "info";
 
+const hasAnalysisOutput = (target?: FineJobJobHuntRefreshRun | null) => Boolean(
+  target?.workflow_options.analyze_conversations
+    || target?.workflow_options.generate_missing_suggestions
+    || target?.workflow_options.generate_reply_drafts
+    || target?.workflow_options.generate_followup_recommendations
+);
+
 const stepLabel = (value?: string) => {
   if (!value) return "等待开始";
   if (value === "waiting_codex") return "等待 Codex 接收任务";
@@ -81,6 +98,9 @@ const stepLabel = (value?: string) => {
   if (value === "waiting_related_jobs" || value.includes("related_job") || value === "refresh_related_job") {
     return "正在采集岗位与 JD";
   }
+  if (value === "prepare_analysis") return "正在准备分析上下文";
+  if (value === "waiting_analysis_prepare") return "等待准备分析上下文";
+  if (value === "waiting_analysis_save") return "等待保存分析结果";
   if (value === "waiting_completion") return "等待汇总任务结果";
   if (value === "completed") return "任务完成";
   if (value === "cancelled") return "任务已取消";
@@ -118,16 +138,100 @@ const discoverScope = async () => {
   }
 };
 
-const refreshPrompt = (runId: string) => [
-  "使用 $finejob 执行 FineJob Job Hunt Refresh Run。",
-  `任务：${JSON.stringify({ workflow: "job_hunt_refresh_v1", run_id: runId })}`,
-  "先调用 finejob.get_job_hunt_refresh_run 读取持久化配置。",
-  "聊天列表已在 Scope Discovery 阶段同步完成，从聊天历史同步步骤开始，严格按 FineJob Skill 的 Job Hunt Refresh Workflow 执行。",
-  "聊天和岗位 item 只使用 list_job_hunt_refresh_items 返回的未完成或可重试项；不得重跑 succeeded 项。",
-  "岗位详情任务返回非终态时，用 finejob.get_operation_status 读取状态，结束后再次调用同一岗位 item 工具完成持久化。",
-  "单项失败后继续其他 item，最后调用 finejob.complete_job_hunt_refresh_run 并输出摘要。",
-  "不得修改 selected_since_time，不得扩大处理范围，不执行 Conversation Insight、投递建议生成、AI Reply 或自动发送。"
+const remaining = (target: FineJobJobHuntRefreshRun, key: "chat_messages" | "related_jobs") =>
+  Math.max(0, target.progress[key].total - target.progress[key].completed);
+
+const numeric = (value: unknown) => Number.isFinite(Number(value)) ? Number(value) : 0;
+
+const analysisProgress = (target: FineJobJobHuntRefreshRun) => {
+  const analysis = (target.summary.analysis ?? {}) as Record<string, unknown>;
+  const conversationEnabled = target.workflow_options.analyze_conversations
+    || target.workflow_options.generate_reply_drafts
+    || target.workflow_options.generate_followup_recommendations;
+  const conversationDone = conversationEnabled
+    ? numeric(target.summary.conversations_analyzed ?? analysis.analyzed)
+      + numeric(target.summary.conversations_skipped ?? analysis.skipped)
+      + numeric(target.summary.conversation_analysis_failed ?? analysis.failed)
+    : 0;
+  const conversationTotal = conversationEnabled
+    ? numeric(analysis.total ?? target.scope.counts.sessions_in_scope)
+    : 0;
+  const evaluationDone = target.workflow_options.generate_missing_suggestions
+    ? numeric(target.summary.missing_suggestions_generated ?? analysis.generated_evaluation)
+      + numeric(target.summary.missing_suggestions_skipped ?? analysis.evaluation_jobs_skipped)
+    : 0;
+  const evaluationTotal = target.workflow_options.generate_missing_suggestions
+    ? numeric(target.summary.missing_suggestions_total ?? analysis.evaluation_jobs_total)
+    : 0;
+  return {
+    completed: conversationDone + evaluationDone,
+    total: conversationTotal + evaluationTotal
+  };
+};
+
+const analysisPrompt = (target: FineJobJobHuntRefreshRun) => [
+  target.workflow_options.analyze_conversations
+    ? "本次需要分析沟通状态并保存 Conversation Insight。"
+    : "",
+  target.workflow_options.generate_missing_suggestions
+    ? "本次需要为 Scope 中缺失投递建议的已采集岗位生成投递建议，结果只保存为正式 evaluation，不触发投递或打招呼。"
+    : "",
+  target.workflow_options.generate_reply_drafts
+    ? "本次需要生成回复草稿并保存展示；不得创建发送动作，不调用 BOSS 发送接口。"
+    : "",
+  target.workflow_options.generate_followup_recommendations
+    ? "本次需要生成跟进建议；推进建议只保存 attention_status/recommendation，不创建正式待执行任务。"
+    : ""
+].filter(Boolean).join(" ");
+
+const unifiedAnalysisPrompt = (target: FineJobJobHuntRefreshRun) => [
+  "分析相关勾选项启用时，数据补充项全部完成后必须按以下顺序执行：",
+  "1. 只调用一次 finejob.prepare_job_hunt_refresh_analysis(run_id)。该工具会返回本 Run 允许分析的统一任务清单，并在 prepare 阶段完成代码确定性事实和旧任务状态同步。",
+  "2. 在当前 Codex CLI 会话内，按 prepare 返回的 conversation_items/job_evaluation_items 的 context_arguments 调用 finejob.get_job_hunt_refresh_analysis_item_context 读取单个 item 详情；这是按需读取资料，不是第二次 AI 调用。",
+  "3. 如果 prepare 或单个 item context 返回 blocker，例如 analysis_manifest_too_large 或 analysis_item_context_too_large，停止并输出 blocker，不要拆这个 item 的上下文、不要重试 prepare、不要继续伪生成。",
+  "4. 基于同一个 Codex CLI 会话中读取到的 item context，一次性完成本次勾选的 AI 结果；输出必须按 session_id/job_id 独立，不得把不同聊天、岗位或 JD 的事实交叉使用。",
+  "5. 调用 finejob.save_job_hunt_refresh_analysis(run_id, analysis_result) 保存同一次分析得到的完整结果；结果体积过大时可分批保存，中间批传 final_batch=false，最后一批传 final_batch=true，但不得重新 prepare，不得把投递建议/回复草稿/跟进建议拆成多次 AI 分析。",
+  "6. 如需核对分析保存/跳过明细，调用 finejob.list_job_hunt_refresh_analysis_items(run_id, item_type)；不要用 finejob.list_job_hunt_refresh_items 查询 conversation 或 job_evaluation 分析明细。",
+  "7. 保存完成后调用 finejob.complete_job_hunt_refresh_run(run_id) 汇总。",
+  analysisPrompt(target)
 ].join(" ");
+
+const refreshPrompt = (target: FineJobJobHuntRefreshRun) => {
+  const chatRemaining = remaining(target, "chat_messages");
+  const jobRemaining = remaining(target, "related_jobs");
+  const dataRefreshCompleted = chatRemaining === 0 && jobRemaining === 0;
+  const analysisEnabled = hasAnalysisOutput(target);
+  const base = [
+    "使用 $finejob 执行 FineJob Job Hunt Refresh Run。",
+    `任务：${JSON.stringify({ workflow: "job_hunt_refresh_v1", run_id: target.id })}`,
+    "先调用 finejob.get_job_hunt_refresh_run 读取持久化配置，并以工具返回的最新 Run 为准。"
+  ];
+  if (dataRefreshCompleted) {
+    return [
+      ...base,
+      `当前没有待执行的数据补充项：聊天消息剩余 ${chatRemaining}，关联岗位/JD 剩余 ${jobRemaining}。`,
+      "不要等待不存在的 item，不要调用 finejob.refresh_job_hunt_chat_batch，不要调用 finejob.refresh_job_hunt_related_job。",
+      analysisEnabled
+        ? unifiedAnalysisPrompt(target)
+        : "现在直接调用 finejob.complete_job_hunt_refresh_run 完成最终汇总。",
+      "完成后输出 complete 工具返回的摘要。不得修改 selected_since_time，不得扩大处理范围，不重新采集聊天、不补历史、不重新采集岗位，不执行自动发送。"
+    ].join(" ");
+  }
+  return [
+    ...base,
+    chatRemaining > 0
+      ? `还有 ${chatRemaining} 个聊天消息 item 待处理；调用 finejob.refresh_job_hunt_chat_batch。任务返回非终态时，用 finejob.get_operation_status 读取状态，结束后再次调用 finejob.refresh_job_hunt_chat_batch 完成持久化；重复到没有未完成或可重试聊天项。`
+      : "聊天消息 item 已完成或无需执行；不要调用 finejob.refresh_job_hunt_chat_batch。",
+    jobRemaining > 0
+      ? `还有 ${jobRemaining} 个关联岗位/JD item 待处理；调用 finejob.refresh_job_hunt_related_job 处理相关 item。聊天批量覆盖的岗位不再逐个调用岗位刷新。岗位补采只处理 extra_jobs；调用 list_job_hunt_refresh_items(item_type='related_job') 时，FineJob Service 会过滤或跳过聊天批量已覆盖的历史岗位 item。岗位详情任务返回非终态时，用 finejob.get_operation_status 读取状态，结束后再次调用同一岗位 item 工具完成持久化。`
+      : "关联岗位/JD item 已完成或无需执行；不要调用 finejob.refresh_job_hunt_related_job。",
+    analysisEnabled
+      ? "单项失败后继续其他 item；没有待处理 item 后执行统一分析流程，再调用 complete 汇总。"
+      : "单项失败后继续其他 item；没有待处理 item 后调用 finejob.complete_job_hunt_refresh_run。",
+    analysisEnabled ? unifiedAnalysisPrompt(target) : "",
+    "不得修改 selected_since_time，不得扩大处理范围，不重新采集聊天、不补历史、不重新采集岗位，不执行自动发送。"
+  ].join(" ");
+};
 
 const submitRunToCodex = async (target: FineJobJobHuntRefreshRun) => {
   const bridge = getCodexBridge();
@@ -135,7 +239,7 @@ const submitRunToCodex = async (target: FineJobJobHuntRefreshRun) => {
     throw new Error("Codex 未就绪，请先在 Codex 工作台选择模型并启动会话。");
   }
   await store.attachCodexSession(target.id, codexStore.runId);
-  const submitted = await bridge.submitCodexPrompt(refreshPrompt(target.id));
+  const submitted = await bridge.submitCodexPrompt(refreshPrompt(target));
   if (!submitted) throw new Error("Codex 未接收任务，可在就绪后使用原 run_id 重新提交。");
   await store.markPromptSubmitted(target.id);
 };
@@ -247,8 +351,10 @@ onBeforeUnmount(() => store.stopProgressReading());
         <el-checkbox :model-value="true" disabled>聊天列表范围在获取范围时确定</el-checkbox>
         <el-checkbox v-model="store.workflowOptions.refresh_chat_messages">更新聊天消息</el-checkbox>
         <el-checkbox v-model="store.workflowOptions.refresh_related_jobs">采集/刷新关联岗位与 JD</el-checkbox>
-        <el-checkbox disabled>AI 分析并更新求职进度（即将支持）</el-checkbox>
-        <el-checkbox disabled>生成缺失投递建议（即将支持）</el-checkbox>
+        <el-checkbox v-model="store.workflowOptions.analyze_conversations">分析沟通状态</el-checkbox>
+        <el-checkbox v-model="store.workflowOptions.generate_missing_suggestions">生成缺失投递建议</el-checkbox>
+        <el-checkbox v-model="store.workflowOptions.generate_reply_drafts">生成回复草稿</el-checkbox>
+        <el-checkbox v-model="store.workflowOptions.generate_followup_recommendations">生成跟进建议</el-checkbox>
       </div>
 
       <div class="source-mode-row">
@@ -305,8 +411,9 @@ onBeforeUnmount(() => store.stopProgressReading());
       <div class="metric-grid">
         <article><span>时间范围内聊天</span><strong>{{ store.scope.counts.sessions_in_scope }}</strong></article>
         <article><span>待同步聊天</span><strong>{{ store.scope.counts.sessions_to_sync }}</strong></article>
-        <article><span>关联岗位</span><strong>{{ store.scope.counts.related_jobs }}</strong></article>
-        <article><span>需采集/刷新岗位</span><strong>{{ store.scope.counts.jobs_to_collect }}</strong></article>
+        <article><span>聊天更新涉及岗位</span><strong>{{ store.scope.counts.chat_update_jobs }}</strong></article>
+        <article><span>额外需要补采岗位</span><strong>{{ store.scope.counts.extra_jobs }}</strong></article>
+        <article><span>去重后实际更新岗位</span><strong>{{ store.scope.counts.jobs_to_update }}</strong></article>
         <article><span>缺失 JD</span><strong>{{ store.scope.counts.jobs_missing_jd }}</strong></article>
         <article><span>缺少投递建议</span><strong>{{ store.scope.counts.jobs_missing_evaluation }}</strong></article>
         <article><span>新增消息</span><strong class="metric-pending">更新完成后统计</strong></article>
@@ -316,6 +423,10 @@ onBeforeUnmount(() => store.stopProgressReading());
         <span>✓ 聊天列表范围已确定</span>
         <span>{{ store.workflowOptions.refresh_chat_messages ? "✓" : "○" }} 更新聊天消息</span>
         <span>{{ store.workflowOptions.refresh_related_jobs ? "✓" : "○" }} 采集关联岗位</span>
+        <span>{{ store.workflowOptions.analyze_conversations ? "✓" : "○" }} 沟通分析</span>
+        <span>{{ store.workflowOptions.generate_missing_suggestions ? "✓" : "○" }} 缺失建议</span>
+        <span>{{ store.workflowOptions.generate_reply_drafts ? "✓" : "○" }} 回复草稿</span>
+        <span>{{ store.workflowOptions.generate_followup_recommendations ? "✓" : "○" }} 跟进建议</span>
       </div>
       <section class="codex-readiness">
         <div>
@@ -379,6 +490,10 @@ onBeforeUnmount(() => store.stopProgressReading());
           <span>关联岗位与 JD</span>
           <strong>{{ run.progress.related_jobs.completed }} / {{ run.progress.related_jobs.total }}</strong>
         </div>
+        <div v-if="hasAnalysisOutput(run)">
+          <span>分析 / 建议</span>
+          <strong>{{ analysisProgress(run).completed }} / {{ analysisProgress(run).total }}</strong>
+        </div>
       </div>
 
       <div v-if="run.status === 'completed' || run.status === 'completed_with_errors'" class="result-grid">
@@ -396,6 +511,14 @@ onBeforeUnmount(() => store.stopProgressReading());
           <p>{{ run.summary.jobs_created ?? 0 }} 个新增</p>
           <p>{{ run.summary.jobs_refreshed ?? 0 }} 个刷新</p>
           <p>{{ run.summary.unresolved_jobs ?? 0 }} 个无法关联</p>
+        </article>
+        <article v-if="hasAnalysisOutput(run)">
+          <h4>分析</h4>
+          <p>{{ run.summary.conversations_analyzed ?? 0 }} 个会话已分析</p>
+          <p>{{ run.summary.conversations_skipped ?? 0 }} 个会话降级或跳过</p>
+          <p>{{ run.summary.activities_written ?? 0 }} 条进度记录</p>
+          <p>{{ run.summary.missing_suggestions_generated ?? 0 }} / {{ run.summary.missing_suggestions_total ?? 0 }} 个缺失建议已生成</p>
+          <p>{{ run.summary.reply_drafts_generated ?? 0 }} 条草稿</p>
         </article>
       </div>
     </section>

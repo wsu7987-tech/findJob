@@ -11,6 +11,8 @@ class JobHuntRefreshWorkflowOptions(BaseModel):
     refresh_related_jobs: bool = True
     analyze_conversations: bool = False
     generate_missing_suggestions: bool = False
+    generate_reply_drafts: bool = False
+    generate_followup_recommendations: bool = False
 
 
 class JobHuntRefreshScopeDiscoveryRequest(BaseModel):

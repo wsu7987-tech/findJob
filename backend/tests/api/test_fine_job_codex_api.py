@@ -40,6 +40,7 @@ def test_internal_runtime_handshake_and_capabilities() -> None:
         assert "finejob.get_job_hunt_refresh_run" in registered_tools
         assert "finejob.list_job_hunt_refresh_items" in registered_tools
         assert "finejob.refresh_job_hunt_chat_list" not in registered_tools
+        assert "finejob.refresh_job_hunt_chat_batch" in registered_tools
         assert "finejob.refresh_job_hunt_chat_messages" in registered_tools
         assert "finejob.refresh_job_hunt_related_job" in registered_tools
         assert "finejob.complete_job_hunt_refresh_run" in registered_tools

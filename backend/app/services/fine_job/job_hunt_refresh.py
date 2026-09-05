@@ -7,12 +7,10 @@ from typing import Any
 from backend.app.config import AppConfig
 from backend.app.db import Database
 from backend.app.errors import AppError
+from backend.app.services.fine_job import boss_chat
+from backend.app.services.fine_job import job_hunt_analysis
 from backend.app.services.fine_job.boss_capture_tasks import boss_capture_task_manager
-from backend.app.services.fine_job.boss_chat import (
-    prepare_chat_job,
-    sync_friend_list,
-    sync_history_messages,
-)
+from backend.app.services.fine_job.boss_chat import CHAT_BATCH_LIMIT
 from backend.app.services.fine_job.boss_scraper.service import boss_scraper_service
 from backend.app.services.fine_job.job_activity import reconcile_chat_session_activity
 from backend.app.utils import new_id, utc_now
@@ -28,6 +26,10 @@ SUPPORTED_WORKFLOWS = (
     "refresh_chat_list",
     "refresh_chat_messages",
     "refresh_related_jobs",
+    "analyze_conversations",
+    "generate_missing_suggestions",
+    "generate_reply_drafts",
+    "generate_followup_recommendations",
 )
 FRIEND_LIST_FRESHNESS = timedelta(minutes=30)
 
@@ -103,7 +105,7 @@ def discover_scope(
 
     if resolved_source == "refresh":
         captured = boss_scraper_service.capture_chat_friend_list()
-        friend_list_result = sync_friend_list(
+        friend_list_result = boss_chat.sync_friend_list(
             db,
             account_uid=str(captured["account_uid"]),
             response=captured["response"],
@@ -152,40 +154,55 @@ def discover_scope(
             is not None
             and latest_at >= since
         ]
-        sessions_to_sync: list[dict[str, Any]] = []
-        for session in sessions_in_scope:
-            is_new = str(session["id"]) in new_session_ids
-            latest_missing_locally = bool(
-                str(session.get("platform_latest_msg_id") or "").strip()
-                and not bool(session.get("latest_message_loaded"))
-            )
-            if is_new or bool(session["message_update_required"]) or latest_missing_locally:
-                sessions_to_sync.append(session)
+        # 与自动代聊“批量更新聊天记录”共用同一候选集合。
+        batch_candidates = {
+            str(candidate["id"]): candidate
+            for candidate in boss_chat.get_batch_candidates(db)
+        }
+        sessions_to_sync = [
+            session
+            for session in sessions_in_scope
+            if str(session["id"]) in batch_candidates
+        ]
 
         related_jobs: dict[str, dict[str, Any]] = {}
+        chat_update_jobs: dict[str, dict[str, Any]] = {}
+        extra_jobs: dict[str, dict[str, Any]] = {}
         unresolved_session_ids: list[str] = []
         for session in sessions_in_scope:
             identity, job = _related_job_identity(connection, session)
             if identity:
-                related_jobs.setdefault(
-                    identity,
-                    {
-                        "entity_id": identity,
-                        "session_id": str(session["id"]),
-                        "job_id": str(job["id"]) if job else None,
-                        "encrypt_job_id": str(session.get("encrypt_job_id") or "") or None,
-                    },
-                )
+                relation = {
+                    "entity_id": identity,
+                    "session_id": str(session["id"]),
+                    "job_id": str(job["id"]) if job else None,
+                    "encrypt_job_id": str(session.get("encrypt_job_id") or "") or None,
+                }
+                related_jobs.setdefault(identity, relation)
+                needs_detail = job is None or _job_needs_refresh(job)
+                if not needs_detail:
+                    continue
+                candidate = batch_candidates.get(str(session["id"]))
+                if candidate and str(candidate.get("job_detail_status") or "") != "completed":
+                    chat_update_jobs.setdefault(identity, relation)
+                else:
+                    extra_jobs.setdefault(identity, relation)
             else:
                 unresolved_session_ids.append(str(session["id"]))
 
-        jobs_to_collect: list[dict[str, Any]] = []
+        for identity in list(extra_jobs):
+            if identity in chat_update_jobs:
+                extra_jobs.pop(identity, None)
+
+        # 稳定岗位身份优先使用已有关联 job_id，其次使用 encrypt_job_id。
+        jobs_to_update = dict(chat_update_jobs)
+        for identity, relation in extra_jobs.items():
+            jobs_to_update.setdefault(identity, relation)
+        jobs_to_collect = list(extra_jobs.values())
         jobs_missing_jd: list[dict[str, Any]] = []
         jobs_missing_evaluation: list[dict[str, Any]] = []
         for relation in related_jobs.values():
             job = _job_for_relation(connection, relation)
-            if job is None or _job_needs_refresh(job):
-                jobs_to_collect.append(relation)
             if job is None or _job_missing_jd(job):
                 jobs_missing_jd.append(relation)
             if job is None:
@@ -208,6 +225,9 @@ def discover_scope(
                 str(session["id"]) in new_session_ids for session in sessions_to_sync
             ),
             "related_jobs": len(related_jobs),
+            "chat_update_jobs": len(chat_update_jobs),
+            "extra_jobs": len(extra_jobs),
+            "jobs_to_update": len(jobs_to_update),
             "jobs_to_collect": len(jobs_to_collect),
             "jobs_missing_jd": len(jobs_missing_jd),
             "jobs_missing_evaluation": len(jobs_missing_evaluation),
@@ -302,7 +322,7 @@ def create_run(
                 scope["counts"]["sessions_in_scope"],
                 scope["counts"]["sessions_to_sync"],
                 scope["counts"]["related_jobs"],
-                scope["counts"]["jobs_to_collect"],
+                scope["counts"]["jobs_to_update"],
                 scope["counts"]["jobs_missing_jd"],
                 scope["counts"]["jobs_missing_evaluation"],
                 trigger_source,
@@ -363,6 +383,8 @@ def mark_prompt_submitted(db: Database, run_id: str) -> dict[str, object]:
         if chat_pending
         else "waiting_related_jobs"
         if job_pending
+        else _analysis_wait_step(run.get("summary", {}))
+        if _analysis_requested(run["workflow_options"])
         else "waiting_completion"
     )
     now = utc_now()
@@ -370,7 +392,7 @@ def mark_prompt_submitted(db: Database, run_id: str) -> dict[str, object]:
         connection.execute(
             """
             UPDATE fj_job_hunt_refresh_runs
-            SET status = CASE WHEN status = 'completed_with_errors' THEN 'running' ELSE status END,
+            SET status = 'running',
                 current_step = ?, prompt_submitted_at = ?, completed_at = NULL,
                 error_summary = NULL, updated_at = ?
             WHERE id = ?
@@ -419,6 +441,7 @@ def list_runs(db: Database, *, limit: int = 10) -> list[dict[str, object]]:
 
 
 def get_run(db: Database, run_id: str) -> dict[str, object]:
+    _reconcile_running_run(db, run_id)
     with db.connect() as connection:
         row = connection.execute(
             "SELECT * FROM fj_job_hunt_refresh_runs WHERE id = ?", (run_id,)
@@ -453,6 +476,8 @@ def list_actionable_items(
     run = _require_run(db, run_id)
     if run["status"] in {"completed", "failed", "cancelled"}:
         return []
+    if item_type == "related_job":
+        _skip_chat_batch_covered_related_jobs(db, run_id)
     with db.connect() as connection:
         rows = connection.execute(
             """
@@ -461,10 +486,11 @@ def list_actionable_items(
               AND (
                 status IN ('pending', 'running')
                 OR (status = 'failed' AND retryable = 1)
-              )
+            )
             ORDER BY created_at, id
+            LIMIT ?
             """,
-            (run_id, item_type),
+            (run_id, item_type, CHAT_BATCH_LIMIT),
         ).fetchall()
         if rows:
             _set_run_running(connection, run_id, f"listing_{item_type}")
@@ -497,19 +523,7 @@ def refresh_chat_messages(db: Database, run_id: str, item_id: str) -> dict[str, 
     )
     _mark_item_running(db, run_id, item_id, "refresh_chat_messages")
     try:
-        with db.connect() as connection:
-            session = connection.execute(
-                "SELECT * FROM fj_chat_sessions WHERE id = ?", (item["session_id"],)
-            ).fetchone()
-        if session is None:
-            raise AppError(404, "CHAT_SESSION_NOT_FOUND", "聊天会话不存在。")
-        result = _sync_session_messages_since(
-            db,
-            session_id=str(item["session_id"]),
-            boss_id=str(session["encrypt_peer_uid"] or ""),
-            security_id=str(session["security_id"] or ""),
-            since=_parse_time(str(run["selected_since_time"])),
-        )
+        result = boss_chat.refresh_session_history(db, str(item["session_id"]))
         result["selected_since_time"] = run["selected_since_time"]
         _mark_item_succeeded(db, run_id, item_id, result=result)
     except Exception as exc:
@@ -520,6 +534,97 @@ def refresh_chat_messages(db: Database, run_id: str, item_id: str) -> dict[str, 
         "terminal": True,
         "reused": False,
         "item": get_item(db, run_id, item_id),
+        "run": get_run(db, run_id),
+    }
+
+
+def refresh_chat_messages_batch(
+    db: Database,
+    config: AppConfig,
+    run_id: str,
+) -> dict[str, object]:
+    """按 Run 中未完成聊天 item 启动原自动代聊批量更新能力。"""
+    run = _require_run(db, run_id)
+    if not run["workflow_options"]["refresh_chat_messages"]:
+        raise AppError(409, "WORKFLOW_NOT_SELECTED", "本次任务未选择更新聊天消息。")
+    if run["status"] in {"completed", "failed", "cancelled"}:
+        return {
+            "status": run["status"],
+            "terminal": True,
+            "reused": True,
+            "run": get_run(db, run_id),
+        }
+
+    active = _active_chat_batch_operation(db, run_id)
+    if active is not None:
+        task_id = str(active["operation_ref_id"])
+        try:
+            task = boss_chat.boss_chat_batch_manager.get(task_id)
+        except AppError:
+            _reset_lost_chat_batch_operation(db, run_id, task_id)
+        else:
+            status = str(task.get("status") or "queued")
+            if status in {"queued", "running"}:
+                return {
+                    "status": status,
+                    "terminal": False,
+                    "operation": {"type": "chat_batch", "id": task_id},
+                    "data": task,
+                }
+            return _finish_chat_batch_operation(db, run_id, task_id, task)
+
+    items = _chat_batch_items(db, run_id)
+    if not items:
+        return {
+            "status": "succeeded",
+            "terminal": True,
+            "reused": True,
+            "run": get_run(db, run_id),
+        }
+
+    session_ids = [str(item["session_id"]) for item in items]
+    _prepare_chat_page_for_batch(db, run_id)
+    candidates = {
+        str(candidate["id"])
+        for candidate in boss_chat.get_batch_candidates(db, session_ids=session_ids)
+    }
+    reusable_ids = [
+        str(item["id"]) for item in items if str(item["session_id"]) not in candidates
+    ]
+    for item_id in reusable_ids:
+        _mark_item_succeeded(
+            db,
+            run_id,
+            item_id,
+            result={
+                "outcome": "reused",
+                "source": "boss_chat_batch",
+                "selected_since_time": run["selected_since_time"],
+            },
+        )
+    pending_session_ids = [
+        str(item["session_id"]) for item in items if str(item["session_id"]) in candidates
+    ]
+    if not pending_session_ids:
+        return {
+            "status": "succeeded",
+            "terminal": True,
+            "reused": True,
+            "run": get_run(db, run_id),
+        }
+
+    task = boss_chat.boss_chat_batch_manager.start(
+        db,
+        config,
+        batch_size=len(pending_session_ids),
+        session_ids=pending_session_ids,
+    )
+    _set_chat_batch_operation(db, run_id, items, str(task["id"]), set(pending_session_ids))
+    return {
+        "status": str(task.get("status") or "queued"),
+        "terminal": False,
+        "operation": {"type": "chat_batch", "id": str(task["id"])},
+        "data": task,
         "run": get_run(db, run_id),
     }
 
@@ -535,6 +640,14 @@ def refresh_related_job(
         raise AppError(409, "WORKFLOW_NOT_SELECTED", "本次任务未选择采集关联岗位。")
     if item["status"] in {"succeeded", "skipped"}:
         return {"status": item["status"], "terminal": True, "reused": True, "item": item}
+    if _skip_chat_batch_covered_related_jobs(db, run_id, item_id=item_id):
+        return {
+            "status": "skipped",
+            "terminal": True,
+            "reused": True,
+            "item": get_item(db, run_id, item_id),
+            "run": get_run(db, run_id),
+        }
     _assert_session_in_scope(
         db,
         run,
@@ -608,7 +721,7 @@ def refresh_related_job(
                 "run": get_run(db, run_id),
             }
 
-        prepared = prepare_chat_job(
+        prepared = boss_chat.prepare_chat_job(
             db,
             str(item["session_id"]),
             can_fetch_details=boss_scraper_service.get_browser_status().running,
@@ -661,10 +774,16 @@ def refresh_related_job(
         raise
 
 
-def complete_run(db: Database, run_id: str) -> dict[str, object]:
+def complete_run(
+    db: Database,
+    run_id: str,
+    config: AppConfig | None = None,
+) -> dict[str, object]:
     run = _require_run(db, run_id)
     if run["status"] in {"completed", "failed", "cancelled"}:
         return get_run(db, run_id)
+    _settle_terminal_chat_batches_for_run(db, run_id)
+    _skip_chat_batch_covered_related_jobs(db, run_id)
     with db.connect() as connection:
         unfinished = int(
             connection.execute(
@@ -681,6 +800,11 @@ def complete_run(db: Database, run_id: str) -> dict[str, object]:
                 "REFRESH_RUN_NOT_FINISHABLE",
                 "更新任务仍有未完成项，请继续处理后再汇总。",
             )
+
+    if _analysis_requested(run["workflow_options"]):
+        job_hunt_analysis.ensure_analysis_ready_for_completion(db, run_id)
+
+    with db.connect() as connection:
         _refresh_run_counts(connection, run_id)
         failed = int(
             connection.execute(
@@ -700,8 +824,9 @@ def complete_run(db: Database, run_id: str) -> dict[str, object]:
                 (run_id,),
             ).fetchone()[0]
         )
-        if run["workflow_options"]["refresh_related_jobs"]:
-            unresolved += int(run["scope"]["counts"].get("unresolved_relations") or 0)
+        if run["workflow_options"]["refresh_related_jobs"] and run.get("scope_id"):
+            scope = get_scope(db, str(run["scope_id"]))
+            unresolved += int(scope["counts"].get("unresolved_relations") or 0)
         has_chat_list_error = run["chat_list_status"] == "failed"
         status = "completed_with_errors" if failed or unresolved or has_chat_list_error else "completed"
         now = utc_now()
@@ -714,6 +839,57 @@ def complete_run(db: Database, run_id: str) -> dict[str, object]:
             (status, now, now, run_id),
         )
     return get_run(db, run_id)
+
+
+def settle_chat_batch_operation(
+    db: Database,
+    task_id: str,
+    task: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """把原批量聊天任务的终态同步回关联的 Refresh Run Item。"""
+    if task is None:
+        task = boss_chat.boss_chat_batch_manager.get(task_id)
+    raw_status = str(task.get("status") or "queued")
+    if raw_status in {"queued", "running"}:
+        return {
+            "status": raw_status,
+            "terminal": False,
+            "operation": {"type": "chat_batch", "id": task_id},
+            "data": task,
+        }
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT run_id
+            FROM fj_job_hunt_refresh_items
+            WHERE item_type = 'chat_session'
+              AND operation_ref_type = 'chat_batch'
+              AND operation_ref_id = ?
+            """,
+            (task_id,),
+        ).fetchall()
+    run_ids = [str(row["run_id"]) for row in rows]
+    if not run_ids:
+        return {
+            "status": {"completed": "succeeded"}.get(raw_status, raw_status),
+            "terminal": True,
+            "operation": {"type": "chat_batch", "id": task_id},
+            "data": task,
+        }
+    settled = [
+        _finish_chat_batch_operation(db, run_id, task_id, task)
+        for run_id in run_ids
+    ]
+    failed_items = sum(int(item.get("failed_items") or 0) for item in settled)
+    return {
+        "status": "failed" if failed_items else "succeeded",
+        "terminal": True,
+        "operation": {"type": "chat_batch", "id": task_id},
+        "data": task,
+        "failed_items": failed_items,
+        "runs": [item.get("run") for item in settled],
+        "run": settled[-1].get("run") if settled else None,
+    }
 
 
 def get_item(db: Database, run_id: str, item_id: str) -> dict[str, object]:
@@ -765,6 +941,438 @@ def _create_run_items_from_scope(
                     now,
                 ),
             )
+
+
+def _reconcile_running_run(db: Database, run_id: str) -> None:
+    with db.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT status, chat_list_status, prompt_submitted_at
+            FROM fj_job_hunt_refresh_runs
+            WHERE id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+    if row is None:
+        return
+    status = str(row["status"])
+    prompt_submitted = bool(str(row["prompt_submitted_at"] or "").strip())
+    if status == "pending" and prompt_submitted:
+        with db.connect() as connection:
+            connection.execute(
+                """
+                UPDATE fj_job_hunt_refresh_runs
+                SET status = 'running',
+                    started_at = COALESCE(started_at, ?),
+                    updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (utc_now(), utc_now(), run_id),
+            )
+    elif status != "running":
+        return
+    _settle_terminal_chat_batches_for_run(db, run_id)
+    _skip_chat_batch_covered_related_jobs(db, run_id)
+    with db.connect() as connection:
+        refreshed = connection.execute(
+            """
+            SELECT status, chat_list_status, scope_id, summary_json, workflow_options_json
+            FROM fj_job_hunt_refresh_runs
+            WHERE id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        if refreshed is None or str(refreshed["status"]) != "running":
+            return
+        unfinished = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM fj_job_hunt_refresh_items
+                WHERE run_id = ? AND status IN ('pending', 'running')
+                """,
+                (run_id,),
+            ).fetchone()[0]
+        )
+        if unfinished or str(refreshed["chat_list_status"]) in {"pending", "running"}:
+            return
+        options = _load(refreshed["workflow_options_json"], {})
+        if _analysis_requested(options):
+            summary = _load(refreshed["summary_json"], {})
+            next_step = _analysis_wait_step(summary)
+            connection.execute(
+                """
+                UPDATE fj_job_hunt_refresh_runs
+                SET current_step = ?, updated_at = ?
+                WHERE id = ? AND current_step <> ?
+                """,
+                (next_step, utc_now(), run_id, next_step),
+            )
+            return
+        _refresh_run_counts(connection, run_id)
+        failed = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM fj_job_hunt_refresh_items
+                WHERE run_id = ? AND status = 'failed'
+                """,
+                (run_id,),
+            ).fetchone()[0]
+        )
+        unresolved = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM fj_job_hunt_refresh_items
+                WHERE run_id = ? AND error_category = 'UNRESOLVED_JOB_RELATION'
+                """,
+                (run_id,),
+            ).fetchone()[0]
+        )
+        if refreshed["scope_id"]:
+            scope_row = connection.execute(
+                "SELECT counts_json FROM fj_job_hunt_refresh_scopes WHERE id = ?",
+                (refreshed["scope_id"],),
+            ).fetchone()
+            if scope_row:
+                unresolved += int(
+                    _load(scope_row["counts_json"], {}).get("unresolved_relations") or 0
+                )
+        has_chat_list_error = str(refreshed["chat_list_status"]) == "failed"
+        status = (
+            "completed_with_errors"
+            if failed or unresolved or has_chat_list_error
+            else "completed"
+        )
+        now = utc_now()
+        connection.execute(
+            """
+            UPDATE fj_job_hunt_refresh_runs
+            SET status = ?, current_step = 'completed',
+                completed_at = ?, updated_at = ?
+            WHERE id = ? AND status = 'running'
+            """,
+            (status, now, now, run_id),
+        )
+
+
+def _skip_chat_batch_covered_related_jobs(
+    db: Database,
+    run_id: str,
+    *,
+    item_id: str | None = None,
+) -> int:
+    with db.connect() as connection:
+        run = connection.execute(
+            """
+            SELECT scope_id, workflow_options_json
+            FROM fj_job_hunt_refresh_runs
+            WHERE id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        if run is None or not run["scope_id"]:
+            return 0
+        options = _load(run["workflow_options_json"], {})
+        if not bool(options.get("refresh_chat_messages")):
+            return 0
+        actionable_chat = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM fj_job_hunt_refresh_items
+                WHERE run_id = ? AND item_type = 'chat_session'
+                  AND (
+                    status IN ('pending', 'running')
+                    OR (status = 'failed' AND retryable = 1)
+                  )
+                """,
+                (run_id,),
+            ).fetchone()[0]
+        )
+        if actionable_chat:
+            return 0
+        scope = connection.execute(
+            """
+            SELECT session_ids_json
+            FROM fj_job_hunt_refresh_scopes
+            WHERE id = ?
+            """,
+            (run["scope_id"],),
+        ).fetchone()
+        if scope is None:
+            return 0
+        session_ids = [
+            str(value).strip()
+            for value in _load(scope["session_ids_json"], [])
+            if str(value).strip()
+        ]
+        if not session_ids:
+            return 0
+        placeholders = ",".join("?" for _ in session_ids)
+        item_filter = "AND id = ?" if item_id else ""
+        parameters: tuple[object, ...] = (
+            run_id,
+            *session_ids,
+            *([item_id] if item_id else []),
+        )
+        now = utc_now()
+        result = {
+            "outcome": "covered_by_chat_batch",
+            "source": "boss_chat_batch",
+            "reason": "聊天批量入口已负责该会话关联岗位。",
+        }
+        cursor = connection.execute(
+            f"""
+            UPDATE fj_job_hunt_refresh_items
+            SET status = 'skipped', retryable = 0, result_json = ?,
+                error_category = 'RELATED_JOB_COVERED_BY_CHAT_BATCH',
+                error_message = '聊天批量入口已负责该会话关联岗位。',
+                operation_ref_type = NULL, operation_ref_id = NULL,
+                completed_at = ?, updated_at = ?
+            WHERE run_id = ? AND item_type = 'related_job'
+              AND status NOT IN ('succeeded', 'skipped')
+              AND session_id IN ({placeholders})
+              {item_filter}
+            """,
+            (_dump(result), now, now, *parameters),
+        )
+        changed = int(cursor.rowcount)
+        if changed:
+            _refresh_run_counts(connection, run_id)
+        return changed
+
+
+def _prepare_chat_page_for_batch(db: Database, run_id: str) -> dict[str, object]:
+    """复用自动代聊“更新信息”入口，让后续历史消息请求拥有可用聊天页。"""
+    try:
+        captured = boss_scraper_service.capture_chat_friend_list()
+        result = boss_chat.sync_friend_list(
+            db,
+            account_uid=str(captured["account_uid"]),
+            response=captured["response"],
+            source_url=str(captured["url"]),
+        )
+    except ValueError as exc:
+        raise AppError(
+            400,
+            "BOSS_CHAT_LIST_CAPTURE_INVALID",
+            str(exc),
+        ) from exc
+    except RuntimeError as exc:
+        raise AppError(
+            409,
+            "BOSS_CHAT_LIST_CAPTURE_FAILED",
+            str(exc),
+        ) from exc
+    _record_chat_list_prepare_result(db, run_id, result)
+    return result
+
+
+def _record_chat_list_prepare_result(
+    db: Database,
+    run_id: str,
+    result: dict[str, object],
+) -> None:
+    now = utc_now()
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT summary_json FROM fj_job_hunt_refresh_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        summary = _load(row["summary_json"] if row else "{}", {})
+        summary["chat_list"] = {
+            "status": "succeeded",
+            "prepared_for_chat_batch": True,
+            "result": result,
+        }
+        connection.execute(
+            """
+            UPDATE fj_job_hunt_refresh_runs
+            SET chat_list_status = 'succeeded', chat_list_retryable = 0,
+                summary_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (_dump(summary), now, run_id),
+        )
+
+
+def _active_chat_batch_operation(
+    db: Database,
+    run_id: str,
+) -> dict[str, object] | None:
+    with db.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT * FROM fj_job_hunt_refresh_items
+            WHERE run_id = ? AND item_type = 'chat_session'
+              AND status = 'running'
+              AND operation_ref_type = 'chat_batch'
+              AND operation_ref_id IS NOT NULL
+            ORDER BY updated_at DESC LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+    return _serialize_item(row) if row is not None else None
+
+
+def _chat_batch_items(db: Database, run_id: str) -> list[dict[str, object]]:
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM fj_job_hunt_refresh_items
+            WHERE run_id = ? AND item_type = 'chat_session'
+              AND (
+                status IN ('pending', 'running')
+                OR (status = 'failed' AND retryable = 1)
+              )
+            ORDER BY created_at, id
+            LIMIT ?
+            """,
+            (run_id, CHAT_BATCH_LIMIT),
+        ).fetchall()
+        if rows:
+            _set_run_running(connection, run_id, "refresh_chat_messages_batch")
+    return [_serialize_item(row) for row in rows]
+
+
+def _set_chat_batch_operation(
+    db: Database,
+    run_id: str,
+    items: list[dict[str, object]],
+    task_id: str,
+    session_ids: set[str],
+) -> None:
+    now = utc_now()
+    with db.connect() as connection:
+        _set_run_running(connection, run_id, "refresh_chat_messages_batch")
+        for item in items:
+            if str(item["session_id"]) not in session_ids:
+                continue
+            connection.execute(
+                """
+                UPDATE fj_job_hunt_refresh_items
+                SET status = 'running', step = 'refresh_chat_messages',
+                    started_at = COALESCE(started_at, ?),
+                    completed_at = NULL, error_category = NULL, error_message = NULL,
+                    operation_ref_type = 'chat_batch', operation_ref_id = ?,
+                    updated_at = ?
+                WHERE id = ? AND run_id = ? AND status <> 'succeeded'
+                """,
+                (now, task_id, now, item["id"], run_id),
+            )
+        _refresh_run_counts(connection, run_id)
+
+
+def _finish_chat_batch_operation(
+    db: Database,
+    run_id: str,
+    task_id: str,
+    task: dict[str, object],
+) -> dict[str, object]:
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM fj_job_hunt_refresh_items
+            WHERE run_id = ? AND item_type = 'chat_session'
+              AND operation_ref_type = 'chat_batch'
+              AND operation_ref_id = ?
+            ORDER BY created_at, id
+            """,
+            (run_id, task_id),
+        ).fetchall()
+    items = [_serialize_item(row) for row in rows]
+    session_ids = [str(item["session_id"]) for item in items]
+    remaining = {
+        str(candidate["id"])
+        for candidate in boss_chat.get_batch_candidates(db, session_ids=session_ids)
+    }
+    run = _require_run(db, run_id)
+    failed_count = 0
+    for item in items:
+        session_id = str(item["session_id"])
+        if session_id not in remaining:
+            _mark_item_succeeded(
+                db,
+                run_id,
+                str(item["id"]),
+                result={
+                    "outcome": "updated",
+                    "source": "boss_chat_batch",
+                    "batch_task_id": task_id,
+                    "selected_since_time": run["selected_since_time"],
+                },
+            )
+            continue
+        failed_count += 1
+        _mark_item_failed(
+            db,
+            run_id,
+            str(item["id"]),
+            AppError(
+                409,
+                "BOSS_CHAT_BATCH_ITEM_FAILED",
+                str(task.get("message") or "原批量聊天更新未完成该会话。"),
+            ),
+            retryable=True,
+        )
+    return {
+        "status": "failed" if failed_count else "succeeded",
+        "terminal": True,
+        "operation": {"type": "chat_batch", "id": task_id},
+        "data": task,
+        "failed_items": failed_count,
+        "run": get_run(db, run_id),
+    }
+
+
+def _settle_terminal_chat_batches_for_run(db: Database, run_id: str) -> None:
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT operation_ref_id
+            FROM fj_job_hunt_refresh_items
+            WHERE run_id = ? AND item_type = 'chat_session'
+              AND status = 'running'
+              AND operation_ref_type = 'chat_batch'
+              AND operation_ref_id IS NOT NULL
+            """,
+            (run_id,),
+        ).fetchall()
+    for row in rows:
+        task_id = str(row["operation_ref_id"])
+        try:
+            task = boss_chat.boss_chat_batch_manager.get(task_id)
+        except AppError:
+            _reset_lost_chat_batch_operation(db, run_id, task_id)
+            continue
+        if str(task.get("status") or "queued") not in {"queued", "running"}:
+            _finish_chat_batch_operation(db, run_id, task_id, task)
+
+
+def _reset_lost_chat_batch_operation(
+    db: Database,
+    run_id: str,
+    task_id: str,
+) -> None:
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_job_hunt_refresh_items
+            SET status = 'failed', retryable = 1,
+                operation_ref_type = NULL, operation_ref_id = NULL,
+                error_category = 'CHAT_BATCH_TASK_LOST',
+                error_message = '批量聊天更新任务状态已丢失，可重新执行。',
+                completed_at = ?, updated_at = ?
+            WHERE run_id = ? AND item_type = 'chat_session'
+              AND operation_ref_type = 'chat_batch'
+              AND operation_ref_id = ?
+            """,
+            (now, now, run_id, task_id),
+        )
+        _refresh_run_counts(connection, run_id)
 
 
 def _latest_local_platform_message_at(connection) -> str | None:
@@ -920,82 +1528,6 @@ def _job_missing_jd(job: dict[str, Any]) -> bool:
     )
 
 
-def _messages_since(messages: list[dict[str, Any]], since: datetime) -> list[dict[str, Any]]:
-    threshold_ms = int(since.timestamp() * 1000)
-    scoped: list[dict[str, Any]] = []
-    for message in messages:
-        try:
-            sent_ms = int(message.get("time") or 0)
-        except (TypeError, ValueError):
-            continue
-        if sent_ms >= threshold_ms:
-            scoped.append(message)
-    return scoped
-
-
-def _sync_session_messages_since(
-    db: Database,
-    *,
-    session_id: str,
-    boss_id: str,
-    security_id: str,
-    since: datetime,
-) -> dict[str, object]:
-    """沿用现有历史接口逐页同步，读取到 selected_since_time 边界后停止。"""
-    cursor = "0"
-    seen_cursors: set[str] = set()
-    platform_fetched = 0
-    considered = 0
-    inserted = 0
-    final_has_more = False
-    while True:
-        captured = boss_scraper_service.capture_chat_history(
-            boss_id=boss_id,
-            security_id=security_id,
-            max_message_id=cursor,
-        )
-        raw_messages = list(captured.get("messages") or [])
-        scoped_messages = _messages_since(raw_messages, since)
-        page_result = sync_history_messages(
-            db,
-            session_id=session_id,
-            messages=scoped_messages,
-            history_has_more=bool(captured.get("has_more")),
-            history_next_cursor=str(captured.get("next_cursor") or ""),
-        )
-        platform_fetched += len(raw_messages)
-        considered += len(scoped_messages)
-        inserted += int(page_result["inserted_count"])
-        final_has_more = bool(captured.get("has_more"))
-        reached_boundary = any(
-            _message_time(message) is not None and _message_time(message) < since
-            for message in raw_messages
-        )
-        next_cursor = str(captured.get("next_cursor") or "")
-        if not final_has_more or reached_boundary or not next_cursor or next_cursor in seen_cursors:
-            break
-        seen_cursors.add(next_cursor)
-        cursor = next_cursor
-    return {
-        "session_id": session_id,
-        "platform_fetched_count": platform_fetched,
-        "fetched_count": considered,
-        "inserted_count": inserted,
-        "message_update_required": False,
-        "has_more": final_has_more,
-    }
-
-
-def _message_time(message: dict[str, Any]) -> datetime | None:
-    try:
-        milliseconds = int(message.get("time") or 0)
-    except (TypeError, ValueError):
-        return None
-    if milliseconds <= 0:
-        return None
-    return datetime.fromtimestamp(milliseconds / 1000, tz=UTC)
-
-
 def _assert_session_in_scope(
     db: Database,
     run: dict[str, object],
@@ -1016,17 +1548,47 @@ def _assert_session_in_scope(
 def _normalize_workflows(options: dict[str, bool]) -> dict[str, bool]:
     normalized = {name: bool(options.get(name, False)) for name in SUPPORTED_WORKFLOWS}
     normalized["refresh_chat_list"] = True
-    normalized["analyze_conversations"] = False
-    normalized["generate_missing_suggestions"] = False
+    if (
+        normalized["generate_reply_drafts"]
+        or normalized["generate_followup_recommendations"]
+    ):
+        normalized["analyze_conversations"] = True
     if not (
-        normalized["refresh_chat_messages"] or normalized["refresh_related_jobs"]
+        normalized["refresh_chat_messages"]
+        or normalized["refresh_related_jobs"]
+        or normalized["analyze_conversations"]
+        or normalized["generate_missing_suggestions"]
+        or normalized["generate_reply_drafts"]
+        or normalized["generate_followup_recommendations"]
     ):
         raise AppError(
             422,
             "REFRESH_WORKFLOW_REQUIRED",
-            "请至少选择聊天消息同步或关联岗位采集。",
+            "请至少选择一个可执行工作流。",
         )
     return normalized
+
+
+def _analysis_requested(options: dict[str, object]) -> bool:
+    return any(
+        bool(options.get(name))
+        for name in (
+            "analyze_conversations",
+            "generate_missing_suggestions",
+            "generate_reply_drafts",
+            "generate_followup_recommendations",
+        )
+    )
+
+
+def _analysis_wait_step(summary: dict[str, object]) -> str:
+    analysis = summary.get("analysis") if isinstance(summary.get("analysis"), dict) else {}
+    analysis_status = str(analysis.get("status") or "")
+    if analysis_status == "saved":
+        return "waiting_completion"
+    if analysis_status in {"prepared", "saved_partial"}:
+        return "waiting_analysis_save"
+    return "waiting_analysis_prepare"
 
 
 def _require_run(db: Database, run_id: str) -> dict[str, object]:
@@ -1211,6 +1773,7 @@ def _refresh_run_counts(connection, run_id: str) -> None:
             )
     summary = {
         "chat_list": old_summary.get("chat_list", {}),
+        "analysis": old_summary.get("analysis", {}),
         "sessions_total": len(chat_rows),
         "sessions_succeeded": sum(row["status"] == "succeeded" for row in chat_rows),
         "sessions_failed": sum(row["status"] == "failed" for row in chat_rows),
@@ -1234,6 +1797,19 @@ def _refresh_run_counts(connection, run_id: str) -> None:
             row["error_category"] == "UNRESOLVED_JOB_RELATION" for row in job_rows
         ),
     }
+    analysis = summary["analysis"] if isinstance(summary.get("analysis"), dict) else {}
+    summary.update(
+        {
+            "conversations_analyzed": int(analysis.get("analyzed") or 0),
+            "conversations_skipped": int(analysis.get("skipped") or 0),
+            "conversation_analysis_failed": int(analysis.get("failed") or 0),
+            "activities_written": int(analysis.get("activities_created") or 0),
+            "reply_drafts_generated": int(analysis.get("generated_reply_draft") or 0),
+            "missing_suggestions_total": int(analysis.get("evaluation_jobs_total") or 0),
+            "missing_suggestions_generated": int(analysis.get("generated_evaluation") or 0),
+            "missing_suggestions_skipped": int(analysis.get("evaluation_jobs_skipped") or 0),
+        }
+    )
     connection.execute(
         """
         UPDATE fj_job_hunt_refresh_runs
@@ -1255,6 +1831,45 @@ def _refresh_run_counts(connection, run_id: str) -> None:
 def _progress(items: list[dict[str, object]], run: dict[str, object]) -> dict[str, object]:
     chat = [item for item in items if item["item_type"] == "chat_session"]
     jobs = [item for item in items if item["item_type"] == "related_job"]
+    scope = run.get("scope") if isinstance(run.get("scope"), dict) else {}
+    scope_counts = scope.get("counts") if isinstance(scope.get("counts"), dict) else {}
+    related_job_total = int(scope_counts.get("jobs_to_update") or len(jobs))
+    chat_status_by_session = {
+        str(item["session_id"]): str(item["status"])
+        for item in chat
+        if item.get("session_id")
+    }
+    extra_entities = {
+        str(item.get("entity_id"))
+        for item in scope.get("jobs_to_collect", [])
+        if isinstance(item, dict) and item.get("entity_id")
+    }
+    related_entities = {
+        str(item.get("entity_id")): item
+        for item in scope.get("related_jobs", [])
+        if isinstance(item, dict) and item.get("entity_id")
+    }
+    completed_related_entities: set[str] = set()
+    failed_related_entities: set[str] = set()
+    for entity_id, relation in related_entities.items():
+        session_id = str(relation.get("session_id") or "")
+        if entity_id in extra_entities:
+            continue
+        chat_status = chat_status_by_session.get(session_id)
+        if chat_status in {"succeeded", "failed", "skipped"}:
+            completed_related_entities.add(entity_id)
+        if chat_status == "failed":
+            failed_related_entities.add(entity_id)
+    for item in jobs:
+        entity_id = str(item.get("entity_id") or "")
+        if not entity_id:
+            continue
+        if item["status"] in {"succeeded", "failed", "skipped"}:
+            completed_related_entities.add(entity_id)
+        if item["status"] == "failed":
+            failed_related_entities.add(entity_id)
+    related_completed = min(related_job_total, len(completed_related_entities))
+    related_failed = min(related_job_total, len(failed_related_entities))
     return {
         "chat_list": {"status": run["chat_list_status"]},
         "chat_messages": {
@@ -1264,10 +1879,10 @@ def _progress(items: list[dict[str, object]], run: dict[str, object]) -> dict[st
             "failed": sum(item["status"] == "failed" for item in chat),
         },
         "related_jobs": {
-            "total": len(jobs),
-            "completed": sum(item["status"] in {"succeeded", "failed", "skipped"} for item in jobs),
-            "succeeded": sum(item["status"] == "succeeded" for item in jobs),
-            "failed": sum(item["status"] == "failed" for item in jobs),
+            "total": related_job_total,
+            "completed": related_completed,
+            "succeeded": max(0, related_completed - related_failed),
+            "failed": related_failed,
             "skipped": sum(item["status"] == "skipped" for item in jobs),
         },
     }
@@ -1316,6 +1931,13 @@ def _serialize_scope(row) -> dict[str, object]:
     result["counts"] = _load(result.pop("counts_json"), {})
     result["counts"].setdefault(
         "sessions_in_scope", len(result["session_ids_in_scope"])
+    )
+    result["counts"].setdefault(
+        "chat_update_jobs", int(result["counts"].get("jobs_to_collect") or 0)
+    )
+    result["counts"].setdefault("extra_jobs", 0)
+    result["counts"].setdefault(
+        "jobs_to_update", int(result["counts"].get("jobs_to_collect") or 0)
     )
     result["friend_list_result"] = _load(result.pop("friend_list_result_json"), {})
     result["related_job_ids"] = [

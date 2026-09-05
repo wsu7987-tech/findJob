@@ -4,7 +4,7 @@ import json
 from datetime import UTC, datetime, timedelta
 
 from backend.app.db import Database
-from backend.app.services.fine_job import job_hunt_refresh
+from backend.app.services.fine_job import boss_chat, job_hunt_refresh
 from backend.app.services.fine_job.boss_capture_history import (
     create_capture_batch,
     record_capture_jobs,
@@ -151,10 +151,27 @@ def test_scope_discovery_uses_friend_refresh_result_and_selected_platform_time(
         changed_at="2026-09-05T02:00:00Z",
         encrypt_job_id="existing-job",
     )
+    _insert_session(
+        test_db,
+        session_id="existing-job-loaded-session",
+        peer_uid="loaded-peer",
+        changed_at="2026-09-05T02:00:00Z",
+        encrypt_job_id="existing-job",
+    )
     with test_db.connect() as connection:
         connection.execute(
             "UPDATE fj_chat_sessions SET platform_latest_msg_id = 'existing-latest' WHERE id = 'existing-session'"
         )
+        connection.execute(
+            "UPDATE fj_chat_sessions SET platform_latest_msg_id = 'loaded-latest' WHERE id = 'existing-job-loaded-session'"
+        )
+    _insert_message(
+        test_db,
+        message_id="loaded-local-message",
+        session_id="existing-job-loaded-session",
+        platform_message_id="loaded-latest",
+        sent_at="2026-09-05T02:00:00Z",
+    )
     recent_ms = int(datetime(2026, 9, 5, 2, tzinfo=UTC).timestamp() * 1_000)
     old_ms = int(datetime(2026, 9, 1, 2, tzinfo=UTC).timestamp() * 1_000)
     response = {"zpData": {"result": [
@@ -167,6 +184,11 @@ def test_scope_discovery_uses_friend_refresh_result_and_selected_platform_time(
             "uid": "new-peer", "encryptFriendId": "encrypt-new-peer",
             "securityId": "security-new-peer", "encryptJobId": "new-job",
             "lastMessageInfo": {"msgId": "new-latest", "msgTime": recent_ms},
+        },
+        {
+            "uid": "loaded-peer", "encryptFriendId": "encrypt-loaded-peer",
+            "securityId": "security-loaded-peer", "encryptJobId": "existing-job",
+            "lastMessageInfo": {"msgId": "loaded-latest", "msgTime": recent_ms},
         },
         {
             "uid": "old-peer", "encryptFriendId": "encrypt-old-peer",
@@ -201,9 +223,13 @@ def test_scope_discovery_uses_friend_refresh_result_and_selected_platform_time(
             for table in table_names
         }
     assert result["counts"]["sessions_to_sync"] == 2
-    assert result["counts"]["sessions_in_scope"] == 2
+    assert result["counts"]["sessions_in_scope"] == 3
     assert result["scope_source"] == "refresh"
     assert result["counts"]["new_sessions_to_sync"] == 1
+    assert result["counts"]["chat_update_jobs"] == 2
+    assert result["counts"]["extra_jobs"] == 0
+    assert result["counts"]["jobs_to_update"] == 2
+    assert result["counts"]["jobs_to_collect"] == 0
     assert result["session_ids_to_sync"][0] == "existing-session"
     assert "old-peer" not in result["session_ids_to_sync"]
     assert len(result["new_session_ids"]) == 2
@@ -294,6 +320,13 @@ def test_local_scope_does_not_call_platform_and_keeps_synced_session_in_job_scop
         peer_uid="local-stale-peer",
         changed_at="2026-09-05T02:01:00Z",
     )
+    _insert_session(
+        test_db,
+        session_id="local-extra-session",
+        peer_uid="local-extra-peer",
+        changed_at="2026-09-05T02:02:00Z",
+        encrypt_job_id="local-extra-job",
+    )
     with test_db.connect() as connection:
         connection.execute(
             """
@@ -310,12 +343,26 @@ def test_local_scope_does_not_call_platform_and_keeps_synced_session_in_job_scop
             WHERE id = 'local-stale-session'
             """
         )
+        connection.execute(
+            """
+            UPDATE fj_chat_sessions
+            SET platform_synced_at = '2026-09-05T02:05:00Z'
+            WHERE id = 'local-extra-session'
+            """
+        )
     _insert_message(
         test_db,
         message_id="local-loaded-message",
         session_id="local-synced-session",
         platform_message_id="local-platform-message",
         sent_at="2026-09-05T02:00:00Z",
+    )
+    _insert_message(
+        test_db,
+        message_id="local-extra-loaded-message",
+        session_id="local-extra-session",
+        platform_message_id="local-extra-platform-message",
+        sent_at="2026-09-05T02:02:00Z",
     )
     capture = monkeypatch.setattr(
         job_hunt_refresh.boss_scraper_service,
@@ -331,12 +378,18 @@ def test_local_scope_does_not_call_platform_and_keeps_synced_session_in_job_scop
 
     assert capture is None
     assert scope["scope_source"] == "local"
-    assert scope["counts"]["sessions_in_scope"] == 1
-    assert scope["session_ids_in_scope"] == ["local-synced-session"]
+    assert scope["counts"]["sessions_in_scope"] == 2
+    assert set(scope["session_ids_in_scope"]) == {
+        "local-extra-session",
+        "local-synced-session",
+    }
     assert scope["counts"]["sessions_to_sync"] == 0
-    assert scope["counts"]["related_jobs"] == 1
-    assert scope["counts"]["jobs_to_collect"] == 0
-    assert scope["counts"]["jobs_missing_evaluation"] == 1
+    assert scope["counts"]["related_jobs"] == 2
+    assert scope["counts"]["chat_update_jobs"] == 0
+    assert scope["counts"]["extra_jobs"] == 1
+    assert scope["counts"]["jobs_to_update"] == 1
+    assert scope["counts"]["jobs_to_collect"] == 1
+    assert scope["counts"]["jobs_missing_evaluation"] == 2
 
 
 def test_auto_uses_fresh_local_list_and_refreshes_stale_list(
@@ -568,7 +621,7 @@ def test_completed_with_errors_can_resume_only_retryable_items(test_db: Database
     assert [item["id"] for item in actionable] == [failed_id]
 
 
-def test_message_refresh_writes_only_messages_at_or_after_selected_since(
+def test_message_refresh_reuses_existing_single_session_history_sync(
     test_db: Database,
     monkeypatch,
 ) -> None:
@@ -623,9 +676,100 @@ def test_message_refresh_writes_only_messages_at_or_after_selected_since(
         messages = connection.execute(
             "SELECT platform_message_id FROM fj_chat_messages ORDER BY platform_message_id"
         ).fetchall()
-    assert first["item"]["result"]["inserted_count"] == 1
+    assert first["item"]["result"]["inserted_count"] == 2
     assert second["reused"] is True
-    assert [row["platform_message_id"] for row in messages] == ["new-message"]
+    assert [row["platform_message_id"] for row in messages] == ["new-message", "old-message"]
+
+
+def test_message_batch_refresh_prepares_chat_page_and_uses_batch_manager(
+    test_db: Database,
+    monkeypatch,
+) -> None:
+    _insert_session(
+        test_db,
+        session_id="batch-session",
+        peer_uid="batch-peer",
+        changed_at="2026-09-05T02:00:00Z",
+    )
+    scope_id = _insert_scope(test_db, ["batch-session"])
+    run = job_hunt_refresh.create_run(
+        test_db,
+        scope_id=scope_id,
+        workflow_options=_options(refresh_related_jobs=False),
+    )
+    captured_friend_lists: list[bool] = []
+    started_batches: list[list[str]] = []
+    message_time = int(datetime(2026, 9, 5, 2, tzinfo=UTC).timestamp() * 1_000)
+    friend_response = {"zpData": {"result": [{
+        "uid": "batch-peer",
+        "encryptFriendId": "encrypt-batch-peer",
+        "securityId": "security-batch-peer",
+        "lastMessageInfo": {"msgId": "batch-message", "msgTime": message_time},
+    }]}}
+
+    def capture_chat_friend_list():
+        captured_friend_lists.append(True)
+        return {"account_uid": "candidate", "response": friend_response, "url": "test"}
+
+    def start_batch(_db, _config, *, batch_size: int, session_ids: list[str] | None = None):
+        started_batches.append(list(session_ids or []))
+        assert batch_size == 1
+        boss_chat.sync_history_messages(
+            test_db,
+            session_id="batch-session",
+            messages=[{
+                "mid": "batch-message",
+                "time": message_time,
+                "from": {"uid": "batch-peer"},
+                "to": {"uid": "candidate"},
+                "body": {"type": 1, "text": "批量消息"},
+            }],
+            history_has_more=False,
+            history_next_cursor="",
+        )
+        return {
+            "id": "chat_batch_test",
+            "status": "completed",
+            "total": 1,
+            "current": 1,
+            "chat_completed": 1,
+            "job_completed": 0,
+            "job_skipped": 1,
+            "failed": 0,
+            "current_session_name": "",
+            "current_job_title": "",
+            "stage": "completed",
+            "message": "批量更新已完成。",
+            "created_at": "2026-09-05T03:00:00Z",
+            "finished_at": "2026-09-05T03:00:01Z",
+        }
+
+    monkeypatch.setattr(
+        job_hunt_refresh.boss_scraper_service,
+        "capture_chat_friend_list",
+        capture_chat_friend_list,
+    )
+    monkeypatch.setattr(
+        boss_chat.boss_chat_batch_manager,
+        "start",
+        start_batch,
+    )
+    monkeypatch.setattr(
+        boss_chat.boss_chat_batch_manager,
+        "get",
+        lambda _task_id: start_batch(test_db, object(), batch_size=1, session_ids=["batch-session"]),
+    )
+
+    started = job_hunt_refresh.refresh_chat_messages_batch(test_db, object(), str(run["id"]))
+    finished = job_hunt_refresh.refresh_chat_messages_batch(test_db, object(), str(run["id"]))
+
+    assert captured_friend_lists == [True]
+    assert started["operation"] == {"type": "chat_batch", "id": "chat_batch_test"}
+    assert finished["status"] == "succeeded"
+    assert started_batches[0] == ["batch-session"]
+    refreshed = job_hunt_refresh.get_run(test_db, str(run["id"]))
+    assert refreshed["items"][0]["status"] == "succeeded"
+    assert refreshed["items"][0]["result"]["source"] == "boss_chat_batch"
 
 
 def test_related_job_refresh_reuses_existing_session_job_flow(test_db: Database) -> None:

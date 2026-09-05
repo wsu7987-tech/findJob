@@ -1085,6 +1085,12 @@ export interface FineJobChatSession {
   message_update_required?: boolean;
   has_local_messages?: boolean;
   history_has_more?: boolean;
+  attention_status?: string;
+  attention_label?: string;
+  attention_action?: string;
+  attention_reason?: string;
+  attention_priority?: number;
+  attention_updated_at?: string;
   reply_task_id?: string | null;
   reply_task_status?: FineJobChatReplyStatus | null;
   reply_draft_text?: string;
@@ -1152,11 +1158,26 @@ export interface FineJobChatSendAction {
   client_mid?: string;
 }
 
+export interface FineJobConversationInsight {
+  id: string;
+  session_id: string;
+  job_id?: string | null;
+  run_id?: string | null;
+  status: "analyzed" | "skipped" | "failed";
+  insight: Record<string, unknown>;
+  model: string;
+  prompt_version: string;
+  analysis_version: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface FineJobChatSessionDetail {
   session: FineJobChatSession;
   messages: FineJobChatMessage[];
   reply_tasks: FineJobChatReplyTask[];
   send_actions: FineJobChatSendAction[];
+  latest_conversation_insight?: FineJobConversationInsight | null;
   messages_truncated?: boolean;
   message_count?: number;
 }
@@ -1234,8 +1255,10 @@ export interface FineJobJobHuntRefreshWorkflowOptions {
   refresh_chat_list: boolean;
   refresh_chat_messages: boolean;
   refresh_related_jobs: boolean;
-  analyze_conversations: false;
-  generate_missing_suggestions: false;
+  analyze_conversations: boolean;
+  generate_missing_suggestions: boolean;
+  generate_reply_drafts: boolean;
+  generate_followup_recommendations: boolean;
 }
 
 export interface FineJobJobHuntRefreshContext {
@@ -1283,6 +1306,9 @@ export interface FineJobJobHuntRefreshScope {
     sessions_to_sync: number;
     new_sessions_to_sync: number;
     related_jobs: number;
+    chat_update_jobs: number;
+    extra_jobs: number;
+    jobs_to_update: number;
     jobs_to_collect: number;
     jobs_missing_jd: number;
     jobs_missing_evaluation: number;
@@ -1357,6 +1383,15 @@ export interface FineJobJobHuntRefreshRun {
     jobs_refreshed?: number;
     jobs_reused?: number;
     unresolved_jobs?: number;
+    analysis?: Record<string, unknown>;
+    conversations_analyzed?: number;
+    conversations_skipped?: number;
+    conversation_analysis_failed?: number;
+    activities_written?: number;
+    reply_drafts_generated?: number;
+    missing_suggestions_total?: number;
+    missing_suggestions_generated?: number;
+    missing_suggestions_skipped?: number;
   };
   error_summary?: string | null;
   prompt_submitted_at?: string | null;

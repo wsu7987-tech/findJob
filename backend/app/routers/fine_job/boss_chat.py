@@ -61,7 +61,10 @@ def start_batch(
     db: Database = Depends(get_database),
 ) -> BossChatBatchTaskResponse:
     return BossChatBatchTaskResponse(**boss_chat.boss_chat_batch_manager.start(
-        db, config, batch_size=payload.batch_size,
+        db,
+        config,
+        batch_size=payload.batch_size,
+        session_ids=payload.session_ids,
     ))
 
 
@@ -216,31 +219,7 @@ def refresh_history(
 ) -> BossChatHistoryRefreshResponse:
     """使用会话保存的 encryptFriendId 和 securityId 获取历史消息。"""
     try:
-        with db.connect() as connection:
-            session = connection.execute(
-                """
-                SELECT encrypt_peer_uid, security_id
-                FROM fj_chat_sessions WHERE id = ?
-                """,
-                (session_id,),
-            ).fetchone()
-        if session is None:
-            raise AppError(
-                status_code=404,
-                error_category="CHAT_SESSION_NOT_FOUND",
-                error_message="聊天会话不存在。",
-            )
-        captured = boss_scraper_service.capture_chat_history(
-            boss_id=str(session["encrypt_peer_uid"] or ""),
-            security_id=str(session["security_id"] or ""),
-        )
-        result = boss_chat.sync_history_messages(
-            db,
-            session_id=session_id,
-            messages=list(captured.get("messages") or []),
-            history_has_more=bool(captured.get("has_more")),
-            history_next_cursor=str(captured.get("next_cursor") or ""),
-        )
+        result = boss_chat.refresh_session_history(db, session_id)
     except ValueError as exc:
         raise AppError(
             status_code=400,

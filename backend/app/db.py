@@ -1586,6 +1586,96 @@ CREATE TABLE IF NOT EXISTS fj_execution_reconciliations (
 CREATE INDEX IF NOT EXISTS idx_fj_execution_reconciliation_action
   ON fj_execution_reconciliations(action_ref_type, action_ref_id, reconciled_at DESC);
 
+CREATE TABLE IF NOT EXISTS fj_conversation_insights (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  job_id TEXT,
+  status TEXT NOT NULL DEFAULT 'analyzed',
+  insight_json TEXT NOT NULL DEFAULT '{}',
+  model TEXT NOT NULL DEFAULT '',
+  prompt_version TEXT NOT NULL DEFAULT '',
+  analysis_version TEXT NOT NULL DEFAULT 'job-hunt-refresh-analysis-v1',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES fj_job_hunt_refresh_runs(id) ON DELETE CASCADE,
+  FOREIGN KEY (session_id) REFERENCES fj_chat_sessions(id) ON DELETE CASCADE,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE SET NULL,
+  UNIQUE (run_id, session_id, analysis_version),
+  CHECK (status IN ('analyzed', 'skipped', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_conversation_insights_session_time
+  ON fj_conversation_insights(session_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_chat_attention_states (
+  session_id TEXT PRIMARY KEY,
+  job_id TEXT,
+  run_id TEXT,
+  insight_id TEXT,
+  attention_status TEXT NOT NULL DEFAULT 'unknown',
+  display_label TEXT NOT NULL DEFAULT '待判断',
+  recommended_action TEXT NOT NULL DEFAULT 'no_further_action',
+  reason TEXT NOT NULL DEFAULT '',
+  priority INTEGER NOT NULL DEFAULT 0,
+  evidence_message_ids_json TEXT NOT NULL DEFAULT '[]',
+  source TEXT NOT NULL DEFAULT 'analysis',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (session_id) REFERENCES fj_chat_sessions(id) ON DELETE CASCADE,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE SET NULL,
+  FOREIGN KEY (run_id) REFERENCES fj_job_hunt_refresh_runs(id) ON DELETE SET NULL,
+  FOREIGN KEY (insight_id) REFERENCES fj_conversation_insights(id) ON DELETE SET NULL,
+  CHECK (attention_status IN (
+    'needs_reply', 'needs_resume', 'needs_followup', 'needs_rejection_reason',
+    'needs_interview_confirm', 'needs_info', 'waiting', 'no_action', 'unknown'
+  )),
+  CHECK (recommended_action IN (
+    'reply_recruiter', 'send_resume', 'follow_up', 'ask_rejection_reason',
+    'confirm_interview', 'provide_information', 'wait_for_recruiter',
+    'no_further_action'
+  ))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_chat_attention_states_status
+  ON fj_chat_attention_states(attention_status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_job_hunt_refresh_analysis_items (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  job_id TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  result_json TEXT NOT NULL DEFAULT '{}',
+  error_category TEXT,
+  error_message TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES fj_job_hunt_refresh_runs(id) ON DELETE CASCADE,
+  FOREIGN KEY (session_id) REFERENCES fj_chat_sessions(id) ON DELETE CASCADE,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE SET NULL,
+  UNIQUE (run_id, session_id),
+  CHECK (status IN ('pending', 'running', 'analyzed', 'skipped', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_job_hunt_refresh_analysis_items_run_status
+  ON fj_job_hunt_refresh_analysis_items(run_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS fj_job_hunt_refresh_analysis_contexts (
+  run_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'prepared',
+  context_json TEXT NOT NULL DEFAULT '{}',
+  context_characters INTEGER NOT NULL DEFAULT 0,
+  max_context_characters INTEGER NOT NULL DEFAULT 0,
+  blocker_reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES fj_job_hunt_refresh_runs(id) ON DELETE CASCADE,
+  CHECK (status IN ('prepared', 'blocked'))
+);
+
 CREATE TABLE IF NOT EXISTS fj_codex_sessions (
   id TEXT PRIMARY KEY,
   status TEXT NOT NULL DEFAULT 'stopped',
@@ -1945,6 +2035,7 @@ class Database:
             self._ensure_resume_analysis_v2_schema(connection)
             self._ensure_resume_analysis_v3_schema(connection)
             self._ensure_job_hunt_refresh_schema(connection)
+            self._ensure_job_hunt_analysis_schema(connection)
             # 兼容升级只从可靠旧事实追加事件，并按完整事件流重放 shadow Pipeline。
             from backend.app.services.fine_job.job_activity import migrate_legacy_job_activity
             from backend.app.services.fine_job.execution_reconciliation import (
@@ -2044,6 +2135,102 @@ class Database:
                 connection.execute(
                     f"ALTER TABLE fj_chat_send_actions ADD COLUMN {column} {definition}"
                 )
+
+    def _ensure_job_hunt_analysis_schema(self, connection: sqlite3.Connection) -> None:
+        """补齐求职数据更新的会话分析、列表提示和单项状态表。"""
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS fj_conversation_insights (
+              id TEXT PRIMARY KEY,
+              run_id TEXT NOT NULL,
+              session_id TEXT NOT NULL,
+              job_id TEXT,
+              status TEXT NOT NULL DEFAULT 'analyzed',
+              insight_json TEXT NOT NULL DEFAULT '{}',
+              model TEXT NOT NULL DEFAULT '',
+              prompt_version TEXT NOT NULL DEFAULT '',
+              analysis_version TEXT NOT NULL DEFAULT 'job-hunt-refresh-analysis-v1',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (run_id) REFERENCES fj_job_hunt_refresh_runs(id) ON DELETE CASCADE,
+              FOREIGN KEY (session_id) REFERENCES fj_chat_sessions(id) ON DELETE CASCADE,
+              FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE SET NULL,
+              UNIQUE (run_id, session_id, analysis_version),
+              CHECK (status IN ('analyzed', 'skipped', 'failed'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_fj_conversation_insights_session_time
+              ON fj_conversation_insights(session_id, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS fj_chat_attention_states (
+              session_id TEXT PRIMARY KEY,
+              job_id TEXT,
+              run_id TEXT,
+              insight_id TEXT,
+              attention_status TEXT NOT NULL DEFAULT 'unknown',
+              display_label TEXT NOT NULL DEFAULT '待判断',
+              recommended_action TEXT NOT NULL DEFAULT 'no_further_action',
+              reason TEXT NOT NULL DEFAULT '',
+              priority INTEGER NOT NULL DEFAULT 0,
+              evidence_message_ids_json TEXT NOT NULL DEFAULT '[]',
+              source TEXT NOT NULL DEFAULT 'analysis',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (session_id) REFERENCES fj_chat_sessions(id) ON DELETE CASCADE,
+              FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE SET NULL,
+              FOREIGN KEY (run_id) REFERENCES fj_job_hunt_refresh_runs(id) ON DELETE SET NULL,
+              FOREIGN KEY (insight_id) REFERENCES fj_conversation_insights(id) ON DELETE SET NULL,
+              CHECK (attention_status IN (
+                'needs_reply', 'needs_resume', 'needs_followup', 'needs_rejection_reason',
+                'needs_interview_confirm', 'needs_info', 'waiting', 'no_action', 'unknown'
+              )),
+              CHECK (recommended_action IN (
+                'reply_recruiter', 'send_resume', 'follow_up', 'ask_rejection_reason',
+                'confirm_interview', 'provide_information', 'wait_for_recruiter',
+                'no_further_action'
+              ))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_fj_chat_attention_states_status
+              ON fj_chat_attention_states(attention_status, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS fj_job_hunt_refresh_analysis_items (
+              id TEXT PRIMARY KEY,
+              run_id TEXT NOT NULL,
+              session_id TEXT NOT NULL,
+              job_id TEXT,
+              status TEXT NOT NULL DEFAULT 'pending',
+              result_json TEXT NOT NULL DEFAULT '{}',
+              error_category TEXT,
+              error_message TEXT,
+              started_at TEXT,
+              completed_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (run_id) REFERENCES fj_job_hunt_refresh_runs(id) ON DELETE CASCADE,
+              FOREIGN KEY (session_id) REFERENCES fj_chat_sessions(id) ON DELETE CASCADE,
+              FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE SET NULL,
+              UNIQUE (run_id, session_id),
+              CHECK (status IN ('pending', 'running', 'analyzed', 'skipped', 'failed'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_fj_job_hunt_refresh_analysis_items_run_status
+              ON fj_job_hunt_refresh_analysis_items(run_id, status, created_at);
+
+            CREATE TABLE IF NOT EXISTS fj_job_hunt_refresh_analysis_contexts (
+              run_id TEXT PRIMARY KEY,
+              status TEXT NOT NULL DEFAULT 'prepared',
+              context_json TEXT NOT NULL DEFAULT '{}',
+              context_characters INTEGER NOT NULL DEFAULT 0,
+              max_context_characters INTEGER NOT NULL DEFAULT 0,
+              blocker_reason TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (run_id) REFERENCES fj_job_hunt_refresh_runs(id) ON DELETE CASCADE,
+              CHECK (status IN ('prepared', 'blocked'))
+            );
+            """
+        )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:

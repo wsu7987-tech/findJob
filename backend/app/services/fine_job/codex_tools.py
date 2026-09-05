@@ -55,7 +55,7 @@ from backend.app.services.fine_job.filter_exclusions import (
     record_job_event,
 )
 from backend.app.services.fine_job.job_applications import set_job_application
-from backend.app.services.fine_job import job_hunt_refresh
+from backend.app.services.fine_job import job_hunt_analysis, job_hunt_refresh
 from backend.app.utils import new_id, utc_now
 
 
@@ -63,8 +63,13 @@ CORE_TOOLS = (
     "finejob.get_capabilities",
     "finejob.get_job_hunt_refresh_run",
     "finejob.list_job_hunt_refresh_items",
+    "finejob.refresh_job_hunt_chat_batch",
     "finejob.refresh_job_hunt_chat_messages",
     "finejob.refresh_job_hunt_related_job",
+    "finejob.prepare_job_hunt_refresh_analysis",
+    "finejob.get_job_hunt_refresh_analysis_item_context",
+    "finejob.list_job_hunt_refresh_analysis_items",
+    "finejob.save_job_hunt_refresh_analysis",
     "finejob.complete_job_hunt_refresh_run",
     "finejob.search_jobs",
     "finejob.list_companies",
@@ -157,8 +162,13 @@ class CodexToolService:
             "finejob.get_capabilities": self.get_capabilities,
             "finejob.get_job_hunt_refresh_run": self.get_job_hunt_refresh_run,
             "finejob.list_job_hunt_refresh_items": self.list_job_hunt_refresh_items,
+            "finejob.refresh_job_hunt_chat_batch": self.refresh_job_hunt_chat_batch,
             "finejob.refresh_job_hunt_chat_messages": self.refresh_job_hunt_chat_messages,
             "finejob.refresh_job_hunt_related_job": self.refresh_job_hunt_related_job,
+            "finejob.prepare_job_hunt_refresh_analysis": self.prepare_job_hunt_refresh_analysis,
+            "finejob.get_job_hunt_refresh_analysis_item_context": self.get_job_hunt_refresh_analysis_item_context,
+            "finejob.list_job_hunt_refresh_analysis_items": self.list_job_hunt_refresh_analysis_items,
+            "finejob.save_job_hunt_refresh_analysis": self.save_job_hunt_refresh_analysis,
             "finejob.complete_job_hunt_refresh_run": self.complete_job_hunt_refresh_run,
             "finejob.list_job_strategies": self.list_job_strategies,
             "finejob.get_job_evaluation_context": self.get_job_evaluation_context,
@@ -212,7 +222,7 @@ class CodexToolService:
         browser = boss_scraper_service.get_browser_status()
         with self.db.connect() as connection:
             executor = connection.execute(
-                "SELECT browser_connected, permission_state, queue_state FROM fj_boss_executor_instances ORDER BY updated_at DESC LIMIT 1"
+                "SELECT browser_connected, queue_state FROM fj_boss_executor_instances ORDER BY updated_at DESC LIMIT 1"
             ).fetchone()
             chat_runtime = connection.execute(
                 "SELECT send_enabled FROM fj_chat_runtime ORDER BY updated_at DESC LIMIT 1"
@@ -228,7 +238,7 @@ class CodexToolService:
                 "job_capture_blockers": [] if browser.running else ["boss_browser_not_running"],
                 "boss_executor_required_for_job_capture": False,
                 "boss_executor_online": bool(executor and executor["browser_connected"]),
-                "boss_executor_permission": executor["permission_state"] if executor else "not_authorized",
+                "boss_executor_permission": "authorized" if executor else "not_authorized",
                 "boss_executor_queue": executor["queue_state"] if executor else "paused",
                 "boss_executor_scope": "仅用于审批后的打招呼动作，不参与岗位采集、筛选、详情获取或建议生成",
                 "chat_send_enabled": bool(chat_runtime and chat_runtime["send_enabled"]),
@@ -279,6 +289,23 @@ class CodexToolService:
             terminal=bool(data["terminal"]),
         )
 
+    def refresh_job_hunt_chat_batch(self, arguments: dict[str, Any]) -> dict[str, object]:
+        run_id = str(arguments.get("run_id") or "").strip()
+        data = job_hunt_refresh.refresh_chat_messages_batch(self.db, self.config, run_id)
+        operation = data.get("operation")
+        resource = (
+            _resource(str(operation["type"]), str(operation["id"]))
+            if isinstance(operation, dict)
+            else _resource("job_hunt_refresh_run", run_id)
+        )
+        return _result(
+            result_type="task" if not data["terminal"] else "data",
+            status=str(data["status"]),
+            resource=resource,
+            data=data,
+            terminal=bool(data["terminal"]),
+        )
+
     def refresh_job_hunt_related_job(self, arguments: dict[str, Any]) -> dict[str, object]:
         run_id = str(arguments.get("run_id") or "").strip()
         item_id = str(arguments.get("item_id") or "").strip()
@@ -302,9 +329,78 @@ class CodexToolService:
             terminal=bool(data["terminal"]),
         )
 
+    def prepare_job_hunt_refresh_analysis(self, arguments: dict[str, Any]) -> dict[str, object]:
+        run_id = str(arguments.get("run_id") or "").strip()
+        data = job_hunt_analysis.prepare_run_analysis(self.db, run_id)
+        status = str(data.get("status") or ("succeeded" if not data.get("enabled") else "prepared"))
+        return _result(
+            result_type="data",
+            status=status,
+            resource=_resource("job_hunt_refresh_run", run_id),
+            data=data,
+            terminal=True,
+            message="本次 Refresh Run 的统一分析任务清单已准备完成。",
+        )
+
+    def get_job_hunt_refresh_analysis_item_context(self, arguments: dict[str, Any]) -> dict[str, object]:
+        run_id = str(arguments.get("run_id") or "").strip()
+        item_type = str(arguments.get("item_type") or "").strip()
+        item_id = str(arguments.get("item_id") or "").strip()
+        data = job_hunt_analysis.get_run_analysis_item_context(
+            self.db,
+            run_id,
+            item_type=item_type,
+            item_id=item_id,
+        )
+        return _result(
+            result_type="data",
+            status=str(data.get("status") or "ready"),
+            resource=_resource("job_hunt_refresh_analysis_item", item_id),
+            data=data,
+            terminal=True,
+            message="分析 item 上下文已读取。",
+        )
+
+    def list_job_hunt_refresh_analysis_items(self, arguments: dict[str, Any]) -> dict[str, object]:
+        run_id = str(arguments.get("run_id") or "").strip()
+        item_type = str(arguments.get("item_type") or "").strip()
+        data = job_hunt_analysis.list_run_analysis_items(
+            self.db,
+            run_id,
+            item_type=item_type,
+        )
+        return _result(
+            result_type="data",
+            status="succeeded",
+            resource=_resource("job_hunt_refresh_run", run_id),
+            data=data,
+            terminal=True,
+            message="Refresh Run 分析 item 明细已读取。",
+        )
+
+    def save_job_hunt_refresh_analysis(self, arguments: dict[str, Any]) -> dict[str, object]:
+        run_id = str(arguments.get("run_id") or "").strip()
+        analysis_result = arguments.get("analysis_result")
+        if not isinstance(analysis_result, dict):
+            raise AppError(422, "VALIDATION_FAILED", "analysis_result 必须是对象。")
+        data = job_hunt_analysis.save_run_analysis(
+            self.db,
+            run_id,
+            analysis_result,
+            final_batch=bool(arguments.get("final_batch", True)),
+        )
+        return _result(
+            result_type="data",
+            status=str(data.get("status") or "saved"),
+            resource=_resource("job_hunt_refresh_run", run_id),
+            data=data,
+            terminal=True,
+            message="本次统一分析结果已保存。",
+        )
+
     def complete_job_hunt_refresh_run(self, arguments: dict[str, Any]) -> dict[str, object]:
         run_id = str(arguments.get("run_id") or "").strip()
-        run = job_hunt_refresh.complete_run(self.db, run_id)
+        run = job_hunt_refresh.complete_run(self.db, run_id, self.config)
         return _result(
             result_type="data",
             status=str(run["status"]),
@@ -1549,6 +1645,30 @@ class CodexToolService:
     def get_operation_status(self, arguments: dict[str, Any]) -> dict[str, object]:
         resource_type = str(arguments.get("resource_type") or "")
         resource_id = str(arguments.get("resource_id") or "")
+        if resource_type == "chat_batch":
+            task = job_hunt_refresh.boss_chat.boss_chat_batch_manager.get(resource_id)
+            raw_status = str(task.get("status") or "queued")
+            data = (
+                job_hunt_refresh.settle_chat_batch_operation(
+                    self.db,
+                    resource_id,
+                    task,
+                )
+                if raw_status not in {"queued", "running"}
+                else task
+            )
+            status = (
+                str(data["status"])
+                if isinstance(data, dict) and "status" in data and data is not task
+                else {"completed": "succeeded"}.get(raw_status, raw_status)
+            )
+            return _result(
+                result_type="task",
+                status=status,
+                resource=_resource(resource_type, resource_id),
+                data=data,
+                terminal=status in {"succeeded", "failed", "cancelled"},
+            )
         if resource_type == "capture_task":
             task = boss_capture_task_manager.get_task(resource_id)
             raw_status = str(task.get("status") or "queued")

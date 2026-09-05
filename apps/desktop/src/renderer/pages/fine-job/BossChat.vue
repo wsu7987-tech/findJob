@@ -29,9 +29,21 @@ const editorDrafts = ref<Record<string, {
   dirty: boolean;
 }>>({});
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value && typeof value === "object" && !Array.isArray(value));
 const session = computed(() => store.detail?.session ?? null);
 const task = computed(() => store.currentTask);
 const latestAction = computed(() => store.detail?.send_actions[0] ?? null);
+const latestInsight = computed(() => store.detail?.latest_conversation_insight?.insight ?? null);
+const analysisReplyDraft = computed(() => {
+  const value = latestInsight.value?.reply_draft;
+  return typeof value === "string" ? value.trim() : "";
+});
+const analysisReason = computed(() => {
+  const recommendation = latestInsight.value?.ai_followup_recommendation;
+  const value = isRecord(recommendation) ? recommendation.reason : "";
+  return typeof value === "string" ? value : session.value?.attention_reason || "";
+});
 const selectedLeader = computed(() => {
   const leaders = store.runtime?.leaders;
   if (leaders?.length && session.value) {
@@ -123,6 +135,27 @@ const latestMessageStatusLabel = (value?: number | null) => ({
   1: "【已送达】",
   2: "【已读】"
 }[value ?? -1] ?? "");
+const attentionLabel = (item?: FineJobChatSession | null) =>
+  item?.attention_label || ({
+    needs_reply: "待回复",
+    needs_resume: "待发简历",
+    needs_followup: "建议跟进",
+    needs_rejection_reason: "建议询问",
+    needs_interview_confirm: "待确认面试",
+    needs_info: "待补充信息",
+    waiting: "等待 HR",
+    no_action: "无需处理"
+  }[item?.attention_status ?? ""] ?? "");
+const attentionType = (item?: FineJobChatSession | null) => ({
+  needs_reply: "danger",
+  needs_resume: "warning",
+  needs_followup: "warning",
+  needs_rejection_reason: "warning",
+  needs_interview_confirm: "primary",
+  needs_info: "danger",
+  waiting: "info",
+  no_action: "info"
+}[item?.attention_status ?? ""] ?? "info") as "success" | "warning" | "danger" | "primary" | "info";
 
 const selectSession = async (item: FineJobChatSession) => {
   saveEditor();
@@ -306,6 +339,12 @@ const generate = async (regenerate = false) => {
   } catch {
     ElMessage.error(store.error ?? "AI 回复生成失败");
   }
+};
+
+const useAnalysisReplyDraft = () => {
+  if (!analysisReplyDraft.value) return;
+  finalText.value = analysisReplyDraft.value;
+  markEditorDirty();
 };
 
 const confirm = async () => {
@@ -530,6 +569,13 @@ onBeforeUnmount(() => {
             size="small"
             type="danger"
           >REJECT</el-tag>
+          <el-tag
+            v-if="attentionLabel(item)"
+            class="session-card__attention-badge"
+            size="small"
+            :type="attentionType(item)"
+            effect="plain"
+          >{{ attentionLabel(item) }}</el-tag>
           <small v-if="item.job_title" class="session-card__job-title">{{ item.job_title }}</small>
           <el-tag v-else size="small" type="info" effect="plain">岗位未返回</el-tag>
           <span
@@ -588,6 +634,12 @@ onBeforeUnmount(() => {
               <p v-if="session.job_title">{{ session.job_title }}</p>
               <div class="identity-tags">
                 <el-tag v-if="session.message_update_required" size="small" type="warning">消息需更新</el-tag>
+                <el-tag
+                  v-if="attentionLabel(session)"
+                  size="small"
+                  :type="attentionType(session)"
+                  effect="plain"
+                >{{ attentionLabel(session) }}</el-tag>
               </div>
               <div class="identity-tags">
                 <el-tag size="small" :type="session.job_context_state === 'linked' ? 'success' : 'info'">
@@ -668,6 +720,14 @@ onBeforeUnmount(() => {
 
       <aside class="reply-panel">
         <h2>AI 回复草稿</h2>
+        <div v-if="analysisReplyDraft" class="analysis-draft">
+          <div>
+            <strong>沟通草稿建议</strong>
+            <span>{{ analysisReason }}</span>
+          </div>
+          <p>{{ analysisReplyDraft }}</p>
+          <el-button size="small" plain @click="useAnalysisReplyDraft">填入编辑框</el-button>
+        </div>
         <el-input
           v-model="instruction"
           type="textarea"
@@ -993,6 +1053,10 @@ onBeforeUnmount(() => {
   pointer-events: none;
 }
 
+.session-card__attention-badge {
+  align-self: flex-start;
+}
+
 .session-card__time {
   font-size: 11px;
 }
@@ -1070,6 +1134,29 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.analysis-draft {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  background: var(--el-fill-color-light);
+}
+
+.analysis-draft > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
+.analysis-draft p {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .send-result,

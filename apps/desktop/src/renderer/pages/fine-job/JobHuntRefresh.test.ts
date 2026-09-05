@@ -72,7 +72,10 @@ vi.mock("@/stores/fineJobJobHuntRefresh", () => ({
         sessions_to_sync: 2,
         new_sessions_to_sync: 1,
         related_jobs: 2,
-        jobs_to_collect: 1,
+        chat_update_jobs: 1,
+        extra_jobs: 1,
+        jobs_to_update: 2,
+        jobs_to_collect: 2,
         jobs_missing_jd: 1,
         jobs_missing_evaluation: 2,
         unresolved_relations: 0
@@ -186,7 +189,9 @@ describe("JobHuntRefresh", () => {
     const prompt = String(mocks.submitPrompt.mock.calls[0][0]);
     expect(prompt).toContain('"workflow":"job_hunt_refresh_v1"');
     expect(prompt).toContain('"run_id":"refresh-run-1"');
-    expect(prompt).toContain("不得重跑 succeeded 项");
+    expect(prompt).toContain("finejob.refresh_job_hunt_chat_batch");
+    expect(prompt).toContain("BossChatBatchManager");
+    expect(prompt).toContain("scope.counts.extra_jobs 大于 0");
 
     wrapper.unmount();
     expect(mocks.stopReading).toHaveBeenCalledTimes(1);

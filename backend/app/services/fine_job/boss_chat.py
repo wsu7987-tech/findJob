@@ -92,6 +92,10 @@ def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
         "facts_used_json",
         "warnings_json",
         "content_categories_json",
+        "insight_json",
+        "recommendation_json",
+        "deterministic_facts_json",
+        "skipped_reasons_json",
     ):
         if key in result:
             fallback: Any = [] if key in {
@@ -562,6 +566,23 @@ def _record_message_activity(
         evidence_level="direct",
         payload={"direction": direction, "platform_message_id": platform_message_id},
         dedupe_key=f"chat_message:{message_id}:{event_type}",
+    )
+
+
+def refresh_session_history(db: Database, session_id: str) -> dict[str, Any]:
+    """复用自动代聊批量任务的单会话历史获取与保存顺序。"""
+    with db.connect() as connection:
+        session = _session_or_404(connection, session_id)
+    captured = boss_scraper_service.capture_chat_history(
+        boss_id=str(session["encrypt_peer_uid"] or ""),
+        security_id=str(session["security_id"] or ""),
+    )
+    return sync_history_messages(
+        db,
+        session_id=session_id,
+        messages=list(captured.get("messages") or []),
+        history_has_more=bool(captured.get("has_more")),
+        history_next_cursor=str(captured.get("next_cursor") or ""),
     )
 
 
@@ -1166,6 +1187,22 @@ def _session_payload(
             # 历史岗位已拿到标题时，优先补齐旧会话留下的空标题。
             if not payload.get("job_title"):
                 payload["job_title"] = str(history["title"] or "")
+        if "attention_status" not in payload:
+            attention = connection.execute(
+                """
+                SELECT attention_status, display_label, recommended_action, reason, priority, updated_at
+                FROM fj_chat_attention_states
+                WHERE session_id = ?
+                """,
+                (payload.get("id"),),
+            ).fetchone()
+            if attention is not None:
+                payload["attention_status"] = str(attention["attention_status"] or "")
+                payload["attention_label"] = str(attention["display_label"] or "")
+                payload["attention_action"] = str(attention["recommended_action"] or "")
+                payload["attention_reason"] = str(attention["reason"] or "")
+                payload["attention_priority"] = int(attention["priority"] or 0)
+                payload["attention_updated_at"] = str(attention["updated_at"] or "")
     payload["identity_state"] = (
         "ready"
         if payload.get("encrypt_peer_uid") and payload.get("security_id") and payload.get("encrypt_job_id")
@@ -1227,6 +1264,12 @@ def list_sessions(
               t.status AS reply_task_status,
               t.draft_text AS reply_draft_text,
               t.final_text AS reply_final_text,
+              att.attention_status,
+              att.display_label AS attention_label,
+              att.recommended_action AS attention_action,
+              att.reason AS attention_reason,
+              att.priority AS attention_priority,
+              att.updated_at AS attention_updated_at,
               (
                 SELECT COUNT(*) FROM fj_chat_reply_tasks pending
                 WHERE pending.session_id = s.id
@@ -1239,6 +1282,7 @@ def list_sessions(
               WHERE session_id = s.id
               ORDER BY created_at DESC LIMIT 1
             )
+            LEFT JOIN fj_chat_attention_states att ON att.session_id = s.id
             {where}
             -- 严格沿用 BOSS 好友列表顺序，聊天消息同步不会改变会话位置。
             ORDER BY s.platform_synced_at DESC, s.platform_list_index ASC, s.id ASC
@@ -1272,11 +1316,22 @@ def get_session(db: Database, session_id: str) -> dict[str, Any]:
             "SELECT COUNT(*) FROM fj_chat_messages WHERE session_id = ?",
             (session_id,),
         ).fetchone()[0])
+        insight = connection.execute(
+            """
+            SELECT *
+            FROM fj_conversation_insights
+            WHERE session_id = ?
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
         return {
             "session": _session_payload(session, connection),
             "messages": [_row(item) for item in messages],
             "reply_tasks": [_row(item) for item in tasks],
             "send_actions": [_row(item) for item in actions],
+            "latest_conversation_insight": _row(insight),
             "messages_truncated": False,
             "message_count": message_count,
         }
@@ -2231,12 +2286,26 @@ def schedule_pending_generation(db: Database, config: AppConfig) -> None:
 CHAT_BATCH_LIMIT = 20
 
 
-def _batch_candidates(db: Database) -> list[dict[str, Any]]:
+def get_batch_candidates(
+    db: Database,
+    *,
+    session_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """返回需要同步最新消息的会话，并计算岗位详情状态。"""
+    session_filter = ""
+    parameters: tuple[Any, ...] = ()
+    if session_ids is not None:
+        normalized_ids = [str(value).strip() for value in session_ids if str(value).strip()]
+        if not normalized_ids:
+            return []
+        placeholders = ",".join("?" for _ in normalized_ids)
+        session_filter = f"AND s.id IN ({placeholders})"
+        parameters = tuple(normalized_ids)
     with db.connect() as connection:
         rows = connection.execute(
-            """
+            f"""
             SELECT s.id, s.peer_name, s.company_name, s.job_title,
+                   s.job_id, s.encrypt_job_id,
                    s.message_update_required,
                    EXISTS(
                      SELECT 1 FROM fj_chat_messages m WHERE m.session_id = s.id
@@ -2248,18 +2317,22 @@ def _batch_candidates(db: Database) -> list[dict[str, Any]]:
                      'not_collected'
                    ) AS job_detail_status
             FROM fj_chat_sessions s
-            WHERE NOT EXISTS(
-              SELECT 1 FROM fj_chat_messages m WHERE m.session_id = s.id
-            ) OR s.message_update_required = 1
+            WHERE (
+              NOT EXISTS(
+                SELECT 1 FROM fj_chat_messages m WHERE m.session_id = s.id
+              ) OR s.message_update_required = 1
+            )
+            {session_filter}
             -- 批量队列与左侧会话列表保持同一套 BOSS 顺序。
             ORDER BY s.platform_synced_at DESC, s.platform_list_index ASC, s.id ASC
-            """
+            """,
+            parameters,
         ).fetchall()
     return [_row(row) or {} for row in rows]
 
 
 def get_batch_summary(db: Database) -> dict[str, int]:
-    candidates = _batch_candidates(db)
+    candidates = get_batch_candidates(db)
     queued = candidates[:CHAT_BATCH_LIMIT]
     return {
         "pending_chat_count": len(candidates),
@@ -2278,12 +2351,32 @@ class BossChatBatchManager:
         self._tasks: dict[str, dict[str, Any]] = {}
         self._active_task_id = ""
 
-    def start(self, db: Database, config: AppConfig, *, batch_size: int = CHAT_BATCH_LIMIT) -> dict[str, Any]:
+    def start(
+        self,
+        db: Database,
+        config: AppConfig,
+        *,
+        batch_size: int = CHAT_BATCH_LIMIT,
+        session_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        scoped_ids = (
+            [str(value).strip() for value in session_ids if str(value).strip()]
+            if session_ids is not None
+            else None
+        )
         if self._active_task_id:
             active = self._tasks.get(self._active_task_id)
             if active and active["status"] in {"queued", "running"}:
+                if scoped_ids is not None and active.get("scope_session_ids") != scoped_ids:
+                    raise AppError(
+                        409,
+                        "CHAT_BATCH_ACTIVE",
+                        "已有批量更新任务正在执行，请等待完成后重试。",
+                    )
                 return self.get(self._active_task_id)
-        candidates = _batch_candidates(db)[:max(1, min(batch_size, CHAT_BATCH_LIMIT))]
+        candidates = get_batch_candidates(db, session_ids=scoped_ids)[
+            :max(1, min(batch_size, CHAT_BATCH_LIMIT))
+        ]
         if not candidates:
             raise AppError(409, "CHAT_BATCH_EMPTY", "当前没有需要更新的聊天记录。")
         now = _now()
@@ -2304,6 +2397,7 @@ class BossChatBatchManager:
             "created_at": now,
             "finished_at": None,
             "candidates": candidates,
+            "scope_session_ids": scoped_ids,
         }
         self._active_task_id = task_id
         threading.Thread(target=self._run, args=(task_id, db, config), daemon=True).start()
@@ -2313,7 +2407,11 @@ class BossChatBatchManager:
         task = self._tasks.get(task_id)
         if task is None:
             raise AppError(404, "CHAT_BATCH_NOT_FOUND", "批量更新任务不存在。")
-        return {key: value for key, value in task.items() if key != "candidates"}
+        return {
+            key: value
+            for key, value in task.items()
+            if key not in {"candidates", "scope_session_ids"}
+        }
 
     def _run(self, task_id: str, db: Database, config: AppConfig) -> None:
         task = self._tasks[task_id]
@@ -2328,19 +2426,7 @@ class BossChatBatchManager:
                     message="正在获取最新 20 条聊天消息。",
                 )
                 try:
-                    with db.connect() as connection:
-                        session = _session_or_404(connection, str(candidate["id"]))
-                    captured = boss_scraper_service.capture_chat_history(
-                        boss_id=str(session["encrypt_peer_uid"] or ""),
-                        security_id=str(session["security_id"] or ""),
-                    )
-                    sync_history_messages(
-                        db,
-                        session_id=str(candidate["id"]),
-                        messages=list(captured.get("messages") or []),
-                        history_has_more=bool(captured.get("has_more")),
-                        history_next_cursor=str(captured.get("next_cursor") or ""),
-                    )
+                    refresh_session_history(db, str(candidate["id"]))
                     task["chat_completed"] += 1
                     job_action = prepare_chat_job(
                         db,

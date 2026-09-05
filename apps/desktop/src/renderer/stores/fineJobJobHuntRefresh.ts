@@ -16,7 +16,9 @@ const defaultWorkflows = (): FineJobJobHuntRefreshWorkflowOptions => ({
   refresh_chat_messages: true,
   refresh_related_jobs: true,
   analyze_conversations: false,
-  generate_missing_suggestions: false
+  generate_missing_suggestions: false,
+  generate_reply_drafts: false,
+  generate_followup_recommendations: false
 });
 
 const isActive = (run: FineJobJobHuntRefreshRun | null) =>
@@ -39,6 +41,10 @@ export const useFineJobJobHuntRefreshStore = defineStore("fine-job-job-hunt-refr
   const hasExecutableWorkflow = computed(() =>
     workflowOptions.value.refresh_chat_messages
       || workflowOptions.value.refresh_related_jobs
+      || workflowOptions.value.analyze_conversations
+      || workflowOptions.value.generate_missing_suggestions
+      || workflowOptions.value.generate_reply_drafts
+      || workflowOptions.value.generate_followup_recommendations
   );
 
   const refreshContext = async () => {
