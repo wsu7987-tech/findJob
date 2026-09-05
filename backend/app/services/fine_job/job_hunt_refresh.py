@@ -29,14 +29,14 @@ SUPPORTED_WORKFLOWS = (
     "refresh_chat_messages",
     "refresh_related_jobs",
 )
+FRIEND_LIST_FRESHNESS = timedelta(minutes=30)
 
 
 def get_refresh_context(db: Database) -> dict[str, object]:
     """返回页面初始时间信息；本方法只读取现有数据。"""
     with db.connect() as connection:
-        latest_local = connection.execute(
-            "SELECT MAX(sent_at) FROM fj_chat_messages"
-        ).fetchone()[0]
+        latest_local = _latest_local_platform_message_at(connection)
+        latest_chat_list = _latest_chat_list_sync(connection)
         last_success = connection.execute(
             """
             SELECT completed_at
@@ -70,33 +70,90 @@ def get_refresh_context(db: Database) -> dict[str, object]:
         "latest_unconsumed_scope_id": (
             str(latest_scope["id"]) if latest_scope is not None else None
         ),
+        "chat_list_synced_at": (
+            str(latest_chat_list["synced_at"]) if latest_chat_list else None
+        ),
     }
 
 
-def discover_scope(db: Database, selected_since_time: str) -> dict[str, object]:
-    """刷新平台聊天列表，并持久化用户随后确认执行的固定范围。"""
+def discover_scope(
+    db: Database,
+    selected_since_time: str,
+    source_mode: str = "auto",
+) -> dict[str, object]:
+    """按来源模式取得聊天列表快照，并持久化用户确认执行的固定范围。"""
     since = _parse_time(selected_since_time)
-    captured = boss_scraper_service.capture_chat_friend_list()
-    friend_list_result = sync_friend_list(
-        db,
-        account_uid=str(captured["account_uid"]),
-        response=captured["response"],
-        source_url=str(captured["url"]),
-    )
-    synced_session_ids = [str(value) for value in friend_list_result.get("session_ids", [])]
-    new_session_ids = {
-        str(value) for value in friend_list_result.get("created_session_ids", [])
-    }
+    requested_mode = source_mode.strip().lower()
+    if requested_mode not in {"auto", "local", "refresh"}:
+        raise AppError(422, "REFRESH_SCOPE_SOURCE_INVALID", "更新范围来源模式无效。")
+    now = datetime.now(UTC)
     with db.connect() as connection:
-        latest_local = connection.execute(
-            "SELECT MAX(sent_at) FROM fj_chat_messages"
-        ).fetchone()[0]
-        refreshed_sessions = _load_refreshed_sessions(connection, synced_session_ids)
+        latest_chat_list = _latest_chat_list_sync(connection)
+    has_fresh_local_list = bool(
+        latest_chat_list
+        and (synced_at := _try_parse_time(latest_chat_list["synced_at"])) is not None
+        and now - synced_at <= FRIEND_LIST_FRESHNESS
+    )
+    resolved_source = (
+        "refresh"
+        if requested_mode == "refresh"
+        or (requested_mode == "auto" and not has_fresh_local_list)
+        else "local"
+    )
+
+    if resolved_source == "refresh":
+        captured = boss_scraper_service.capture_chat_friend_list()
+        friend_list_result = sync_friend_list(
+            db,
+            account_uid=str(captured["account_uid"]),
+            response=captured["response"],
+            source_url=str(captured["url"]),
+        )
+        account_uid = str(friend_list_result["account_uid"])
+        session_ids = [str(value) for value in friend_list_result.get("session_ids", [])]
+        new_session_ids = {
+            str(value) for value in friend_list_result.get("created_session_ids", [])
+        }
+        chat_list_synced_at = str(friend_list_result["synced_at"])
+        source_url = str(friend_list_result["source_url"])
+    else:
+        with db.connect() as connection:
+            account_uid = _local_scope_account_uid(connection, latest_chat_list)
+            session_ids = _local_session_ids(
+                connection,
+                account_uid,
+                str(latest_chat_list["synced_at"]) if latest_chat_list else None,
+            )
+        new_session_ids = set()
+        chat_list_synced_at = (
+            str(latest_chat_list["synced_at"]) if latest_chat_list else None
+        )
+        source_url = ""
+        age_minutes = _age_minutes(chat_list_synced_at, now)
+        friend_list_result = {
+            "account_uid": account_uid,
+            "count": len(session_ids),
+            "created_count": 0,
+            "changed_count": 0,
+            "source_url": "",
+            "synced_at": chat_list_synced_at,
+            "session_ids": session_ids,
+            "created_session_ids": [],
+            "reused_local_snapshot": True,
+            "age_minutes": age_minutes,
+        }
+    with db.connect() as connection:
+        latest_local = _latest_local_platform_message_at(connection)
+        available_sessions = _load_sessions(connection, session_ids)
+        sessions_in_scope = [
+            session
+            for session in available_sessions
+            if (latest_at := _try_parse_time(session.get("platform_latest_message_at")))
+            is not None
+            and latest_at >= since
+        ]
         sessions_to_sync: list[dict[str, Any]] = []
-        for session in refreshed_sessions:
-            latest_at = _try_parse_time(session.get("platform_latest_message_at"))
-            if latest_at is None or latest_at < since:
-                continue
+        for session in sessions_in_scope:
             is_new = str(session["id"]) in new_session_ids
             latest_missing_locally = bool(
                 str(session.get("platform_latest_msg_id") or "").strip()
@@ -107,7 +164,7 @@ def discover_scope(db: Database, selected_since_time: str) -> dict[str, object]:
 
         related_jobs: dict[str, dict[str, Any]] = {}
         unresolved_session_ids: list[str] = []
-        for session in sessions_to_sync:
+        for session in sessions_in_scope:
             identity, job = _related_job_identity(connection, session)
             if identity:
                 related_jobs.setdefault(
@@ -144,7 +201,8 @@ def discover_scope(db: Database, selected_since_time: str) -> dict[str, object]:
         scope_id = new_id()
         generated_at = utc_now()
         counts = {
-            "refreshed_sessions": len(refreshed_sessions),
+            "refreshed_sessions": len(available_sessions),
+            "sessions_in_scope": len(sessions_in_scope),
             "sessions_to_sync": len(sessions_to_sync),
             "new_sessions_to_sync": sum(
                 str(session["id"]) in new_session_ids for session in sessions_to_sync
@@ -158,22 +216,28 @@ def discover_scope(db: Database, selected_since_time: str) -> dict[str, object]:
         connection.execute(
             """
             INSERT INTO fj_job_hunt_refresh_scopes (
-              id, selected_since_time, account_uid, source_url,
-              friend_list_synced_at, scope_generated_at, latest_local_message_at,
-              session_ids_json, new_session_ids_json, related_jobs_json,
+              id, selected_since_time, requested_source_mode, scope_source,
+              account_uid, source_url, friend_list_synced_at, chat_list_synced_at,
+              scope_generated_at, latest_local_message_at,
+              session_ids_in_scope_json, session_ids_json,
+              new_session_ids_json, related_jobs_json,
               jobs_to_collect_json, jobs_missing_jd_json,
               jobs_missing_evaluation_json, unresolved_session_ids_json,
               counts_json, friend_list_result_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 scope_id,
                 _iso(since),
-                str(friend_list_result["account_uid"]),
-                str(friend_list_result["source_url"]),
-                str(friend_list_result["synced_at"]),
+                requested_mode,
+                resolved_source,
+                account_uid,
+                source_url,
+                chat_list_synced_at or generated_at,
+                chat_list_synced_at,
                 generated_at,
                 str(latest_local) if latest_local else None,
+                _dump([str(session["id"]) for session in sessions_in_scope]),
                 _dump([str(session["id"]) for session in sessions_to_sync]),
                 _dump(sorted(new_session_ids)),
                 _dump(list(related_jobs.values())),
@@ -210,11 +274,6 @@ def create_run(
     scope = get_scope(db, scope_id)
     run_id = new_id()
     now = utc_now()
-    first_step = (
-        "waiting_chat_messages"
-        if options["refresh_chat_messages"]
-        else "waiting_related_jobs"
-    )
     with db.connect() as connection:
         existing = connection.execute(
             "SELECT id FROM fj_job_hunt_refresh_runs WHERE scope_id = ?", (scope_id,)
@@ -231,7 +290,7 @@ def create_run(
               estimated_missing_suggestions, chat_list_status, chat_list_retryable,
               current_step, trigger_source, created_at, updated_at
             ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'succeeded', 0,
-                      ?, ?, ?, ?)
+                      'waiting_codex', ?, ?, ?)
             """,
             (
                 run_id,
@@ -240,13 +299,12 @@ def create_run(
                 scope["selected_since_time"],
                 scope["latest_local_message_at"],
                 _dump(options),
-                scope["counts"]["refreshed_sessions"],
+                scope["counts"]["sessions_in_scope"],
                 scope["counts"]["sessions_to_sync"],
                 scope["counts"]["related_jobs"],
                 scope["counts"]["jobs_to_collect"],
                 scope["counts"]["jobs_missing_jd"],
                 scope["counts"]["jobs_missing_evaluation"],
-                first_step,
                 trigger_source,
                 now,
                 now,
@@ -259,6 +317,8 @@ def create_run(
 
 def attach_codex_session(db: Database, run_id: str, codex_session_ref: str) -> dict[str, object]:
     current = get_run(db, run_id)
+    if current["status"] in {"completed", "failed", "cancelled"}:
+        raise AppError(409, "REFRESH_RUN_TERMINAL", "当前更新任务已经结束。")
     if current["status"] == "completed_with_errors" and not current["resume_available"]:
         raise AppError(409, "REFRESH_RUN_NOT_RESUMABLE", "当前任务没有可继续处理的项目。")
     now = utc_now()
@@ -267,12 +327,84 @@ def attach_codex_session(db: Database, run_id: str, codex_session_ref: str) -> d
             """
             UPDATE fj_job_hunt_refresh_runs
             SET codex_session_ref = ?,
-                status = CASE WHEN status = 'completed_with_errors' THEN 'running' ELSE status END,
-                current_step = CASE WHEN status = 'completed_with_errors' THEN 'waiting_codex' ELSE current_step END,
-                completed_at = CASE WHEN status = 'completed_with_errors' THEN NULL ELSE completed_at END,
+                current_step = 'waiting_codex',
+                prompt_submitted_at = NULL,
                 updated_at = ? WHERE id = ?
             """,
             (codex_session_ref.strip() or None, now, run_id),
+        )
+    return get_run(db, run_id)
+
+
+def mark_prompt_submitted(db: Database, run_id: str) -> dict[str, object]:
+    run = get_run(db, run_id)
+    if run["status"] in {"completed", "failed", "cancelled"}:
+        raise AppError(409, "REFRESH_RUN_TERMINAL", "当前更新任务已经结束。")
+    if not str(run.get("codex_session_ref") or "").strip():
+        raise AppError(409, "REFRESH_CODEX_SESSION_MISSING", "任务尚未关联 Codex 会话。")
+    chat_pending = any(
+        item["item_type"] == "chat_session"
+        and (
+            item["status"] in {"pending", "running"}
+            or (item["status"] == "failed" and item["retryable"])
+        )
+        for item in run["items"]
+    )
+    job_pending = any(
+        item["item_type"] == "related_job"
+        and (
+            item["status"] in {"pending", "running"}
+            or (item["status"] == "failed" and item["retryable"])
+        )
+        for item in run["items"]
+    )
+    next_step = (
+        "waiting_chat_messages"
+        if chat_pending
+        else "waiting_related_jobs"
+        if job_pending
+        else "waiting_completion"
+    )
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_job_hunt_refresh_runs
+            SET status = CASE WHEN status = 'completed_with_errors' THEN 'running' ELSE status END,
+                current_step = ?, prompt_submitted_at = ?, completed_at = NULL,
+                error_summary = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (next_step, now, now, run_id),
+        )
+    return get_run(db, run_id)
+
+
+def cancel_run(db: Database, run_id: str) -> dict[str, object]:
+    run = get_run(db, run_id)
+    if run["status"] in {"completed", "failed", "cancelled"}:
+        return run
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_job_hunt_refresh_items
+            SET status = 'skipped', retryable = 0,
+                error_category = 'RUN_CANCELLED', error_message = '用户取消更新任务。',
+                operation_ref_type = NULL, operation_ref_id = NULL,
+                completed_at = COALESCE(completed_at, ?), updated_at = ?
+            WHERE run_id = ? AND status NOT IN ('succeeded', 'skipped')
+            """,
+            (now, now, run_id),
+        )
+        _refresh_run_counts(connection, run_id)
+        connection.execute(
+            """
+            UPDATE fj_job_hunt_refresh_runs
+            SET status = 'cancelled', current_step = 'cancelled',
+                completed_at = ?, updated_at = ? WHERE id = ?
+            """,
+            (now, now, run_id),
         )
     return get_run(db, run_id)
 
@@ -357,7 +489,12 @@ def refresh_chat_messages(db: Database, run_id: str, item_id: str) -> dict[str, 
         raise AppError(409, "WORKFLOW_NOT_SELECTED", "本次任务未选择更新聊天消息。")
     if item["status"] in {"succeeded", "skipped"}:
         return {"status": item["status"], "terminal": True, "reused": True, "item": item}
-    _assert_session_in_scope(db, run, str(item["session_id"]))
+    _assert_session_in_scope(
+        db,
+        run,
+        str(item["session_id"]),
+        scope_key="session_ids_to_sync",
+    )
     _mark_item_running(db, run_id, item_id, "refresh_chat_messages")
     try:
         with db.connect() as connection:
@@ -398,7 +535,12 @@ def refresh_related_job(
         raise AppError(409, "WORKFLOW_NOT_SELECTED", "本次任务未选择采集关联岗位。")
     if item["status"] in {"succeeded", "skipped"}:
         return {"status": item["status"], "terminal": True, "reused": True, "item": item}
-    _assert_session_in_scope(db, run, str(item["session_id"]))
+    _assert_session_in_scope(
+        db,
+        run,
+        str(item["session_id"]),
+        scope_key="session_ids_in_scope",
+    )
 
     operation_id = str(item.get("operation_ref_id") or "")
     if item["status"] == "running" and operation_id:
@@ -521,6 +663,8 @@ def refresh_related_job(
 
 def complete_run(db: Database, run_id: str) -> dict[str, object]:
     run = _require_run(db, run_id)
+    if run["status"] in {"completed", "failed", "cancelled"}:
+        return get_run(db, run_id)
     with db.connect() as connection:
         unfinished = int(
             connection.execute(
@@ -623,7 +767,77 @@ def _create_run_items_from_scope(
             )
 
 
-def _load_refreshed_sessions(connection, session_ids: list[str]) -> list[dict[str, Any]]:
+def _latest_local_platform_message_at(connection) -> str | None:
+    """只统计已经拥有真实平台消息标识的聊天记录。"""
+    row = connection.execute(
+        """
+        SELECT MAX(sent_at) AS latest_at
+        FROM fj_chat_messages
+        WHERE TRIM(platform_message_id) <> ''
+          AND NOT (
+            source = 'assistant'
+            AND platform_message_id LIKE 'assistant:%'
+          )
+        """
+    ).fetchone()
+    return str(row["latest_at"]) if row and row["latest_at"] else None
+
+
+def _latest_chat_list_sync(connection) -> dict[str, str] | None:
+    row = connection.execute(
+        """
+        SELECT account_uid, MAX(platform_synced_at) AS synced_at
+        FROM fj_chat_sessions
+        WHERE platform_synced_at IS NOT NULL AND TRIM(platform_synced_at) <> ''
+        GROUP BY account_uid
+        ORDER BY synced_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is None or not row["synced_at"]:
+        return None
+    return {"account_uid": str(row["account_uid"]), "synced_at": str(row["synced_at"])}
+
+
+def _local_scope_account_uid(connection, latest_sync: dict[str, str] | None) -> str:
+    if latest_sync:
+        return str(latest_sync["account_uid"])
+    row = connection.execute(
+        "SELECT account_uid FROM fj_chat_sessions ORDER BY updated_at DESC LIMIT 1"
+    ).fetchone()
+    return str(row["account_uid"]) if row is not None else ""
+
+
+def _local_session_ids(
+    connection,
+    account_uid: str,
+    latest_synced_at: str | None,
+) -> list[str]:
+    if not account_uid:
+        return []
+    # 有可靠同步时间时，只复用最近一次 friend-list 响应实际包含的会话。
+    synced_filter = " AND platform_synced_at = ?" if latest_synced_at else ""
+    parameters = (account_uid, latest_synced_at) if latest_synced_at else (account_uid,)
+    rows = connection.execute(
+        f"""
+        SELECT id FROM fj_chat_sessions
+        WHERE account_uid = ?
+        {synced_filter}
+        ORDER BY platform_list_index, id
+        """,
+        parameters,
+    ).fetchall()
+    return [str(row["id"]) for row in rows]
+
+
+def _age_minutes(value: str | None, now: datetime) -> int | None:
+    parsed = _try_parse_time(value)
+    if parsed is None:
+        return None
+    return max(0, int((now - parsed).total_seconds() // 60))
+
+
+def _load_sessions(connection, session_ids: list[str]) -> list[dict[str, Any]]:
     if not session_ids:
         return []
     placeholders = ",".join("?" for _ in session_ids)
@@ -782,9 +996,15 @@ def _message_time(message: dict[str, Any]) -> datetime | None:
     return datetime.fromtimestamp(milliseconds / 1000, tz=UTC)
 
 
-def _assert_session_in_scope(db: Database, run: dict[str, object], session_id: str) -> None:
+def _assert_session_in_scope(
+    db: Database,
+    run: dict[str, object],
+    session_id: str,
+    *,
+    scope_key: str,
+) -> None:
     scope = run.get("scope") or get_scope(db, str(run.get("scope_id") or ""))
-    scoped_ids = {str(value) for value in scope["session_ids_to_sync"]}
+    scoped_ids = {str(value) for value in scope[scope_key]}
     if session_id not in scoped_ids:
         raise AppError(
             409,
@@ -1077,7 +1297,12 @@ def _serialize_run(row) -> dict[str, object]:
 
 def _serialize_scope(row) -> dict[str, object]:
     result = dict(row)
+    result["session_ids_in_scope"] = _load(
+        result.pop("session_ids_in_scope_json"), []
+    )
     result["session_ids_to_sync"] = _load(result.pop("session_ids_json"), [])
+    if not result["session_ids_in_scope"]:
+        result["session_ids_in_scope"] = list(result["session_ids_to_sync"])
     result["new_session_ids"] = _load(result.pop("new_session_ids_json"), [])
     result["related_jobs"] = _load(result.pop("related_jobs_json"), [])
     result["jobs_to_collect"] = _load(result.pop("jobs_to_collect_json"), [])
@@ -1089,6 +1314,9 @@ def _serialize_scope(row) -> dict[str, object]:
         result.pop("unresolved_session_ids_json"), []
     )
     result["counts"] = _load(result.pop("counts_json"), {})
+    result["counts"].setdefault(
+        "sessions_in_scope", len(result["session_ids_in_scope"])
+    )
     result["friend_list_result"] = _load(result.pop("friend_list_result_json"), {})
     result["related_job_ids"] = [
         str(item["job_id"])

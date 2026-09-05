@@ -1601,11 +1601,15 @@ CREATE TABLE IF NOT EXISTS fj_codex_sessions (
 CREATE TABLE IF NOT EXISTS fj_job_hunt_refresh_scopes (
   id TEXT PRIMARY KEY,
   selected_since_time TEXT NOT NULL,
+  requested_source_mode TEXT NOT NULL DEFAULT 'auto',
+  scope_source TEXT NOT NULL DEFAULT 'refresh',
   account_uid TEXT NOT NULL,
   source_url TEXT NOT NULL DEFAULT '',
   friend_list_synced_at TEXT NOT NULL,
+  chat_list_synced_at TEXT,
   scope_generated_at TEXT NOT NULL,
   latest_local_message_at TEXT,
+  session_ids_in_scope_json TEXT NOT NULL DEFAULT '[]',
   session_ids_json TEXT NOT NULL DEFAULT '[]',
   new_session_ids_json TEXT NOT NULL DEFAULT '[]',
   related_jobs_json TEXT NOT NULL DEFAULT '[]',
@@ -1615,7 +1619,9 @@ CREATE TABLE IF NOT EXISTS fj_job_hunt_refresh_scopes (
   unresolved_session_ids_json TEXT NOT NULL DEFAULT '[]',
   counts_json TEXT NOT NULL DEFAULT '{}',
   friend_list_result_json TEXT NOT NULL DEFAULT '{}',
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  CHECK (requested_source_mode IN ('auto', 'local', 'refresh')),
+  CHECK (scope_source IN ('local', 'refresh'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_fj_job_hunt_refresh_scopes_generated_at
@@ -1647,6 +1653,7 @@ CREATE TABLE IF NOT EXISTS fj_job_hunt_refresh_runs (
   codex_session_ref TEXT,
   summary_json TEXT NOT NULL DEFAULT '{}',
   error_summary TEXT,
+  prompt_submitted_at TEXT,
   started_at TEXT,
   completed_at TEXT,
   created_at TEXT NOT NULL,
@@ -1959,6 +1966,50 @@ class Database:
             connection.execute(
                 "ALTER TABLE fj_job_hunt_refresh_runs ADD COLUMN scope_generated_at TEXT"
             )
+        if "prompt_submitted_at" not in columns:
+            connection.execute(
+                "ALTER TABLE fj_job_hunt_refresh_runs ADD COLUMN prompt_submitted_at TEXT"
+            )
+        scope_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(fj_job_hunt_refresh_scopes)")
+        }
+        scope_migrations = {
+            "requested_source_mode": (
+                "ALTER TABLE fj_job_hunt_refresh_scopes "
+                "ADD COLUMN requested_source_mode TEXT NOT NULL DEFAULT 'auto'"
+            ),
+            "scope_source": (
+                "ALTER TABLE fj_job_hunt_refresh_scopes "
+                "ADD COLUMN scope_source TEXT NOT NULL DEFAULT 'refresh'"
+            ),
+            "chat_list_synced_at": (
+                "ALTER TABLE fj_job_hunt_refresh_scopes ADD COLUMN chat_list_synced_at TEXT"
+            ),
+            "session_ids_in_scope_json": (
+                "ALTER TABLE fj_job_hunt_refresh_scopes "
+                "ADD COLUMN session_ids_in_scope_json TEXT NOT NULL DEFAULT '[]'"
+            ),
+        }
+        for column, ddl in scope_migrations.items():
+            if column not in scope_columns:
+                connection.execute(ddl)
+
+        # 旧版在 Prompt 提交前写入 waiting_chat_messages；无 Codex 引用且 Item 未启动时恢复真实语义。
+        connection.execute(
+            """
+            UPDATE fj_job_hunt_refresh_runs
+            SET current_step = 'waiting_codex', updated_at = COALESCE(updated_at, created_at)
+            WHERE status = 'pending'
+              AND current_step = 'waiting_chat_messages'
+              AND codex_session_ref IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM fj_job_hunt_refresh_items i
+                WHERE i.run_id = fj_job_hunt_refresh_runs.id
+                  AND (i.started_at IS NOT NULL OR i.status <> 'pending')
+              )
+            """
+        )
 
     def _ensure_fj_execution_observability_schema(
         self,

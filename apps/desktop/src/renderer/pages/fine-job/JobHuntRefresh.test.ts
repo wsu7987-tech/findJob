@@ -8,14 +8,18 @@ import { defineComponent } from "vue";
 const mocks = vi.hoisted(() => ({
   createRun: vi.fn(),
   attach: vi.fn(),
+  markSubmitted: vi.fn(),
+  cancelRun: vi.fn(),
   submitPrompt: vi.fn(),
+  startCodex: vi.fn(),
   startReading: vi.fn(),
   stopReading: vi.fn(),
   load: vi.fn(),
   codexLoad: vi.fn(),
   messageSuccess: vi.fn(),
   messageError: vi.fn(),
-  messageWarning: vi.fn()
+  messageWarning: vi.fn(),
+  codexState: { status: "running", runId: "codex-session-1" as string | null }
 }));
 
 const { createdRun } = vi.hoisted(() => ({ createdRun: {
@@ -23,6 +27,7 @@ const { createdRun } = vi.hoisted(() => ({ createdRun: {
   scope_id: "refresh-scope-1",
   scope_generated_at: "2026-09-05T00:00:00Z",
   status: "pending",
+  current_step: "waiting_codex",
   selected_since_time: "2026-09-04T00:00:00Z",
   workflow_options: {
     refresh_chat_list: true,
@@ -51,13 +56,19 @@ vi.mock("@/stores/fineJobJobHuntRefresh", () => ({
       default_since_time: "2026-09-04T00:00:00Z"
     },
     selectedSinceTime: "2026-09-04T00:00:00Z",
+    sourceMode: "auto",
     workflowOptions: createdRun.workflow_options,
     scope: {
       id: "refresh-scope-1",
       selected_since_time: "2026-09-04T00:00:00Z",
+      requested_source_mode: "auto",
+      scope_source: "local",
+      chat_list_synced_at: "2026-09-05T00:00:00Z",
       scope_generated_at: "2026-09-05T00:00:00Z",
+      friend_list_result: { age_minutes: 5 },
       counts: {
         refreshed_sessions: 3,
+        sessions_in_scope: 3,
         sessions_to_sync: 2,
         new_sessions_to_sync: 1,
         related_jobs: 2,
@@ -77,6 +88,8 @@ vi.mock("@/stores/fineJobJobHuntRefresh", () => ({
     discoverScope: vi.fn(),
     createRun: mocks.createRun,
     attachCodexSession: mocks.attach,
+    markPromptSubmitted: mocks.markSubmitted,
+    cancelRun: mocks.cancelRun,
     selectRun: vi.fn(),
     startProgressReading: mocks.startReading,
     stopProgressReading: mocks.stopReading,
@@ -86,10 +99,10 @@ vi.mock("@/stores/fineJobJobHuntRefresh", () => ({
 
 vi.mock("@/stores/fineJobCodex", () => ({
   useFineJobCodexStore: () => ({
-    status: "running",
-    runId: "codex-session-1",
+    get status() { return mocks.codexState.status; },
+    get runId() { return mocks.codexState.runId; },
     load: mocks.codexLoad,
-    start: vi.fn()
+    start: mocks.startCodex
   })
 }));
 
@@ -122,14 +135,26 @@ const ButtonStub = defineComponent({
   template: "<button v-bind=\"$attrs\" @click=\"$emit('click')\"><slot /></button>"
 });
 
+const TableColumnStub = defineComponent({
+  inheritAttrs: false,
+  template: "<div v-bind=\"$attrs\"><slot :row=\"{}\" /></div>"
+});
+
 describe("JobHuntRefresh", () => {
   beforeEach(() => {
-    Object.values(mocks).forEach((mock) => mock.mockReset());
+    Object.values(mocks).forEach((value) => {
+      if (typeof value === "function" && "mockReset" in value) {
+        (value as ReturnType<typeof vi.fn>).mockReset();
+      }
+    });
     mocks.load.mockResolvedValue(undefined);
     mocks.codexLoad.mockResolvedValue(undefined);
     mocks.createRun.mockResolvedValue(createdRun);
     mocks.attach.mockResolvedValue(createdRun);
+    mocks.markSubmitted.mockResolvedValue({ ...createdRun, current_step: "waiting_chat_messages" });
     mocks.submitPrompt.mockResolvedValue(true);
+    mocks.codexState.status = "running";
+    mocks.codexState.runId = "codex-session-1";
   });
 
   it("创建持久化 Run 后向 Codex 提交只含 run_id 的结构化任务", async () => {
@@ -140,8 +165,10 @@ describe("JobHuntRefresh", () => {
           ElButton: ButtonStub,
           ElCheckbox: ElementStub,
           ElDatePicker: ElementStub,
+          ElRadioGroup: ElementStub,
+          ElRadioButton: ElementStub,
           ElTable: ElementStub,
-          ElTableColumn: ElementStub,
+          ElTableColumn: TableColumnStub,
           ElTag: ElementStub
         }
       }
@@ -153,6 +180,8 @@ describe("JobHuntRefresh", () => {
 
     expect(mocks.createRun).toHaveBeenCalledTimes(1);
     expect(mocks.attach).toHaveBeenCalledWith("refresh-run-1", "codex-session-1");
+    expect(mocks.markSubmitted).toHaveBeenCalledWith("refresh-run-1");
+    expect(mocks.startCodex).not.toHaveBeenCalled();
     expect(mocks.submitPrompt).toHaveBeenCalledTimes(1);
     const prompt = String(mocks.submitPrompt.mock.calls[0][0]);
     expect(prompt).toContain('"workflow":"job_hunt_refresh_v1"');
@@ -161,5 +190,64 @@ describe("JobHuntRefresh", () => {
 
     wrapper.unmount();
     expect(mocks.stopReading).toHaveBeenCalledTimes(1);
+  });
+
+  it("Codex 未就绪时不会创建 Refresh Run", async () => {
+    mocks.codexState.status = "idle";
+    mocks.codexState.runId = null;
+    const wrapper = mount(JobHuntRefresh, {
+      global: {
+        stubs: {
+          ElAlert: ElementStub,
+          ElButton: ButtonStub,
+          ElCheckbox: ElementStub,
+          ElDatePicker: ElementStub,
+          ElRadioGroup: ElementStub,
+          ElRadioButton: ElementStub,
+          ElTable: ElementStub,
+          ElTableColumn: TableColumnStub,
+          ElTag: ElementStub
+        }
+      }
+    });
+    await flushPromises();
+
+    await wrapper.get("[data-testid='start-refresh-button']").trigger("click");
+    await flushPromises();
+
+    expect(mocks.createRun).not.toHaveBeenCalled();
+    expect(mocks.startCodex).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("Prompt 提交失败时保留原 Run 且不标记为已提交", async () => {
+    mocks.submitPrompt.mockResolvedValue(false);
+    const wrapper = mount(JobHuntRefresh, {
+      global: {
+        stubs: {
+          ElAlert: ElementStub,
+          ElButton: ButtonStub,
+          ElCheckbox: ElementStub,
+          ElDatePicker: ElementStub,
+          ElRadioGroup: ElementStub,
+          ElRadioButton: ElementStub,
+          ElTable: ElementStub,
+          ElTableColumn: TableColumnStub,
+          ElTag: ElementStub
+        }
+      }
+    });
+    await flushPromises();
+
+    await wrapper.get("[data-testid='start-refresh-button']").trigger("click");
+    await flushPromises();
+
+    expect(mocks.createRun).toHaveBeenCalledTimes(1);
+    expect(mocks.attach).toHaveBeenCalledTimes(1);
+    expect(mocks.markSubmitted).not.toHaveBeenCalled();
+    expect(mocks.messageError).toHaveBeenCalledWith(
+      expect.stringContaining("原 run_id")
+    );
+    wrapper.unmount();
   });
 });

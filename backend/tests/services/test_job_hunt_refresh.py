@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from backend.app.db import Database
 from backend.app.services.fine_job import job_hunt_refresh
@@ -50,6 +50,35 @@ def _options(**changes: bool) -> dict[str, bool]:
     }
     options.update(changes)
     return options
+
+
+def _insert_message(
+    db: Database,
+    *,
+    message_id: str,
+    session_id: str,
+    platform_message_id: str,
+    sent_at: str,
+    source: str = "websocket",
+) -> None:
+    with db.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO fj_chat_messages (
+              id, session_id, platform_message_id, direction, message_type,
+              content, source, sent_at, observed_at, created_at
+            ) VALUES (?, ?, ?, 'outbound', 'text', '消息', ?, ?, ?, ?)
+            """,
+            (
+                message_id,
+                session_id,
+                platform_message_id,
+                source,
+                sent_at,
+                sent_at,
+                sent_at,
+            ),
+        )
 
 
 def _insert_scope(
@@ -172,11 +201,187 @@ def test_scope_discovery_uses_friend_refresh_result_and_selected_platform_time(
             for table in table_names
         }
     assert result["counts"]["sessions_to_sync"] == 2
+    assert result["counts"]["sessions_in_scope"] == 2
+    assert result["scope_source"] == "refresh"
     assert result["counts"]["new_sessions_to_sync"] == 1
     assert result["session_ids_to_sync"][0] == "existing-session"
     assert "old-peer" not in result["session_ids_to_sync"]
     assert len(result["new_session_ids"]) == 2
     assert before == after
+
+
+def test_latest_local_chat_excludes_synthetic_assistant_placeholder(
+    test_db: Database,
+) -> None:
+    _insert_session(
+        test_db,
+        session_id="latest-session",
+        peer_uid="latest-peer",
+        changed_at="2026-09-05T01:00:00Z",
+    )
+    _insert_message(
+        test_db,
+        message_id="real-websocket",
+        session_id="latest-session",
+        platform_message_id="platform-1",
+        sent_at="2026-09-05T01:00:00Z",
+    )
+    _insert_message(
+        test_db,
+        message_id="real-echo",
+        session_id="latest-session",
+        platform_message_id="platform-echo",
+        sent_at="2026-09-05T02:00:00Z",
+        source="assistant",
+    )
+    _insert_message(
+        test_db,
+        message_id="synthetic-placeholder",
+        session_id="latest-session",
+        platform_message_id="assistant:send-action-1",
+        sent_at="2026-09-05T03:00:00Z",
+        source="assistant",
+    )
+
+    context = job_hunt_refresh.get_refresh_context(test_db)
+
+    assert context["latest_local_message_at"] == "2026-09-05T02:00:00Z"
+
+
+def test_local_scope_does_not_call_platform_and_keeps_synced_session_in_job_scope(
+    test_db: Database,
+    monkeypatch,
+) -> None:
+    create_capture_batch(
+        test_db,
+        capture_id="scope-local-job",
+        keyword="本地范围岗位",
+        city="",
+        pages=1,
+        auto_details=False,
+        created_at="2026-09-05T00:00:00Z",
+    )
+    job = record_capture_jobs(
+        test_db,
+        capture_id="scope-local-job",
+        search_keyword="本地范围岗位",
+        jobs=[{
+            "job_id": "local-source-job",
+            "encrypt_job_id": "local-encrypt-job",
+            "title": "后端工程师",
+            "boss_name": "本地公司",
+            "salary": "20-30K",
+            "location": "上海",
+        }],
+        collected_at="2026-09-05T00:10:00Z",
+    )[0]
+    update_capture_job_detail(
+        test_db,
+        job={"history_record_id": job["history_record_id"]},
+        detail={"description": "负责服务开发。"},
+        status="completed",
+    )
+    _insert_session(
+        test_db,
+        session_id="local-synced-session",
+        peer_uid="local-synced-peer",
+        changed_at="2026-09-05T02:00:00Z",
+        encrypt_job_id="local-encrypt-job",
+    )
+    _insert_session(
+        test_db,
+        session_id="local-stale-session",
+        peer_uid="local-stale-peer",
+        changed_at="2026-09-05T02:01:00Z",
+    )
+    with test_db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_chat_sessions
+            SET platform_latest_msg_id = 'local-platform-message',
+                platform_synced_at = '2026-09-05T02:05:00Z'
+            WHERE id = 'local-synced-session'
+            """
+        )
+        connection.execute(
+            """
+            UPDATE fj_chat_sessions
+            SET platform_synced_at = '2026-09-05T01:00:00Z'
+            WHERE id = 'local-stale-session'
+            """
+        )
+    _insert_message(
+        test_db,
+        message_id="local-loaded-message",
+        session_id="local-synced-session",
+        platform_message_id="local-platform-message",
+        sent_at="2026-09-05T02:00:00Z",
+    )
+    capture = monkeypatch.setattr(
+        job_hunt_refresh.boss_scraper_service,
+        "capture_chat_friend_list",
+        lambda: (_ for _ in ()).throw(AssertionError("local 模式不应访问 BOSS")),
+    )
+
+    scope = job_hunt_refresh.discover_scope(
+        test_db,
+        "2026-09-04T00:00:00Z",
+        "local",
+    )
+
+    assert capture is None
+    assert scope["scope_source"] == "local"
+    assert scope["counts"]["sessions_in_scope"] == 1
+    assert scope["session_ids_in_scope"] == ["local-synced-session"]
+    assert scope["counts"]["sessions_to_sync"] == 0
+    assert scope["counts"]["related_jobs"] == 1
+    assert scope["counts"]["jobs_to_collect"] == 0
+    assert scope["counts"]["jobs_missing_evaluation"] == 1
+
+
+def test_auto_uses_fresh_local_list_and_refreshes_stale_list(
+    test_db: Database,
+    monkeypatch,
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    _insert_session(
+        test_db,
+        session_id="auto-session",
+        peer_uid="auto-peer",
+        changed_at=(now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+    )
+    with test_db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_chat_sessions SET platform_synced_at = ? WHERE id = 'auto-session'",
+            ((now - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),),
+        )
+    capture_calls = 0
+
+    def capture_friend_list():
+        nonlocal capture_calls
+        capture_calls += 1
+        return {"account_uid": "candidate", "response": {"zpData": {"result": []}}, "url": "test"}
+
+    monkeypatch.setattr(
+        job_hunt_refresh.boss_scraper_service,
+        "capture_chat_friend_list",
+        capture_friend_list,
+    )
+    selected = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+
+    fresh_scope = job_hunt_refresh.discover_scope(test_db, selected, "auto")
+    with test_db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_chat_sessions SET platform_synced_at = ? WHERE id = 'auto-session'",
+            ((now - timedelta(minutes=31)).isoformat().replace("+00:00", "Z"),),
+        )
+    stale_scope = job_hunt_refresh.discover_scope(test_db, selected, "auto")
+    refresh_scope = job_hunt_refresh.discover_scope(test_db, selected, "refresh")
+
+    assert fresh_scope["scope_source"] == "local"
+    assert stale_scope["scope_source"] == "refresh"
+    assert refresh_scope["requested_source_mode"] == "refresh"
+    assert capture_calls == 2
 
 
 def test_run_and_items_survive_database_reinitialization_and_skip_succeeded(
@@ -248,6 +453,74 @@ def test_run_items_are_copied_from_scope_without_recalculating_database(
     assert [item["session_id"] for item in run["items"]] == ["scope-session"]
 
 
+def test_run_waits_for_prompt_then_can_be_cancelled_without_deleting_scope(
+    test_db: Database,
+) -> None:
+    _insert_session(
+        test_db,
+        session_id="prompt-session",
+        peer_uid="prompt-peer",
+        changed_at="2026-09-05T02:00:00Z",
+    )
+    scope_id = _insert_scope(test_db, ["prompt-session"])
+    run = job_hunt_refresh.create_run(
+        test_db,
+        scope_id=scope_id,
+        workflow_options=_options(refresh_related_jobs=False),
+    )
+
+    assert run["current_step"] == "waiting_codex"
+    attached = job_hunt_refresh.attach_codex_session(
+        test_db,
+        str(run["id"]),
+        "codex-session-ready",
+    )
+    assert attached["current_step"] == "waiting_codex"
+    submitted = job_hunt_refresh.mark_prompt_submitted(test_db, str(run["id"]))
+    assert submitted["current_step"] == "waiting_chat_messages"
+    assert submitted["prompt_submitted_at"] is not None
+
+    cancelled = job_hunt_refresh.cancel_run(test_db, str(run["id"]))
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["current_step"] == "cancelled"
+    assert cancelled["items"][0]["status"] == "skipped"
+    assert job_hunt_refresh.get_scope(test_db, scope_id)["id"] == scope_id
+
+
+def test_database_upgrade_recovers_legacy_pending_run_waiting_for_codex(
+    test_db: Database,
+) -> None:
+    _insert_session(
+        test_db,
+        session_id="legacy-waiting-session",
+        peer_uid="legacy-waiting-peer",
+        changed_at="2026-09-05T02:00:00Z",
+    )
+    scope_id = _insert_scope(test_db, ["legacy-waiting-session"])
+    run = job_hunt_refresh.create_run(
+        test_db,
+        scope_id=scope_id,
+        workflow_options=_options(refresh_related_jobs=False),
+    )
+    with test_db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_job_hunt_refresh_runs
+            SET current_step = 'waiting_chat_messages', codex_session_ref = NULL
+            WHERE id = ?
+            """,
+            (run["id"],),
+        )
+
+    reopened = Database(test_db.sqlite_path)
+    reopened.initialize()
+    recovered = job_hunt_refresh.get_run(reopened, str(run["id"]))
+
+    assert recovered["status"] == "pending"
+    assert recovered["current_step"] == "waiting_codex"
+    assert recovered["resume_available"] is True
+
+
 def test_completed_with_errors_can_resume_only_retryable_items(test_db: Database) -> None:
     for index in range(2):
         _insert_session(
@@ -280,6 +553,7 @@ def test_completed_with_errors_can_resume_only_retryable_items(test_db: Database
         str(run["id"]),
         "codex-resume-1",
     )
+    submitted = job_hunt_refresh.mark_prompt_submitted(test_db, str(run["id"]))
     actionable = job_hunt_refresh.list_actionable_items(
         test_db,
         str(run["id"]),
@@ -288,7 +562,9 @@ def test_completed_with_errors_can_resume_only_retryable_items(test_db: Database
 
     assert completed["status"] == "completed_with_errors"
     assert completed["resume_available"] is True
-    assert resumed["status"] == "running"
+    assert resumed["status"] == "completed_with_errors"
+    assert resumed["current_step"] == "waiting_codex"
+    assert submitted["status"] == "running"
     assert [item["id"] for item in actionable] == [failed_id]
 
 

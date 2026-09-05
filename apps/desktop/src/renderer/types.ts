@@ -1173,7 +1173,11 @@ export interface FineJobChatFriendListRefreshResponse {
   created_count: number;
   changed_count: number;
   source_url: string;
-  synced_at: string;
+  synced_at: string | null;
+  session_ids?: string[];
+  created_session_ids?: string[];
+  reused_local_snapshot?: boolean;
+  age_minutes?: number | null;
 }
 export interface FineJobChatHistoryRefreshResponse {
   session_id: string;
@@ -1240,7 +1244,10 @@ export interface FineJobJobHuntRefreshContext {
   last_successful_completed_at?: string | null;
   default_since_time: string;
   latest_unconsumed_scope_id?: string | null;
+  chat_list_synced_at?: string | null;
 }
+
+export type FineJobJobHuntRefreshScopeSourceMode = "auto" | "local" | "refresh";
 
 export interface FineJobJobHuntRefreshScopeJobRef {
   entity_id: string;
@@ -1252,11 +1259,15 @@ export interface FineJobJobHuntRefreshScopeJobRef {
 export interface FineJobJobHuntRefreshScope {
   id: string;
   selected_since_time: string;
+  requested_source_mode: FineJobJobHuntRefreshScopeSourceMode;
+  scope_source: "local" | "refresh";
   account_uid: string;
   source_url: string;
   friend_list_synced_at: string;
+  chat_list_synced_at?: string | null;
   scope_generated_at: string;
   latest_local_message_at?: string | null;
+  session_ids_in_scope: string[];
   session_ids_to_sync: string[];
   new_session_ids: string[];
   related_jobs: FineJobJobHuntRefreshScopeJobRef[];
@@ -1268,6 +1279,7 @@ export interface FineJobJobHuntRefreshScope {
   unresolved_session_ids: string[];
   counts: {
     refreshed_sessions: number;
+    sessions_in_scope: number;
     sessions_to_sync: number;
     new_sessions_to_sync: number;
     related_jobs: number;
@@ -1347,6 +1359,7 @@ export interface FineJobJobHuntRefreshRun {
     unresolved_jobs?: number;
   };
   error_summary?: string | null;
+  prompt_submitted_at?: string | null;
   started_at?: string | null;
   completed_at?: string | null;
   created_at: string;

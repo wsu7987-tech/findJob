@@ -28,7 +28,11 @@ def discover_scope(
     payload: JobHuntRefreshScopeDiscoveryRequest,
     db: Database = Depends(get_database),
 ):
-    return job_hunt_refresh.discover_scope(db, payload.selected_since_time)
+    return job_hunt_refresh.discover_scope(
+        db,
+        payload.selected_since_time,
+        payload.source_mode,
+    )
 
 
 @router.get("/scopes/{scope_id}")
@@ -73,3 +77,13 @@ def attach_codex_session(
         run_id,
         payload.codex_session_ref,
     )
+
+
+@router.post("/runs/{run_id}/prompt-submitted")
+def prompt_submitted(run_id: str, db: Database = Depends(get_database)):
+    return job_hunt_refresh.mark_prompt_submitted(db, run_id)
+
+
+@router.post("/runs/{run_id}/cancel")
+def cancel_run(run_id: str, db: Database = Depends(get_database)):
+    return job_hunt_refresh.cancel_run(db, run_id)

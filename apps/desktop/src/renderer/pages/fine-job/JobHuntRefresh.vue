@@ -18,6 +18,19 @@ const submittingCodex = ref(false);
 
 const run = computed(() => store.currentRun);
 const runIsActive = computed(() => run.value?.status === "pending" || run.value?.status === "running");
+const codexReady = computed(() => {
+  const bridge = getCodexBridge();
+  return codexStore.status === "running"
+    && Boolean(codexStore.runId)
+    && typeof bridge?.submitCodexPrompt === "function";
+});
+const codexStatusLabel = computed(() => ({
+  idle: "未启动",
+  starting: "正在启动",
+  running: "已就绪",
+  exited: "已退出",
+  failed: "启动失败"
+}[codexStore.status] ?? codexStore.status));
 const scopeIsOld = computed(() => Boolean(
   store.scope
     && Date.now() - new Date(store.scope.scope_generated_at).getTime() > 30 * 60 * 1_000
@@ -26,7 +39,18 @@ const canStart = computed(() => Boolean(
   store.scope
     && store.scope.selected_since_time === store.selectedSinceTime
     && store.hasExecutableWorkflow
+    && codexReady.value
     && !runIsActive.value
+));
+const canResubmit = computed(() => Boolean(
+  run.value
+    && !["completed", "failed", "cancelled"].includes(run.value.status)
+    && (run.value.resume_available || run.value.current_step === "waiting_codex")
+    && codexReady.value
+));
+const canCancel = computed(() => Boolean(
+  run.value
+    && ["pending", "running", "completed_with_errors"].includes(run.value.status)
 ));
 
 const statusLabel = (value?: string) => ({
@@ -47,6 +71,21 @@ const statusType = (value?: string) => ({
   failed: "danger",
   running: "primary"
 }[value ?? ""] ?? "info") as "success" | "warning" | "danger" | "primary" | "info";
+
+const stepLabel = (value?: string) => {
+  if (!value) return "等待开始";
+  if (value === "waiting_codex") return "等待 Codex 接收任务";
+  if (value === "waiting_chat_messages" || value.includes("chat_session") || value === "refresh_chat_messages") {
+    return "正在更新聊天消息";
+  }
+  if (value === "waiting_related_jobs" || value.includes("related_job") || value === "refresh_related_job") {
+    return "正在采集岗位与 JD";
+  }
+  if (value === "waiting_completion") return "等待汇总任务结果";
+  if (value === "completed") return "任务完成";
+  if (value === "cancelled") return "任务已取消";
+  return value;
+};
 
 const setSince = (date: Date) => {
   const normalized = new Date(date);
@@ -92,20 +131,21 @@ const refreshPrompt = (runId: string) => [
 
 const submitRunToCodex = async (target: FineJobJobHuntRefreshRun) => {
   const bridge = getCodexBridge();
-  if (!bridge?.submitCodexPrompt) throw new Error("求职数据更新需要在 FineJob 桌面端执行。");
-  if (codexStore.status !== "running" && codexStore.status !== "starting") {
-    await codexStore.start(120, 36, false);
+  if (!codexReady.value || !bridge?.submitCodexPrompt || !codexStore.runId) {
+    throw new Error("Codex 未就绪，请先在 Codex 工作台选择模型并启动会话。");
   }
-  if (!codexStore.runId) throw new Error("Codex 会话尚未取得运行标识。");
   await store.attachCodexSession(target.id, codexStore.runId);
   const submitted = await bridge.submitCodexPrompt(refreshPrompt(target.id));
-  if (!submitted) throw new Error("Codex 会话当前不能接收任务。");
-  store.startProgressReading();
+  if (!submitted) throw new Error("Codex 未接收任务，可在就绪后使用原 run_id 重新提交。");
+  await store.markPromptSubmitted(target.id);
 };
 
 const start = async () => {
   submittingCodex.value = true;
   try {
+    if (!codexReady.value) {
+      throw new Error("Codex 未就绪，请先在 Codex 工作台选择模型并启动会话。");
+    }
     if (store.scope && Date.now() - new Date(store.scope.scope_generated_at).getTime() > 30 * 60 * 1_000) {
       ElMessage.warning("当前 Scope 已生成超过 30 分钟，本次仍按页面显示的固定范围执行。");
     }
@@ -129,6 +169,16 @@ const resume = async () => {
     ElMessage.error(value instanceof Error ? value.message : "任务继续失败");
   } finally {
     submittingCodex.value = false;
+  }
+};
+
+const cancel = async () => {
+  if (!run.value) return;
+  try {
+    await store.cancelRun(run.value.id);
+    ElMessage.success("Refresh Run 已取消，Scope 和执行记录已保留");
+  } catch (value) {
+    ElMessage.error(value instanceof Error ? value.message : "任务取消失败");
   }
 };
 
@@ -172,7 +222,7 @@ onBeforeUnmount(() => store.stopProgressReading());
         <div>
           <h3>从此时间开始更新</h3>
           <p class="secondary-text">
-            本地最新聊天：{{ formatDateTime(store.context?.latest_local_message_at) }} · 时区：Asia/Shanghai
+            本地已同步最新聊天：{{ formatDateTime(store.context?.latest_local_message_at) }} · 时区：Asia/Shanghai
           </p>
         </div>
       </div>
@@ -194,11 +244,23 @@ onBeforeUnmount(() => store.stopProgressReading());
       </div>
 
       <div class="workflow-grid">
-        <el-checkbox :model-value="true" disabled>聊天列表已在获取范围时更新</el-checkbox>
+        <el-checkbox :model-value="true" disabled>聊天列表范围在获取范围时确定</el-checkbox>
         <el-checkbox v-model="store.workflowOptions.refresh_chat_messages">更新聊天消息</el-checkbox>
         <el-checkbox v-model="store.workflowOptions.refresh_related_jobs">采集/刷新关联岗位与 JD</el-checkbox>
         <el-checkbox disabled>AI 分析并更新求职进度（即将支持）</el-checkbox>
         <el-checkbox disabled>生成缺失投递建议（即将支持）</el-checkbox>
+      </div>
+
+      <div class="source-mode-row">
+        <span>聊天列表来源</span>
+        <el-radio-group v-model="store.sourceMode" @change="store.invalidateScope()">
+          <el-radio-button value="auto">智能选择（默认）</el-radio-button>
+          <el-radio-button value="local">使用本地聊天列表</el-radio-button>
+          <el-radio-button value="refresh">先刷新 BOSS 聊天列表</el-radio-button>
+        </el-radio-group>
+        <span class="secondary-text">
+          本地聊天列表最后同步：{{ formatDateTime(store.context?.chat_list_synced_at) }}
+        </span>
       </div>
 
       <div class="card-actions">
@@ -221,6 +283,16 @@ onBeforeUnmount(() => store.stopProgressReading());
           <p class="secondary-text">
             Scope 生成时间：{{ formatDateTime(store.scope.scope_generated_at) }}
           </p>
+          <p class="secondary-text">
+            本次范围来源：{{ store.scope.scope_source === "refresh" ? "BOSS 最新列表" : "本地聊天列表" }} ·
+            列表同步时间：{{ formatDateTime(store.scope.chat_list_synced_at) }}
+          </p>
+          <p
+            v-if="store.scope.scope_source === 'local' && typeof store.scope.friend_list_result.age_minutes === 'number'"
+            class="secondary-text"
+          >
+            聊天列表 {{ store.scope.friend_list_result.age_minutes }} 分钟前已同步，本次直接使用本地数据。
+          </p>
         </div>
         <el-tag type="success">已确定</el-tag>
       </div>
@@ -231,6 +303,7 @@ onBeforeUnmount(() => store.stopProgressReading());
         :closable="false"
       />
       <div class="metric-grid">
+        <article><span>时间范围内聊天</span><strong>{{ store.scope.counts.sessions_in_scope }}</strong></article>
         <article><span>待同步聊天</span><strong>{{ store.scope.counts.sessions_to_sync }}</strong></article>
         <article><span>关联岗位</span><strong>{{ store.scope.counts.related_jobs }}</strong></article>
         <article><span>需采集/刷新岗位</span><strong>{{ store.scope.counts.jobs_to_collect }}</strong></article>
@@ -240,10 +313,21 @@ onBeforeUnmount(() => store.stopProgressReading());
       </div>
       <div class="execution-summary">
         <span>{{ formatDateTime(store.scope.selected_since_time) }} → Scope 生成时间</span>
-        <span>✓ 平台聊天列表已刷新</span>
+        <span>✓ 聊天列表范围已确定</span>
         <span>{{ store.workflowOptions.refresh_chat_messages ? "✓" : "○" }} 更新聊天消息</span>
         <span>{{ store.workflowOptions.refresh_related_jobs ? "✓" : "○" }} 采集关联岗位</span>
       </div>
+      <section class="codex-readiness">
+        <div>
+          <strong>Codex 执行器</strong>
+          <span>状态：{{ codexStatusLabel }}</span>
+          <span>会话：{{ codexStore.runId || "无" }}</span>
+        </div>
+        <p v-if="!codexReady" class="secondary-text">
+          Codex 未就绪，请先选择模型并启动 Codex 会话。
+        </p>
+        <el-button v-if="!codexReady" @click="openCodex">前往 Codex 工作台</el-button>
+      </section>
       <el-button
         type="primary"
         :disabled="!canStart"
@@ -266,15 +350,22 @@ onBeforeUnmount(() => store.stopProgressReading());
         <div class="card-actions">
           <el-tag :type="statusType(run.status)">{{ statusLabel(run.status) }}</el-tag>
           <el-button
-            v-if="run.resume_available && !runIsActive"
+            v-if="canResubmit"
             :loading="submittingCodex"
             data-testid="resume-refresh-button"
             @click="resume"
-          >继续任务</el-button>
+          >重新提交到 Codex</el-button>
+          <el-button
+            v-if="canCancel"
+            type="danger"
+            plain
+            data-testid="cancel-refresh-button"
+            @click="cancel"
+          >取消任务</el-button>
         </div>
       </div>
 
-      <p class="current-step">Codex 当前步骤：{{ run.current_step }}</p>
+      <p class="current-step">{{ stepLabel(run.current_step) }}</p>
       <div class="progress-list">
         <div>
           <span>范围发现 / 聊天列表</span>
@@ -336,7 +427,7 @@ onBeforeUnmount(() => store.stopProgressReading());
 .setup-card, .preview-card, .run-card, .recent-card { display: grid; gap: 18px; }
 .section-title { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
 .section-title h3, .section-title h4, .section-title p { margin: 0; }
-.range-row, .card-actions, .execution-summary { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.range-row, .card-actions, .execution-summary, .source-mode-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .workflow-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
 .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
 .metric-grid article, .result-grid article { display: grid; gap: 6px; padding: 16px; border-radius: 12px; background: var(--el-fill-color-light); }
@@ -344,6 +435,9 @@ onBeforeUnmount(() => store.stopProgressReading());
 .metric-grid strong { font-size: 28px; }
 .metric-grid .metric-pending { font-size: 16px; }
 .current-step { margin: 0; color: var(--el-color-primary); }
+.codex-readiness { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 14px; border-radius: 12px; background: var(--el-fill-color-light); }
+.codex-readiness > div { display: flex; flex-wrap: wrap; gap: 12px; }
+.codex-readiness p { margin: 0; }
 .progress-list { display: grid; gap: 10px; }
 .progress-list > div { display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid var(--el-border-color-lighter); }
 .result-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }

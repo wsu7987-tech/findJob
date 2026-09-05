@@ -154,14 +154,16 @@ uv run python -m backend.app.services.fine_job.boss_scraper.boss_cdp_raw --keywo
 
 ## 求职数据更新（阶段 2A）
 
-桌面端“求职数据更新”先按用户选择时间执行 Refresh Scope Discovery。该步骤复用现有
-`capture_chat_friend_list → sync_friend_list`，用刷新后的 `platform_latest_message_at`、
-本次新建 Session 标识、`message_update_required` 和本地最新消息去重状态确定待同步会话，
-并把会话、关联岗位、待采集岗位、缺失 JD 和缺失评估保存为固定 Scope Snapshot。
-页面显示 Scope 生成时间；超过 30 分钟会提示范围可能已变旧，继续执行仍使用原固定 Scope。
+桌面端“求职数据更新”按用户选择时间执行 Refresh Scope Discovery。列表来源支持智能选择、仅使用
+本地列表和明确刷新 BOSS；智能模式在最近 `platform_synced_at` 不超过 30 分钟时复用本地数据，
+否则复用 `capture_chat_friend_list → sync_friend_list`。Scope 将时间范围内完整会话
+`sessions_in_scope` 与需要 history API 的 `sessions_to_sync` 分开保存，关联岗位、缺失 JD 和缺失评估
+均从完整会话集合计算。页面显示实际来源、列表同步时间和 Scope 生成时间。
 
-用户确认后，页面以 `scope_id` 创建持久化 Refresh Run。Run Item 只从 Scope 复制，Codex/MCP
-从聊天历史同步开始，继续复用 `sync_history_messages`、`prepare_chat_job` 和现有岗位详情采集流程。
+用户确认后，页面只在已有 Codex 会话处于 running 且可提交 Prompt 时以 `scope_id` 创建持久化
+Refresh Run。Run 初始步骤为 `waiting_codex`；Prompt 成功写入当前 Codex 会话后进入聊天历史同步。
+提交失败时可按原 `run_id` 重新提交或取消。Run Item 只从 Scope 复制，并继续复用
+`sync_history_messages`、`prepare_chat_job` 和现有岗位详情采集流程。
 Run 与 Item 状态可在页面关闭、Codex 中断或应用重启后恢复；恢复时只返回未完成和可重试 Item。
 页面在 Run 运行期间每 2 秒读取持久化进度，进入终态或离开页面后停止。阶段 2A 不执行会话洞察、
 AI 状态判断、投递建议生成、AI Reply 或自动发送。

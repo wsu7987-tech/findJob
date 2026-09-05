@@ -57,6 +57,7 @@ def test_scope_discovery_and_run_endpoints_persist_fixed_scope(client, monkeypat
     assert created.json()["status"] == "pending"
     assert created.json()["scope_id"] == scope_id
     assert created.json()["selected_since_time"] == "2026-09-04T00:00:00Z"
+    assert created.json()["current_step"] == "waiting_codex"
 
     attached = client.patch(
         f"/api/fine-job/job-hunt-refresh/runs/{run_id}/codex-session",
@@ -64,6 +65,19 @@ def test_scope_discovery_and_run_endpoints_persist_fixed_scope(client, monkeypat
     )
     assert attached.status_code == 200
     assert attached.json()["codex_session_ref"] == "codex-run-example"
+    assert attached.json()["current_step"] == "waiting_codex"
+
+    submitted = client.post(
+        f"/api/fine-job/job-hunt-refresh/runs/{run_id}/prompt-submitted"
+    )
+    assert submitted.status_code == 200
+    assert submitted.json()["current_step"] == "waiting_completion"
+
+    cancelled = client.post(
+        f"/api/fine-job/job-hunt-refresh/runs/{run_id}/cancel"
+    )
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
 
     listed = client.get("/api/fine-job/job-hunt-refresh/runs")
     assert listed.status_code == 200

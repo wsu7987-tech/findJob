@@ -14,7 +14,9 @@ const apiMocks = vi.hoisted(() => ({
   getScope: vi.fn(),
   discoverScope: vi.fn(),
   createRun: vi.fn(),
-  attach: vi.fn()
+  attach: vi.fn(),
+  markSubmitted: vi.fn(),
+  cancelRun: vi.fn()
 }));
 
 vi.mock("@/services/api", () => ({
@@ -27,7 +29,9 @@ vi.mock("@/services/api", () => ({
     getFineJobJobHuntRefreshScope: apiMocks.getScope,
     discoverFineJobJobHuntRefreshScope: apiMocks.discoverScope,
     createFineJobJobHuntRefreshRun: apiMocks.createRun,
-    attachFineJobJobHuntRefreshCodexSession: apiMocks.attach
+    attachFineJobJobHuntRefreshCodexSession: apiMocks.attach,
+    markFineJobJobHuntRefreshPromptSubmitted: apiMocks.markSubmitted,
+    cancelFineJobJobHuntRefreshRun: apiMocks.cancelRun
   }
 }));
 
@@ -36,11 +40,15 @@ import { useFineJobJobHuntRefreshStore } from "./fineJobJobHuntRefresh";
 const scope = {
   id: "refresh-scope-1",
   selected_since_time: "2026-09-04T00:00:00Z",
+  requested_source_mode: "auto" as const,
+  scope_source: "local" as const,
   account_uid: "candidate",
   source_url: "test",
   friend_list_synced_at: "2026-09-05T00:00:00Z",
+  chat_list_synced_at: "2026-09-05T00:00:00Z",
   scope_generated_at: "2026-09-05T00:00:00Z",
   latest_local_message_at: null,
+  session_ids_in_scope: [],
   session_ids_to_sync: [],
   new_session_ids: [],
   related_jobs: [],
@@ -52,6 +60,7 @@ const scope = {
   unresolved_session_ids: [],
   counts: {
     refreshed_sessions: 0,
+    sessions_in_scope: 0,
     sessions_to_sync: 0,
     new_sessions_to_sync: 0,
     related_jobs: 0,
@@ -93,7 +102,7 @@ const run = (status: FineJobJobHuntRefreshRun["status"]): FineJobJobHuntRefreshR
   failed_jobs: 0,
   chat_list_status: "succeeded",
   chat_list_retryable: false,
-  current_step: "waiting_chat_messages",
+  current_step: "waiting_codex",
   trigger_source: "page",
   summary: {},
   created_at: "2026-09-05T00:00:00Z",
@@ -132,10 +141,22 @@ describe("fineJobJobHuntRefresh store", () => {
     await vi.advanceTimersByTimeAsync(2_000);
     await flushPromises();
     expect(apiMocks.getRun).toHaveBeenCalledTimes(1);
+    expect(apiMocks.context).toHaveBeenCalledTimes(2);
 
     await vi.advanceTimersByTimeAsync(4_000);
     await flushPromises();
     expect(apiMocks.getRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancelled Run 不启动进度读取", async () => {
+    apiMocks.listRuns.mockResolvedValue({ runs: [run("cancelled")] });
+    const store = useFineJobJobHuntRefreshStore();
+
+    await store.load();
+    await vi.advanceTimersByTimeAsync(4_000);
+    await flushPromises();
+
+    expect(apiMocks.getRun).not.toHaveBeenCalled();
   });
 
   it("Scope Discovery 与 Run 创建使用同一个持久化 scope_id", async () => {
@@ -148,7 +169,11 @@ describe("fineJobJobHuntRefresh store", () => {
     await store.discoverScope();
     await store.createRun();
 
-    expect(apiMocks.discoverScope).toHaveBeenCalledWith("2026-09-04T00:00:00Z");
+    expect(apiMocks.discoverScope).toHaveBeenCalledWith(
+      "2026-09-04T00:00:00Z",
+      "auto"
+    );
+    expect(apiMocks.context).toHaveBeenCalledTimes(2);
     expect(apiMocks.createRun).toHaveBeenCalledWith(expect.objectContaining({
       scope_id: "refresh-scope-1"
     }));

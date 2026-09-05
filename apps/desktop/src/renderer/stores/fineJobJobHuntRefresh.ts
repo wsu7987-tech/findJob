@@ -5,6 +5,7 @@ import { ApiError, NetworkError, api } from "@/services/api";
 import type {
   FineJobJobHuntRefreshContext,
   FineJobJobHuntRefreshScope,
+  FineJobJobHuntRefreshScopeSourceMode,
   FineJobJobHuntRefreshRun,
   FineJobJobHuntRefreshWorkflowOptions
 } from "@/types";
@@ -24,6 +25,7 @@ const isActive = (run: FineJobJobHuntRefreshRun | null) =>
 export const useFineJobJobHuntRefreshStore = defineStore("fine-job-job-hunt-refresh", () => {
   const context = ref<FineJobJobHuntRefreshContext | null>(null);
   const selectedSinceTime = ref("");
+  const sourceMode = ref<FineJobJobHuntRefreshScopeSourceMode>("auto");
   const workflowOptions = ref(defaultWorkflows());
   const scope = ref<FineJobJobHuntRefreshScope | null>(null);
   const currentRun = ref<FineJobJobHuntRefreshRun | null>(null);
@@ -38,6 +40,11 @@ export const useFineJobJobHuntRefreshStore = defineStore("fine-job-job-hunt-refr
     workflowOptions.value.refresh_chat_messages
       || workflowOptions.value.refresh_related_jobs
   );
+
+  const refreshContext = async () => {
+    context.value = await api.getFineJobJobHuntRefreshContext();
+    return context.value;
+  };
 
   const load = async () => {
     loading.value = true;
@@ -54,6 +61,7 @@ export const useFineJobJobHuntRefreshStore = defineStore("fine-job-job-hunt-refr
           contextResult.latest_unconsumed_scope_id
         );
         selectedSinceTime.value = scope.value.selected_since_time;
+        sourceMode.value = scope.value.requested_source_mode;
       } else if (!selectedSinceTime.value) {
         selectedSinceTime.value = contextResult.default_since_time;
       }
@@ -71,7 +79,11 @@ export const useFineJobJobHuntRefreshStore = defineStore("fine-job-job-hunt-refr
     discovering.value = true;
     error.value = null;
     try {
-      scope.value = await api.discoverFineJobJobHuntRefreshScope(selectedSinceTime.value);
+      scope.value = await api.discoverFineJobJobHuntRefreshScope(
+        selectedSinceTime.value,
+        sourceMode.value
+      );
+      await refreshContext();
       return scope.value;
     } catch (value) {
       error.value = mapError(value);
@@ -99,7 +111,6 @@ export const useFineJobJobHuntRefreshStore = defineStore("fine-job-job-hunt-refr
         created,
         ...recentRuns.value.filter((item) => item.id !== created.id)
       ].slice(0, 10);
-      startProgressReading();
       return created;
     } catch (value) {
       error.value = mapError(value);
@@ -124,12 +135,35 @@ export const useFineJobJobHuntRefreshStore = defineStore("fine-job-job-hunt-refr
     return currentRun.value;
   };
 
+  const markPromptSubmitted = async (runId: string) => {
+    currentRun.value = await api.markFineJobJobHuntRefreshPromptSubmitted(runId);
+    startProgressReading();
+    return currentRun.value;
+  };
+
+  const cancelRun = async (runId: string) => {
+    currentRun.value = await api.cancelFineJobJobHuntRefreshRun(runId);
+    const index = recentRuns.value.findIndex((item) => item.id === runId);
+    if (index >= 0) recentRuns.value[index] = currentRun.value;
+    stopProgressReading();
+    await refreshContext();
+    return currentRun.value;
+  };
+
   const refreshCurrentRun = async () => {
     if (!currentRun.value) return null;
+    const previous = currentRun.value;
     const refreshed = await api.getFineJobJobHuntRefreshRun(currentRun.value.id);
     currentRun.value = refreshed;
     const index = recentRuns.value.findIndex((item) => item.id === refreshed.id);
     if (index >= 0) recentRuns.value[index] = refreshed;
+    const chatCompleted = refreshed.progress.chat_messages.total > 0
+      && refreshed.progress.chat_messages.completed === refreshed.progress.chat_messages.total;
+    const chatWasIncomplete = previous.progress.chat_messages.completed
+      < previous.progress.chat_messages.total;
+    if ((chatCompleted && chatWasIncomplete) || !isActive(refreshed)) {
+      await refreshContext();
+    }
     if (!isActive(refreshed)) stopProgressReading();
     return refreshed;
   };
@@ -157,6 +191,7 @@ export const useFineJobJobHuntRefreshStore = defineStore("fine-job-job-hunt-refr
   return {
     context,
     selectedSinceTime,
+    sourceMode,
     workflowOptions,
     scope,
     currentRun,
@@ -166,11 +201,14 @@ export const useFineJobJobHuntRefreshStore = defineStore("fine-job-job-hunt-refr
     starting,
     error,
     hasExecutableWorkflow,
+    refreshContext,
     load,
     discoverScope,
     createRun,
     selectRun,
     attachCodexSession,
+    markPromptSubmitted,
+    cancelRun,
     refreshCurrentRun,
     startProgressReading,
     stopProgressReading,

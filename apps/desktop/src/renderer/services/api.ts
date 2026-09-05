@@ -1114,10 +1114,13 @@ export const api = {
   async getFineJobJobHuntRefreshContext() {
     return request<FineJobJobHuntRefreshContext>("/api/fine-job/job-hunt-refresh/context");
   },
-  async discoverFineJobJobHuntRefreshScope(selectedSinceTime: string) {
+  async discoverFineJobJobHuntRefreshScope(
+    selectedSinceTime: string,
+    sourceMode: "auto" | "local" | "refresh"
+  ) {
     return request<FineJobJobHuntRefreshScope>("/api/fine-job/job-hunt-refresh/scopes", {
       method: "POST",
-      body: JSON.stringify({ selected_since_time: selectedSinceTime })
+      body: JSON.stringify({ selected_since_time: selectedSinceTime, source_mode: sourceMode })
     });
   },
   async getFineJobJobHuntRefreshScope(scopeId: string) {
@@ -1152,6 +1155,18 @@ export const api = {
         method: "PATCH",
         body: JSON.stringify({ codex_session_ref: codexSessionRef })
       }
+    );
+  },
+  async markFineJobJobHuntRefreshPromptSubmitted(runId: string) {
+    return request<FineJobJobHuntRefreshRun>(
+      `/api/fine-job/job-hunt-refresh/runs/${encodeURIComponent(runId)}/prompt-submitted`,
+      { method: "POST" }
+    );
+  },
+  async cancelFineJobJobHuntRefreshRun(runId: string) {
+    return request<FineJobJobHuntRefreshRun>(
+      `/api/fine-job/job-hunt-refresh/runs/${encodeURIComponent(runId)}/cancel`,
+      { method: "POST" }
     );
   },
   async setFineJobJobApplicationStatus(
