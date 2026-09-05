@@ -152,7 +152,7 @@ uv run python -m backend.app.services.fine_job.boss_scraper.boss_cdp_raw --keywo
 实现和限制见《自动代聊功能具体执行方案.md》，扩展安装与验证见
 《boss-executor-extension/README.md》。
 
-## 求职数据更新（阶段 2A）
+## 求职数据更新
 
 桌面端“求职数据更新”按用户选择时间执行 Refresh Scope Discovery。列表来源支持智能选择、仅使用
 本地列表和明确刷新 BOSS；智能模式在最近 `platform_synced_at` 不超过 30 分钟时复用本地数据，
@@ -165,8 +165,28 @@ Refresh Run。Run 初始步骤为 `waiting_codex`；Prompt 成功写入当前 Co
 提交失败时可按原 `run_id` 重新提交或取消。Run Item 只从 Scope 复制，并继续复用
 `sync_history_messages`、`prepare_chat_job` 和现有岗位详情采集流程。
 Run 与 Item 状态可在页面关闭、Codex 中断或应用重启后恢复；恢复时只返回未完成和可重试 Item。
-页面在 Run 运行期间每 2 秒读取持久化进度，进入终态或离开页面后停止。阶段 2A 不执行会话洞察、
-AI 状态判断、投递建议生成、AI Reply 或自动发送。
+页面在 Run 运行期间每 2 秒读取持久化进度，进入终态或离开页面后停止。
+
+数据补充完成后，若用户勾选沟通分析、缺失投递建议、回复草稿或跟进建议，Refresh Run 进入统一
+Codex 分析链路。页面只提交一次任务 Prompt；Codex 在当前 CLI 会话中先调用一次
+`finejob.prepare_job_hunt_refresh_analysis(run_id)`，由服务端完成确定性事实锚定和旧任务状态同步，
+再按 `context_arguments` 调用 `finejob.get_job_hunt_refresh_analysis_item_context` 逐项读取聊天、
+岗位、JD 和候选人上下文。所有已勾选 AI 结果在同一个 Codex CLI 会话内生成，并通过
+`finejob.save_job_hunt_refresh_analysis` 保存；结果体积较大时允许分批保存，但不重新 prepare，
+不把投递建议、回复草稿和跟进建议拆成多次独立 AI 分析。若 manifest 或单个 item 上下文过大，
+服务返回明确 blocker，流程停止等待人工处理。
+
+服务端将代码可确定的事实写入 Activity 和 Pipeline：完整历史下的首条真实会话消息可锚定
+`greeting_sent`，系统消息 `附件状态更新` 可锚定 `resume_submitted`，真实入站和出站消息分别同步
+招聘方回复和候选人回复。历史不完整、缺聊天、缺岗位、缺 JD 或缺候选人上下文时按原因降级或跳过，
+不会为分析重新采集数据。AI 结果只保存为 Conversation Insight、正式岗位 evaluation、回复草稿和
+轻量 `fj_chat_attention_states`；跟进建议只更新 `attention_status` / recommendation，不创建正式待执行任务。
+回复草稿只保存和展示，不创建发送动作，不调用 BOSS 发送接口。
+
+缺失投递建议写回复用正式 `fj_job_evaluations` 能力，并保留 JD 版本、候选人上下文修订和输出校验。
+Refresh 的 evaluation 写回用于补资料，不触发投递、打招呼或发送动作，也不受策略冷却排除拦截。
+Run 提供 `finejob.list_job_hunt_refresh_analysis_items` 查询分析 item 明细，可定位每个聊天或岗位的
+保存、跳过、当前 evaluation 和原因。
 
 ## 当前状态
 
