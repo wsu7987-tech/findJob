@@ -11,15 +11,23 @@ const mocks = vi.hoisted(() => ({
   getJob: vi.fn(),
   getJourney: vi.fn(),
   loadHistory: vi.fn(),
-  stopDetailPolling: vi.fn()
+  stopDetailPolling: vi.fn(),
+  analyzeProgress: vi.fn(),
+  generateReply: vi.fn(),
+  push: vi.fn()
 }));
 
-vi.mock("vue-router", () => ({ useRoute: () => ({ query: mocks.routeQuery }) }));
+vi.mock("vue-router", () => ({
+  useRoute: () => ({ query: mocks.routeQuery }),
+  useRouter: () => ({ push: mocks.push })
+}));
 vi.mock("@/services/api", () => ({
   ApiError: class extends Error {},
   api: {
     getFineJobBossCaptureHistoryJob: mocks.getJob,
-    getFineJobJobJourney: mocks.getJourney
+    getFineJobJobJourney: mocks.getJourney,
+    analyzeFineJobChatProgress: mocks.analyzeProgress,
+    generateFineJobChatReply: mocks.generateReply
   }
 }));
 vi.mock("element-plus", () => ({
@@ -84,9 +92,11 @@ describe("BossCaptureHistory 求职链路", () => {
     config.global.renderStubDefaultSlot = true;
     mocks.routeQuery.history_id = "job-1";
     mocks.getJob.mockResolvedValue(job);
+    mocks.analyzeProgress.mockResolvedValue({ reply_task_created: true });
+    mocks.generateReply.mockResolvedValue({ reply_task: { id: "reply-1" } });
   });
 
-  it("显示 legacy、pipeline、evidence 与 reconciliation", async () => {
+  it("显示统一求职进展、执行证据与状态校正", async () => {
     mocks.getJourney.mockResolvedValue({
       job_id: "job-1",
       legacy_application: { id: "application-1", status: "pending_application", source: "boss_action", applied_at: "", updated_at: "" },
@@ -96,9 +106,29 @@ describe("BossCaptureHistory 求职链路", () => {
         stage_source: "executor",
         stage_event_id: "event-1",
         stage_updated_at: "2026-09-05T10:00:00Z",
-        projection_version: 1,
+        waiting_on: "recruiter",
+        waiting_since_at: "2026-09-05T10:00:00Z",
+        contact_origin: "finejob_auto",
+        rejection_reason_source: "unknown",
+        rejection_reason_category: "unknown",
+        rejection_reason_summary: "",
+        projection_version: 2,
         created_at: "2026-09-05T10:00:00Z",
         updated_at: "2026-09-05T10:00:00Z"
+      },
+      progress: {
+        job_id: "job-1",
+        session_id: "session-1",
+        stage: "greeted",
+        stage_updated_at: "2026-09-05T10:00:00Z",
+        waiting_on: "recruiter",
+        waiting_since_at: "2026-09-05T10:00:00Z",
+        contact_origin: "finejob_auto",
+        latest_activity: null,
+        followup: { decision: "wait", reason_code: "recruiter_owes_reply", reason_summary: "当前等待招聘方回复", recommended_at: null, recommended_action: "wait_for_recruiter", draft_message: "", draft_task_id: null },
+        outcome: { status: "ongoing", rejection_reason_source: "unknown", rejection_reason_category: "unknown", rejection_reason_summary: "" },
+        primary_action: null,
+        analysis_updated_at: "2026-09-05T10:00:00Z"
       },
       activities: [{
         id: "event-1",
@@ -156,13 +186,17 @@ describe("BossCaptureHistory 求职链路", () => {
     });
 
     const wrapper = shallowMount(BossCaptureHistory, {
-      global: { directives: { loading: () => undefined } }
+      global: {
+        directives: { loading: () => undefined },
+        stubs: { "el-table-column": { template: "<div />" } }
+      }
     });
     await flushPromises();
 
-    expect(wrapper.text()).toContain("求职链路");
-    expect(wrapper.text()).toContain("pending_application");
+    expect(wrapper.text()).toContain("当前阶段");
     expect(wrapper.text()).toContain("已打招呼");
+    expect(wrapper.text()).toContain("等招聘方回复");
+    expect(wrapper.text()).toContain("FineJob 自动打招呼");
     expect(wrapper.text()).toContain("outbound_message_observed");
     expect(wrapper.text()).toContain("unknown → succeeded");
   });
@@ -176,10 +210,58 @@ describe("BossCaptureHistory 求职链路", () => {
       executions: []
     });
     const wrapper = shallowMount(BossCaptureHistory, {
-      global: { directives: { loading: () => undefined } }
+      global: {
+        directives: { loading: () => undefined },
+        stubs: { "el-table-column": { template: "<div />" } }
+      }
     });
     await flushPromises();
 
     expect(wrapper.text()).toContain("暂无新链路数据");
+  });
+
+  it("拒绝原因未知时可分析原因并生成询问草稿", async () => {
+    mocks.getJourney.mockResolvedValue({
+      job_id: "job-1",
+      pipeline: { stage: "rejected" },
+      legacy_application: { status: "rejected" },
+      progress: {
+        job_id: "job-1",
+        session_id: "session-1",
+        stage: "rejected",
+        stage_updated_at: "2026-09-05T10:00:00Z",
+        waiting_on: "none",
+        contact_origin: "finejob_auto",
+        followup: { decision: "follow", reason_code: "rejected_no_reason", reason_summary: "尚未说明原因", recommended_action: "ask_rejection_reason", draft_message: "", draft_task_id: null },
+        outcome: { status: "rejected", rejection_reason_source: "unknown", rejection_reason_category: "unknown", rejection_reason_summary: "" },
+        primary_action: { type: "ask_rejection_reason", label: "询问拒绝原因" }
+      },
+      activities: [],
+      executions: []
+    });
+    const wrapper = shallowMount(BossCaptureHistory, {
+      global: {
+        directives: { loading: () => undefined },
+        stubs: { "el-table-column": { template: "<div />" } }
+      }
+    });
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("分析拒绝原因");
+    expect(wrapper.text()).toContain("生成原因询问");
+    const buttons = wrapper.findAll("el-button");
+    await buttons.find((button) => button.text() === "分析拒绝原因")?.trigger("click");
+    await flushPromises();
+    expect(mocks.analyzeProgress).toHaveBeenCalledWith("session-1");
+
+    await buttons.find((button) => button.text() === "生成原因询问")?.trigger("click");
+    await flushPromises();
+    expect(mocks.generateReply).toHaveBeenCalledWith(
+      "session-1", "", false, "ask_rejection_reason"
+    );
+    expect(mocks.push).toHaveBeenCalledWith({
+      name: "fine-job-chat",
+      query: { session_id: "session-1" }
+    });
   });
 });

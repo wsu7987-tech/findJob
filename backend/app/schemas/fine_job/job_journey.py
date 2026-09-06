@@ -12,6 +12,12 @@ class JobPipelineSnapshot(BaseModel):
     stage_source: str
     stage_event_id: str
     stage_updated_at: str
+    waiting_on: str = "unknown"
+    waiting_since_at: str | None = None
+    contact_origin: str = "unknown"
+    rejection_reason_source: str = "unknown"
+    rejection_reason_category: str = "unknown"
+    rejection_reason_summary: str = ""
     projection_version: int
     created_at: str
     updated_at: str
@@ -99,9 +105,25 @@ class JobExecutionSummary(BaseModel):
     reconciliations: list[ExecutionReconciliation]
 
 
+class JobProgressView(BaseModel):
+    job_id: str
+    session_id: str | None = None
+    stage: str
+    stage_updated_at: str
+    waiting_on: str
+    waiting_since_at: str | None = None
+    contact_origin: str
+    latest_activity: dict[str, Any] | None = None
+    followup: dict[str, Any]
+    outcome: dict[str, Any]
+    primary_action: dict[str, Any] | None = None
+    analysis_updated_at: str | None = None
+
+
 class JobJourneyResponse(BaseModel):
     job_id: str
     pipeline: JobPipelineSnapshot | None = None
     legacy_application: JobLegacyApplication | None = None
+    progress: JobProgressView | None = None
     activities: list[JobActivityEvent]
     executions: list[JobExecutionSummary]

@@ -431,6 +431,10 @@ export interface FineJobBossHistoryJob extends FineJobBossCapturedJob {
   last_collected_at: string;
   collect_count: number;
   latest_capture_id: string;
+  pipeline_stage?: FineJobPipelineStage | null;
+  waiting_on?: FineJobWaitingOn;
+  contact_origin?: FineJobContactOrigin;
+  attention_status?: string;
 }
 
 export interface FineJobBossHistoryResponse {
@@ -790,16 +794,62 @@ export interface FineJobReviewItem {
   job_chat_session_id?: string | null;
 }
 
+export type FineJobPipelineStage =
+  | "discovered" | "shortlisted" | "greeted" | "communicating"
+  | "resume_requested" | "resume_submitted" | "resume_viewed" | "under_review"
+  | "interview_scheduling" | "interviewing" | "offer" | "rejected" | "closed";
+export type FineJobWaitingOn = "candidate" | "recruiter" | "none" | "unknown";
+export type FineJobContactOrigin =
+  | "finejob_auto" | "candidate_initiated" | "recruiter_initiated"
+  | "external_candidate_initiated" | "unknown";
+
 export interface FineJobPipelineSnapshot {
   job_id: string;
   company_id?: string | null;
-  stage: string;
+  stage: FineJobPipelineStage;
   stage_source: string;
   stage_event_id: string;
   stage_updated_at: string;
+  waiting_on: FineJobWaitingOn;
+  waiting_since_at?: string | null;
+  contact_origin: FineJobContactOrigin;
+  rejection_reason_source: "recruiter_explicit" | "ai_inferred" | "unknown";
+  rejection_reason_category: string;
+  rejection_reason_summary: string;
   projection_version: number;
   created_at: string;
   updated_at: string;
+}
+
+export interface FineJobJobProgress {
+  job_id: string;
+  session_id?: string | null;
+  stage: FineJobPipelineStage;
+  stage_updated_at: string;
+  waiting_on: FineJobWaitingOn;
+  waiting_since_at?: string | null;
+  contact_origin: FineJobContactOrigin;
+  latest_activity?: FineJobActivityEvent | null;
+  followup: {
+    decision: "follow" | "wait" | "do_not_follow";
+    reason_code: string;
+    reason_summary: string;
+    recommended_at?: string | null;
+    recommended_action: string;
+    draft_message: string;
+    draft_task_id?: string | null;
+  };
+  outcome: {
+    status: "ongoing" | "offer" | "rejected" | "closed";
+    rejection_reason_source: "recruiter_explicit" | "ai_inferred" | "unknown";
+    rejection_reason_category: string;
+    rejection_reason_summary: string;
+  };
+  primary_action?: {
+    type: "reply" | "followup" | "ask_rejection_reason";
+    label: string;
+  } | null;
+  analysis_updated_at?: string | null;
 }
 
 export interface FineJobActivityEvent {
@@ -877,6 +927,7 @@ export interface FineJobJobJourney {
     applied_at: string;
     updated_at: string;
   } | null;
+  progress?: FineJobJobProgress | null;
   activities: FineJobActivityEvent[];
   executions: FineJobExecutionSummary[];
 }
@@ -1091,6 +1142,7 @@ export interface FineJobChatSession {
   attention_reason?: string;
   attention_priority?: number;
   attention_updated_at?: string;
+  progress?: FineJobJobProgress | null;
   reply_task_id?: string | null;
   reply_task_status?: FineJobChatReplyStatus | null;
   reply_draft_text?: string;
@@ -1117,6 +1169,8 @@ export interface FineJobChatReplyTask {
   id: string;
   session_id: string;
   trigger_source: "realtime" | "interval" | "manual";
+  action_kind?: "reply" | "followup" | "ask_rejection_reason";
+  insight_id?: string | null;
   status: FineJobChatReplyStatus;
   based_on_message_id: string;
   based_on_session_version: number;
@@ -1257,8 +1311,8 @@ export interface FineJobJobHuntRefreshWorkflowOptions {
   refresh_related_jobs: boolean;
   analyze_conversations: boolean;
   generate_missing_suggestions: boolean;
-  generate_reply_drafts: boolean;
-  generate_followup_recommendations: boolean;
+  generate_reply_drafts?: boolean;
+  generate_followup_recommendations?: boolean;
 }
 
 export interface FineJobJobHuntRefreshContext {
@@ -1392,6 +1446,14 @@ export interface FineJobJobHuntRefreshRun {
     missing_suggestions_total?: number;
     missing_suggestions_generated?: number;
     missing_suggestions_skipped?: number;
+    progress_updates?: number;
+    waiting_for_recruiter?: number;
+    waiting_for_candidate?: number;
+    followup_recommended?: number;
+    resume_viewed?: number;
+    under_review?: number;
+    rejections_detected?: number;
+    jobs_closed?: number;
   };
   error_summary?: string | null;
   prompt_submitted_at?: string | null;

@@ -27,6 +27,7 @@ from backend.app.schemas.fine_job.boss_chat import (
     BossChatRuntimeUpdateRequest,
 )
 from backend.app.services.fine_job import boss_chat
+from backend.app.services.fine_job import job_hunt_analysis
 from backend.app.services.fine_job.boss_scraper.service import boss_scraper_service
 
 
@@ -185,6 +186,7 @@ def complete_action(
 def sessions(
     status: str | None = Query(default=None),
     account_uid: str | None = Query(default=None, max_length=80),
+    attention: str | None = Query(default=None, max_length=40),
     q: str | None = Query(default=None, max_length=120),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
@@ -194,6 +196,7 @@ def sessions(
         db,
         status=status,
         account_uid=account_uid,
+        attention=attention,
         query=q,
         limit=limit,
         offset=offset,
@@ -332,8 +335,17 @@ def generate(
     config: AppConfig = Depends(get_config),
 ):
     return {"reply_task": boss_chat.generate_reply(
-        db, config, session_id, instruction=payload.instruction
+        db, config, session_id, instruction=payload.instruction, action_kind=payload.action_kind
     )}
+
+
+@router.post("/sessions/{session_id}/analyze-progress")
+def analyze_progress(
+    session_id: str,
+    db: Database = Depends(get_database),
+    config: AppConfig = Depends(get_config),
+):
+    return job_hunt_analysis.analyze_single_session(db, config, session_id)
 
 
 @router.post("/sessions/{session_id}/regenerate")
@@ -344,7 +356,8 @@ def regenerate(
     config: AppConfig = Depends(get_config),
 ):
     return {"reply_task": boss_chat.generate_reply(
-        db, config, session_id, instruction=payload.instruction, regenerate=True
+        db, config, session_id, instruction=payload.instruction,
+        action_kind=payload.action_kind, regenerate=True
     )}
 
 

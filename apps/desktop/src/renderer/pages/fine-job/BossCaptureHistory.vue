@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { useRoute } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 
 import { ApiError, api } from "@/services/api";
 import { formatDateTime } from "@/services/format";
@@ -16,10 +16,22 @@ const executorStore = useFineJobBossExecutorStore();
 const historyStore = useFineJobBossHistoryStore();
 const strategiesStore = useFineJobStrategiesStore();
 const route = useRoute();
+const router = useRouter();
 const selectedJob = ref<FineJobBossHistoryJob | null>(null);
 const detailDrawerOpen = ref(false);
 const selectedJourney = ref<FineJobJobJourney | null>(null);
 const journeyLoading = ref(false);
+const journeyAnalysisRunning = ref(false);
+const rejectionMessageRunning = ref(false);
+const rejectionReasonNeedsDetail = computed(() => Boolean(
+  selectedJourney.value?.progress?.outcome.status === "rejected"
+  && (
+    selectedJourney.value.progress.outcome.rejection_reason_source === "unknown"
+    || ["unknown", "fit"].includes(
+      selectedJourney.value.progress.outcome.rejection_reason_category
+    )
+  )
+));
 const expandedJourneySections = ref<string[]>([]);
 const recommendationStrategyId = ref<string | null>(null);
 const dateRange = ref<string[]>([]);
@@ -256,12 +268,15 @@ const applicationStatusLabel = (status?: string | null) => ({
   pending_greeting: "待打招呼",
   pending_application: "待投递",
   communicating: "沟通中",
-  rejected: "已被拒绝"
+  offer: "已获得 Offer",
+  rejected: "已被拒绝",
+  closed: "岗位关闭"
 }[status || ""] || "");
 
 const applicationStatusType = (status?: string | null) => {
+  if (status === "offer") return "success";
   if (status === "communicating") return "success";
-  if (status === "rejected") return "danger";
+  if (status === "rejected" || status === "closed") return "danger";
   if (status === "pending_greeting" || status === "pending_application") return "warning";
   return "info";
 };
@@ -273,11 +288,76 @@ const pipelineStageLabel = (stage?: string | null) => ({
   communicating: "沟通中",
   resume_requested: "已请求简历",
   resume_submitted: "已投递简历",
+  resume_viewed: "简历已查看",
+  under_review: "用人部门评估中",
+  interview_scheduling: "面试时间沟通中",
   interviewing: "面试中",
   offer: "Offer",
   rejected: "已拒绝",
   closed: "已关闭"
 }[stage || ""] || "暂无");
+
+const waitingLabel = (waiting?: string | null) => ({
+  candidate: "等我回复", recruiter: "等招聘方回复", none: "当前无需回复", unknown: "等待对象待判断"
+}[waiting || ""] || "等待对象待判断");
+
+const contactOriginLabel = (origin?: string | null) => ({
+  finejob_auto: "FineJob 自动打招呼", candidate_initiated: "我在 FineJob 内主动联系",
+  recruiter_initiated: "招聘方主动联系", external_candidate_initiated: "我从其他渠道主动联系",
+  unknown: "沟通来源待判断"
+}[origin || ""] || "沟通来源待判断");
+
+const rejectionSourceLabel = (source?: string | null) => ({
+  recruiter_explicit: "招聘方明确说明", ai_inferred: "AI 推测", unknown: "未知"
+}[source || ""] || "未知");
+
+const rejectionCategoryLabel = (category?: string | null) => ({
+  experience: "工作经验", education: "学历", skills: "技能不匹配",
+  industry_background: "行业背景", salary: "薪资", location: "地点",
+  availability: "到岗时间", position_filled: "已招到人", headcount_closed: "岗位已关闭",
+  fit: "综合匹配度", other: "其他", unknown: "未知"
+}[category || ""] || "未知");
+
+const viewChat = async () => {
+  const sessionId = selectedJourney.value?.progress?.session_id;
+  if (!sessionId) return;
+  await router.push({ name: "fine-job-chat", query: { session_id: sessionId } });
+};
+
+const analyzeHistoryProgress = async () => {
+  const sessionId = selectedJourney.value?.progress?.session_id;
+  const jobId = selectedJob.value?.id;
+  if (!sessionId || !jobId) return;
+  journeyAnalysisRunning.value = true;
+  try {
+    const result = await api.analyzeFineJobChatProgress(sessionId);
+    await loadJourney(jobId);
+    ElMessage.success(
+      result.reply_task_created
+        ? "拒绝原因已分析，并生成了待确认草稿"
+        : "聊天进展与拒绝原因已更新"
+    );
+  } catch (error) {
+    ElMessage.error((error as Error).message || "聊天进展分析失败");
+  } finally {
+    journeyAnalysisRunning.value = false;
+  }
+};
+
+const generateRejectionQuestion = async () => {
+  const sessionId = selectedJourney.value?.progress?.session_id;
+  if (!sessionId) return;
+  rejectionMessageRunning.value = true;
+  try {
+    await api.generateFineJobChatReply(sessionId, "", false, "ask_rejection_reason");
+    ElMessage.success("拒绝原因询问草稿已生成");
+    await router.push({ name: "fine-job-chat", query: { session_id: sessionId } });
+  } catch (error) {
+    ElMessage.error((error as Error).message || "拒绝原因询问草稿生成失败");
+  } finally {
+    rejectionMessageRunning.value = false;
+  }
+};
 
 const activityTypeLabel = (type: string) => ({
   job_discovered: "发现岗位",
@@ -289,10 +369,14 @@ const activityTypeLabel = (type: string) => ({
   candidate_replied: "候选人回复",
   resume_requested: "HR 请求简历",
   resume_submitted: "已投递简历",
+  resume_accepted: "简历已接收",
+  resume_viewed: "简历已查看",
+  under_review: "用人部门评估中",
   interview_intent_detected: "检测到面试意向",
   interview_invited: "收到面试邀请",
   interview_scheduled: "面试已安排",
   rejected: "已拒绝",
+  job_closed: "岗位关闭",
   followup_recommended: "建议跟进",
   no_response_detected: "检测到未回复",
   offer_received: "收到 Offer",
@@ -488,12 +572,20 @@ watch(
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="投递状态" width="120">
+        <el-table-column label="求职进展" min-width="210">
           <template #default="{ row }">
-            <el-tag v-if="row.application_status" :type="applicationStatusType(row.application_status)" size="small">
-              {{ applicationStatusLabel(row.application_status) }}
-            </el-tag>
-            <span v-else class="secondary-text">未设置</span>
+            <span v-if="row.pipeline_stage">
+              {{ pipelineStageLabel(row.pipeline_stage) }} · {{ waitingLabel(row.waiting_on) }}
+              <el-tag v-if="row.attention_status === 'needs_followup'" type="warning" size="small">
+                建议跟进
+              </el-tag>
+            </span>
+            <el-tag
+              v-else-if="row.application_status"
+              :type="applicationStatusType(row.application_status)"
+              size="small"
+            >{{ applicationStatusLabel(row.application_status) }}</el-tag>
+            <span v-else class="secondary-text">尚无求职进展</span>
           </template>
         </el-table-column>
 
@@ -604,7 +696,10 @@ watch(
             <el-tag :type="detailStatusType(selectedJob.detail_status)">{{ detailStatusLabel(selectedJob.detail_status) }}</el-tag>
             <el-tag v-if="selectedJob.is_outsourcing_company" type="warning">外包公司</el-tag>
             <el-tag v-if="selectedJob.is_blacklisted" type="danger">公司黑名单</el-tag>
-            <el-tag v-if="selectedJob.application_status" :type="applicationStatusType(selectedJob.application_status)">
+            <el-tag v-if="selectedJob.pipeline_stage" type="success">
+              {{ pipelineStageLabel(selectedJob.pipeline_stage) }} · {{ waitingLabel(selectedJob.waiting_on) }}
+            </el-tag>
+            <el-tag v-else-if="selectedJob.application_status" :type="applicationStatusType(selectedJob.application_status)">
               {{ applicationStatusLabel(selectedJob.application_status) }}
             </el-tag>
           </div>
@@ -624,24 +719,60 @@ watch(
           <template v-if="selectedJourney && (selectedJourney.pipeline || selectedJourney.activities.length || selectedJourney.executions.length)">
             <div class="journey-stage-grid">
               <div>
-                <span class="secondary-text">Legacy Status</span>
-                <strong>{{ selectedJourney.legacy_application?.status || "未设置" }}</strong>
+                <span class="secondary-text">当前阶段</span>
+                <strong>{{ pipelineStageLabel(selectedJourney.progress?.stage || selectedJourney.pipeline?.stage) }}</strong>
               </div>
               <div>
-                <span class="secondary-text">New Pipeline</span>
-                <strong>{{ pipelineStageLabel(selectedJourney.pipeline?.stage) }}</strong>
+                <span class="secondary-text">当前等待对象</span>
+                <strong>{{ waitingLabel(selectedJourney.progress?.waiting_on || selectedJourney.pipeline?.waiting_on) }}</strong>
               </div>
               <div>
-                <span class="secondary-text">Stage Source</span>
-                <strong>{{ selectedJourney.pipeline?.stage_source || "暂无" }}</strong>
+                <span class="secondary-text">沟通来源</span>
+                <strong>{{ contactOriginLabel(selectedJourney.progress?.contact_origin || selectedJourney.pipeline?.contact_origin) }}</strong>
               </div>
               <div>
-                <span class="secondary-text">Stage Updated</span>
-                <strong>{{ selectedJourney.pipeline ? formatDateTime(selectedJourney.pipeline.stage_updated_at) : "暂无" }}</strong>
+                <span class="secondary-text">最近进展</span>
+                <strong>
+                  {{ selectedJourney.progress?.latest_activity
+                    ? `${formatDateTime(selectedJourney.progress.latest_activity.occurred_at)} · ${activityTypeLabel(selectedJourney.progress.latest_activity.event_type)}`
+                    : "暂无" }}
+                </strong>
+              </div>
+              <div>
+                <span class="secondary-text">跟进建议</span>
+                <strong>{{ selectedJourney.progress?.followup.reason_summary || "暂无行动建议" }}</strong>
+              </div>
+              <div>
+                <span class="secondary-text">求职结果</span>
+                <strong>{{ selectedJourney.progress?.outcome.status === "ongoing" ? "进行中" : pipelineStageLabel(selectedJourney.progress?.outcome.status) }}</strong>
+              </div>
+              <div v-if="selectedJourney.progress?.outcome.status === 'rejected' || selectedJourney.progress?.outcome.status === 'closed'">
+                <span class="secondary-text">拒绝原因</span>
+                <strong>{{ selectedJourney.progress.outcome.rejection_reason_summary || rejectionCategoryLabel(selectedJourney.progress.outcome.rejection_reason_category) }}</strong>
+              </div>
+              <div v-if="selectedJourney.progress?.outcome.status === 'rejected' || selectedJourney.progress?.outcome.status === 'closed'">
+                <span class="secondary-text">原因来源</span>
+                <strong>{{ rejectionSourceLabel(selectedJourney.progress.outcome.rejection_reason_source) }}</strong>
               </div>
             </div>
 
-            <h4>Activity Timeline</h4>
+            <div v-if="selectedJourney.progress?.session_id" class="journey-actions">
+              <el-button type="primary" @click="viewChat">查看聊天</el-button>
+              <el-button
+                plain
+                :loading="journeyAnalysisRunning"
+                @click="analyzeHistoryProgress"
+              >{{ rejectionReasonNeedsDetail ? "分析拒绝原因" : "分析聊天进展" }}</el-button>
+              <el-button
+                v-if="rejectionReasonNeedsDetail"
+                type="warning"
+                plain
+                :loading="rejectionMessageRunning"
+                @click="generateRejectionQuestion"
+              >生成原因询问</el-button>
+            </div>
+
+            <h4>进展记录</h4>
             <el-timeline v-if="selectedJourney.activities.length">
               <el-timeline-item
                 v-for="activity in selectedJourney.activities"
@@ -659,7 +790,7 @@ watch(
             </el-timeline>
             <p v-else class="secondary-text">暂无 Activity。</p>
 
-            <h4>Execution Evidence</h4>
+            <h4>执行记录</h4>
             <el-collapse v-if="selectedJourney.executions.length">
               <el-collapse-item
                 v-for="execution in selectedJourney.executions"
@@ -817,7 +948,8 @@ watch(
 }
 
 .history-filter-actions,
-.history-detail-tags {
+.history-detail-tags,
+.journey-actions {
   display: flex;
   align-items: center;
   gap: 12px;

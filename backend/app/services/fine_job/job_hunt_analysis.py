@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import httpx
+
+from backend.app.config import AppConfig
 from backend.app.db import Database
 from backend.app.errors import AppError
 from backend.app.services.fine_job import profile_store, profile_v3
@@ -14,13 +18,17 @@ from backend.app.services.fine_job.boss_capture_history import (
 from backend.app.services.fine_job.execution_reconciliation import (
     record_execution_evidence_with_connection,
 )
-from backend.app.services.fine_job.job_activity import append_job_activity_with_connection
+from backend.app.services.fine_job.job_activity import (
+    append_contact_origin_for_session_with_connection,
+    append_job_activity_with_connection,
+)
 from backend.app.services.fine_job.filter_exclusions import assert_job_action_allowed, record_job_event
 from backend.app.services.fine_job.profile_context import get_profile_context
 from backend.app.services.fine_job.strategies import (
     get_filter_strategy,
     list_recommendation_strategies,
 )
+from backend.app.services.reasoning.codex_exec import run_codex_exec
 from backend.app.utils import new_id, utc_now
 
 
@@ -29,6 +37,20 @@ PROMPT_VERSION = "job-hunt-refresh-codex-cli-v1"
 MAX_PREPARE_MANIFEST_CHARACTERS = 1_000_000
 MAX_ITEM_CONTEXT_CHARACTERS = 1_000_000
 EXPLICIT_REJECTION_CONFIDENCE = 0.85
+FOLLOWUP_DELAYS = {
+    "greeted": timedelta(days=2),
+    "communicating": timedelta(days=2),
+    "resume_submitted": timedelta(days=2),
+    "resume_viewed": timedelta(days=1),
+    "under_review": timedelta(days=3),
+}
+FOLLOWUP_REASON_CODES = {
+    "greeted": "high_match_no_reply",
+    "communicating": "recruiter_owes_reply",
+    "resume_submitted": "resume_sent_no_response",
+    "resume_viewed": "resume_viewed_no_reply",
+    "under_review": "under_review_stale",
+}
 
 ANALYSIS_WORKFLOWS = {
     "analyze_conversations",
@@ -377,6 +399,360 @@ def latest_job_insight(db: Database, job_id: str) -> dict[str, Any] | None:
     return item
 
 
+def analyze_single_session(
+    db: Database,
+    config: AppConfig,
+    session_id: str,
+) -> dict[str, Any]:
+    """同一消息证据重复分析时覆盖单会话 Insight，并复用已存在的 Activity。"""
+    # 正式 Activity/Pipeline 先独立提交，后续辅助任务处理失败也不会撤销已确认状态。
+    with db.connect() as connection:
+        session = _load_session(connection, session_id)
+        job_id = _resolve_session_job_id(connection, session)
+        messages = _load_messages(connection, session_id)
+        conversation_messages = _real_conversation_messages(messages)
+        deterministic = _anchor_facts(
+            connection, session, job_id, messages, conversation_messages
+        )
+
+    task_sync: dict[str, Any]
+    preparation_warning: str | None = None
+    try:
+        with db.connect() as connection:
+            session = _load_session(connection, session_id)
+            task_sync = _sync_tasks_from_facts(connection, session, job_id, deterministic)
+    except Exception as exc:
+        task_sync = {"auxiliary_error": type(exc).__name__}
+        preparation_warning = (
+            f"正式状态已保存，关联任务处理失败：{type(exc).__name__}"
+        )
+
+    with db.connect() as connection:
+        session = _load_session(connection, session_id)
+        messages = _load_messages(connection, session_id)
+        context = _build_session_analysis_context(
+            connection, db, session, job_id, messages, deterministic, task_sync
+        )
+
+    raw = _generate_single_analysis(config, context)
+    message_ids = {str(message["id"]) for message in messages}
+    insight = _normalize_codex_insight(
+        raw,
+        {"deterministic_facts": deterministic, "task_sync": task_sync},
+        message_ids,
+        {
+            "analyze_conversations": True,
+            "generate_reply_drafts": True,
+            "generate_followup_recommendations": True,
+        },
+    )
+    rejection_evidence_id: str | None = None
+    reply_task_created = False
+    with db.connect() as connection:
+        if job_id:
+            _created, rejection_evidence_id = _write_ai_activities(
+                connection, job_id, session_id, insight, message_ids
+            )
+            _apply_followup_policy(connection, job_id, insight)
+        insight_id = _save_insight(
+            connection,
+            run_id=None,
+            session_id=session_id,
+            job_id=job_id,
+            insight=insight,
+            model=_analysis_model_name(config),
+            status="analyzed",
+        )
+        _save_attention_state(connection, None, session_id, job_id, insight_id, insight)
+        reply_task_created = _create_analysis_reply_task(
+            connection, session, insight_id, insight
+        )
+        if job_id:
+            snapshot = connection.execute(
+                "SELECT stage FROM fj_job_pipeline_snapshots WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if snapshot and snapshot["stage"] in {"offer", "rejected", "closed"}:
+                _sync_legacy_terminal_status(
+                    connection, job_id, str(snapshot["stage"]), rejection_evidence_id
+                )
+        terminal_fact = deterministic.get("rejected") or deterministic.get("job_closed")
+        if not rejection_evidence_id and isinstance(terminal_fact, dict):
+            rejection_evidence_id = str(terminal_fact.get("message_id") or "") or None
+
+    auxiliary_warning = preparation_warning
+    if job_id and rejection_evidence_id:
+        try:
+            with db.connect() as connection:
+                _cancel_open_progress_tasks_for_rejection(
+                    connection, job_id, session_id, rejection_evidence_id
+                )
+        except Exception as exc:
+            auxiliary_warning = f"正式状态已保存，关联任务处理失败：{type(exc).__name__}"
+
+    from backend.app.services.fine_job.job_progress import get_job_progress
+
+    return {
+        "insight": latest_session_insight(db, session_id),
+        "progress": get_job_progress(db, job_id, session_id=session_id) if job_id else None,
+        "reply_task_created": reply_task_created,
+        "auxiliary_warning": auxiliary_warning,
+    }
+
+
+def _generate_single_analysis(config: AppConfig, context: dict[str, Any]) -> dict[str, Any]:
+    if config.reasoning_executor == "llm" and (config.llm_provider or "").strip().lower() == "stub-llm":
+        return _stub_single_analysis(context)
+    prompt = (
+        "你是 FineJob 求职沟通分析器。只依据当前会话判断求职进展。"
+        "已招到合适候选人属于 rejected/position_filled；只有岗位取消、HC 关闭、停止招聘或职位关闭"
+        "才属于 job_closed/headcount_closed。‘有消息再联系’等证据不足的表达不能判定为明确拒绝。"
+        "progress_events 只输出有消息证据且置信度不低于 0.8 的正式事件。"
+        "当 suggested_next_action 为 reply_recruiter、follow_up 或 ask_rejection_reason 时，"
+        "reply_draft 必须生成一条待用户确认的中文消息；其余情况返回 null。"
+        "招聘方只表达不合适或暂不考虑时，拒绝已成立，但具体原因仍需询问。"
+        "草稿结合岗位匹配结论、已确认候选人资料和等待天数，保持简洁、真实且不重复提问。"
+        "所有 evidence_message_ids 必须来自输入消息。只返回符合约定的 JSON。\n"
+        f"上下文：{json.dumps(context, ensure_ascii=False, default=str)}"
+    )
+    schema = _single_analysis_json_schema()
+    if config.reasoning_executor == "codex-cli":
+        result = run_codex_exec(
+            cli_path=config.codex_cli_path,
+            prompt=prompt,
+            output_schema=schema,
+            model=config.codex_model,
+            reasoning_effort=config.codex_reasoning_effort,
+            timeout_seconds=config.codex_timeout_seconds,
+        )
+        return dict(result.output)
+    if config.reasoning_executor != "llm" or not config.llm_model or not config.llm_api_key:
+        raise AppError(400, "CONFIG_INVALID", "分析进展需要可用的 LLM 或 Codex 执行器。")
+    try:
+        response = httpx.post(
+            f"{(config.llm_base_url or 'https://api.openai.com/v1').rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {config.llm_api_key}"},
+            json={
+                "model": config.llm_model,
+                "temperature": 0.1,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": "严格输出求职进展分析 JSON。"},
+                    {"role": "user", "content": prompt},
+                ],
+            },
+            timeout=config.llm_timeout_seconds,
+        )
+        response.raise_for_status()
+        return json.loads(response.json()["choices"][0]["message"]["content"])
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+        raise AppError(502, "CHAT_PROGRESS_ANALYSIS_FAILED", f"分析进展失败：{exc}") from exc
+
+
+def _stub_single_analysis(context: dict[str, Any]) -> dict[str, Any]:
+    messages = list(context.get("messages") or [])
+    latest = messages[-1] if messages else {}
+    evidence_id = str(latest.get("id") or "")
+    waiting_on = "candidate" if latest.get("direction") == "inbound" else (
+        "recruiter" if latest else "unknown"
+    )
+    rejection: dict[str, Any] = {
+        "rejected": False, "rejection_type": "none", "outcome": "rejected",
+        "reason_type": "unknown", "reason_source": "unknown", "reason_text": "",
+        "confidence": 0, "evidence_message_ids": [],
+    }
+    progress_events: list[dict[str, Any]] = []
+    for message in messages:
+        for spec in _rule_activity_specs(message):
+            event_type = str(spec["event_type"])
+            if event_type in {"rejected", "job_closed"}:
+                rejection = {
+                    "rejected": True,
+                    "rejection_type": "explicit",
+                    "outcome": event_type,
+                    "reason_type": spec.get("rejection_reason_category", "unknown"),
+                    "reason_source": spec.get("rejection_reason_source", "unknown"),
+                    "reason_text": spec.get("rejection_reason_summary", ""),
+                    "confidence": 1,
+                    "evidence_message_ids": [message["id"]],
+                }
+                waiting_on = "none"
+            else:
+                progress_events.append({
+                    "event_type": event_type,
+                    "confidence": 1,
+                    "evidence_message_ids": [message["id"]],
+                })
+    pipeline = context.get("pipeline") if isinstance(context.get("pipeline"), dict) else {}
+    rejection_needs_detail = bool(rejection.get("rejected")) and rejection.get("reason_type") in {
+        "unknown", "fit"
+    }
+    if rejection_needs_detail or (
+        pipeline.get("stage") == "rejected"
+        and pipeline.get("rejection_reason_category") in {"unknown", "fit"}
+    ):
+        suggested_action = "ask_rejection_reason"
+        reply_draft = "感谢您的回复。方便的话，想请教一下这次未能继续推进的主要原因，谢谢。"
+    else:
+        suggested_action = (
+            "reply_recruiter" if waiting_on == "candidate" else
+            "follow_up" if waiting_on == "recruiter" else
+            "no_further_action"
+        )
+        reply_draft = (
+            "您好，感谢您的消息。我已了解，会根据岗位要求及时补充相关信息。"
+            if suggested_action == "reply_recruiter"
+            else "您好，想礼貌跟进一下目前的评估进展。如需补充材料，请随时告诉我，谢谢。"
+            if suggested_action == "follow_up"
+            else None
+        )
+    return {"insight": {
+        "conversation_summary": "已按当前本地聊天记录分析求职进展。",
+        "current_conversation_state": "",
+        "signals": [],
+        "needs_candidate_reply": waiting_on == "candidate",
+        "waiting_for_recruiter": waiting_on == "recruiter",
+        "waiting_on": waiting_on,
+        "progress_events": progress_events,
+        "rejection_analysis": rejection,
+        "suggested_next_action": suggested_action,
+        "ai_followup_recommendation": {},
+        "attention_status": "unknown",
+        "reply_draft": reply_draft,
+        "evidence_message_ids": [evidence_id] if evidence_id else [],
+        "confidence": 1 if evidence_id else 0,
+    }}
+
+
+def _analysis_model_name(config: AppConfig) -> str:
+    return str(config.codex_model if config.reasoning_executor == "codex-cli" else config.llm_model or "")
+
+
+def _single_analysis_json_schema() -> dict[str, Any]:
+    progress_event_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "event_type": {
+                "type": "string",
+                "enum": [
+                    "resume_requested", "resume_submitted", "resume_accepted",
+                    "resume_viewed", "under_review", "interview_invited",
+                    "interview_scheduled", "offer_received",
+                ],
+            },
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "evidence_message_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["event_type", "confidence", "evidence_message_ids"],
+    }
+    rejection_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "rejected": {"type": "boolean"},
+            "outcome": {"type": "string", "enum": ["rejected", "job_closed"]},
+            "rejection_type": {
+                "type": "string",
+                "enum": ["explicit", "soft", "none"],
+            },
+            "reason_type": {
+                "type": "string",
+                "enum": [
+                    "experience", "education", "skills", "industry_background",
+                    "salary", "location", "availability", "position_filled",
+                    "headcount_closed", "fit", "other", "unknown",
+                ],
+            },
+            "reason_text": {"type": "string"},
+            "reason_source": {
+                "type": "string",
+                "enum": ["recruiter_explicit", "ai_inferred", "unknown"],
+            },
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "evidence_message_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": [
+            "rejected", "outcome", "rejection_type", "reason_type", "reason_text",
+            "reason_source", "confidence", "evidence_message_ids",
+        ],
+    }
+    followup_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "attention_status": {
+                "type": "string",
+                "enum": list(ATTENTION_LABELS),
+            },
+            "recommended_action": {
+                "type": "string",
+                "enum": sorted(RECOMMENDED_ACTIONS),
+            },
+            "reason": {"type": "string"},
+            "decision": {
+                "type": "string",
+                "enum": ["follow", "wait", "do_not_follow"],
+            },
+            "reason_code": {"type": "string"},
+            "recommended_at": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+            },
+            "evidence_message_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": [
+            "attention_status", "recommended_action", "reason", "decision",
+            "reason_code", "recommended_at", "evidence_message_ids",
+        ],
+    }
+    insight_properties = {
+        "conversation_summary": {"type": "string"},
+        "current_conversation_state": {"type": "string"},
+        "signals": {"type": "array", "items": {"type": "string"}},
+        "needs_candidate_reply": {"type": "boolean"},
+        "waiting_for_recruiter": {"type": "boolean"},
+        "waiting_on": {
+            "type": "string",
+            "enum": ["candidate", "recruiter", "none", "unknown"],
+        },
+        "progress_events": {"type": "array", "items": progress_event_schema},
+        "rejection_analysis": rejection_schema,
+        "suggested_next_action": {
+            "type": "string",
+            "enum": sorted(RECOMMENDED_ACTIONS),
+        },
+        "ai_followup_recommendation": followup_schema,
+        "attention_status": {"type": "string", "enum": list(ATTENTION_LABELS)},
+        "reply_draft": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "evidence_message_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "insight": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": insight_properties,
+                "required": list(insight_properties),
+            }
+        },
+        "required": ["insight"],
+    }
+
+
 def _build_conversation_item_context(
     db: Database,
     run_id: str,
@@ -446,10 +822,12 @@ def _build_unified_context(
         },
         "rules": {
             "deterministic_before_ai": [
-                "history complete + first real non-system chat message => greeting_sent",
+                "完整历史下按 FineJob 动作证据和首条真实消息判定 contact_origin；证据不足保持 unknown",
                 "system message content exactly 附件状态更新 => resume_submitted",
                 "inbound real chat message => recruiter_replied",
                 "outbound real chat message => candidate_replied",
+                "已经招到合适候选人/已招满 => rejected + position_filled",
+                "仅岗位取消、HC 关闭、停止招聘、职位关闭 => job_closed + headcount_closed",
             ],
             "item_isolation": "统一上下文只用于一次 AI 调用；生成结果时必须按 session_id/job_id 独立，不得把不同聊天、岗位或 JD 的事实交叉使用。",
             "ai_boundary": "AI 结果只保存 insight/recommendation；只有代码规则校验后的高置信 explicit_rejection 可写 rejected Activity。",
@@ -510,13 +888,24 @@ def _build_unified_context(
 
 def _prepare_session_context(db: Database, run_id: str, session_id: str) -> dict[str, Any]:
     try:
+        # 规则确认的 Activity/Pipeline 使用独立事务，辅助清理失败不影响正式状态。
         with db.connect() as connection:
             session = _load_session(connection, session_id)
             job_id = _resolve_session_job_id(connection, session)
             messages = _load_messages(connection, session_id)
             conversation_messages = _real_conversation_messages(messages)
             deterministic = _anchor_facts(connection, session, job_id, messages, conversation_messages)
-            task_sync = _sync_tasks_from_facts(connection, session, job_id, deterministic)
+
+        try:
+            with db.connect() as connection:
+                session = _load_session(connection, session_id)
+                task_sync = _sync_tasks_from_facts(connection, session, job_id, deterministic)
+        except Exception as exc:
+            task_sync = {"auxiliary_error": type(exc).__name__}
+
+        with db.connect() as connection:
+            session = _load_session(connection, session_id)
+            messages = _load_messages(connection, session_id)
             status = "prepared" if messages and job_id else "skipped"
             skipped_reasons: list[str] = []
             if not messages:
@@ -535,7 +924,7 @@ def _prepare_session_context(db: Database, run_id: str, session_id: str) -> dict
                 "generated_reply_draft": False,
                 "updated_pipeline": bool(deterministic.get("activities_created")),
                 "reconciled_tasks": _task_sync_count(task_sync) > 0,
-                "rejection_detected": False,
+                "rejection_detected": bool(deterministic.get("rejected")),
             }
             _upsert_analysis_item(
                 connection,
@@ -654,6 +1043,63 @@ def _message_digest(message: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _rule_activity_specs(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """把平台确定性文案转换为可追溯的正式求职事件。"""
+    content = _text(message.get("content")).strip()
+    compact = "".join(content.split())
+    specs: list[dict[str, Any]] = []
+    if message.get("message_type") == "system":
+        if content == "附件状态更新" or ("附件简历" in compact and "已发送" in compact):
+            specs.append({"event_type": "resume_submitted"})
+        if "对方已同意" in compact and "简历已发送给对方" in compact:
+            specs.append({"event_type": "resume_accepted"})
+        if "对方已查看" in compact and "附件简历" in compact:
+            specs.append({"event_type": "resume_viewed"})
+        return specs
+    if message.get("direction") != "inbound":
+        return specs
+
+    closed_phrases = ("HC关闭", "HC已关闭", "岗位取消", "职位取消", "停止招聘", "岗位关闭", "职位关闭")
+    filled_phrases = ("已经招到合适候选人", "已经找到合适候选人", "已经找到人", "岗位已招满", "已经招满")
+    review_phrases = (
+        "发给业务部门看看", "发给用人部门看看", "给用人部门评估",
+        "用人部门评估", "内部再评估", "业务部门评估",
+    )
+    if any(phrase in compact for phrase in closed_phrases):
+        return [{
+            "event_type": "job_closed",
+            "rejection_reason_source": "recruiter_explicit",
+            "rejection_reason_category": "headcount_closed",
+            "rejection_reason_summary": content,
+        }]
+    if any(phrase in compact for phrase in filled_phrases):
+        return [{
+            "event_type": "rejected",
+            "rejection_reason_source": "recruiter_explicit",
+            "rejection_reason_category": "position_filled",
+            "rejection_reason_summary": content,
+        }]
+    rejection_categories = (
+        (("经验不匹配", "经验和岗位不太匹配", "工作经验不足"), "experience"),
+        (("技能方向不符合", "技能不匹配"), "skills"),
+        (("学历不符合", "学历不匹配"), "education"),
+        (("薪资不匹配",), "salary"),
+        (("到岗时间不合适",), "availability"),
+        (("不合适", "暂时不考虑"), "fit"),
+    )
+    for phrases, category in rejection_categories:
+        if any(phrase in compact for phrase in phrases):
+            return [{
+                "event_type": "rejected",
+                "rejection_reason_source": "recruiter_explicit",
+                "rejection_reason_category": category,
+                "rejection_reason_summary": content,
+            }]
+    if any(phrase in compact for phrase in review_phrases):
+        return [{"event_type": "under_review"}]
+    return specs
+
+
 def _anchor_facts(
     connection: sqlite3.Connection,
     session: sqlite3.Row,
@@ -666,11 +1112,20 @@ def _anchor_facts(
         "greeting_anchor": None,
         "greeting_anchor_skip_reason": None,
         "resume_submitted": None,
+        "resume_accepted": None,
+        "resume_viewed": None,
+        "under_review": None,
+        "rejected": None,
+        "job_closed": None,
         "first_recruiter_reply": None,
         "latest_candidate_reply": None,
     }
     if not job_id:
         return facts
+
+    facts["activities_created"] += append_contact_origin_for_session_with_connection(
+        connection, session, messages
+    )
 
     if bool(session["history_has_more"]):
         facts["greeting_anchor_skip_reason"] = "skipped_missing_full_history_for_greeting_anchor"
@@ -678,25 +1133,7 @@ def _anchor_facts(
         facts["greeting_anchor_skip_reason"] = "skipped_missing_real_chat_message_for_greeting_anchor"
     else:
         first_message = conversation_messages[0]
-        _activity, inserted = append_job_activity_with_connection(
-            connection,
-            job_id=job_id,
-            chat_session_id=str(session["id"]),
-            event_type="greeting_sent",
-            occurred_at=str(first_message["sent_at"]),
-            source="chat",
-            source_ref_type="chat_message",
-            source_ref_id=str(first_message["id"]),
-            confidence=1.0,
-            evidence_level="direct",
-            payload={
-                "anchor": "session_first_real_conversation_message",
-                "direction": str(first_message["direction"]),
-                "platform_message_id": str(first_message["platform_message_id"]),
-            },
-            dedupe_key=f"chat_session:{session['id']}:first_real_message:{first_message['id']}:greeting_sent",
-        )
-        facts["activities_created"] += int(inserted)
+        # 已建立真实会话即可关闭旧打招呼任务，沟通来源由独立规则事件表达。
         facts["greeting_anchor"] = _message_fact(first_message, "greeting_sent")
 
     for message in conversation_messages:
@@ -725,24 +1162,32 @@ def _anchor_facts(
             facts["latest_candidate_reply"] = _message_fact(message, event_type)
 
     for message in messages:
-        if message["message_type"] == "system" and str(message["content"]).strip() == "附件状态更新":
+        for spec in _rule_activity_specs(message):
+            event_type = str(spec["event_type"])
+            payload = {
+                "derived_by": "rule",
+                "analysis_version": ANALYSIS_VERSION,
+                "evidence_message_id": str(message["id"]),
+                "evidence_text": _text(message.get("content"))[:500],
+                **{key: value for key, value in spec.items() if key != "event_type"},
+            }
             _activity, inserted = append_job_activity_with_connection(
                 connection,
                 job_id=job_id,
                 chat_session_id=str(session["id"]),
-                event_type="resume_submitted",
+                event_type=event_type,
                 occurred_at=str(message["sent_at"]),
-                source="chat",
+                source="rule",
                 source_ref_type="chat_message",
                 source_ref_id=str(message["id"]),
                 confidence=1.0,
                 evidence_level="direct",
-                payload={"anchor": "attachment_status_update"},
-                dedupe_key=f"chat_message:{message['id']}:resume_submitted",
+                payload=payload,
+                dedupe_key=f"chat_message:{message['id']}:{event_type}:rule-v1",
             )
             facts["activities_created"] += int(inserted)
-            if facts["resume_submitted"] is None:
-                facts["resume_submitted"] = _message_fact(message, "resume_submitted")
+            if event_type in facts and facts[event_type] is None:
+                facts[event_type] = _message_fact(message, event_type)
     return facts
 
 
@@ -886,6 +1331,7 @@ def _save_conversation_result(
     item: dict[str, Any],
     options: dict[str, Any],
 ) -> dict[str, Any]:
+    rejection_evidence_id: str | None = None
     with db.connect() as connection:
         session = _load_session(connection, session_id)
         job_id = _resolve_session_job_id(connection, session)
@@ -893,7 +1339,29 @@ def _save_conversation_result(
         messages = _load_messages(connection, session_id)
         message_ids = {str(message["id"]) for message in messages}
         insight = _normalize_codex_insight(item, prepared, message_ids, options)
-        ai_activity_count = _write_ai_activities(connection, job_id, session_id, insight, message_ids) if job_id else 0
+        if job_id:
+            ai_activity_count, rejection_evidence_id = _write_ai_activities(
+                connection, job_id, session_id, insight, message_ids
+            )
+            _apply_followup_policy(connection, job_id, insight)
+            snapshot = connection.execute(
+                "SELECT stage FROM fj_job_pipeline_snapshots WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if snapshot and snapshot["stage"] in {"offer", "rejected", "closed"}:
+                _sync_legacy_terminal_status(
+                    connection,
+                    job_id,
+                    str(snapshot["stage"]),
+                    rejection_evidence_id,
+                )
+            deterministic = prepared.get("deterministic_facts") or {}
+            if not rejection_evidence_id:
+                terminal_fact = deterministic.get("rejected") or deterministic.get("job_closed")
+                if isinstance(terminal_fact, dict):
+                    rejection_evidence_id = str(terminal_fact.get("message_id") or "") or None
+        else:
+            ai_activity_count = 0
         insight_id = _save_insight(
             connection,
             run_id=run_id,
@@ -904,6 +1372,9 @@ def _save_conversation_result(
             status="analyzed",
         )
         _save_attention_state(connection, run_id, session_id, job_id, insight_id, insight)
+        reply_task_created = _create_analysis_reply_task(
+            connection, session, insight_id, insight
+        ) if bool(options.get("generate_reply_drafts")) else False
         result = {
             "status": "analyzed",
             "skipped_reasons": prepared.get("skipped_reasons") or [],
@@ -911,9 +1382,13 @@ def _save_conversation_result(
             "task_sync": prepared.get("task_sync") or {},
             "generated_evaluation": False,
             "generated_reply_draft": bool(insight.get("reply_draft")),
+            "reply_task_created": reply_task_created,
             "updated_pipeline": bool((prepared.get("deterministic_facts") or {}).get("activities_created") or ai_activity_count),
             "reconciled_tasks": _task_sync_count(prepared.get("task_sync") or {}) > 0,
-            "rejection_detected": bool((insight.get("rejection_analysis") or {}).get("rejected")),
+            "rejection_detected": bool(
+                (insight.get("rejection_analysis") or {}).get("rejected")
+                or (prepared.get("deterministic_facts") or {}).get("rejected")
+            ),
             "attention_status": str(insight.get("attention_status") or "unknown"),
             "insight_id": insight_id,
         }
@@ -927,7 +1402,109 @@ def _save_conversation_result(
             started_at=None,
             completed_at=utc_now(),
         )
+    if job_id and rejection_evidence_id:
+        try:
+            # 辅助任务清理与执行证据使用独立事务，失败时正式求职状态仍然保留。
+            with db.connect() as connection:
+                _cancel_open_progress_tasks_for_rejection(
+                    connection, job_id, session_id, rejection_evidence_id
+                )
+        except Exception as exc:
+            result["auxiliary_warning"] = (
+                "正式拒绝状态已保存；关联任务清理或执行证据记录失败："
+                f"{type(exc).__name__}"
+            )
     return result
+
+
+def _sync_legacy_terminal_status(
+    connection: sqlite3.Connection,
+    job_id: str,
+    stage: str,
+    evidence_message_id: str | None,
+) -> None:
+    """兼容仍读取旧投递表的调用方，正式状态始终由 Pipeline 决定。"""
+    now = utc_now()
+    connection.execute(
+        """
+        INSERT INTO fj_job_applications (
+          id, job_id, company_id, status, source, source_action_id,
+          evidence_level, applied_at, note, created_at, updated_at
+        )
+        SELECT ?, j.id, j.company_id, ?, 'mcp', ?, 'inferred', ?, ?, ?, ?
+        FROM fj_boss_jobs j WHERE j.id = ?
+        ON CONFLICT(job_id) DO UPDATE SET
+          status = excluded.status,
+          source = excluded.source,
+          source_action_id = excluded.source_action_id,
+          evidence_level = excluded.evidence_level,
+          applied_at = excluded.applied_at,
+          note = excluded.note,
+          updated_at = excluded.updated_at
+        """,
+        (
+            new_id(), stage, evidence_message_id, now,
+            "由正式求职进展同步终态", now, now, job_id,
+        ),
+    )
+
+
+def _create_analysis_reply_task(
+    connection: sqlite3.Connection,
+    session: sqlite3.Row,
+    insight_id: str,
+    insight: dict[str, Any],
+) -> bool:
+    draft = insight.get("reply_draft")
+    if not isinstance(draft, dict) or not _text(draft.get("text")):
+        return False
+    action = str(insight.get("suggested_next_action") or "")
+    if action not in {"reply_recruiter", "follow_up", "ask_rejection_reason"}:
+        return False
+    action_kind = {
+        "follow_up": "followup",
+        "ask_rejection_reason": "ask_rejection_reason",
+    }.get(action, "reply")
+    based_on_message_id = (
+        session["latest_inbound_message_id"]
+        if action_kind == "reply"
+        else session["latest_message_id"]
+    )
+    if not based_on_message_id:
+        return False
+    active = connection.execute(
+        """
+        SELECT id, insight_id FROM fj_chat_reply_tasks
+        WHERE session_id = ?
+          AND status IN ('pending_generation', 'generating', 'awaiting_review', 'confirmed')
+        ORDER BY updated_at DESC LIMIT 1
+        """,
+        (session["id"],),
+    ).fetchone()
+    if active is not None:
+        return False
+    now = utc_now()
+    text = _text(draft.get("text"))[:5000]
+    recommendation = insight.get("ai_followup_recommendation")
+    reason = _text(recommendation.get("reason")) if isinstance(recommendation, dict) else ""
+    connection.execute(
+        """
+        INSERT INTO fj_chat_reply_tasks (
+          id, session_id, trigger_source, action_kind, insight_id, status,
+          based_on_message_id, based_on_session_version, input_message_ids_json,
+          decision, decision_reason, context_json, draft_text, final_text,
+          generation_model, generated_at, created_at, updated_at
+        ) VALUES (?, ?, 'manual', ?, ?, 'awaiting_review', ?, ?, ?,
+                  'reply', ?, ?, ?, ?, 'codex-cli', ?, ?, ?)
+        """,
+        (
+            new_id(), session["id"], action_kind, insight_id, based_on_message_id,
+            session["session_version"], _dump(insight.get("evidence_message_ids") or []),
+            reason[:500], _dump({"source": "conversation_analysis", "insight_id": insight_id}),
+            text, text, now, now, now,
+        ),
+    )
+    return True
 
 
 def _normalize_codex_insight(
@@ -946,6 +1523,19 @@ def _normalize_codex_insight(
         raw_insight.get("evidence_message_ids") or recommendation.get("evidence_message_ids"),
         message_ids,
     )
+    waiting_on = str(raw_insight.get("waiting_on") or "")
+    if waiting_on not in {"candidate", "recruiter", "none", "unknown"}:
+        if bool(raw_insight.get("needs_candidate_reply")):
+            waiting_on = "candidate"
+        elif bool(raw_insight.get("waiting_for_recruiter")):
+            waiting_on = "recruiter"
+        else:
+            waiting_on = "unknown"
+    decision = str(recommendation.get("decision") or "")
+    if decision not in {"follow", "wait", "do_not_follow"}:
+        decision = "follow" if suggested_action == "follow_up" else (
+            "do_not_follow" if suggested_action == "no_further_action" else "wait"
+        )
     reply_draft = raw_insight.get("reply_draft") if bool(options.get("generate_reply_drafts")) else None
     if isinstance(reply_draft, dict):
         reply_text = _text(reply_draft.get("text"))
@@ -967,12 +1557,19 @@ def _normalize_codex_insight(
         "signals": _string_list(raw_insight.get("signals"))[:30],
         "needs_candidate_reply": bool(raw_insight.get("needs_candidate_reply")),
         "waiting_for_recruiter": bool(raw_insight.get("waiting_for_recruiter")),
+        "waiting_on": waiting_on,
+        "progress_events": _normalize_progress_events(
+            raw_insight.get("progress_events"), message_ids
+        ),
         "rejection_analysis": _normalize_rejection(raw_insight.get("rejection_analysis"), message_ids),
         "suggested_next_action": suggested_action,
         "ai_followup_recommendation": {
             "attention_status": attention_status,
             "recommended_action": suggested_action,
             "reason": _text(recommendation.get("reason") or raw_insight.get("reason"))[:1000],
+            "decision": decision,
+            "reason_code": _text(recommendation.get("reason_code"))[:100],
+            "recommended_at": _text(recommendation.get("recommended_at"))[:80] or None,
             "evidence_message_ids": evidence,
         },
         "attention_status": attention_status,
@@ -993,37 +1590,274 @@ def _write_ai_activities(
     session_id: str,
     insight: dict[str, Any],
     message_ids: set[str],
-) -> int:
+) -> tuple[int, str | None]:
     if not job_id or _has_manual_terminal_stage(connection, job_id):
-        return 0
+        return 0, None
+    created = 0
+    evidence_ids = _valid_message_ids(insight.get("evidence_message_ids"), message_ids)
+
+    for progress_event in insight.get("progress_events") or []:
+        event_type = str(progress_event.get("event_type") or "")
+        event_evidence = _valid_message_ids(
+            progress_event.get("evidence_message_ids"), message_ids
+        )
+        if not event_evidence or _activity_exists_for_message(
+            connection, job_id, event_type, event_evidence[0]
+        ):
+            continue
+        occurred_at = _message_time(connection, event_evidence[0]) or utc_now()
+        _activity, inserted = append_job_activity_with_connection(
+            connection,
+            job_id=job_id,
+            chat_session_id=session_id,
+            event_type=event_type,
+            occurred_at=occurred_at,
+            source="analysis",
+            source_ref_type="chat_message",
+            source_ref_id=event_evidence[0],
+            confidence=_score(progress_event.get("confidence"), 0.0),
+            evidence_level="strong_inferred",
+            payload={
+                "derived_by": "ai",
+                "analysis_version": ANALYSIS_VERSION,
+                "evidence_message_id": event_evidence[0],
+                "evidence_text": _message_text(connection, event_evidence[0]),
+            },
+            dedupe_key=f"chat_message:{event_evidence[0]}:{ANALYSIS_VERSION}:{event_type}",
+        )
+        created += int(inserted)
+
+    waiting_on = str(insight.get("waiting_on") or "unknown")
+    if (
+        waiting_on != "unknown"
+        and evidence_ids
+        and not _has_deterministic_waiting_event(
+            connection, job_id, evidence_ids[-1]
+        )
+    ):
+        occurred_at = _message_time(connection, evidence_ids[-1]) or utc_now()
+        _activity, inserted = append_job_activity_with_connection(
+            connection,
+            job_id=job_id,
+            chat_session_id=session_id,
+            event_type="conversation_state_analyzed",
+            occurred_at=occurred_at,
+            source="analysis",
+            source_ref_type="chat_message",
+            source_ref_id=evidence_ids[-1],
+            confidence=_score(insight.get("confidence"), 0.0),
+            evidence_level="strong_inferred",
+            payload={
+                "waiting_on": waiting_on,
+                "waiting_since_at": occurred_at,
+                "derived_by": "ai",
+                "analysis_version": ANALYSIS_VERSION,
+                "evidence_message_id": evidence_ids[-1],
+                "evidence_text": _message_text(connection, evidence_ids[-1]),
+            },
+            dedupe_key=(
+                f"chat_session:{session_id}:message:{evidence_ids[-1]}:"
+                f"{ANALYSIS_VERSION}:conversation_state"
+            ),
+        )
+        created += int(inserted)
+
     rejection = insight.get("rejection_analysis") if isinstance(insight.get("rejection_analysis"), dict) else {}
     if not (
         rejection.get("rejection_type") == "explicit"
         and bool(rejection.get("rejected"))
         and _score(rejection.get("confidence"), 0.0) >= EXPLICIT_REJECTION_CONFIDENCE
     ):
-        return 0
-    evidence_ids = _valid_message_ids(rejection.get("evidence_message_ids"), message_ids)
-    if not evidence_ids:
-        return 0
-    occurred_at = _message_time(connection, evidence_ids[0]) or utc_now()
+        return created, None
+    rejection_evidence = _valid_message_ids(rejection.get("evidence_message_ids"), message_ids)
+    if not rejection_evidence:
+        return created, None
+    event_type = "job_closed" if rejection.get("outcome") == "job_closed" else "rejected"
+    if _activity_exists_for_message(connection, job_id, event_type, rejection_evidence[0]):
+        return created, rejection_evidence[0]
+    occurred_at = _message_time(connection, rejection_evidence[0]) or utc_now()
     _activity, inserted = append_job_activity_with_connection(
         connection,
         job_id=job_id,
         chat_session_id=session_id,
-        event_type="rejected",
+        event_type=event_type,
         occurred_at=occurred_at,
         source="analysis",
         source_ref_type="chat_message",
-        source_ref_id=evidence_ids[0],
+        source_ref_id=rejection_evidence[0],
         confidence=_score(rejection.get("confidence"), 0.0),
         evidence_level="strong_inferred",
-        payload={"rejection_analysis": rejection, "analysis_version": ANALYSIS_VERSION},
-        dedupe_key=f"chat_message:{evidence_ids[0]}:{ANALYSIS_VERSION}:explicit_rejection",
+        payload={
+            "rejection_analysis": rejection,
+            "rejection_reason_source": rejection.get("reason_source", "unknown"),
+            "rejection_reason_category": rejection.get("reason_type", "unknown"),
+            "rejection_reason_summary": rejection.get("reason_text", ""),
+            "derived_by": "ai",
+            "analysis_version": ANALYSIS_VERSION,
+            "evidence_message_id": rejection_evidence[0],
+            "evidence_text": _message_text(connection, rejection_evidence[0]),
+        },
+        dedupe_key=f"chat_message:{rejection_evidence[0]}:{ANALYSIS_VERSION}:{event_type}",
     )
-    if inserted:
-        _cancel_open_progress_tasks_for_rejection(connection, job_id, session_id, evidence_ids[0])
-    return int(inserted)
+    created += int(inserted)
+    return created, rejection_evidence[0] if inserted else None
+
+
+def _activity_exists_for_message(
+    connection: sqlite3.Connection,
+    job_id: str,
+    event_type: str,
+    message_id: str,
+) -> bool:
+    return connection.execute(
+        """
+        SELECT 1 FROM fj_job_activity_events
+        WHERE job_id = ? AND event_type = ?
+          AND source_ref_type = 'chat_message' AND source_ref_id = ?
+        LIMIT 1
+        """,
+        (job_id, event_type, message_id),
+    ).fetchone() is not None
+
+
+def _has_deterministic_waiting_event(
+    connection: sqlite3.Connection,
+    job_id: str,
+    message_id: str,
+) -> bool:
+    return connection.execute(
+        """
+        SELECT 1 FROM fj_job_activity_events
+        WHERE job_id = ? AND source_ref_type = 'chat_message' AND source_ref_id = ?
+          AND event_type IN (
+            'resume_requested', 'resume_submitted', 'resume_accepted', 'resume_viewed',
+            'under_review', 'interview_invited', 'interview_scheduled',
+            'offer_received', 'rejected', 'job_closed'
+          )
+        LIMIT 1
+        """,
+        (job_id, message_id),
+    ).fetchone() is not None
+
+
+def _apply_followup_policy(
+    connection: sqlite3.Connection,
+    job_id: str,
+    insight: dict[str, Any],
+) -> None:
+    """规则决定是否行动，AI 文本只补充原因与草稿表达。"""
+    snapshot = connection.execute(
+        "SELECT * FROM fj_job_pipeline_snapshots WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    if snapshot is None:
+        return
+    recommendation = insight.get("ai_followup_recommendation")
+    if not isinstance(recommendation, dict):
+        recommendation = {}
+        insight["ai_followup_recommendation"] = recommendation
+    stage = str(snapshot["stage"])
+    waiting_on = str(snapshot["waiting_on"] or "unknown")
+    insight["waiting_on"] = waiting_on
+
+    if stage == "rejected":
+        reason_source = str(snapshot["rejection_reason_source"] or "unknown")
+        reason_category = str(snapshot["rejection_reason_category"] or "unknown")
+        if reason_source == "unknown" or reason_category in {"unknown", "fit"}:
+            insight["attention_status"] = "needs_rejection_reason"
+            insight["suggested_next_action"] = "ask_rejection_reason"
+            recommendation.update({
+                "attention_status": "needs_rejection_reason",
+                "recommended_action": "ask_rejection_reason",
+                "decision": "follow",
+                "reason_code": "rejected_no_reason",
+                "recommended_at": utc_now(),
+            })
+            recommendation["reason"] = recommendation.get("reason") or "已确认拒绝，但招聘方尚未说明具体原因。"
+        else:
+            _set_no_follow(insight, recommendation, "rejection_reason_known")
+        return
+    if stage in {"closed", "offer"}:
+        _set_no_follow(insight, recommendation, "job_closed" if stage == "closed" else "offer_received")
+        return
+    if waiting_on == "candidate":
+        insight["attention_status"] = "needs_reply"
+        insight["suggested_next_action"] = "reply_recruiter"
+        recommendation.update({
+            "attention_status": "needs_reply",
+            "recommended_action": "reply_recruiter",
+            "decision": "wait",
+            "reason_code": "user_owes_reply",
+            "recommended_at": None,
+        })
+        recommendation["reason"] = recommendation.get("reason") or "招聘方发来了需要处理的新消息。"
+        return
+    if waiting_on == "none":
+        _set_no_follow(insight, recommendation, "no_action_required")
+        return
+    if waiting_on != "recruiter":
+        insight["attention_status"] = "unknown"
+        insight["suggested_next_action"] = "no_further_action"
+        recommendation.update({
+            "attention_status": "unknown",
+            "recommended_action": "no_further_action",
+            "decision": "wait",
+            "reason_code": "",
+            "recommended_at": None,
+        })
+        return
+
+    delay = FOLLOWUP_DELAYS.get(stage, timedelta(days=2))
+    waiting_since = _parse_datetime(str(snapshot["waiting_since_at"] or snapshot["stage_updated_at"]))
+    recommended_at = waiting_since + delay if waiting_since else None
+    due = bool(recommended_at and datetime.now(timezone.utc) >= recommended_at)
+    if due:
+        insight["attention_status"] = "needs_followup"
+        insight["suggested_next_action"] = "follow_up"
+        recommendation.update({
+            "attention_status": "needs_followup",
+            "recommended_action": "follow_up",
+            "decision": "follow",
+            "reason_code": FOLLOWUP_REASON_CODES.get(stage, "recruiter_owes_reply"),
+            "recommended_at": recommended_at.isoformat().replace("+00:00", "Z"),
+        })
+        recommendation["reason"] = recommendation.get("reason") or "等待招聘方反馈已达到建议跟进时间。"
+    else:
+        insight["attention_status"] = "waiting"
+        insight["suggested_next_action"] = "wait_for_recruiter"
+        recommendation.update({
+            "attention_status": "waiting",
+            "recommended_action": "wait_for_recruiter",
+            "decision": "wait",
+            "reason_code": "recruiter_owes_reply",
+            "recommended_at": recommended_at.isoformat().replace("+00:00", "Z") if recommended_at else None,
+        })
+        recommendation["reason"] = recommendation.get("reason") or "当前正在等待招聘方反馈。"
+
+
+def _set_no_follow(
+    insight: dict[str, Any],
+    recommendation: dict[str, Any],
+    reason_code: str,
+) -> None:
+    insight["attention_status"] = "no_action"
+    insight["suggested_next_action"] = "no_further_action"
+    recommendation.update({
+        "attention_status": "no_action",
+        "recommended_action": "no_further_action",
+        "decision": "do_not_follow",
+        "reason_code": reason_code,
+        "recommended_at": None,
+    })
+
+
+def _parse_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _save_job_evaluation_result(
@@ -1153,6 +1987,14 @@ def _build_session_analysis_context(
         """,
         (job_id or "",),
     ).fetchone() if job_id else None
+    pipeline_payload = dict(pipeline) if pipeline else None
+    waiting_since = _parse_datetime(
+        str(pipeline["waiting_since_at"] or pipeline["stage_updated_at"])
+    ) if pipeline else None
+    waiting_days = (
+        max(0, int((datetime.now(timezone.utc) - waiting_since).total_seconds() // 86_400))
+        if waiting_since else 0
+    )
     return {
         "session_id": str(session["id"]),
         "job_id": job_id,
@@ -1168,13 +2010,15 @@ def _build_session_analysis_context(
         "latest_message": messages[-1] if messages else None,
         "job": job,
         "activities": activities,
-        "pipeline": dict(pipeline) if pipeline else None,
+        "pipeline": pipeline_payload,
+        "waiting_duration_days": waiting_days,
         "evaluation": {
             "decision": evaluation["decision"],
             "confidence": evaluation["confidence"],
             "created_at": evaluation["created_at"],
             "detail": _load_json(evaluation["evaluation_json"], {}),
         } if evaluation else None,
+        "candidate_profile_context": _candidate_context(db, view="chat"),
         "deterministic_facts": deterministic,
         "task_sync": task_sync,
         "expected_output": _conversation_output_schema(),
@@ -1214,6 +2058,7 @@ def _message_payload(row: sqlite3.Row) -> dict[str, Any]:
         "message_type": str(row["message_type"]),
         "content": str(row["content"] or ""),
         "sender_uid": str(row["sender_uid"] or ""),
+        "client_mid": str(row["client_mid"] or ""),
         "sent_at": str(row["sent_at"]),
         "observed_at": str(row["observed_at"]),
         "source": str(row["source"]),
@@ -1751,7 +2596,7 @@ def _mark_analysis_failed(db: Database, run_id: str, session_id: str, exc: Excep
 def _save_insight(
     connection: sqlite3.Connection,
     *,
-    run_id: str,
+    run_id: str | None,
     session_id: str,
     job_id: str | None,
     insight: dict[str, Any],
@@ -1759,49 +2604,53 @@ def _save_insight(
     status: str,
 ) -> str:
     now = utc_now()
-    existing = connection.execute(
-        """
-        SELECT id, created_at FROM fj_conversation_insights
-        WHERE run_id = ? AND session_id = ? AND analysis_version = ?
-        """,
-        (run_id, session_id, ANALYSIS_VERSION),
-    ).fetchone()
+    if run_id is None:
+        existing = connection.execute(
+            """
+            SELECT id, created_at FROM fj_conversation_insights
+            WHERE run_id IS NULL AND session_id = ? AND analysis_version = ?
+            """,
+            (session_id, ANALYSIS_VERSION),
+        ).fetchone()
+    else:
+        existing = connection.execute(
+            """
+            SELECT id, created_at FROM fj_conversation_insights
+            WHERE run_id = ? AND session_id = ? AND analysis_version = ?
+            """,
+            (run_id, session_id, ANALYSIS_VERSION),
+        ).fetchone()
     insight_id = str(existing["id"]) if existing else new_id()
     created_at = str(existing["created_at"]) if existing else now
-    connection.execute(
-        """
-        INSERT INTO fj_conversation_insights (
+    if existing:
+        connection.execute(
+            """
+            UPDATE fj_conversation_insights
+            SET job_id = ?, status = ?, insight_json = ?, model = ?,
+                prompt_version = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (job_id, status, _dump(insight), model, PROMPT_VERSION, now, insight_id),
+        )
+    else:
+        connection.execute(
+            """
+            INSERT INTO fj_conversation_insights (
           id, run_id, session_id, job_id, status, insight_json, model,
           prompt_version, analysis_version, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(run_id, session_id, analysis_version) DO UPDATE SET
-          job_id = excluded.job_id,
-          status = excluded.status,
-          insight_json = excluded.insight_json,
-          model = excluded.model,
-          prompt_version = excluded.prompt_version,
-          updated_at = excluded.updated_at
-        """,
-        (
-            insight_id,
-            run_id,
-            session_id,
-            job_id,
-            status,
-            _dump(insight),
-            model,
-            PROMPT_VERSION,
-            ANALYSIS_VERSION,
-            created_at,
-            now,
-        ),
-    )
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                insight_id, run_id, session_id, job_id, status, _dump(insight),
+                model, PROMPT_VERSION, ANALYSIS_VERSION, created_at, now,
+            ),
+        )
     return insight_id
 
 
 def _save_attention_state(
     connection: sqlite3.Connection,
-    run_id: str,
+    run_id: str | None,
     session_id: str,
     job_id: str | None,
     insight_id: str,
@@ -1811,6 +2660,11 @@ def _save_attention_state(
     action = _recommended_action(str(insight.get("suggested_next_action") or "no_further_action"))
     recommendation = insight.get("ai_followup_recommendation")
     reason = _text(recommendation.get("reason")) if isinstance(recommendation, dict) else ""
+    decision = _text(recommendation.get("decision")) if isinstance(recommendation, dict) else "wait"
+    if decision not in {"follow", "wait", "do_not_follow"}:
+        decision = "wait"
+    reason_code = _text(recommendation.get("reason_code")) if isinstance(recommendation, dict) else ""
+    recommended_at = _text(recommendation.get("recommended_at")) if isinstance(recommendation, dict) else ""
     evidence = _message_ids(insight.get("evidence_message_ids"))
     now = utc_now()
     existing = connection.execute(
@@ -1822,9 +2676,10 @@ def _save_attention_state(
         """
         INSERT INTO fj_chat_attention_states (
           session_id, job_id, run_id, insight_id, attention_status, display_label,
-          recommended_action, reason, priority, evidence_message_ids_json,
+          recommended_action, reason, decision, reason_code, recommended_at,
+          priority, evidence_message_ids_json,
           source, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'analysis', ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'analysis', ?, ?)
         ON CONFLICT(session_id) DO UPDATE SET
           job_id = excluded.job_id,
           run_id = excluded.run_id,
@@ -1833,6 +2688,9 @@ def _save_attention_state(
           display_label = excluded.display_label,
           recommended_action = excluded.recommended_action,
           reason = excluded.reason,
+          decision = excluded.decision,
+          reason_code = excluded.reason_code,
+          recommended_at = excluded.recommended_at,
           priority = excluded.priority,
           evidence_message_ids_json = excluded.evidence_message_ids_json,
           source = excluded.source,
@@ -1847,6 +2705,9 @@ def _save_attention_state(
             ATTENTION_LABELS[status],
             action,
             reason[:500],
+            decision,
+            reason_code[:100],
+            recommended_at[:80] or None,
             ATTENTION_PRIORITY[status],
             _dump(evidence),
             created_at,
@@ -2048,6 +2909,13 @@ def _message_time(connection: sqlite3.Connection, message_id: str) -> str | None
     return str(row["sent_at"]) if row else None
 
 
+def _message_text(connection: sqlite3.Connection, message_id: str) -> str:
+    row = connection.execute(
+        "SELECT content FROM fj_chat_messages WHERE id = ?", (message_id,)
+    ).fetchone()
+    return _text(row["content"] if row else "")[:500]
+
+
 def _message_fact(message: dict[str, Any], fact_type: str) -> dict[str, Any]:
     return {
         "fact_type": fact_type,
@@ -2067,7 +2935,22 @@ def _conversation_output_schema() -> dict[str, Any]:
             "signals": ["string"],
             "needs_candidate_reply": "boolean",
             "waiting_for_recruiter": "boolean",
-            "rejection_analysis": "object",
+            "waiting_on": "candidate|recruiter|none|unknown",
+            "progress_events": [{
+                "event_type": "resume_requested|resume_submitted|resume_accepted|resume_viewed|under_review|interview_invited|interview_scheduled|offer_received",
+                "confidence": "0..1",
+                "evidence_message_ids": ["message id from context"],
+            }],
+            "rejection_analysis": {
+                "rejected": "boolean",
+                "outcome": "rejected|job_closed",
+                "rejection_type": "explicit|soft|none",
+                "rejection_reason_source": "recruiter_explicit|ai_inferred|unknown",
+                "rejection_reason_category": "experience|education|skills|industry_background|salary|location|availability|position_filled|headcount_closed|fit|other|unknown",
+                "reason_text": "string",
+                "confidence": "0..1",
+                "evidence_message_ids": ["message id from context"],
+            },
             "suggested_next_action": "enum",
             "ai_followup_recommendation": "object",
             "attention_status": "enum",
@@ -2181,26 +3064,52 @@ def _normalize_rejection(value: object, message_ids: set[str]) -> dict[str, Any]
     rejection_type = str(raw.get("rejection_type") or "none")
     if rejection_type not in {"explicit", "soft", "none"}:
         rejection_type = "none"
-    reason_type = str(raw.get("reason_type") or "unknown")
+    outcome = str(raw.get("outcome") or raw.get("outcome_type") or "rejected")
+    if outcome not in {"rejected", "job_closed"}:
+        outcome = "rejected"
+    reason_type = str(
+        raw.get("rejection_reason_category") or raw.get("reason_type") or "unknown"
+    )
+    reason_type = {
+        "experience_mismatch": "experience",
+        "skill_mismatch": "skills",
+        "education_mismatch": "education",
+        "salary_mismatch": "salary",
+        "location_mismatch": "location",
+        "availability_mismatch": "availability",
+        "background_mismatch": "industry_background",
+    }.get(reason_type, reason_type)
     if reason_type not in {
-        "experience_mismatch",
-        "skill_mismatch",
-        "education_mismatch",
-        "salary_mismatch",
-        "location_mismatch",
-        "availability_mismatch",
-        "background_mismatch",
+        "experience",
+        "skills",
+        "education",
+        "salary",
+        "location",
+        "availability",
+        "industry_background",
         "position_filled",
         "headcount_closed",
+        "fit",
         "other",
         "unknown",
     }:
         reason_type = "unknown"
-    reason_source = str(raw.get("reason_source") or "unknown")
-    if reason_source not in {"explicit", "inferred", "unknown"}:
+    reason_source = str(
+        raw.get("rejection_reason_source") or raw.get("reason_source") or "unknown"
+    )
+    reason_source = {
+        "explicit": "recruiter_explicit",
+        "inferred": "ai_inferred",
+    }.get(reason_source, reason_source)
+    if reason_source not in {"recruiter_explicit", "ai_inferred", "unknown"}:
         reason_source = "unknown"
+    if reason_type == "position_filled":
+        outcome = "rejected"
+    if outcome == "job_closed" and reason_type != "headcount_closed":
+        outcome = "rejected"
     return {
         "rejected": bool(raw.get("rejected")) and rejection_type != "none",
+        "outcome": outcome,
         "rejection_type": rejection_type,
         "reason_type": reason_type,
         "reason_text": _text(raw.get("reason_text"))[:500],
@@ -2208,6 +3117,30 @@ def _normalize_rejection(value: object, message_ids: set[str]) -> dict[str, Any]
         "confidence": _score(raw.get("confidence"), 0.0),
         "evidence_message_ids": _valid_message_ids(raw.get("evidence_message_ids"), message_ids),
     }
+
+
+def _normalize_progress_events(value: object, message_ids: set[str]) -> list[dict[str, Any]]:
+    allowed = {
+        "resume_requested", "resume_submitted", "resume_accepted", "resume_viewed",
+        "under_review", "interview_invited", "interview_scheduled", "offer_received",
+    }
+    if not isinstance(value, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        event_type = str(item.get("event_type") or "")
+        evidence = _valid_message_ids(item.get("evidence_message_ids"), message_ids)
+        confidence = _score(item.get("confidence"), 0.0)
+        if event_type not in allowed or not evidence or confidence < 0.8:
+            continue
+        normalized.append({
+            "event_type": event_type,
+            "confidence": confidence,
+            "evidence_message_ids": evidence,
+        })
+    return normalized[:20]
 
 
 def _attention_status(value: str) -> str:

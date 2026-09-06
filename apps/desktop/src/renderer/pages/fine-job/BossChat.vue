@@ -33,11 +33,39 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   Boolean(value && typeof value === "object" && !Array.isArray(value));
 const session = computed(() => store.detail?.session ?? null);
 const task = computed(() => store.currentTask);
+const progress = computed(() => session.value?.progress ?? null);
+const primaryAction = computed(() => progress.value?.primary_action ?? null);
+const canMarkRejected = computed(() => Boolean(
+  session.value?.job_context_state === "linked"
+  && !["offer", "rejected", "closed"].includes(progress.value?.stage ?? "")
+));
+const rejectionReasonNeedsDetail = computed(() => Boolean(
+  progress.value?.stage === "rejected"
+  && (
+    progress.value.outcome.rejection_reason_source === "unknown"
+    || ["unknown", "fit"].includes(progress.value.outcome.rejection_reason_category)
+  )
+));
+const analysisButtonLabel = computed(() => (
+  rejectionReasonNeedsDetail.value
+    ? "分析拒绝原因"
+    : "分析进展"
+));
+const defaultMessageActionKind = computed<"reply" | "followup" | "ask_rejection_reason">(() => {
+  if (primaryAction.value?.type) return primaryAction.value.type;
+  if (rejectionReasonNeedsDetail.value) {
+    return "ask_rejection_reason";
+  }
+  if (progress.value?.waiting_on === "recruiter") return "followup";
+  return "reply";
+});
 const latestAction = computed(() => store.detail?.send_actions[0] ?? null);
 const latestInsight = computed(() => store.detail?.latest_conversation_insight?.insight ?? null);
 const analysisReplyDraft = computed(() => {
   const value = latestInsight.value?.reply_draft;
-  return typeof value === "string" ? value.trim() : "";
+  if (typeof value === "string") return value.trim();
+  if (isRecord(value) && typeof value.text === "string") return value.text.trim();
+  return "";
 });
 const analysisReason = computed(() => {
   const recommendation = latestInsight.value?.ai_followup_recommendation;
@@ -156,6 +184,36 @@ const attentionType = (item?: FineJobChatSession | null) => ({
   waiting: "info",
   no_action: "info"
 }[item?.attention_status ?? ""] ?? "info") as "success" | "warning" | "danger" | "primary" | "info";
+const stageLabel = (value?: string | null) => ({
+  discovered: "已发现岗位", shortlisted: "已进入候选", greeted: "已打招呼",
+  communicating: "沟通中", resume_requested: "HR 请求简历",
+  resume_submitted: "已发送简历", resume_viewed: "简历已查看",
+  under_review: "用人部门评估中", interview_scheduling: "面试时间沟通中",
+  interviewing: "面试阶段", offer: "已获得 Offer", rejected: "已被拒绝", closed: "岗位关闭"
+}[value ?? ""] ?? "进展待分析");
+const waitingLabel = (value?: string | null) => ({
+  candidate: "等我回复", recruiter: "等招聘方回复", none: "当前无需回复", unknown: "等待对象待判断"
+}[value ?? ""] ?? "等待对象待判断");
+const contactOriginLabel = (value?: string | null) => ({
+  finejob_auto: "FineJob 自动打招呼", candidate_initiated: "我在 FineJob 内主动联系",
+  recruiter_initiated: "招聘方主动联系", external_candidate_initiated: "我从其他渠道主动联系",
+  unknown: "沟通来源待判断"
+}[value ?? ""] ?? "沟通来源待判断");
+const rejectionSourceLabel = (value?: string | null) => ({
+  recruiter_explicit: "招聘方明确说明", ai_inferred: "AI 推测", unknown: "未知"
+}[value ?? ""] ?? "未知");
+const rejectionCategoryLabel = (value?: string | null) => ({
+  experience: "工作经验", education: "学历", skills: "技能不匹配",
+  industry_background: "行业背景", salary: "薪资", location: "地点",
+  availability: "到岗时间", position_filled: "已招到人",
+  headcount_closed: "岗位已关闭", fit: "综合匹配度", other: "其他", unknown: "未知"
+}[value ?? ""] ?? "未知");
+const waitingDuration = computed(() => {
+  const since = progress.value?.waiting_since_at;
+  if (!since || progress.value?.waiting_on === "none") return "";
+  const days = Math.max(0, Math.floor((Date.now() - new Date(since).getTime()) / 86_400_000));
+  return days > 0 ? `已等待 ${days} 天` : "等待不足 1 天";
+});
 
 const selectSession = async (item: FineJobChatSession) => {
   saveEditor();
@@ -328,16 +386,32 @@ watch(
   { immediate: true }
 );
 
-const generate = async (regenerate = false) => {
+const generate = async (
+  regenerate = false,
+  actionKind: "reply" | "followup" | "ask_rejection_reason" = (
+    primaryAction.value?.type ?? task.value?.action_kind ?? "reply"
+  )
+) => {
   try {
-    await store.generate(instruction.value, regenerate);
+    await store.generate(instruction.value, regenerate, actionKind);
     if (store.selectedSessionId && editorDrafts.value[store.selectedSessionId]) {
       editorDrafts.value[store.selectedSessionId].dirty = false;
     }
     restoreEditor();
-    ElMessage.success(regenerate ? "已基于最新本地上下文重新生成" : "AI 回复已生成，请编辑后确认");
+    ElMessage.success(regenerate ? "已基于最新本地上下文重新生成" : "消息草稿已生成，请编辑后确认");
   } catch {
     ElMessage.error(store.error ?? "AI 回复生成失败");
+  }
+};
+
+const analyzeProgress = async () => {
+  try {
+    const result = await store.analyzeProgress();
+    if (result.auxiliary_warning) ElMessage.warning(result.auxiliary_warning);
+    else if (result.reply_task_created) ElMessage.success("当前求职进展已更新，并生成了待确认草稿");
+    else ElMessage.success("当前求职进展已更新");
+  } catch {
+    ElMessage.error(store.error ?? "分析进展失败");
   }
 };
 
@@ -394,6 +468,7 @@ const emergencyStop = async () => {
 };
 
 onMounted(() => {
+  if (route.query.attention === "actionable") store.attentionFilter = "actionable";
   void store.load()
     .then(async () => {
       const sessionId = typeof route.query.session_id === "string" ? route.query.session_id : "";
@@ -537,6 +612,17 @@ onBeforeUnmount(() => {
             @keyup.enter="applySessionFilters"
             @clear="applySessionFilters"
           />
+          <el-select
+            v-model="store.attentionFilter"
+            clearable
+            placeholder="处理状态"
+            @change="applySessionFilters"
+          >
+            <el-option label="只看需要处理" value="actionable" />
+            <el-option label="建议跟进" value="needs_followup" />
+            <el-option label="等我回复" value="needs_reply" />
+            <el-option label="建议询问原因" value="needs_rejection_reason" />
+          </el-select>
         </div>
         <button
           v-for="item in store.sessions"
@@ -661,13 +747,19 @@ onBeforeUnmount(() => {
                 @click="refreshJob"
               >更新岗位</el-button>
               <el-button
-                v-if="session.job_context_state === 'linked'"
+                v-if="canMarkRejected"
                 size="small"
                 type="danger"
                 plain
                 :loading="store.mutating"
                 @click="rejectJob"
               >已被拒绝</el-button>
+              <el-button
+                size="small"
+                plain
+                :loading="store.mutating"
+                @click="analyzeProgress"
+              >{{ analysisButtonLabel }}</el-button>
               <el-button
                 v-if="(store.detail?.message_count ?? 0) === 0"
                 type="primary"
@@ -696,6 +788,29 @@ onBeforeUnmount(() => {
             :closable="false"
             :title="`当前显示最近 ${store.detail.messages.length} 条，本地共 ${store.detail.message_count} 条消息`"
           />
+          <section v-if="progress" class="progress-card">
+            <div class="progress-card__heading">
+              <div>
+                <small>当前进展</small>
+                <h3>{{ stageLabel(progress.stage) }}</h3>
+              </div>
+              <el-tag :type="primaryAction ? 'warning' : 'info'">
+                {{ primaryAction?.label || (progress.waiting_on === "recruiter" ? "等待中，可主动生成消息" : "当前无需行动") }}
+              </el-tag>
+            </div>
+            <div class="progress-card__facts">
+              <span>{{ waitingLabel(progress.waiting_on) }}</span>
+              <span v-if="waitingDuration">{{ waitingDuration }}</span>
+              <span>{{ contactOriginLabel(progress.contact_origin) }}</span>
+            </div>
+            <p v-if="progress.followup.reason_summary">
+              行动建议：{{ progress.followup.reason_summary }}
+            </p>
+            <p v-if="progress.stage === 'rejected' || progress.stage === 'closed'">
+              拒绝原因：{{ progress.outcome.rejection_reason_summary || rejectionCategoryLabel(progress.outcome.rejection_reason_category) }}
+              · 来源：{{ rejectionSourceLabel(progress.outcome.rejection_reason_source) }}
+            </p>
+          </section>
           <div class="message-timeline">
             <article
               v-for="message in store.detail?.messages"
@@ -737,16 +852,22 @@ onBeforeUnmount(() => {
         />
         <div class="reply-actions">
           <el-button
+            v-if="primaryAction"
             type="primary"
             plain
-            :disabled="!session || session.status === 'human_takeover' || session.status === 'paused'"
+            :disabled="!session"
             :loading="store.mutating"
-            @click="generate(false)"
-          >生成 AI 回复</el-button>
+            @click="generate(false, primaryAction.type)"
+          >{{ primaryAction.label }}</el-button>
           <el-button
-            :disabled="!task || session?.status !== 'active'"
+            :disabled="!session"
             :loading="store.mutating"
-            @click="generate(true)"
+            @click="generate(false, defaultMessageActionKind)"
+          >生成消息</el-button>
+          <el-button
+            :disabled="!task || !session"
+            :loading="store.mutating"
+            @click="generate(true, task?.action_kind || 'reply')"
           >重新生成</el-button>
         </div>
         <el-tag v-if="task" :type="task.status === 'failed' ? 'danger' : 'info'">{{ task.status }}</el-tag>
@@ -1134,6 +1255,36 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.progress-card {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+  background: var(--el-fill-color-lighter);
+}
+
+.progress-card__heading,
+.progress-card__facts {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.progress-card h3,
+.progress-card p {
+  margin: 0;
+}
+
+.progress-card__facts {
+  justify-content: flex-start;
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
 }
 
 .analysis-draft {

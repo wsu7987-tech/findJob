@@ -23,12 +23,14 @@ from backend.app.services.fine_job.boss_scraper.service import boss_scraper_serv
 from backend.app.services.fine_job.codex_authorization import classify_outbound_content
 from backend.app.services.fine_job.profile_context import get_profile_context
 from backend.app.services.fine_job.job_applications import set_job_application_status
+from backend.app.services.fine_job.job_progress import build_job_progress_with_connection
 from backend.app.services.fine_job.execution_reconciliation import (
     observe_outbound_chat_message,
     record_execution_evidence_with_connection,
     set_canonical_from_raw,
 )
 from backend.app.services.fine_job.job_activity import append_job_activity_with_connection
+from backend.app.services.reasoning.codex_exec import run_codex_exec
 
 
 RUNTIME_ID = "boss"
@@ -1098,7 +1100,9 @@ def ingest_events(
             next_version = int(session["session_version"]) + 1
             inbound_id = message_id if message["direction"] == "inbound" else session["latest_inbound_message_id"]
             next_status = "human_takeover" if (
-                message["direction"] == "outbound" and message.get("source") == "manual"
+                message["direction"] == "outbound"
+                and message.get("source") == "manual"
+                and assistant_echo is None
             ) else session["status"]
             connection.execute(
                 """
@@ -1203,6 +1207,12 @@ def _session_payload(
                 payload["attention_reason"] = str(attention["reason"] or "")
                 payload["attention_priority"] = int(attention["priority"] or 0)
                 payload["attention_updated_at"] = str(attention["updated_at"] or "")
+        if payload.get("job_id"):
+            payload["progress"] = build_job_progress_with_connection(
+                connection,
+                str(payload["job_id"]),
+                session_id=str(payload.get("id") or ""),
+            )
     payload["identity_state"] = (
         "ready"
         if payload.get("encrypt_peer_uid") and payload.get("security_id") and payload.get("encrypt_job_id")
@@ -1217,6 +1227,7 @@ def list_sessions(
     *,
     status: str | None = None,
     account_uid: str | None = None,
+    attention: str | None = None,
     query: str | None = None,
     limit: int = 50,
     offset: int = 0,
@@ -1231,6 +1242,15 @@ def list_sessions(
         if account_uid:
             conditions.append("s.account_uid = ?")
             params.append(account_uid)
+        if attention == "actionable":
+            conditions.append(
+                "att.attention_status IN ("
+                "'needs_reply', 'needs_resume', 'needs_followup', "
+                "'needs_rejection_reason', 'needs_interview_confirm', 'needs_info')"
+            )
+        elif attention:
+            conditions.append("att.attention_status = ?")
+            params.append(attention)
         if query:
             conditions.append(
                 "(s.peer_name LIKE ? OR s.company_name LIKE ? OR s.job_title LIKE ? "
@@ -1508,6 +1528,26 @@ def _build_context(db: Database, connection: sqlite3.Connection, session: sqlite
             """,
             (session["job_id"],),
         ).fetchone()
+    progress = (
+        build_job_progress_with_connection(
+            connection, str(session["job_id"]), session_id=str(session["id"])
+        )
+        if session["job_id"] else None
+    )
+    waiting_since = None
+    if progress and progress.get("waiting_since_at"):
+        try:
+            waiting_since = datetime.fromisoformat(
+                str(progress["waiting_since_at"]).replace("Z", "+00:00")
+            )
+            if waiting_since.tzinfo is None:
+                waiting_since = waiting_since.replace(tzinfo=timezone.utc)
+        except ValueError:
+            waiting_since = None
+    waiting_days = (
+        max(0, int((datetime.now(timezone.utc) - waiting_since).total_seconds() // 86_400))
+        if waiting_since else 0
+    )
     return {
         "conversation": messages,
         "job": {
@@ -1520,13 +1560,102 @@ def _build_context(db: Database, connection: sqlite3.Connection, session: sqlite
             "decision": evaluation_row["decision"],
             "detail": _loads(evaluation_row["evaluation_json"], {}),
         } if evaluation_row else None,
+        "job_progress": {
+            "stage": progress.get("stage"),
+            "waiting_on": progress.get("waiting_on"),
+            "waiting_since_at": progress.get("waiting_since_at"),
+            "waiting_duration_days": waiting_days,
+            "followup": progress.get("followup"),
+            "outcome": progress.get("outcome"),
+        } if progress else None,
         "candidate_profile_context": candidate_context,
         "resume_facts": resume_facts if confirmed_profile_count == 0 else [],
         "job_intent": _row(intent_row) if intent_row else None,
     }
 
 
-def _chat_completion(config: AppConfig, context: dict[str, Any], instruction: str) -> tuple[dict[str, Any], str]:
+def _chat_reply_json_schema() -> dict[str, Any]:
+    properties = {
+        "decision": {"type": "string", "enum": ["reply", "manual", "ignore"]},
+        "reply_text": {"type": "string"},
+        "facts_used": {"type": "array", "items": {"type": "string"}},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "requires_user_input": {"type": "boolean"},
+        "reason": {"type": "string"},
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": list(properties),
+    }
+
+
+def _normalize_chat_completion(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        raise AppError(status_code=502, error_category="INVALID_LLM_RESPONSE", error_message="智能执行器回复结构无效。")
+    decision = str(result.get("decision") or "")
+    if decision not in {"reply", "manual", "ignore"}:
+        raise AppError(status_code=502, error_category="INVALID_LLM_RESPONSE", error_message="智能执行器回复决定无效。")
+    text = str(result.get("reply_text") or "").strip()
+    if decision == "reply" and not text:
+        raise AppError(status_code=502, error_category="INVALID_LLM_RESPONSE", error_message="智能执行器返回了空回复。")
+    facts_used = result.get("facts_used") if isinstance(result.get("facts_used"), list) else []
+    warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+    return {
+        "decision": decision,
+        "reply_text": text[:5000],
+        "facts_used": [str(item)[:300] for item in facts_used if str(item).strip()][:30],
+        "warnings": [str(item)[:80] for item in warnings if str(item).strip()][:20],
+        "requires_user_input": bool(result.get("requires_user_input")),
+        "reason": str(result.get("reason") or "")[:500],
+    }
+
+
+def _chat_completion(
+    config: AppConfig,
+    context: dict[str, Any],
+    instruction: str,
+    action_kind: str = "reply",
+) -> tuple[dict[str, Any], str]:
+    action_instruction = {
+        "reply": "回复招聘方最新消息",
+        "followup": "礼貌跟进当前求职进展",
+        "ask_rejection_reason": "礼貌询问本次未继续推进的具体原因",
+    }.get(action_kind, "回复招聘方最新消息")
+    system_prompt = (
+        "你是求职者的沟通助手。只根据给定的本地对话、岗位信息、已确认候选人上下文和求职意向，"
+        "生成一条简洁、自然、诚实的中文回复。不得虚构经历、薪资、到岗时间或联系方式；"
+        "资料不足时应明确表示需要确认。只输出 JSON 对象，字段为 decision、reply_text、facts_used、"
+        "warnings、requires_user_input、reason；decision 只能是 reply、manual、ignore。"
+        "主动跟进时结合岗位匹配结论、已确认候选人优势和等待天数，只使用上下文中可证实的信息；"
+        "简历已提交或已查看后，优先询问匹配情况、评估进度或需要补充的材料。"
+        f"本次目标：{action_instruction}。"
+    )
+    user_prompt = json.dumps(
+        {"context": context, "temporary_instruction": instruction},
+        ensure_ascii=False,
+    )
+    executor = (config.reasoning_executor or "llm").strip().lower()
+    # 草稿生成跟随统一智能执行器配置，让 Codex 模式直接复用本机已登录的执行器。
+    if executor == "codex-cli":
+        codex_result = run_codex_exec(
+            cli_path=config.codex_cli_path,
+            prompt=f"{system_prompt}\n输入：{user_prompt}",
+            output_schema=_chat_reply_json_schema(),
+            model=config.codex_model,
+            reasoning_effort=config.codex_reasoning_effort,
+            timeout_seconds=config.codex_timeout_seconds,
+        )
+        return _normalize_chat_completion(codex_result.output), str(
+            codex_result.model or config.codex_model or "codex-cli"
+        )
+    if executor != "llm":
+        raise AppError(
+            status_code=422,
+            error_category="UNSUPPORTED_REASONING_EXECUTOR",
+            error_message=f"不支持的智能执行器：{config.reasoning_executor}",
+        )
     if not config.llm_provider or not config.llm_model:
         raise AppError(
             status_code=422,
@@ -1542,28 +1671,27 @@ def _chat_completion(config: AppConfig, context: dict[str, Any], instruction: st
             break
     if provider == "stub-llm":
         subject = latest[:60] or "您的问题"
+        if action_kind == "followup":
+            reply_text = "您好，想礼貌跟进一下目前的评估进展。如需我补充材料，请随时告诉我，谢谢。"
+            reason = "根据当前等待状态生成礼貌跟进"
+        elif action_kind == "ask_rejection_reason":
+            reply_text = "感谢您的回复。方便的话，想请教一下这次未能继续推进的主要原因，便于我后续改进，谢谢。"
+            reason = "根据已拒绝但原因未知的状态生成询问草稿"
+        else:
+            reply_text = f"您好，感谢您的消息。关于“{subject}”，我确认一下相关情况后回复您。"
+            reason = "根据最新招聘方消息生成保守回复"
         return {
             "decision": "reply",
-            "reply_text": f"您好，感谢您的消息。关于“{subject}”，我确认一下相关情况后回复您。",
+            "reply_text": reply_text,
             "facts_used": [],
             "warnings": [],
             "requires_user_input": False,
-            "reason": "根据最新招聘方消息生成保守回复",
+            "reason": reason,
         }, model
     if provider not in {"openai", "openai-compatible"}:
         raise AppError(status_code=422, error_category="UNSUPPORTED_LLM_PROVIDER", error_message=f"不支持的 LLM 提供方：{config.llm_provider}")
     if not config.llm_api_key:
         raise AppError(status_code=422, error_category="LLM_NOT_CONFIGURED", error_message="请先配置 LLM API Key。")
-    system_prompt = (
-        "你是求职者的沟通助手。只根据给定的本地对话、岗位信息、已确认候选人上下文和求职意向，"
-        "生成一条简洁、自然、诚实的中文回复。不得虚构经历、薪资、到岗时间或联系方式；"
-        "资料不足时应明确表示需要确认。只输出 JSON 对象，字段为 decision、reply_text、facts_used、"
-        "warnings、requires_user_input、reason；decision 只能是 reply、manual、ignore。"
-    )
-    user_prompt = json.dumps(
-        {"context": context, "temporary_instruction": instruction},
-        ensure_ascii=False,
-    )
     payload = _post_json(
         url=f"{(config.llm_base_url or 'https://api.openai.com/v1').rstrip('/')}/chat/completions",
         api_key=config.llm_api_key,
@@ -1587,24 +1715,7 @@ def _chat_completion(config: AppConfig, context: dict[str, Any], instruction: st
         result = json.loads(raw_text)
     except (TypeError, json.JSONDecodeError):
         raise AppError(status_code=502, error_category="INVALID_LLM_RESPONSE", error_message="LLM 未返回有效的结构化回复。")
-    if not isinstance(result, dict):
-        raise AppError(status_code=502, error_category="INVALID_LLM_RESPONSE", error_message="LLM 回复结构无效。")
-    decision = str(result.get("decision") or "")
-    if decision not in {"reply", "manual", "ignore"}:
-        raise AppError(status_code=502, error_category="INVALID_LLM_RESPONSE", error_message="LLM 回复决定无效。")
-    text = str(result.get("reply_text") or "").strip()
-    if decision == "reply" and not text:
-        raise AppError(status_code=502, error_category="INVALID_LLM_RESPONSE", error_message="LLM 返回了空回复。")
-    facts_used = result.get("facts_used") if isinstance(result.get("facts_used"), list) else []
-    warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
-    return {
-        "decision": decision,
-        "reply_text": text[:5000],
-        "facts_used": [str(item)[:300] for item in facts_used if str(item).strip()][:30],
-        "warnings": [str(item)[:80] for item in warnings if str(item).strip()][:20],
-        "requires_user_input": bool(result.get("requires_user_input")),
-        "reason": str(result.get("reason") or "")[:500],
-    }, model
+    return _normalize_chat_completion(result), model
 
 
 def generate_reply(
@@ -1613,14 +1724,22 @@ def generate_reply(
     session_id: str,
     *,
     instruction: str = "",
+    action_kind: str = "reply",
     regenerate: bool = False,
 ) -> dict[str, Any]:
+    if action_kind not in {"reply", "followup", "ask_rejection_reason"}:
+        raise AppError(422, "CHAT_ACTION_KIND_INVALID", "消息草稿类型无效。")
     with db.connect() as connection:
         session = _session_or_404(connection, session_id)
-        if session["status"] not in {"active", "unsupported"}:
-            raise AppError(status_code=409, error_category="CHAT_SESSION_TAKEN_OVER", error_message="该会话已由人工接管，不能生成自动回复。")
-        if not session["latest_inbound_message_id"]:
-            raise AppError(status_code=409, error_category="NO_INBOUND_MESSAGE", error_message="会话没有可回复的新消息。")
+        if session["status"] not in {"active", "unsupported", "human_takeover", "paused"}:
+            raise AppError(status_code=409, error_category="CHAT_SESSION_UNAVAILABLE", error_message="当前会话状态不支持生成消息草稿。")
+        based_on_message_id = (
+            session["latest_inbound_message_id"]
+            if action_kind == "reply"
+            else session["latest_message_id"]
+        )
+        if not based_on_message_id:
+            raise AppError(status_code=409, error_category="NO_CHAT_MESSAGE", error_message="会话没有可作为草稿依据的消息。")
         current = connection.execute(
             """
             SELECT * FROM fj_chat_reply_tasks WHERE session_id = ?
@@ -1636,7 +1755,14 @@ def generate_reply(
                 error_category="CHAT_REPLY_GENERATING",
                 error_message="该会话正在生成回复，请稍后查看结果。",
             )
-        if current is None or regenerate:
+        replace_current = (
+            current is None
+            or regenerate
+            or str(current["action_kind"] or "reply") != action_kind
+            or str(current["based_on_message_id"]) != str(based_on_message_id)
+            or int(current["based_on_session_version"]) != int(session["session_version"])
+        )
+        if replace_current:
             if current is not None:
                 connection.execute(
                     "UPDATE fj_chat_reply_tasks SET status = 'stale', cancelled_at = ?, updated_at = ? WHERE id = ?",
@@ -1646,18 +1772,19 @@ def generate_reply(
             connection.execute(
                 """
                 INSERT INTO fj_chat_reply_tasks (
-                  id, session_id, trigger_source, status, based_on_message_id,
+                  id, session_id, trigger_source, action_kind, status, based_on_message_id,
                   based_on_session_version, generation_due_at, input_message_ids_json,
                   created_at, updated_at
-                ) VALUES (?, ?, 'manual', 'generating', ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, 'manual', ?, 'generating', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
                     session_id,
-                    session["latest_inbound_message_id"],
+                    action_kind,
+                    based_on_message_id,
                     session["session_version"],
                     now,
-                    json.dumps([session["latest_inbound_message_id"]], ensure_ascii=False),
+                    json.dumps([based_on_message_id], ensure_ascii=False),
                     now,
                     now,
                 ),
@@ -1665,8 +1792,8 @@ def generate_reply(
         else:
             task_id = str(current["id"])
             connection.execute(
-                "UPDATE fj_chat_reply_tasks SET status = 'generating', generation_error = NULL, updated_at = ? WHERE id = ?",
-                (now, task_id),
+                "UPDATE fj_chat_reply_tasks SET status = 'generating', action_kind = ?, generation_error = NULL, updated_at = ? WHERE id = ?",
+                (action_kind, now, task_id),
             )
         context = _build_context(db, connection, session)
         candidate_context = context["candidate_profile_context"]
@@ -1684,7 +1811,7 @@ def generate_reply(
             ),
         )
     try:
-        completion, model = _chat_completion(config, context, instruction)
+        completion, model = _chat_completion(config, context, instruction, action_kind)
     except Exception as exc:
         with db.connect() as connection:
             connection.execute(
@@ -1696,7 +1823,11 @@ def generate_reply(
         task = _task_or_404(connection, task_id)
         session = _session_or_404(connection, session_id)
         if (
-            task["based_on_message_id"] != session["latest_inbound_message_id"]
+            task["based_on_message_id"] != (
+                session["latest_inbound_message_id"]
+                if task["action_kind"] == "reply"
+                else session["latest_message_id"]
+            )
             or int(task["based_on_session_version"]) != int(session["session_version"])
         ):
             connection.execute(
@@ -1837,10 +1968,15 @@ def confirm_reply(db: Database, task_id: str, payload: dict[str, Any]) -> dict[s
             )
         expected_message = payload["based_on_message_id"]
         expected_version = int(payload["based_on_session_version"])
+        current_basis_message = (
+            session["latest_inbound_message_id"]
+            if task["action_kind"] == "reply"
+            else session["latest_message_id"]
+        )
         if (
             expected_message != task["based_on_message_id"]
             or expected_version != int(task["based_on_session_version"])
-            or expected_message != session["latest_inbound_message_id"]
+            or expected_message != current_basis_message
             or expected_version != int(session["session_version"])
         ):
             connection.execute(

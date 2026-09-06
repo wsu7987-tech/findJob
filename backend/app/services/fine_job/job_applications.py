@@ -12,7 +12,9 @@ JobApplicationStatus = Literal[
     "pending_greeting",
     "pending_application",
     "communicating",
+    "offer",
     "rejected",
+    "closed",
 ]
 
 
@@ -55,24 +57,29 @@ def set_job_application_status(
                 source_action_id, evidence_level, event_at, note.strip(), now, now,
             ),
         )
-        if status == "rejected":
+        if status in {"offer", "rejected", "closed"}:
             application = connection.execute(
                 "SELECT id FROM fj_job_applications WHERE job_id = ?",
                 (resolved_job_id,),
             ).fetchone()
+            event_type = {
+                "offer": "offer_received",
+                "rejected": "rejected",
+                "closed": "job_closed",
+            }[status]
             append_job_activity_with_connection(
                 connection,
                 job_id=resolved_job_id,
                 company_id=str(job["company_id"]) if job["company_id"] else None,
-                event_type="rejected",
+                event_type=event_type,
                 occurred_at=event_at,
                 source="manual" if source == "manual" else source,
                 source_ref_type="job_application",
                 source_ref_id=str(application["id"]),
                 confidence=1.0,
                 evidence_level="direct" if evidence_level == "confirmed" else "strong_inferred",
-                payload={"legacy_status": "rejected"},
-                dedupe_key=f"job_application:{application['id']}:rejected",
+                payload={"legacy_status": status, "waiting_on": "none"},
+                dedupe_key=f"job_application:{application['id']}:{event_type}",
             )
     if status in {"pending_application", "communicating"}:
         from backend.app.services.fine_job.filter_exclusions import record_job_event

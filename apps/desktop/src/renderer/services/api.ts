@@ -47,6 +47,7 @@
   FineJobBossHistoryJob,
   FineJobBossHistoryResponse,
   FineJobJobJourney,
+  FineJobJobProgress,
   FineJobBossSearchPageRequest,
   FineJobBossSearchPageResponse,
   FineJobReviewBatchResponse,
@@ -62,6 +63,7 @@
   FineJobBossNavigationTask,
   FineJobOperationsDashboard,
   FineJobChatRuntime,
+  FineJobConversationInsight,
   FineJobChatRuntimeEnvelope,
   FineJobChatSessionDetail,
   FineJobChatSessionListEnvelope,
@@ -1037,6 +1039,7 @@ export const api = {
   async listFineJobChatSessions(params: {
     status?: string;
     account_uid?: string;
+    attention?: string;
     q?: string;
     limit?: number;
     offset?: number;
@@ -1044,6 +1047,7 @@ export const api = {
     const query = new URLSearchParams();
     if (params.status) query.set("status", params.status);
     if (params.account_uid) query.set("account_uid", params.account_uid);
+    if (params.attention) query.set("attention", params.attention);
     if (params.q) query.set("q", params.q);
     if (params.limit) query.set("limit", String(params.limit));
     if (params.offset) query.set("offset", String(params.offset));
@@ -1060,6 +1064,22 @@ export const api = {
       `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/history/refresh`,
       { method: "POST" }
     );
+  },
+  async getFineJobJobProgress(jobId: string, sessionId?: string) {
+    const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
+    return request<FineJobJobProgress | null>(
+      `/api/fine-job/jobs/${encodeURIComponent(jobId)}/progress${query}`
+    );
+  },
+  async analyzeFineJobChatProgress(sessionId: string) {
+    return request<{
+      insight: FineJobConversationInsight | null;
+      progress: FineJobJobProgress | null;
+      reply_task_created?: boolean;
+      auxiliary_warning?: string | null;
+    }>(`/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/analyze-progress`, {
+      method: "POST"
+    });
   },
   async linkFineJobReviewItemsChat(payload: {
     status: "pending" | "rejected" | "approved";
@@ -1171,7 +1191,7 @@ export const api = {
   },
   async setFineJobJobApplicationStatus(
     jobId: string,
-    status: "pending_greeting" | "pending_application" | "communicating" | "rejected" | null,
+    status: "pending_greeting" | "pending_application" | "communicating" | "offer" | "rejected" | "closed" | null,
     note = ""
   ) {
     return request(`/api/fine-job/companies/jobs/${encodeURIComponent(jobId)}/application-status`, {
@@ -1179,11 +1199,16 @@ export const api = {
       body: JSON.stringify({ status, note })
     });
   },
-  async generateFineJobChatReply(sessionId: string, instruction = "", regenerate = false) {
+  async generateFineJobChatReply(
+    sessionId: string,
+    instruction = "",
+    regenerate = false,
+    actionKind: "reply" | "followup" | "ask_rejection_reason" = "reply"
+  ) {
     const operation = regenerate ? "regenerate" : "generate";
     return request<FineJobChatReplyEnvelope>(
       `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/${operation}`,
-      { method: "POST", body: JSON.stringify({ instruction }) }
+      { method: "POST", body: JSON.stringify({ instruction, action_kind: actionKind }) }
     );
   },
   async setFineJobChatSessionStatus(

@@ -1111,7 +1111,10 @@ CREATE TABLE IF NOT EXISTS fj_job_applications (
   updated_at TEXT NOT NULL,
   FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
   FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE SET NULL,
-  CHECK (status IS NULL OR status IN ('pending_greeting', 'pending_application', 'communicating', 'rejected')),
+  CHECK (status IS NULL OR status IN (
+    'pending_greeting', 'pending_application', 'communicating',
+    'offer', 'rejected', 'closed'
+  )),
   CHECK (source IN ('boss_action', 'manual', 'mcp', 'migration')),
   CHECK (evidence_level IN ('confirmed', 'inferred'))
 );
@@ -1396,6 +1399,8 @@ CREATE TABLE IF NOT EXISTS fj_chat_reply_tasks (
   id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,
   trigger_source TEXT NOT NULL,
+  action_kind TEXT NOT NULL DEFAULT 'reply',
+  insight_id TEXT,
   status TEXT NOT NULL DEFAULT 'pending_generation',
   based_on_message_id TEXT NOT NULL,
   based_on_session_version INTEGER NOT NULL,
@@ -1418,7 +1423,9 @@ CREATE TABLE IF NOT EXISTS fj_chat_reply_tasks (
   updated_at TEXT NOT NULL,
   FOREIGN KEY (session_id) REFERENCES fj_chat_sessions(id) ON DELETE CASCADE,
   FOREIGN KEY (based_on_message_id) REFERENCES fj_chat_messages(id) ON DELETE CASCADE,
+  FOREIGN KEY (insight_id) REFERENCES fj_conversation_insights(id) ON DELETE SET NULL,
   CHECK (trigger_source IN ('realtime', 'interval', 'manual')),
+  CHECK (action_kind IN ('reply', 'followup', 'ask_rejection_reason')),
   CHECK (status IN ('pending_generation', 'generating', 'awaiting_review', 'confirmed', 'cancelled', 'stale', 'failed'))
 );
 
@@ -1497,11 +1504,13 @@ CREATE TABLE IF NOT EXISTS fj_job_activity_events (
   FOREIGN KEY (chat_session_id) REFERENCES fj_chat_sessions(id) ON DELETE SET NULL,
   CHECK (event_type IN (
     'job_discovered', 'job_shortlisted',
+    'candidate_initiated_contact', 'recruiter_initiated_contact', 'conversation_state_analyzed',
     'greeting_requested', 'greeting_sent', 'greeting_failed',
     'recruiter_replied', 'candidate_replied',
-    'resume_requested', 'resume_submitted',
+    'resume_requested', 'resume_submitted', 'resume_accepted', 'resume_viewed',
+    'under_review',
     'interview_intent_detected', 'interview_invited', 'interview_scheduled',
-    'rejected', 'followup_recommended', 'no_response_detected',
+    'rejected', 'job_closed', 'followup_recommended', 'no_response_detected',
     'offer_received', 'conversation_closed', 'manual_stage_changed'
   )),
   CHECK (confidence >= 0 AND confidence <= 1),
@@ -1521,6 +1530,12 @@ CREATE TABLE IF NOT EXISTS fj_job_pipeline_snapshots (
   stage_source TEXT NOT NULL,
   stage_event_id TEXT NOT NULL,
   stage_updated_at TEXT NOT NULL,
+  waiting_on TEXT NOT NULL DEFAULT 'unknown',
+  waiting_since_at TEXT,
+  contact_origin TEXT NOT NULL DEFAULT 'unknown',
+  rejection_reason_source TEXT NOT NULL DEFAULT 'unknown',
+  rejection_reason_category TEXT NOT NULL DEFAULT 'unknown',
+  rejection_reason_summary TEXT NOT NULL DEFAULT '',
   projection_version INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -1529,8 +1544,20 @@ CREATE TABLE IF NOT EXISTS fj_job_pipeline_snapshots (
   FOREIGN KEY (stage_event_id) REFERENCES fj_job_activity_events(id) ON DELETE CASCADE,
   CHECK (stage IN (
     'discovered', 'shortlisted', 'greeted', 'communicating',
-    'resume_requested', 'resume_submitted', 'interviewing',
+    'resume_requested', 'resume_submitted', 'resume_viewed', 'under_review',
+    'interview_scheduling', 'interviewing',
     'offer', 'rejected', 'closed'
+  )),
+  CHECK (waiting_on IN ('candidate', 'recruiter', 'none', 'unknown')),
+  CHECK (contact_origin IN (
+    'finejob_auto', 'candidate_initiated', 'recruiter_initiated',
+    'external_candidate_initiated', 'unknown'
+  )),
+  CHECK (rejection_reason_source IN ('recruiter_explicit', 'ai_inferred', 'unknown')),
+  CHECK (rejection_reason_category IN (
+    'experience', 'education', 'skills', 'industry_background', 'salary',
+    'location', 'availability', 'position_filled', 'headcount_closed', 'fit',
+    'other', 'unknown'
   ))
 );
 
@@ -1556,7 +1583,7 @@ CREATE TABLE IF NOT EXISTS fj_execution_evidence (
   CHECK (evidence_type IN (
     'outbound_message_observed', 'inbound_reply_observed',
     'conversation_created', 'greeting_state_changed',
-    'page_state_confirmed', 'protocol_acknowledged'
+    'page_state_confirmed', 'protocol_acknowledged', 'rejection_observed'
   )),
   CHECK (confidence >= 0 AND confidence <= 1),
   CHECK (evidence_level IN ('direct', 'strong_inferred', 'weak_inferred'))
@@ -1588,7 +1615,7 @@ CREATE INDEX IF NOT EXISTS idx_fj_execution_reconciliation_action
 
 CREATE TABLE IF NOT EXISTS fj_conversation_insights (
   id TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL,
+  run_id TEXT,
   session_id TEXT NOT NULL,
   job_id TEXT,
   status TEXT NOT NULL DEFAULT 'analyzed',
@@ -1607,6 +1634,9 @@ CREATE TABLE IF NOT EXISTS fj_conversation_insights (
 
 CREATE INDEX IF NOT EXISTS idx_fj_conversation_insights_session_time
   ON fj_conversation_insights(session_id, updated_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_conversation_insights_single_current
+  ON fj_conversation_insights(session_id, analysis_version)
+  WHERE run_id IS NULL;
 
 CREATE TABLE IF NOT EXISTS fj_chat_attention_states (
   session_id TEXT PRIMARY KEY,
@@ -1617,6 +1647,9 @@ CREATE TABLE IF NOT EXISTS fj_chat_attention_states (
   display_label TEXT NOT NULL DEFAULT '待判断',
   recommended_action TEXT NOT NULL DEFAULT 'no_further_action',
   reason TEXT NOT NULL DEFAULT '',
+  decision TEXT NOT NULL DEFAULT 'wait',
+  reason_code TEXT NOT NULL DEFAULT '',
+  recommended_at TEXT,
   priority INTEGER NOT NULL DEFAULT 0,
   evidence_message_ids_json TEXT NOT NULL DEFAULT '[]',
   source TEXT NOT NULL DEFAULT 'analysis',
@@ -1634,7 +1667,8 @@ CREATE TABLE IF NOT EXISTS fj_chat_attention_states (
     'reply_recruiter', 'send_resume', 'follow_up', 'ask_rejection_reason',
     'confirm_interview', 'provide_information', 'wait_for_recruiter',
     'no_further_action'
-  ))
+  )),
+  CHECK (decision IN ('follow', 'wait', 'do_not_follow'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_fj_chat_attention_states_status
@@ -2036,6 +2070,7 @@ class Database:
             self._ensure_resume_analysis_v3_schema(connection)
             self._ensure_job_hunt_refresh_schema(connection)
             self._ensure_job_hunt_analysis_schema(connection)
+            self._ensure_job_progress_schema(connection)
             # 兼容升级只从可靠旧事实追加事件，并按完整事件流重放 shadow Pipeline。
             from backend.app.services.fine_job.job_activity import migrate_legacy_job_activity
             from backend.app.services.fine_job.execution_reconciliation import (
@@ -2142,7 +2177,7 @@ class Database:
             """
             CREATE TABLE IF NOT EXISTS fj_conversation_insights (
               id TEXT PRIMARY KEY,
-              run_id TEXT NOT NULL,
+              run_id TEXT,
               session_id TEXT NOT NULL,
               job_id TEXT,
               status TEXT NOT NULL DEFAULT 'analyzed',
@@ -2161,6 +2196,9 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_fj_conversation_insights_session_time
               ON fj_conversation_insights(session_id, updated_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_conversation_insights_single_current
+              ON fj_conversation_insights(session_id, analysis_version)
+              WHERE run_id IS NULL;
 
             CREATE TABLE IF NOT EXISTS fj_chat_attention_states (
               session_id TEXT PRIMARY KEY,
@@ -2171,6 +2209,9 @@ class Database:
               display_label TEXT NOT NULL DEFAULT '待判断',
               recommended_action TEXT NOT NULL DEFAULT 'no_further_action',
               reason TEXT NOT NULL DEFAULT '',
+              decision TEXT NOT NULL DEFAULT 'wait',
+              reason_code TEXT NOT NULL DEFAULT '',
+              recommended_at TEXT,
               priority INTEGER NOT NULL DEFAULT 0,
               evidence_message_ids_json TEXT NOT NULL DEFAULT '[]',
               source TEXT NOT NULL DEFAULT 'analysis',
@@ -2188,7 +2229,8 @@ class Database:
                 'reply_recruiter', 'send_resume', 'follow_up', 'ask_rejection_reason',
                 'confirm_interview', 'provide_information', 'wait_for_recruiter',
                 'no_further_action'
-              ))
+              )),
+              CHECK (decision IN ('follow', 'wait', 'do_not_follow'))
             );
 
             CREATE INDEX IF NOT EXISTS idx_fj_chat_attention_states_status
@@ -2231,6 +2273,253 @@ class Database:
             );
             """
         )
+
+        attention_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(fj_chat_attention_states)")
+        }
+        for column, definition in (
+            ("decision", "TEXT NOT NULL DEFAULT 'wait'"),
+            ("reason_code", "TEXT NOT NULL DEFAULT ''"),
+            ("recommended_at", "TEXT"),
+        ):
+            if column not in attention_columns:
+                connection.execute(
+                    f"ALTER TABLE fj_chat_attention_states ADD COLUMN {column} {definition}"
+                )
+
+        reply_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(fj_chat_reply_tasks)")
+        }
+        if "action_kind" not in reply_columns:
+            connection.execute(
+                "ALTER TABLE fj_chat_reply_tasks ADD COLUMN action_kind TEXT NOT NULL DEFAULT 'reply'"
+            )
+        if "insight_id" not in reply_columns:
+            connection.execute("ALTER TABLE fj_chat_reply_tasks ADD COLUMN insight_id TEXT")
+
+    def _ensure_job_progress_schema(self, connection: sqlite3.Connection) -> None:
+        """升级正式求职进展表，并保留已有事件、终态与分析结果。"""
+        table_sql = {
+            name: str(row["sql"] or "") if row else ""
+            for name in (
+                "fj_job_applications",
+                "fj_job_activity_events",
+                "fj_job_pipeline_snapshots",
+                "fj_execution_evidence",
+                "fj_conversation_insights",
+            )
+            for row in [connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (name,),
+            ).fetchone()]
+        }
+        pipeline_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(fj_job_pipeline_snapshots)")
+        }
+        required_activity_types = (
+            "candidate_initiated_contact",
+            "recruiter_initiated_contact",
+            "conversation_state_analyzed",
+            "resume_accepted",
+            "resume_viewed",
+            "under_review",
+            "job_closed",
+        )
+        rebuild = {
+            "applications": "'offer'" not in table_sql["fj_job_applications"],
+            # 部分升级过的数据库可能已有个别新事件，必须逐项确认正式事件集合。
+            "activities": any(
+                f"'{event_type}'" not in table_sql["fj_job_activity_events"]
+                for event_type in required_activity_types
+            ),
+            "pipeline": "waiting_on" not in pipeline_columns,
+            "evidence": "'rejection_observed'" not in table_sql["fj_execution_evidence"],
+            "insights": "run_id TEXT NOT NULL" in table_sql["fj_conversation_insights"],
+        }
+        if not any(rebuild.values()):
+            return
+
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            if rebuild["applications"]:
+                connection.executescript(
+                    """
+                    CREATE TABLE fj_job_applications_next (
+                      id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE, company_id TEXT,
+                      status TEXT DEFAULT 'pending_greeting', source TEXT NOT NULL DEFAULT 'manual',
+                      source_action_id TEXT, evidence_level TEXT NOT NULL DEFAULT 'confirmed',
+                      applied_at TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
+                      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                      FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+                      FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE SET NULL,
+                      CHECK (status IS NULL OR status IN (
+                        'pending_greeting', 'pending_application', 'communicating',
+                        'offer', 'rejected', 'closed'
+                      )),
+                      CHECK (source IN ('boss_action', 'manual', 'mcp', 'migration')),
+                      CHECK (evidence_level IN ('confirmed', 'inferred'))
+                    );
+                    INSERT INTO fj_job_applications_next
+                    SELECT * FROM fj_job_applications;
+                    DROP TABLE fj_job_applications;
+                    ALTER TABLE fj_job_applications_next RENAME TO fj_job_applications;
+                    CREATE INDEX idx_fj_job_applications_status_time
+                      ON fj_job_applications(status, applied_at DESC);
+                    CREATE INDEX idx_fj_job_applications_company
+                      ON fj_job_applications(company_id, status, applied_at DESC);
+                    """
+                )
+
+            if rebuild["activities"]:
+                connection.executescript(
+                    """
+                    CREATE TABLE fj_job_activity_events_next (
+                      id TEXT PRIMARY KEY, job_id TEXT NOT NULL, company_id TEXT,
+                      chat_session_id TEXT, event_type TEXT NOT NULL, occurred_at TEXT NOT NULL,
+                      source TEXT NOT NULL, source_ref_type TEXT NOT NULL,
+                      source_ref_id TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 1,
+                      evidence_level TEXT NOT NULL DEFAULT 'direct',
+                      payload_json TEXT NOT NULL DEFAULT '{}', dedupe_key TEXT NOT NULL UNIQUE,
+                      created_at TEXT NOT NULL,
+                      FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+                      FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE SET NULL,
+                      FOREIGN KEY (chat_session_id) REFERENCES fj_chat_sessions(id) ON DELETE SET NULL,
+                      CHECK (event_type IN (
+                        'job_discovered', 'job_shortlisted',
+                        'candidate_initiated_contact', 'recruiter_initiated_contact',
+                        'conversation_state_analyzed',
+                        'greeting_requested', 'greeting_sent', 'greeting_failed',
+                        'recruiter_replied', 'candidate_replied',
+                        'resume_requested', 'resume_submitted', 'resume_accepted', 'resume_viewed',
+                        'under_review', 'interview_intent_detected', 'interview_invited',
+                        'interview_scheduled', 'rejected', 'job_closed',
+                        'followup_recommended', 'no_response_detected', 'offer_received',
+                        'conversation_closed', 'manual_stage_changed'
+                      )),
+                      CHECK (confidence >= 0 AND confidence <= 1),
+                      CHECK (evidence_level IN ('direct', 'strong_inferred', 'weak_inferred'))
+                    );
+                    INSERT INTO fj_job_activity_events_next
+                    SELECT * FROM fj_job_activity_events;
+                    DROP TABLE fj_job_activity_events;
+                    ALTER TABLE fj_job_activity_events_next RENAME TO fj_job_activity_events;
+                    CREATE INDEX idx_fj_job_activity_job_time
+                      ON fj_job_activity_events(job_id, occurred_at DESC, created_at DESC);
+                    CREATE INDEX idx_fj_job_activity_type_time
+                      ON fj_job_activity_events(event_type, occurred_at DESC);
+                    """
+                )
+
+            if rebuild["pipeline"]:
+                connection.executescript(
+                    """
+                    CREATE TABLE fj_job_pipeline_snapshots_next (
+                      job_id TEXT PRIMARY KEY, company_id TEXT, stage TEXT NOT NULL,
+                      stage_source TEXT NOT NULL, stage_event_id TEXT NOT NULL,
+                      stage_updated_at TEXT NOT NULL,
+                      waiting_on TEXT NOT NULL DEFAULT 'unknown', waiting_since_at TEXT,
+                      contact_origin TEXT NOT NULL DEFAULT 'unknown',
+                      rejection_reason_source TEXT NOT NULL DEFAULT 'unknown',
+                      rejection_reason_category TEXT NOT NULL DEFAULT 'unknown',
+                      rejection_reason_summary TEXT NOT NULL DEFAULT '',
+                      projection_version INTEGER NOT NULL DEFAULT 2,
+                      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                      FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+                      FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE SET NULL,
+                      FOREIGN KEY (stage_event_id) REFERENCES fj_job_activity_events(id) ON DELETE CASCADE,
+                      CHECK (stage IN (
+                        'discovered', 'shortlisted', 'greeted', 'communicating',
+                        'resume_requested', 'resume_submitted', 'resume_viewed', 'under_review',
+                        'interview_scheduling', 'interviewing', 'offer', 'rejected', 'closed'
+                      )),
+                      CHECK (waiting_on IN ('candidate', 'recruiter', 'none', 'unknown')),
+                      CHECK (contact_origin IN (
+                        'finejob_auto', 'candidate_initiated', 'recruiter_initiated',
+                        'external_candidate_initiated', 'unknown'
+                      )),
+                      CHECK (rejection_reason_source IN ('recruiter_explicit', 'ai_inferred', 'unknown')),
+                      CHECK (rejection_reason_category IN (
+                        'experience', 'education', 'skills', 'industry_background', 'salary',
+                        'location', 'availability', 'position_filled', 'headcount_closed',
+                        'fit', 'other', 'unknown'
+                      ))
+                    );
+                    INSERT INTO fj_job_pipeline_snapshots_next (
+                      job_id, company_id, stage, stage_source, stage_event_id,
+                      stage_updated_at, created_at, updated_at
+                    )
+                    SELECT job_id, company_id, stage, stage_source, stage_event_id,
+                           stage_updated_at, created_at, updated_at
+                    FROM fj_job_pipeline_snapshots;
+                    DROP TABLE fj_job_pipeline_snapshots;
+                    ALTER TABLE fj_job_pipeline_snapshots_next RENAME TO fj_job_pipeline_snapshots;
+                    CREATE INDEX idx_fj_pipeline_stage_time
+                      ON fj_job_pipeline_snapshots(stage, stage_updated_at DESC);
+                    """
+                )
+
+            if rebuild["evidence"]:
+                connection.executescript(
+                    """
+                    CREATE TABLE fj_execution_evidence_next (
+                      id TEXT PRIMARY KEY, action_ref_type TEXT NOT NULL,
+                      action_ref_id TEXT NOT NULL, evidence_type TEXT NOT NULL,
+                      source TEXT NOT NULL, source_ref_type TEXT NOT NULL,
+                      source_ref_id TEXT NOT NULL, observed_at TEXT NOT NULL,
+                      confidence REAL NOT NULL DEFAULT 1, evidence_level TEXT NOT NULL,
+                      payload_json TEXT NOT NULL DEFAULT '{}', dedupe_key TEXT NOT NULL UNIQUE,
+                      created_at TEXT NOT NULL,
+                      CHECK (action_ref_type IN ('automation_action', 'chat_send_action')),
+                      CHECK (evidence_type IN (
+                        'outbound_message_observed', 'inbound_reply_observed',
+                        'conversation_created', 'greeting_state_changed',
+                        'page_state_confirmed', 'protocol_acknowledged', 'rejection_observed'
+                      )),
+                      CHECK (confidence >= 0 AND confidence <= 1),
+                      CHECK (evidence_level IN ('direct', 'strong_inferred', 'weak_inferred'))
+                    );
+                    INSERT INTO fj_execution_evidence_next
+                    SELECT * FROM fj_execution_evidence;
+                    DROP TABLE fj_execution_evidence;
+                    ALTER TABLE fj_execution_evidence_next RENAME TO fj_execution_evidence;
+                    CREATE INDEX idx_fj_execution_evidence_action
+                      ON fj_execution_evidence(action_ref_type, action_ref_id, observed_at DESC);
+                    """
+                )
+
+            if rebuild["insights"]:
+                connection.executescript(
+                    """
+                    CREATE TABLE fj_conversation_insights_next (
+                      id TEXT PRIMARY KEY, run_id TEXT, session_id TEXT NOT NULL, job_id TEXT,
+                      status TEXT NOT NULL DEFAULT 'analyzed', insight_json TEXT NOT NULL DEFAULT '{}',
+                      model TEXT NOT NULL DEFAULT '', prompt_version TEXT NOT NULL DEFAULT '',
+                      analysis_version TEXT NOT NULL DEFAULT 'job-hunt-refresh-analysis-v1',
+                      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                      FOREIGN KEY (run_id) REFERENCES fj_job_hunt_refresh_runs(id) ON DELETE CASCADE,
+                      FOREIGN KEY (session_id) REFERENCES fj_chat_sessions(id) ON DELETE CASCADE,
+                      FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE SET NULL,
+                      UNIQUE (run_id, session_id, analysis_version),
+                      CHECK (status IN ('analyzed', 'skipped', 'failed'))
+                    );
+                    INSERT INTO fj_conversation_insights_next
+                    SELECT * FROM fj_conversation_insights;
+                    DROP TABLE fj_conversation_insights;
+                    ALTER TABLE fj_conversation_insights_next RENAME TO fj_conversation_insights;
+                    CREATE INDEX idx_fj_conversation_insights_session_time
+                      ON fj_conversation_insights(session_id, updated_at DESC);
+                    CREATE UNIQUE INDEX idx_fj_conversation_insights_single_current
+                      ON fj_conversation_insights(session_id, analysis_version)
+                      WHERE run_id IS NULL;
+                    """
+                )
+            connection.commit()
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -2516,7 +2805,8 @@ class Database:
               FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
               FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE SET NULL,
               CHECK (status IS NULL OR status IN (
-                'pending_greeting', 'pending_application', 'communicating', 'rejected'
+                'pending_greeting', 'pending_application', 'communicating',
+                'offer', 'rejected', 'closed'
               )),
               CHECK (source IN ('boss_action', 'manual', 'mcp', 'migration')),
               CHECK (evidence_level IN ('confirmed', 'inferred'))
@@ -2603,7 +2893,8 @@ class Database:
               FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
               FOREIGN KEY (company_id) REFERENCES fj_companies(id) ON DELETE SET NULL,
               CHECK (status IS NULL OR status IN (
-                'pending_greeting', 'pending_application', 'communicating', 'rejected'
+                'pending_greeting', 'pending_application', 'communicating',
+                'offer', 'rejected', 'closed'
               )),
               CHECK (source IN ('boss_action', 'manual', 'mcp', 'migration')),
               CHECK (evidence_level IN ('confirmed', 'inferred'))
@@ -2631,6 +2922,7 @@ class Database:
                   ) THEN 'communicating'
                   ELSE 'pending_application'
                 END
+                WHEN old.status IN ('offer', 'rejected', 'closed') THEN old.status
                 ELSE NULL
               END,
               old.source, old.source_action_id, old.evidence_level,

@@ -595,6 +595,14 @@ def get_capture_history_job(db: Database, history_job_id: str) -> dict[str, obje
                    (SELECT is_blacklisted FROM fj_companies c WHERE c.id = fj_boss_jobs.company_id) AS is_blacklisted,
                    (SELECT status FROM fj_job_applications a WHERE a.job_id = fj_boss_jobs.id) AS application_status,
                    (SELECT applied_at FROM fj_job_applications a WHERE a.job_id = fj_boss_jobs.id) AS applied_at,
+                   (SELECT stage FROM fj_job_pipeline_snapshots p WHERE p.job_id = fj_boss_jobs.id) AS pipeline_stage,
+                   (SELECT waiting_on FROM fj_job_pipeline_snapshots p WHERE p.job_id = fj_boss_jobs.id) AS waiting_on,
+                   (SELECT contact_origin FROM fj_job_pipeline_snapshots p WHERE p.job_id = fj_boss_jobs.id) AS contact_origin,
+                   (SELECT a.attention_status
+                    FROM fj_chat_attention_states a
+                    JOIN fj_chat_sessions s ON s.id = a.session_id
+                    WHERE s.job_id = fj_boss_jobs.id
+                    ORDER BY a.updated_at DESC LIMIT 1) AS attention_status,
                    company_scale, company_stage, company_industry, welfare,
                    salary, location, experience, degree,
                    boss_active_status, job_link, tags, skills, job_labels, search_keyword, payload_json,
@@ -689,6 +697,14 @@ def list_capture_history(
                    (SELECT is_blacklisted FROM fj_companies c WHERE c.id = fj_boss_jobs.company_id) AS is_blacklisted,
                    (SELECT status FROM fj_job_applications a WHERE a.job_id = fj_boss_jobs.id) AS application_status,
                    (SELECT applied_at FROM fj_job_applications a WHERE a.job_id = fj_boss_jobs.id) AS applied_at,
+                   (SELECT stage FROM fj_job_pipeline_snapshots p WHERE p.job_id = fj_boss_jobs.id) AS pipeline_stage,
+                   (SELECT waiting_on FROM fj_job_pipeline_snapshots p WHERE p.job_id = fj_boss_jobs.id) AS waiting_on,
+                   (SELECT contact_origin FROM fj_job_pipeline_snapshots p WHERE p.job_id = fj_boss_jobs.id) AS contact_origin,
+                   (SELECT a.attention_status
+                    FROM fj_chat_attention_states a
+                    JOIN fj_chat_sessions s ON s.id = a.session_id
+                    WHERE s.job_id = fj_boss_jobs.id
+                    ORDER BY a.updated_at DESC LIMIT 1) AS attention_status,
                    company_scale, salary,
                    company_stage, company_industry, welfare, location, experience,
                    degree, boss_active_status, job_link,
@@ -754,6 +770,10 @@ def _serialize_history_row(row) -> dict[str, object]:
         "is_blacklisted": bool(row["is_blacklisted"]),
         "application_status": row["application_status"],
         "applied_at": row["applied_at"],
+        "pipeline_stage": row["pipeline_stage"],
+        "waiting_on": row["waiting_on"] or "unknown",
+        "contact_origin": row["contact_origin"] or "unknown",
+        "attention_status": row["attention_status"] or "",
         "company_scale": row["company_scale"],
         "company_stage": row["company_stage"],
         "company_industry": row["company_industry"],

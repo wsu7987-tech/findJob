@@ -68,6 +68,12 @@ describe("fineJobBossChat store", () => {
     vi.spyOn(api, "getFineJobChatRuntime").mockResolvedValue({ runtime } as never);
     vi.spyOn(api, "listFineJobChatSessions").mockResolvedValue({ sessions: [session] } as never);
     vi.spyOn(api, "getFineJobChatSession").mockResolvedValue(detail() as never);
+    vi.spyOn(api, "getFineJobChatBatchSummary").mockResolvedValue({
+      pending_chat_count: 0,
+      pending_job_count: 0,
+      queued_chat_count: 0,
+      batch_limit: 100
+    } as never);
   });
 
   it("加载运行状态、会话列表和选中会话详情", async () => {

@@ -204,7 +204,8 @@ const refreshPrompt = (target: FineJobJobHuntRefreshRun) => {
   const base = [
     "使用 $finejob 执行 FineJob Job Hunt Refresh Run。",
     `任务：${JSON.stringify({ workflow: "job_hunt_refresh_v1", run_id: target.id })}`,
-    "先调用 finejob.get_job_hunt_refresh_run 读取持久化配置，并以工具返回的最新 Run 为准。"
+    "先调用 finejob.get_job_hunt_refresh_run 读取持久化配置，并以工具返回的最新 Run 为准。",
+    "聊天消息同步由后端 BossChatBatchManager 执行；只有 scope.counts.extra_jobs 大于 0 时才逐项补采额外岗位。"
   ];
   if (dataRefreshCompleted) {
     return [
@@ -295,6 +296,10 @@ const selectRun = async (runId: string) => {
 };
 
 const openCodex = () => router.push({ name: "fine-job-codex" });
+const openActionableChats = () => router.push({
+  name: "fine-job-chat",
+  query: { attention: "actionable" }
+});
 
 onMounted(async () => {
   try {
@@ -351,7 +356,7 @@ onBeforeUnmount(() => store.stopProgressReading());
         <el-checkbox :model-value="true" disabled>聊天列表范围在获取范围时确定</el-checkbox>
         <el-checkbox v-model="store.workflowOptions.refresh_chat_messages">更新聊天消息</el-checkbox>
         <el-checkbox v-model="store.workflowOptions.refresh_related_jobs">采集/刷新关联岗位与 JD</el-checkbox>
-        <el-checkbox v-model="store.workflowOptions.analyze_conversations">分析沟通状态</el-checkbox>
+        <el-checkbox v-model="store.workflowOptions.analyze_conversations">识别聊天事实并更新求职进展</el-checkbox>
         <el-checkbox v-model="store.workflowOptions.generate_missing_suggestions">生成缺失投递建议</el-checkbox>
         <el-checkbox v-model="store.workflowOptions.generate_reply_drafts">生成回复草稿</el-checkbox>
         <el-checkbox v-model="store.workflowOptions.generate_followup_recommendations">生成跟进建议</el-checkbox>
@@ -519,6 +524,18 @@ onBeforeUnmount(() => store.stopProgressReading());
           <p>{{ run.summary.activities_written ?? 0 }} 条进度记录</p>
           <p>{{ run.summary.missing_suggestions_generated ?? 0 }} / {{ run.summary.missing_suggestions_total ?? 0 }} 个缺失建议已生成</p>
           <p>{{ run.summary.reply_drafts_generated ?? 0 }} 条草稿</p>
+        </article>
+        <article v-if="hasAnalysisOutput(run)" class="progress-result">
+          <h4>求职进展</h4>
+          <p>更新进展：{{ run.summary.progress_updates ?? 0 }}</p>
+          <p>等招聘方回复：{{ run.summary.waiting_for_recruiter ?? 0 }}</p>
+          <p>等我回复：{{ run.summary.waiting_for_candidate ?? 0 }}</p>
+          <p>建议跟进：{{ run.summary.followup_recommended ?? 0 }}</p>
+          <p>简历已查看：{{ run.summary.resume_viewed ?? 0 }}</p>
+          <p>用人部门评估：{{ run.summary.under_review ?? 0 }}</p>
+          <p>新识别拒绝：{{ run.summary.rejections_detected ?? 0 }}</p>
+          <p>岗位关闭：{{ run.summary.jobs_closed ?? 0 }}</p>
+          <el-button type="primary" plain @click="openActionableChats">查看需要处理的岗位</el-button>
         </article>
       </div>
     </section>

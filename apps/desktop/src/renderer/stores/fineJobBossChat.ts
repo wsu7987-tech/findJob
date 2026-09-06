@@ -19,6 +19,7 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
   const searchQuery = ref("");
   const statusFilter = ref("");
   const accountFilter = ref("");
+  const attentionFilter = ref("");
   const nextOffset = ref<number | null>(null);
   const detail = ref<FineJobChatSessionDetail | null>(null);
   const detailCache = ref<Record<string, FineJobChatSessionDetail>>({});
@@ -66,6 +67,7 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     q: searchQuery.value.trim() || undefined,
     status: statusFilter.value || undefined,
     account_uid: accountFilter.value.trim() || undefined,
+    ...(attentionFilter.value ? { attention: attentionFilter.value } : {}),
     limit: 50,
     offset
   });
@@ -213,12 +215,24 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     return result;
   });
 
-  const generate = async (instruction: string, regenerate = false) => mutate(async () => {
+  const analyzeProgress = async () => mutate(async () => {
+    if (!selectedSessionId.value) throw new Error("请先选择聊天会话");
+    const result = await api.analyzeFineJobChatProgress(selectedSessionId.value);
+    await refreshSelected();
+    return result;
+  });
+
+  const generate = async (
+    instruction: string,
+    regenerate = false,
+    actionKind: "reply" | "followup" | "ask_rejection_reason" = "reply"
+  ) => mutate(async () => {
     if (!selectedSessionId.value) throw new Error("请先选择聊天会话");
     const result = await api.generateFineJobChatReply(
       selectedSessionId.value,
       instruction,
-      regenerate
+      regenerate,
+      actionKind
     );
     await refreshSelected();
     return result.reply_task;
@@ -295,6 +309,7 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     searchQuery,
     statusFilter,
     accountFilter,
+    attentionFilter,
     nextOffset,
     detail,
     detailCache,
@@ -319,6 +334,7 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     loadMoreHistory,
     updateJob,
     rejectJob,
+    analyzeProgress,
     generate,
     confirm,
     cancel,

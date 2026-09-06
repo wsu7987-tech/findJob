@@ -123,6 +123,7 @@ class BossChatEventBatchRequest(BaseModel):
 
 class BossChatGenerateRequest(BaseModel):
     instruction: str = Field(default="", max_length=2_000)
+    action_kind: Literal["reply", "followup", "ask_rejection_reason"] = "reply"
 
 
 class BossChatReplyEditRequest(BaseModel):

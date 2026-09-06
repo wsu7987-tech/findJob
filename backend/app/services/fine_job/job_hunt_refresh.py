@@ -989,7 +989,10 @@ def _reconcile_running_run(db: Database, run_id: str) -> None:
                 """
                 SELECT COUNT(*)
                 FROM fj_job_hunt_refresh_items
-                WHERE run_id = ? AND status IN ('pending', 'running')
+                WHERE run_id = ? AND (
+                  status IN ('pending', 'running')
+                  OR (status = 'failed' AND retryable = 1)
+                )
                 """,
                 (run_id,),
             ).fetchone()[0]
@@ -1009,51 +1012,13 @@ def _reconcile_running_run(db: Database, run_id: str) -> None:
                 (next_step, utc_now(), run_id, next_step),
             )
             return
-        _refresh_run_counts(connection, run_id)
-        failed = int(
-            connection.execute(
-                """
-                SELECT COUNT(*)
-                FROM fj_job_hunt_refresh_items
-                WHERE run_id = ? AND status = 'failed'
-                """,
-                (run_id,),
-            ).fetchone()[0]
-        )
-        unresolved = int(
-            connection.execute(
-                """
-                SELECT COUNT(*)
-                FROM fj_job_hunt_refresh_items
-                WHERE run_id = ? AND error_category = 'UNRESOLVED_JOB_RELATION'
-                """,
-                (run_id,),
-            ).fetchone()[0]
-        )
-        if refreshed["scope_id"]:
-            scope_row = connection.execute(
-                "SELECT counts_json FROM fj_job_hunt_refresh_scopes WHERE id = ?",
-                (refreshed["scope_id"],),
-            ).fetchone()
-            if scope_row:
-                unresolved += int(
-                    _load(scope_row["counts_json"], {}).get("unresolved_relations") or 0
-                )
-        has_chat_list_error = str(refreshed["chat_list_status"]) == "failed"
-        status = (
-            "completed_with_errors"
-            if failed or unresolved or has_chat_list_error
-            else "completed"
-        )
-        now = utc_now()
+        # 所有数据项完成后等待显式 complete 汇总，避免只读取 Run 就提前终结任务。
         connection.execute(
             """
-            UPDATE fj_job_hunt_refresh_runs
-            SET status = ?, current_step = 'completed',
-                completed_at = ?, updated_at = ?
+            UPDATE fj_job_hunt_refresh_runs SET current_step = 'waiting_completion', updated_at = ?
             WHERE id = ? AND status = 'running'
             """,
-            (status, now, now, run_id),
+            (utc_now(), run_id),
         )
 
 
@@ -1798,6 +1763,7 @@ def _refresh_run_counts(connection, run_id: str) -> None:
         ),
     }
     analysis = summary["analysis"] if isinstance(summary.get("analysis"), dict) else {}
+    progress_summary = _scope_progress_summary(connection, old_summary_row)
     summary.update(
         {
             "conversations_analyzed": int(analysis.get("analyzed") or 0),
@@ -1808,6 +1774,14 @@ def _refresh_run_counts(connection, run_id: str) -> None:
             "missing_suggestions_total": int(analysis.get("evaluation_jobs_total") or 0),
             "missing_suggestions_generated": int(analysis.get("generated_evaluation") or 0),
             "missing_suggestions_skipped": int(analysis.get("evaluation_jobs_skipped") or 0),
+            "progress_updates": int(analysis.get("updated_pipeline") or 0),
+            "waiting_for_recruiter": progress_summary["waiting_for_recruiter"],
+            "waiting_for_candidate": progress_summary["waiting_for_candidate"],
+            "followup_recommended": progress_summary["followup_recommended"],
+            "resume_viewed": progress_summary["resume_viewed"],
+            "under_review": progress_summary["under_review"],
+            "rejections_detected": int(analysis.get("rejection_detected") or 0),
+            "jobs_closed": progress_summary["jobs_closed"],
         }
     )
     connection.execute(
@@ -1826,6 +1800,52 @@ def _refresh_run_counts(connection, run_id: str) -> None:
             run_id,
         ),
     )
+
+
+def _scope_progress_summary(connection, run_row) -> dict[str, int]:
+    result = {
+        "waiting_for_recruiter": 0,
+        "waiting_for_candidate": 0,
+        "followup_recommended": 0,
+        "resume_viewed": 0,
+        "under_review": 0,
+        "jobs_closed": 0,
+    }
+    if not run_row or not run_row["scope_id"]:
+        return result
+    scope = connection.execute(
+        """
+        SELECT session_ids_in_scope_json, session_ids_json
+        FROM fj_job_hunt_refresh_scopes WHERE id = ?
+        """,
+        (run_row["scope_id"],),
+    ).fetchone()
+    session_ids = _load(scope["session_ids_in_scope_json"], []) if scope else []
+    if not session_ids and scope:
+        session_ids = _load(scope["session_ids_json"], [])
+    session_ids = [str(value) for value in session_ids if str(value)]
+    if not session_ids:
+        return result
+    placeholders = ",".join("?" for _ in session_ids)
+    rows = connection.execute(
+        f"""
+        SELECT s.id AS session_id, s.job_id, p.stage, p.waiting_on,
+               a.attention_status
+        FROM fj_chat_sessions s
+        LEFT JOIN fj_job_pipeline_snapshots p ON p.job_id = s.job_id
+        LEFT JOIN fj_chat_attention_states a ON a.session_id = s.id
+        WHERE s.id IN ({placeholders})
+        """,
+        tuple(session_ids),
+    ).fetchall()
+    result["waiting_for_recruiter"] = sum(row["waiting_on"] == "recruiter" for row in rows)
+    result["waiting_for_candidate"] = sum(row["waiting_on"] == "candidate" for row in rows)
+    result["followup_recommended"] = sum(row["attention_status"] == "needs_followup" for row in rows)
+    jobs = {str(row["job_id"]): str(row["stage"] or "") for row in rows if row["job_id"]}
+    result["resume_viewed"] = sum(stage == "resume_viewed" for stage in jobs.values())
+    result["under_review"] = sum(stage == "under_review" for stage in jobs.values())
+    result["jobs_closed"] = sum(stage == "closed" for stage in jobs.values())
+    return result
 
 
 def _progress(items: list[dict[str, object]], run: dict[str, object]) -> dict[str, object]:

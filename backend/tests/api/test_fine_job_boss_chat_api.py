@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from backend.app.services.fine_job import boss_chat
 
@@ -63,6 +64,76 @@ def _message_event(
             "source": source,
         },
     }
+
+
+def test_generate_routes_to_codex_executor_without_llm_api_key(
+    configured_client,
+    monkeypatch,
+) -> None:
+    config = configured_client.app.state.config
+    config.reasoning_executor = "codex-cli"
+    config.codex_model = "gpt-5.6-luna"
+    config.llm_provider = "openai"
+    config.llm_model = "deepseek-v4-pro"
+    config.llm_api_key = None
+    captured: dict[str, object] = {}
+
+    def fake_run_codex_exec(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            output={
+                "decision": "reply",
+                "reply_text": "您好，简历已发送，想跟进一下目前的评估进展。",
+                "facts_used": ["简历已发送"],
+                "warnings": [],
+                "requires_user_input": False,
+                "reason": "等待招聘方回复后进行礼貌跟进",
+            },
+            model=kwargs["model"],
+        )
+
+    monkeypatch.setattr(boss_chat, "run_codex_exec", fake_run_codex_exec)
+    _, token = _pair(configured_client)
+    headers = {"Authorization": f"Bearer {token}"}
+    enabled = configured_client.patch(
+        "/api/fine-job/boss-chat/runtime",
+        json={"listen_enabled": True, "generation_enabled": False, "send_enabled": False},
+    )
+    assert enabled.status_code == 200
+    heartbeat = configured_client.post(
+        "/api/fine-job/boss-chat/executor/heartbeat",
+        headers=headers,
+        json={
+            "account_uid": "geek-100",
+            "tab_id": "tab-codex",
+            "leader_epoch": 1,
+            "is_leader": True,
+        },
+    )
+    assert heartbeat.status_code == 200
+    observed = configured_client.post(
+        "/api/fine-job/boss-chat/executor/events/batch",
+        headers=headers,
+        json={"events": [_message_event("event-codex", "message-codex", "简历已收到")]},
+    )
+    assert observed.status_code == 200
+    session = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]
+
+    generated = configured_client.post(
+        f"/api/fine-job/boss-chat/sessions/{session['id']}/generate",
+        json={"instruction": "礼貌跟进", "action_kind": "followup"},
+    )
+
+    assert generated.status_code == 200
+    task = generated.json()["reply_task"]
+    assert task["status"] == "awaiting_review"
+    assert task["generation_model"] == "gpt-5.6-luna"
+    assert "评估进展" in task["draft_text"]
+    assert captured["model"] == "gpt-5.6-luna"
+    schema = captured["output_schema"]
+    assert isinstance(schema, dict)
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(schema["properties"])
 
 
 def test_refresh_friend_list_saves_identity_and_detects_latest_message_change(configured_client) -> None:

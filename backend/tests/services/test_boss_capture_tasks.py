@@ -122,6 +122,30 @@ class FakeScraper:
             for job in selected
         ]
 
+    def capture_chat_job_detail(
+        self,
+        *,
+        job,
+        output_path,
+        progress_callback,
+    ):
+        # 历史岗位从聊天上下文采集详情，测试替身保持与生产采集器接口一致。
+        detail = {"job_id": job["job_id"], "jd": "重新采集的岗位描述"}
+        progress_callback(
+            {
+                "stage": "details_collecting",
+                "status": "completed",
+                "current": 1,
+                "total": 1,
+                "job_id": job["job_id"],
+                "title": job.get("title"),
+                "company": job.get("boss_name"),
+                "detail": detail,
+                "message": "详情完成",
+            }
+        )
+        return detail
+
 
 class GateFakeScraper(FakeScraper):
     def capture_jobs(self, request, *, progress_callback, should_stop=None):

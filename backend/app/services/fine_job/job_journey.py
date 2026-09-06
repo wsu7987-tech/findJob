@@ -5,6 +5,7 @@ from typing import Any
 
 from backend.app.db import Database
 from backend.app.errors import AppError
+from backend.app.services.fine_job.job_progress import build_job_progress_with_connection
 
 
 def get_job_journey(db: Database, job_id: str) -> dict[str, Any]:
@@ -53,6 +54,7 @@ def get_job_journey(db: Database, job_id: str) -> dict[str, Any]:
             """,
             (job_id,),
         ).fetchall()
+        progress = build_job_progress_with_connection(connection, job_id)
 
         executions = [
             _execution_summary(connection, "automation_action", row)
@@ -70,6 +72,7 @@ def get_job_journey(db: Database, job_id: str) -> dict[str, Any]:
         "job_id": job_id,
         "pipeline": pipeline,
         "legacy_application": legacy_application,
+        "progress": progress,
         "activities": [_activity_summary(row) for row in activity_rows],
         "executions": executions,
     }
