@@ -187,6 +187,7 @@ def sessions(
     status: str | None = Query(default=None),
     account_uid: str | None = Query(default=None, max_length=80),
     attention: str | None = Query(default=None, max_length=40),
+    waiting_on: str | None = Query(default=None, pattern="^(candidate|recruiter)$"),
     q: str | None = Query(default=None, max_length=120),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
@@ -197,6 +198,7 @@ def sessions(
         status=status,
         account_uid=account_uid,
         attention=attention,
+        waiting_on=waiting_on,
         query=q,
         limit=limit,
         offset=offset,
@@ -335,7 +337,12 @@ def generate(
     config: AppConfig = Depends(get_config),
 ):
     return {"reply_task": boss_chat.generate_reply(
-        db, config, session_id, instruction=payload.instruction, action_kind=payload.action_kind
+        db,
+        config,
+        session_id,
+        instruction=payload.instruction,
+        action_kind=payload.action_kind,
+        job_action_key=payload.job_action_key,
     )}
 
 
@@ -357,7 +364,8 @@ def regenerate(
 ):
     return {"reply_task": boss_chat.generate_reply(
         db, config, session_id, instruction=payload.instruction,
-        action_kind=payload.action_kind, regenerate=True
+        action_kind=payload.action_kind, regenerate=True,
+        job_action_key=payload.job_action_key,
     )}
 
 

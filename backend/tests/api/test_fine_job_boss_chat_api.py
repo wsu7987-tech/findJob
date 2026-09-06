@@ -66,6 +66,25 @@ def _message_event(
     }
 
 
+def test_session_waiting_filter_accepts_only_supported_values(configured_client) -> None:
+    recruiter = configured_client.get(
+        "/api/fine-job/boss-chat/sessions",
+        params={"waiting_on": "recruiter"},
+    )
+    candidate = configured_client.get(
+        "/api/fine-job/boss-chat/sessions",
+        params={"waiting_on": "candidate"},
+    )
+    invalid = configured_client.get(
+        "/api/fine-job/boss-chat/sessions",
+        params={"waiting_on": "none"},
+    )
+
+    assert recruiter.status_code == 200
+    assert candidate.status_code == 200
+    assert invalid.status_code == 422
+
+
 def test_generate_routes_to_codex_executor_without_llm_api_key(
     configured_client,
     monkeypatch,

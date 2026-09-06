@@ -72,6 +72,19 @@
   FineJobChatBatchSummary,
   FineJobChatBatchTask,
   FineJobChatJobUpdateResponse,
+  FineJobAnalyticsGranularity,
+  FineJobAnalyticsMetric,
+  FineJobJobHuntAnalyticsResponse,
+  FineJobJobHuntAnalyticsJobsResponse,
+  FineJobJobActionItem,
+  FineJobJobActionGenerateDraftsResponse,
+  FineJobJobActionListResponse,
+  FineJobJobActionMutationResponse,
+  FineJobJobActionPriority,
+  FineJobJobActionState,
+  FineJobJobActionType,
+  FineJobRejectionReasonSource,
+  FineJobWaitingOn,
   FineJobJobHuntRefreshContext,
   FineJobJobHuntRefreshScope,
   FineJobJobHuntRefreshRun,
@@ -1040,6 +1053,7 @@ export const api = {
     status?: string;
     account_uid?: string;
     attention?: string;
+    waiting_on?: "candidate" | "recruiter";
     q?: string;
     limit?: number;
     offset?: number;
@@ -1048,6 +1062,7 @@ export const api = {
     if (params.status) query.set("status", params.status);
     if (params.account_uid) query.set("account_uid", params.account_uid);
     if (params.attention) query.set("attention", params.attention);
+    if (params.waiting_on) query.set("waiting_on", params.waiting_on);
     if (params.q) query.set("q", params.q);
     if (params.limit) query.set("limit", String(params.limit));
     if (params.offset) query.set("offset", String(params.offset));
@@ -1069,6 +1084,50 @@ export const api = {
     const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
     return request<FineJobJobProgress | null>(
       `/api/fine-job/jobs/${encodeURIComponent(jobId)}/progress${query}`
+    );
+  },
+  async listFineJobJobActions(params: {
+    status?: FineJobJobActionState;
+    priority?: FineJobJobActionPriority;
+    action_type?: FineJobJobActionType;
+  } = {}) {
+    const query = new URLSearchParams();
+    if (params.status) query.set("status", params.status);
+    if (params.priority) query.set("priority", params.priority);
+    if (params.action_type) query.set("action_type", params.action_type);
+    const suffix = query.size ? `?${query.toString()}` : "";
+    return request<FineJobJobActionListResponse>(
+      `/api/fine-job/job-actions${suffix}`
+    );
+  },
+  async generateFineJobJobActionDrafts(actionKeys: string[]) {
+    return request<FineJobJobActionGenerateDraftsResponse>(
+      "/api/fine-job/job-actions/generate-drafts",
+      { method: "POST", body: JSON.stringify({ action_keys: actionKeys }) }
+    );
+  },
+  async snoozeFineJobJobAction(actionKey: string, snoozedUntil: string) {
+    return request<FineJobJobActionMutationResponse>(
+      `/api/fine-job/job-actions/${encodeURIComponent(actionKey)}/snooze`,
+      { method: "POST", body: JSON.stringify({ snoozed_until: snoozedUntil }) }
+    );
+  },
+  async dismissFineJobJobAction(actionKey: string) {
+    return request<FineJobJobActionMutationResponse>(
+      `/api/fine-job/job-actions/${encodeURIComponent(actionKey)}/dismiss`,
+      { method: "POST" }
+    );
+  },
+  async completeFineJobJobAction(actionKey: string) {
+    return request<FineJobJobActionMutationResponse>(
+      `/api/fine-job/job-actions/${encodeURIComponent(actionKey)}/complete`,
+      { method: "POST" }
+    );
+  },
+  async restoreFineJobJobAction(actionKey: string) {
+    return request<FineJobJobActionMutationResponse>(
+      `/api/fine-job/job-actions/${encodeURIComponent(actionKey)}/restore`,
+      { method: "POST" }
     );
   },
   async analyzeFineJobChatProgress(sessionId: string) {
@@ -1133,6 +1192,54 @@ export const api = {
   },
   async getFineJobJobHuntRefreshContext() {
     return request<FineJobJobHuntRefreshContext>("/api/fine-job/job-hunt-refresh/context");
+  },
+  async getFineJobJobHuntAnalytics(params: {
+    from: string;
+    to: string;
+    timezone?: string;
+    granularity?: FineJobAnalyticsGranularity;
+    contact_origin?: string | null;
+  }) {
+    const query = new URLSearchParams({
+      from: params.from,
+      to: params.to,
+      timezone: params.timezone ?? "Asia/Shanghai",
+      granularity: params.granularity ?? "auto"
+    });
+    if (params.contact_origin) query.set("contact_origin", params.contact_origin);
+    return request<FineJobJobHuntAnalyticsResponse>(
+      `/api/fine-job/job-hunt/analytics?${query.toString()}`
+    );
+  },
+  async getFineJobJobHuntAnalyticsJobs(params: {
+    metric: FineJobAnalyticsMetric;
+    from: string;
+    to: string;
+    timezone?: string;
+    contact_origin?: string | null;
+    rejection_reason_source?: FineJobRejectionReasonSource | null;
+    rejection_reason_category?: string | null;
+    waiting_on?: FineJobWaitingOn | null;
+    attention?: string | null;
+  }) {
+    const query = new URLSearchParams({
+      metric: params.metric,
+      from: params.from,
+      to: params.to,
+      timezone: params.timezone ?? "Asia/Shanghai"
+    });
+    if (params.contact_origin) query.set("contact_origin", params.contact_origin);
+    if (params.rejection_reason_source) {
+      query.set("rejection_reason_source", params.rejection_reason_source);
+    }
+    if (params.rejection_reason_category) {
+      query.set("rejection_reason_category", params.rejection_reason_category);
+    }
+    if (params.waiting_on) query.set("waiting_on", params.waiting_on);
+    if (params.attention) query.set("attention", params.attention);
+    return request<FineJobJobHuntAnalyticsJobsResponse>(
+      `/api/fine-job/job-hunt/analytics/jobs?${query.toString()}`
+    );
   },
   async discoverFineJobJobHuntRefreshScope(
     selectedSinceTime: string,
@@ -1203,12 +1310,20 @@ export const api = {
     sessionId: string,
     instruction = "",
     regenerate = false,
-    actionKind: "reply" | "followup" | "ask_rejection_reason" = "reply"
+    actionKind: "reply" | "followup" | "ask_rejection_reason" = "reply",
+    jobActionKey?: string
   ) {
     const operation = regenerate ? "regenerate" : "generate";
     return request<FineJobChatReplyEnvelope>(
       `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/${operation}`,
-      { method: "POST", body: JSON.stringify({ instruction, action_kind: actionKind }) }
+      {
+        method: "POST",
+        body: JSON.stringify({
+          instruction,
+          action_kind: actionKind,
+          job_action_key: jobActionKey
+        })
+      }
     );
   },
   async setFineJobChatSessionStatus(

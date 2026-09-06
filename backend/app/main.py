@@ -17,6 +17,8 @@ from backend.app.routers.fine_job.delivery_runs import router as fine_job_delive
 from backend.app.routers.fine_job.delivery_strategies import router as fine_job_delivery_strategies_router
 from backend.app.routers.fine_job.job_intents import router as fine_job_intents_router
 from backend.app.routers.fine_job.job_journey import router as fine_job_job_journey_router
+from backend.app.routers.fine_job.job_actions import router as fine_job_job_actions_router
+from backend.app.routers.fine_job.job_hunt_analytics import router as fine_job_job_hunt_analytics_router
 from backend.app.routers.fine_job.job_hunt_refresh import router as fine_job_job_hunt_refresh_router
 from backend.app.routers.fine_job.platform_sessions import router as fine_job_platform_sessions_router
 from backend.app.routers.fine_job.profiles import router as fine_job_profiles_router
@@ -97,6 +99,8 @@ def create_app() -> FastAPI:
     app.include_router(fine_job_delivery_strategies_router, prefix="/api")
     app.include_router(fine_job_intents_router, prefix="/api")
     app.include_router(fine_job_job_journey_router, prefix="/api")
+    app.include_router(fine_job_job_actions_router, prefix="/api")
+    app.include_router(fine_job_job_hunt_analytics_router, prefix="/api")
     app.include_router(fine_job_job_hunt_refresh_router, prefix="/api")
     app.include_router(fine_job_platform_sessions_router, prefix="/api")
     app.include_router(fine_job_profiles_router, prefix="/api")

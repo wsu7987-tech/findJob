@@ -20,6 +20,7 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
   const statusFilter = ref("");
   const accountFilter = ref("");
   const attentionFilter = ref("");
+  const waitingOnFilter = ref<"candidate" | "recruiter" | "">("");
   const nextOffset = ref<number | null>(null);
   const detail = ref<FineJobChatSessionDetail | null>(null);
   const detailCache = ref<Record<string, FineJobChatSessionDetail>>({});
@@ -68,6 +69,7 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     status: statusFilter.value || undefined,
     account_uid: accountFilter.value.trim() || undefined,
     ...(attentionFilter.value ? { attention: attentionFilter.value } : {}),
+    ...(waitingOnFilter.value ? { waiting_on: waitingOnFilter.value } : {}),
     limit: 50,
     offset
   });
@@ -225,14 +227,16 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
   const generate = async (
     instruction: string,
     regenerate = false,
-    actionKind: "reply" | "followup" | "ask_rejection_reason" = "reply"
+    actionKind: "reply" | "followup" | "ask_rejection_reason" = "reply",
+    jobActionKey?: string
   ) => mutate(async () => {
     if (!selectedSessionId.value) throw new Error("请先选择聊天会话");
     const result = await api.generateFineJobChatReply(
       selectedSessionId.value,
       instruction,
       regenerate,
-      actionKind
+      actionKind,
+      jobActionKey
     );
     await refreshSelected();
     return result.reply_task;
@@ -310,6 +314,7 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     statusFilter,
     accountFilter,
     attentionFilter,
+    waitingOnFilter,
     nextOffset,
     detail,
     detailCache,

@@ -12,7 +12,9 @@ import ReviewQueuePage from "@/pages/fine-job/ReviewQueue.vue";
 import BossChatPage from "@/pages/fine-job/BossChat.vue";
 import CodexWorkspacePage from "@/pages/fine-job/CodexWorkspace.vue";
 import CompanyManagementPage from "@/pages/fine-job/CompanyManagement.vue";
+import JobHuntAnalyticsPage from "@/pages/fine-job/JobHuntAnalytics.vue";
 import JobHuntRefreshPage from "@/pages/fine-job/JobHuntRefresh.vue";
+import JobActionsPage from "@/pages/fine-job/JobActions.vue";
 
 export const router = createRouter({
   history: createWebHashHistory(),
@@ -90,6 +92,18 @@ export const router = createRouter({
       name: "fine-job-refresh",
       component: JobHuntRefreshPage,
       meta: { title: "求职数据更新" }
+    },
+    {
+      path: "/fine-job/analytics",
+      name: "fine-job-analytics",
+      component: JobHuntAnalyticsPage,
+      meta: { title: "求职分析" }
+    },
+    {
+      path: "/fine-job/actions",
+      name: "fine-job-actions",
+      component: JobActionsPage,
+      meta: { title: "今日行动" }
     },
     {
       path: "/fine-job/codex",

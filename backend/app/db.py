@@ -1399,6 +1399,7 @@ CREATE TABLE IF NOT EXISTS fj_chat_reply_tasks (
   id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,
   trigger_source TEXT NOT NULL,
+  job_action_key TEXT,
   action_kind TEXT NOT NULL DEFAULT 'reply',
   insight_id TEXT,
   status TEXT NOT NULL DEFAULT 'pending_generation',
@@ -1434,7 +1435,6 @@ CREATE INDEX IF NOT EXISTS idx_fj_chat_reply_tasks_status_created_at
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_chat_reply_tasks_one_active
   ON fj_chat_reply_tasks(session_id)
   WHERE status IN ('pending_generation', 'generating', 'awaiting_review', 'confirmed');
-
 CREATE TABLE IF NOT EXISTS fj_chat_send_actions (
   id TEXT PRIMARY KEY,
   reply_task_id TEXT NOT NULL UNIQUE,
@@ -1673,6 +1673,34 @@ CREATE TABLE IF NOT EXISTS fj_chat_attention_states (
 
 CREATE INDEX IF NOT EXISTS idx_fj_chat_attention_states_status
   ON fj_chat_attention_states(attention_status, updated_at DESC);
+
+-- 今日行动只持久化用户处理状态，行动内容继续根据正式事实动态计算。
+CREATE TABLE IF NOT EXISTS fj_job_action_item_states (
+  action_key TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  action_type TEXT NOT NULL,
+  status TEXT NOT NULL,
+  snoozed_until TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+  FOREIGN KEY (session_id) REFERENCES fj_chat_sessions(id) ON DELETE CASCADE,
+  CHECK (action_type IN (
+    'respond_interview', 'send_resume', 'reply_recruiter',
+    'review_draft', 'followup_recruiter', 'ask_rejection_reason'
+  )),
+  CHECK (status IN ('snoozed', 'dismissed', 'completed')),
+  CHECK (
+    (status = 'snoozed' AND snoozed_until IS NOT NULL)
+    OR (status IN ('dismissed', 'completed') AND snoozed_until IS NULL)
+  )
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_job_action_states_status_snooze
+  ON fj_job_action_item_states(status, snoozed_until);
+CREATE INDEX IF NOT EXISTS idx_fj_job_action_states_job_updated
+  ON fj_job_action_item_states(job_id, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS fj_job_hunt_refresh_analysis_items (
   id TEXT PRIMARY KEY,
@@ -3038,6 +3066,7 @@ class Database:
                 "classification_version": "ALTER TABLE fj_automation_actions ADD COLUMN classification_version INTEGER NOT NULL DEFAULT 1",
             },
             "fj_chat_reply_tasks": {
+                "job_action_key": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN job_action_key TEXT",
                 "text_version": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN text_version INTEGER NOT NULL DEFAULT 1",
                 "content_categories_json": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN content_categories_json TEXT NOT NULL DEFAULT '[]'",
                 "classification_version": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN classification_version INTEGER NOT NULL DEFAULT 1",
@@ -3073,6 +3102,12 @@ class Database:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_fj_chat_reply_tasks_due "
             "ON fj_chat_reply_tasks(status, generation_due_at, created_at)"
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_chat_reply_tasks_active_action_key "
+            "ON fj_chat_reply_tasks(job_action_key) "
+            "WHERE job_action_key IS NOT NULL "
+            "AND status IN ('pending_generation', 'generating', 'awaiting_review', 'confirmed')"
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_fj_chat_send_actions_dispatch_deadline "

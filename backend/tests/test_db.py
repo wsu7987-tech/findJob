@@ -167,8 +167,10 @@ def test_database_initializes_boss_chat_debounce_columns(
         "warnings_json",
         "requires_user_input",
         "decision_reason",
+        "job_action_key",
     } <= columns
     assert "idx_fj_chat_reply_tasks_due" in indexes
+    assert "idx_fj_chat_reply_tasks_active_action_key" in indexes
 
     with database.connect() as connection:
         chat_session_columns = {
@@ -196,3 +198,39 @@ def test_database_initializes_boss_chat_debounce_columns(
         "client_mid",
     } <= send_columns
     assert "idx_fj_chat_send_actions_dispatch_deadline" in send_indexes
+
+
+def test_database_initializes_job_action_state_schema(
+    app_paths: dict[str, str],
+) -> None:
+    database = Database(app_paths["sqlite_path"])
+    database.initialize()
+
+    with database.connect() as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(fj_job_action_item_states)"
+            ).fetchall()
+        }
+        indexes = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA index_list(fj_job_action_item_states)"
+            ).fetchall()
+        }
+
+    assert {
+        "action_key",
+        "job_id",
+        "session_id",
+        "action_type",
+        "status",
+        "snoozed_until",
+        "created_at",
+        "updated_at",
+    } <= columns
+    assert {
+        "idx_fj_job_action_states_status_snooze",
+        "idx_fj_job_action_states_job_updated",
+    } <= indexes

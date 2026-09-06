@@ -803,6 +803,106 @@ export type FineJobContactOrigin =
   | "finejob_auto" | "candidate_initiated" | "recruiter_initiated"
   | "external_candidate_initiated" | "unknown";
 
+export type FineJobJobActionType =
+  | "respond_interview"
+  | "send_resume"
+  | "reply_recruiter"
+  | "review_draft"
+  | "followup_recruiter"
+  | "ask_rejection_reason";
+export type FineJobJobActionPriority = "urgent" | "high" | "normal" | "low";
+export type FineJobJobActionState = "active" | "snoozed" | "dismissed" | "completed";
+
+export interface FineJobJobActionReplyTask {
+  id: string;
+  action_kind: "reply" | "followup" | "ask_rejection_reason";
+  status: "awaiting_review";
+  based_on_message_id: string;
+  based_on_session_version: number;
+  draft_text: string;
+  final_text: string;
+  generated_at?: string | null;
+  updated_at: string;
+}
+
+export interface FineJobJobActionPrimaryAction {
+  type: "open_chat";
+  label: string;
+  route_name: "fine-job-chat";
+  query: Record<string, string>;
+  action_kind?: "reply" | "followup" | "ask_rejection_reason" | null;
+  reply_task_id?: string | null;
+}
+
+export interface FineJobJobActionEvidence {
+  trigger_type: "message" | "activity_event" | "reply_task";
+  trigger_id: string;
+  message_ids: string[];
+  activity_event_ids: string[];
+  attention_insight_id?: string | null;
+}
+
+export interface FineJobJobActionItem {
+  action_key: string;
+  job_id: string;
+  session_id: string;
+  action_type: FineJobJobActionType;
+  priority_tier: FineJobJobActionPriority;
+  title: string;
+  company_name: string;
+  stage: string;
+  waiting_on: string;
+  waiting_since_at?: string | null;
+  due_at?: string | null;
+  overdue_seconds: number;
+  reason_code: string;
+  reason_summary: string;
+  evidence: FineJobJobActionEvidence;
+  reply_task?: FineJobJobActionReplyTask | null;
+  primary_action: FineJobJobActionPrimaryAction;
+  secondary_actions: Array<"snooze" | "dismiss" | "complete" | "restore">;
+  state: FineJobJobActionState;
+  snoozed_until?: string | null;
+}
+
+export interface FineJobJobActionSummary {
+  urgent: number;
+  high: number;
+  normal: number;
+  low: number;
+  snoozed: number;
+}
+
+export interface FineJobJobActionListResponse {
+  summary: FineJobJobActionSummary;
+  items: FineJobJobActionItem[];
+  generated_at: string;
+}
+
+export interface FineJobJobActionMutationResponse {
+  action_key: string;
+  state?: FineJobJobActionState | null;
+  snoozed_until?: string | null;
+  item?: FineJobJobActionItem | null;
+}
+
+export type FineJobJobActionDraftStatus =
+  | "created"
+  | "already_exists"
+  | "skipped"
+  | "failed";
+
+export interface FineJobJobActionDraftResult {
+  action_key: string;
+  status: FineJobJobActionDraftStatus;
+  reply_task_id?: string | null;
+  error?: string | null;
+}
+
+export interface FineJobJobActionGenerateDraftsResponse {
+  results: FineJobJobActionDraftResult[];
+}
+
 export interface FineJobPipelineSnapshot {
   job_id: string;
   company_id?: string | null;
@@ -850,6 +950,137 @@ export interface FineJobJobProgress {
     label: string;
   } | null;
   analysis_updated_at?: string | null;
+}
+
+export type FineJobAnalyticsGranularity = "auto" | "day" | "week";
+export type FineJobAnalyticsMetric =
+  | "candidate_contacts"
+  | "candidate_contact_replies"
+  | "recruiter_contacts"
+  | "resume_submitted"
+  | "resume_viewed"
+  | "under_review"
+  | "interview_scheduled"
+  | "rejected"
+  | "job_closed"
+  | "offer_received";
+export type FineJobRejectionReasonSource = "recruiter_explicit" | "ai_inferred" | "unknown";
+export type FineJobAnalyticsPreset =
+  | "today"
+  | "last7"
+  | "thisWeek"
+  | "last30"
+  | "thisMonth"
+  | "custom";
+
+export interface FineJobJobHuntAnalyticsRange {
+  from?: string;
+  to?: string;
+  timezone?: string;
+  granularity?: "day" | "week";
+  contact_origin?: FineJobContactOrigin | null;
+}
+
+export interface FineJobJobHuntAnalyticsOverview {
+  candidate_contacts?: number | null;
+  recruiter_contacts?: number | null;
+  candidate_contact_replies?: number | null;
+  candidate_reply_rate?: number | null;
+  resume_submitted?: number | null;
+  resume_viewed?: number | null;
+  under_review?: number | null;
+  interview_scheduled?: number | null;
+  rejected?: number | null;
+  job_closed?: number | null;
+  offer_received?: number | null;
+}
+
+export type FineJobAnalyticsFunnelStageKey =
+  | "candidate_contacts"
+  | "candidate_contact_replies"
+  | "resume_submitted"
+  | "resume_viewed"
+  | "interview_scheduled"
+  | "offer_received";
+
+export interface FineJobJobHuntAnalyticsTrendPoint {
+  period_start?: string | null;
+  candidate_contacts?: number | null;
+  resume_submitted?: number | null;
+  interview_scheduled?: number | null;
+  rejected?: number | null;
+}
+
+export interface FineJobJobHuntAnalyticsFunnelStage {
+  key: FineJobAnalyticsFunnelStageKey;
+  count?: number | null;
+  previous_rate?: number | null;
+  total_rate?: number | null;
+}
+
+export interface FineJobJobHuntAnalyticsFunnel {
+  available?: boolean;
+  unavailable_reason?: string | null;
+  stages?: FineJobJobHuntAnalyticsFunnelStage[];
+}
+
+export interface FineJobJobHuntAnalyticsCurrentState {
+  waiting_recruiter?: number | null;
+  waiting_candidate?: number | null;
+  followup_recommended?: number | null;
+  under_review?: number | null;
+  interview_scheduling?: number | null;
+}
+
+export interface FineJobJobHuntAnalyticsRejectionReasonBucket {
+  category?: string | null;
+  job_count?: number | null;
+}
+
+export interface FineJobJobHuntAnalyticsRejectionAnalysis {
+  recruiter_explicit?: FineJobJobHuntAnalyticsRejectionReasonBucket[] | null;
+  ai_inferred?: FineJobJobHuntAnalyticsRejectionReasonBucket[] | null;
+  unknown?: FineJobJobHuntAnalyticsRejectionReasonBucket[] | null;
+}
+
+export interface FineJobJobHuntAnalyticsSourcePerformanceItem {
+  contact_origin: FineJobContactOrigin;
+  job_count?: number | null;
+  candidate_reply_rate?: number | null;
+  resume_rate?: number | null;
+  interview_rate?: number | null;
+  offer_rate?: number | null;
+  rejection_rate?: number | null;
+}
+
+export interface FineJobJobHuntAnalyticsResponse {
+  range?: FineJobJobHuntAnalyticsRange;
+  overview?: FineJobJobHuntAnalyticsOverview;
+  trend?: FineJobJobHuntAnalyticsTrendPoint[] | null;
+  funnel?: FineJobJobHuntAnalyticsFunnel | null;
+  current_state?: FineJobJobHuntAnalyticsCurrentState | null;
+  rejection_analysis?: FineJobJobHuntAnalyticsRejectionAnalysis | null;
+  source_performance?: FineJobJobHuntAnalyticsSourcePerformanceItem[] | null;
+  definitions?: Record<string, unknown> | null;
+  generated_at?: string;
+}
+
+export interface FineJobJobHuntAnalyticsJobItem {
+  job_id: string;
+  title: string;
+  company_name: string;
+  progress: string;
+  matched_at: string;
+  metric: FineJobAnalyticsMetric;
+  rejection_reason_source?: FineJobRejectionReasonSource | null;
+  rejection_reason_category?: string | null;
+  rejection_reason_summary?: string | null;
+}
+
+export interface FineJobJobHuntAnalyticsJobsResponse {
+  metric: FineJobAnalyticsMetric;
+  total: number;
+  jobs: FineJobJobHuntAnalyticsJobItem[];
 }
 
 export interface FineJobActivityEvent {

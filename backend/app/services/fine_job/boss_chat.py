@@ -1228,6 +1228,7 @@ def list_sessions(
     status: str | None = None,
     account_uid: str | None = None,
     attention: str | None = None,
+    waiting_on: str | None = None,
     query: str | None = None,
     limit: int = 50,
     offset: int = 0,
@@ -1251,6 +1252,9 @@ def list_sessions(
         elif attention:
             conditions.append("att.attention_status = ?")
             params.append(attention)
+        if waiting_on:
+            conditions.append("pipeline.waiting_on = ?")
+            params.append(waiting_on)
         if query:
             conditions.append(
                 "(s.peer_name LIKE ? OR s.company_name LIKE ? OR s.job_title LIKE ? "
@@ -1303,6 +1307,7 @@ def list_sessions(
               ORDER BY created_at DESC LIMIT 1
             )
             LEFT JOIN fj_chat_attention_states att ON att.session_id = s.id
+            LEFT JOIN fj_job_pipeline_snapshots pipeline ON pipeline.job_id = s.job_id
             {where}
             -- 严格沿用 BOSS 好友列表顺序，聊天消息同步不会改变会话位置。
             ORDER BY s.platform_synced_at DESC, s.platform_list_index ASC, s.id ASC
@@ -1718,7 +1723,7 @@ def _chat_completion(
     return _normalize_chat_completion(result), model
 
 
-def generate_reply(
+def _generate_reply(
     db: Database,
     config: AppConfig,
     session_id: str,
@@ -1726,7 +1731,8 @@ def generate_reply(
     instruction: str = "",
     action_kind: str = "reply",
     regenerate: bool = False,
-) -> dict[str, Any]:
+    job_action_key: str | None = None,
+) -> tuple[dict[str, Any], bool]:
     if action_kind not in {"reply", "followup", "ask_rejection_reason"}:
         raise AppError(422, "CHAT_ACTION_KIND_INVALID", "消息草稿类型无效。")
     with db.connect() as connection:
@@ -1743,12 +1749,45 @@ def generate_reply(
         current = connection.execute(
             """
             SELECT * FROM fj_chat_reply_tasks WHERE session_id = ?
-              AND status IN ('pending_generation', 'generating', 'awaiting_review')
+              AND status IN ('pending_generation', 'generating', 'awaiting_review', 'confirmed')
             ORDER BY created_at DESC LIMIT 1
             """,
             (session_id,),
         ).fetchone()
         now = _now()
+        same_business_trigger = bool(
+            current is not None
+            and str(current["action_kind"] or "reply") == action_kind
+            and str(current["based_on_message_id"]) == str(based_on_message_id)
+            and int(current["based_on_session_version"]) == int(session["session_version"])
+            and (
+                not job_action_key
+                or not current["job_action_key"]
+                or str(current["job_action_key"]) == job_action_key
+            )
+        )
+        should_reuse_current = bool(
+            same_business_trigger
+            and not regenerate
+            and (
+                job_action_key
+                or str(current["status"]) in {"generating", "awaiting_review"}
+            )
+        )
+        if should_reuse_current:
+            # 单条与批量并发命中同一业务触发时，复用已经存在的有效任务。
+            if job_action_key and not current["job_action_key"]:
+                try:
+                    connection.execute(
+                        "UPDATE fj_chat_reply_tasks SET job_action_key = ? WHERE id = ?",
+                        (job_action_key, current["id"]),
+                    )
+                except sqlite3.IntegrityError:
+                    pass
+            refreshed = connection.execute(
+                "SELECT * FROM fj_chat_reply_tasks WHERE id = ?", (current["id"],)
+            ).fetchone()
+            return _row(refreshed) or {}, False
         if current is not None and current["status"] == "generating":
             raise AppError(
                 status_code=409,
@@ -1761,6 +1800,12 @@ def generate_reply(
             or str(current["action_kind"] or "reply") != action_kind
             or str(current["based_on_message_id"]) != str(based_on_message_id)
             or int(current["based_on_session_version"]) != int(session["session_version"])
+            or str(current["status"]) == "confirmed"
+            or bool(
+                job_action_key
+                and current["job_action_key"]
+                and str(current["job_action_key"]) != job_action_key
+            )
         )
         if replace_current:
             if current is not None:
@@ -1769,31 +1814,62 @@ def generate_reply(
                     (now, now, current["id"]),
                 )
             task_id = _id("chat_reply")
-            connection.execute(
-                """
-                INSERT INTO fj_chat_reply_tasks (
-                  id, session_id, trigger_source, action_kind, status, based_on_message_id,
-                  based_on_session_version, generation_due_at, input_message_ids_json,
-                  created_at, updated_at
-                ) VALUES (?, ?, 'manual', ?, 'generating', ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    session_id,
-                    action_kind,
-                    based_on_message_id,
-                    session["session_version"],
-                    now,
-                    json.dumps([based_on_message_id], ensure_ascii=False),
-                    now,
-                    now,
-                ),
-            )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO fj_chat_reply_tasks (
+                      id, session_id, trigger_source, job_action_key, action_kind,
+                      status, based_on_message_id, based_on_session_version,
+                      generation_due_at, input_message_ids_json, created_at, updated_at
+                    ) VALUES (?, ?, 'manual', ?, ?, 'generating', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        session_id,
+                        job_action_key,
+                        action_kind,
+                        based_on_message_id,
+                        session["session_version"],
+                        now,
+                        json.dumps([based_on_message_id], ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                competing = connection.execute(
+                    """
+                    SELECT * FROM fj_chat_reply_tasks
+                    WHERE session_id = ?
+                      AND status IN ('pending_generation', 'generating', 'awaiting_review', 'confirmed')
+                    ORDER BY updated_at DESC, created_at DESC LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if (
+                    job_action_key
+                    and competing is not None
+                    and str(competing["action_kind"] or "reply") == action_kind
+                    and str(competing["based_on_message_id"]) == str(based_on_message_id)
+                    and int(competing["based_on_session_version"] or 0)
+                    == int(session["session_version"])
+                    and (
+                        not competing["job_action_key"]
+                        or str(competing["job_action_key"]) == job_action_key
+                    )
+                ):
+                    return _row(competing) or {}, False
+                raise
         else:
             task_id = str(current["id"])
             connection.execute(
-                "UPDATE fj_chat_reply_tasks SET status = 'generating', action_kind = ?, generation_error = NULL, updated_at = ? WHERE id = ?",
-                (action_kind, now, task_id),
+                """
+                UPDATE fj_chat_reply_tasks
+                SET status = 'generating', action_kind = ?, job_action_key = ?,
+                    generation_error = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (action_kind, job_action_key, now, task_id),
             )
         context = _build_context(db, connection, session)
         candidate_context = context["candidate_profile_context"]
@@ -1867,9 +1943,49 @@ def generate_reply(
                 task_id,
             ),
         )
-        return _row(connection.execute(
+        task_result = _row(connection.execute(
             "SELECT * FROM fj_chat_reply_tasks WHERE id = ?", (task_id,)
         ).fetchone()) or {}
+        return task_result, True
+
+
+def generate_reply(
+    db: Database,
+    config: AppConfig,
+    session_id: str,
+    *,
+    instruction: str = "",
+    action_kind: str = "reply",
+    regenerate: bool = False,
+    job_action_key: str | None = None,
+) -> dict[str, Any]:
+    task, _ = _generate_reply(
+        db,
+        config,
+        session_id,
+        instruction=instruction,
+        action_kind=action_kind,
+        regenerate=regenerate,
+        job_action_key=job_action_key,
+    )
+    return task
+
+
+def generate_reply_for_action(
+    db: Database,
+    config: AppConfig,
+    session_id: str,
+    *,
+    action_kind: str,
+    job_action_key: str,
+) -> tuple[dict[str, Any], bool]:
+    return _generate_reply(
+        db,
+        config,
+        session_id,
+        action_kind=action_kind,
+        job_action_key=job_action_key,
+    )
 
 
 def edit_reply(db: Database, task_id: str, final_text: str) -> dict[str, Any]:

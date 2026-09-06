@@ -18,6 +18,7 @@ const router = useRouter();
 const route = useRoute();
 const instruction = ref("");
 const finalText = ref("");
+const preferredReplyTaskId = ref<string | null>(null);
 const expandedMessages = ref<Record<string, boolean>>({});
 const messagePreviewNeedsExpand = ref<Record<string, boolean>>({});
 const messagePreviewElements = new Map<string, HTMLElement>();
@@ -32,7 +33,14 @@ const editorDrafts = ref<Record<string, {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   Boolean(value && typeof value === "object" && !Array.isArray(value));
 const session = computed(() => store.detail?.session ?? null);
-const task = computed(() => store.currentTask);
+const task = computed(() => {
+  const preferred = store.detail?.reply_tasks.find((item) =>
+    item.id === preferredReplyTaskId.value
+    && item.session_id === session.value?.id
+    && item.status === "awaiting_review"
+  );
+  return preferred ?? store.currentTask;
+});
 const progress = computed(() => session.value?.progress ?? null);
 const primaryAction = computed(() => progress.value?.primary_action ?? null);
 const canMarkRejected = computed(() => Boolean(
@@ -53,6 +61,10 @@ const analysisButtonLabel = computed(() => (
 ));
 const defaultMessageActionKind = computed<"reply" | "followup" | "ask_rejection_reason">(() => {
   if (primaryAction.value?.type) return primaryAction.value.type;
+  const routeActionKind = route.query.action_kind;
+  if (routeActionKind === "reply" || routeActionKind === "followup" || routeActionKind === "ask_rejection_reason") {
+    return routeActionKind;
+  }
   if (rejectionReasonNeedsDetail.value) {
     return "ask_rejection_reason";
   }
@@ -393,7 +405,15 @@ const generate = async (
   )
 ) => {
   try {
-    await store.generate(instruction.value, regenerate, actionKind);
+    const routeSessionId = typeof route.query.session_id === "string" ? route.query.session_id : "";
+    const routeActionKind = typeof route.query.action_kind === "string" ? route.query.action_kind : "";
+    const routeActionKey = typeof route.query.action_key === "string" ? route.query.action_key : undefined;
+    const jobActionKey = !regenerate
+      && routeSessionId === store.selectedSessionId
+      && routeActionKind === actionKind
+      ? routeActionKey
+      : undefined;
+    await store.generate(instruction.value, regenerate, actionKind, jobActionKey);
     if (store.selectedSessionId && editorDrafts.value[store.selectedSessionId]) {
       editorDrafts.value[store.selectedSessionId].dirty = false;
     }
@@ -468,7 +488,15 @@ const emergencyStop = async () => {
 };
 
 onMounted(() => {
-  if (route.query.attention === "actionable") store.attentionFilter = "actionable";
+  preferredReplyTaskId.value = typeof route.query.reply_task_id === "string"
+    ? route.query.reply_task_id
+    : null;
+  const attention = typeof route.query.attention === "string" ? route.query.attention : "";
+  if (attention) store.attentionFilter = attention;
+  const waitingOn = typeof route.query.waiting_on === "string" ? route.query.waiting_on : "";
+  if (waitingOn === "candidate" || waitingOn === "recruiter") {
+    store.waitingOnFilter = waitingOn;
+  }
   void store.load()
     .then(async () => {
       const sessionId = typeof route.query.session_id === "string" ? route.query.session_id : "";
@@ -622,6 +650,15 @@ onBeforeUnmount(() => {
             <el-option label="建议跟进" value="needs_followup" />
             <el-option label="等我回复" value="needs_reply" />
             <el-option label="建议询问原因" value="needs_rejection_reason" />
+          </el-select>
+          <el-select
+            v-model="store.waitingOnFilter"
+            clearable
+            placeholder="等待对象"
+            @change="applySessionFilters"
+          >
+            <el-option label="等我回复" value="candidate" />
+            <el-option label="等招聘方回复" value="recruiter" />
           </el-select>
         </div>
         <button

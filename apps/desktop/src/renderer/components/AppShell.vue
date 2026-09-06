@@ -6,6 +6,7 @@ import {
   ChatDotRound,
   Clock,
   Cpu,
+  DataAnalysis,
   Document,
   Link,
   List,
@@ -41,6 +42,8 @@ const navigation = [
   { label: "待确认", routeName: "fine-job-review", icon: User },
   { label: "自动代聊", routeName: "fine-job-chat", icon: ChatDotRound },
   { label: "求职数据更新", routeName: "fine-job-refresh", icon: Clock },
+  { label: "今日行动", routeName: "fine-job-actions", icon: List },
+  { label: "求职分析", routeName: "fine-job-analytics", icon: DataAnalysis },
   { label: "Codex 工作台", routeName: "fine-job-codex", icon: Cpu },
   { label: "动作日志", routeName: "fine-job-logs", icon: User }
 ];

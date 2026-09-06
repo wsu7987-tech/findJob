@@ -252,7 +252,7 @@ def project_job_pipeline(
 
         if event_type in {"rejected", "job_closed"}:
             rejection_reason_source, rejection_reason_category, rejection_reason_summary = (
-                _rejection_fields(payload)
+                normalize_rejection_fields(payload)
             )
 
         if candidate is None:
@@ -657,7 +657,8 @@ def append_contact_origin_for_session_with_connection(
     return int(inserted)
 
 
-def _rejection_fields(payload: dict[str, Any]) -> tuple[str, str, str]:
+def normalize_rejection_fields(payload: dict[str, Any]) -> tuple[str, str, str]:
+    """统一兼容规则事件、AI 分析事件和历史回填的拒绝原因结构。"""
     analysis = payload.get("rejection_analysis")
     source = payload
     if isinstance(analysis, dict):

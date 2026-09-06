@@ -114,7 +114,9 @@ def _latest_session_id(connection: sqlite3.Connection, job_id: str) -> str | Non
         """
         SELECT id FROM fj_chat_sessions
         WHERE job_id = ?
-        ORDER BY COALESCE(last_message_at, platform_latest_message_at, updated_at) DESC
+        ORDER BY COALESCE(
+          last_message_at, platform_latest_message_at, updated_at, created_at
+        ) DESC, id DESC
         LIMIT 1
         """,
         (job_id,),

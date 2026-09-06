@@ -102,6 +102,25 @@ describe("fineJobBossChat store", () => {
     });
   });
 
+  it("从今日行动生成草稿时携带当前业务触发标识", async () => {
+    const generateSpy = vi.spyOn(api, "generateFineJobChatReply").mockResolvedValue({
+      reply_task: replyTask
+    } as never);
+    const store = useFineJobBossChatStore();
+    await store.load();
+    await store.loadDetail("session-1");
+
+    await store.generate("", false, "reply", "reply:session-1:message-1");
+
+    expect(generateSpy).toHaveBeenCalledWith(
+      "session-1",
+      "",
+      false,
+      "reply",
+      "reply:session-1:message-1"
+    );
+  });
+
   it("紧急设置可一次关闭监听、生成和发送权限", async () => {
     const updateSpy = vi.spyOn(api, "updateFineJobChatRuntime").mockResolvedValue({
       runtime: { ...runtime, listen_enabled: false, generation_enabled: false, send_enabled: false }
@@ -123,6 +142,8 @@ describe("fineJobBossChat store", () => {
     store.searchQuery = "王经理";
     store.statusFilter = "active";
     store.accountFilter = "100";
+    store.attentionFilter = "needs_followup";
+    store.waitingOnFilter = "recruiter";
 
     await store.loadList();
 
@@ -130,6 +151,8 @@ describe("fineJobBossChat store", () => {
       q: "王经理",
       status: "active",
       account_uid: "100",
+      attention: "needs_followup",
+      waiting_on: "recruiter",
       limit: 50,
       offset: 0
     });
