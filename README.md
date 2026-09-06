@@ -93,7 +93,7 @@ codex --version
 codex login status
 ```
 
-然后在桌面端“FineJob 配置 → 智能执行器”中选择“本机 Codex CLI”。模型支持下拉选择，也可以直接输入自定义模型 ID；点击“刷新模型列表”会调用 `codex debug models` 获取当前 Codex 模型目录，不需要额外填写 API Key。推理强度支持默认、Minimal、Low、Medium、High 和 XHigh。模型或推理强度留空时跟随 Codex 默认值。保存后点击“检测 Codex CLI”。
+然后在桌面端“FineJob 配置 → 智能执行器”中选择“本机 Codex CLI”。模型支持下拉选择，也可以直接输入自定义模型 ID；点击“刷新模型列表”会调用 `codex debug models` 获取当前 Codex 模型目录，不需要额外填写 API Key。推理强度支持默认、Minimal、Low、Medium、High 和 XHigh。模型或推理强度留空时跟随 Codex 默认值。保存后点击“检测 Codex CLI”。该选择同时用于求职进展分析和自动代聊消息草稿生成；选择 Codex CLI 后，生成消息不再要求配置 LLM API Key。
 
 Codex 生成任务使用临时目录、只读沙箱、JSONL 事件和 JSON Schema 结果约束。FineJob 不读取 Codex 登录凭据，最终业务结果及运行元数据仍保存在 FineJob 中。
 
@@ -138,13 +138,15 @@ uv run python -m backend.app.services.fine_job.boss_scraper.boss_cdp_raw --setup
 uv run python -m backend.app.services.fine_job.boss_scraper.boss_cdp_raw --keyword "AI Agent" --city 上海 --pages 1
 ```
 
-## BOSS 自动代聊（首版）
+## BOSS 自动代聊
 
 桌面端新增“自动代聊”工作台，扩展在用户开启监听后观察 BOSS `chat` WebSocket 的新消息，后端按
 实时、定时或手动三种触发方式生成回复草稿。草稿可以重新生成和人工编辑；只有用户点击“确认发送”
 且草稿依据的最后入站消息与会话版本仍一致时，才会创建一次发送动作。
 
-首版明确不读取 BOSS 历史聊天、不提供回复置信率；回复可读取用户已确认且允许对外使用的 QA 与回答版本，不自动发送简历或联系方式，也不会
+工作台可按需同步 BOSS 历史聊天，并在会话顶部展示当前阶段、等待对象、等待时长、沟通来源、跟进建议与拒绝原因。
+“分析进展”只处理当前会话，并按状态提供“生成回复”“生成跟进”或“询问拒绝原因”一个主要动作。
+回复、跟进和询问原因都先生成草稿，由用户查看或编辑后确认发送；不会自动发送简历或联系方式，也不会
 自动确认 AI 草稿。发送使用 BOSS 的 `chat` MQTT/Protobuf 通道；`publish` 未抛错只展示为“已提交发送”，
 不表示平台已经送达。多个 BOSS 沟通页通过账号级租约选出一个领导标签页，领导失效后递增 epoch 切换，
 未知发送结果不会自动重试。
@@ -176,12 +178,26 @@ Codex 分析链路。页面只提交一次任务 Prompt；Codex 在当前 CLI �
 不把投递建议、回复草稿和跟进建议拆成多次独立 AI 分析。若 manifest 或单个 item 上下文过大，
 服务返回明确 blocker，流程停止等待人工处理。
 
-服务端将代码可确定的事实写入 Activity 和 Pipeline：完整历史下的首条真实会话消息可锚定
-`greeting_sent`，系统消息 `附件状态更新` 可锚定 `resume_submitted`，真实入站和出站消息分别同步
-招聘方回复和候选人回复。历史不完整、缺聊天、缺岗位、缺 JD 或缺候选人上下文时按原因降级或跳过，
-不会为分析重新采集数据。AI 结果只保存为 Conversation Insight、正式岗位 evaluation、回复草稿和
-轻量 `fj_chat_attention_states`；跟进建议只更新 `attention_status` / recommendation，不创建正式待执行任务。
-回复草稿只保存和展示，不创建发送动作，不调用 BOSS 发送接口。
+服务端以 Activity 作为求职事实流，并投影为正式 Pipeline。Pipeline 覆盖简历已查看、用人部门评估、
+面试时间沟通、面试、Offer、拒绝和岗位关闭，同时保存 `waiting_on`、`contact_origin` 与结构化拒绝原因。
+数据库升级会逐项检查正式 Activity 事件集合，把旧投递表中的 `offer`、`rejected`、`closed` 幂等回填为
+Activity，并重建 Pipeline，保留历史事件和终态。
+
+沟通来源优先使用 FineJob 自动打招呼或人工确认发送的动作证据；完整历史首条真实消息由招聘方发送时记为
+招聘方主动，由候选人发送且缺少 FineJob 动作证据时记为外部主动，历史不完整时保持未知。系统附件消息可锚定
+简历提交、接收和查看，招聘方明确表示“已招到人”记录为候选人被拒绝且原因为岗位已招满；只有岗位取消、
+HC 关闭或停止招聘才关闭岗位。模糊表达会保留当前状态等待更多证据。
+
+批量和单会话分析共用 Activity → Pipeline 闭环。单会话 Insight 以会话与分析版本覆盖最新结果，重复分析复用
+同一 Insight，并按消息证据去重 Activity；单会话进展分析通过严格 JSON Schema 约束 Codex 输出。
+需要回复、到期跟进或补充拒绝原因时，单会话分析会在同一流程中生成待确认草稿。消息草稿结合岗位评估、
+已确认候选人资料与等待天数；页面同时保留常驻“生成消息”入口，允许用户在建议时间前主动生成。
+自动识别拒绝后隐藏人工拒绝标记，原因仍不明确时可在聊天页或历史岗位页继续分析并生成原因询问。
+跟进策略集中根据阶段与等待时长判断，结果保存在
+`fj_chat_attention_states`。分析生成的草稿可进入待确认回复任务，保存分析本身不会创建发送动作。
+
+岗位详情通过统一 Job Progress 视图展示阶段、等待对象、来源、最近进展、行动建议和求职结果，并可直接进入对应聊天。
+求职数据更新完成后汇总等待招聘方、等待候选人、建议跟进、简历已查看、用人部门评估、拒绝和岗位关闭数量。
 
 缺失投递建议写回复用正式 `fj_job_evaluations` 能力，并保留 JD 版本、候选人上下文修订和输出校验。
 Refresh 的 evaluation 写回用于补资料，不触发投递、打招呼或发送动作，也不受策略冷却排除拦截。
