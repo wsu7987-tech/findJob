@@ -97,4 +97,20 @@ describe("BOSS 聊天协议", () => {
       clientMid: "1000000000000000003"
     });
   });
+
+  it("按 Native Trace 编码 protocolType=6 简历通知的动态字段", () => {
+    const protobuf = bossChatProtocol.encodeResume({
+      field1Value: "200",
+      field2Value: "300000000000001",
+      field3Value: "1788748127339"
+    });
+    const decoded = bossChatProtocol.decode(protobuf) as Record<string, unknown>;
+    expect(decoded.type).toBe(6);
+    expect(decoded.protocolType6Payload).toMatchObject({
+      field1Value: "200",
+      field2Value: "300000000000001",
+      field3Value: "1788748127339",
+      field5Value: 0
+    });
+  });
 });

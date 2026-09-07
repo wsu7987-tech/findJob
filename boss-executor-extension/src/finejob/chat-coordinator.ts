@@ -130,7 +130,8 @@ export class BossChatCoordinator {
           leader.epoch
         );
         if (this.listenEnabled) await this.flushAccountOutbox(accountUid, leader.epoch);
-        if (this.runtimeCache?.sendEnabled) await this.claimAndDispatch(accountUid, leader);
+        // 附件列表读取复用同一动作队列，不产生发送；真正简历发送仍由服务端和页面双重检查 send_enabled。
+        await this.claimAndDispatch(accountUid, leader);
       }
       await this.expireUnreportedActions();
       this.lastError = "";

@@ -255,6 +255,34 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     return result.action;
   });
 
+  const refreshResumeAttachments = async () => mutate(async () => {
+    if (!selectedSessionId.value) throw new Error("请先选择聊天会话");
+    const result = await api.refreshFineJobChatResumeAttachments(selectedSessionId.value);
+    await refreshSelected();
+    return result.action;
+  });
+
+  const confirmResume = async (encryptResumeId: string, filename: string) => mutate(async () => {
+    if (!selectedSessionId.value) throw new Error("请先选择聊天会话");
+    const result = await api.createFineJobChatResumeAction(selectedSessionId.value, encryptResumeId, filename);
+    await refreshSelected();
+    return result.action;
+  });
+
+  const pollResumeAction = async (actionId: string) => {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 1000));
+      const sessionId = selectedSessionId.value;
+      if (!sessionId) return null;
+      const loaded = await api.getFineJobChatSession(sessionId);
+      detailCache.value[sessionId] = loaded;
+      detail.value = loaded;
+      const action = loaded.send_actions.find((item) => item.id === actionId) ?? null;
+      if (!action || ["accepted", "failed", "unknown"].includes(action.outcome ?? "")) return action;
+    }
+    return null;
+  };
+
   const cancel = async () => mutate(async () => {
     if (!currentTask.value) return null;
     const result = await api.cancelFineJobChatReply(currentTask.value.id);
@@ -342,6 +370,9 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     analyzeProgress,
     generate,
     confirm,
+    refreshResumeAttachments,
+    confirmResume,
+    pollResumeAction,
     cancel,
     setSessionStatus
   };

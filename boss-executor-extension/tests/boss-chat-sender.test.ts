@@ -12,11 +12,19 @@ const mqttMock = vi.hoisted(() => {
   };
   return { client, connect: vi.fn(() => client) };
 });
+const resumeCardMock = vi.hoisted(() => ({
+  wait: vi.fn()
+}));
 
 vi.mock("mqtt", () => ({ default: { connect: mqttMock.connect } }));
+vi.mock("../src/platform/boss/chat/observer", () => ({
+  markAssistantClientMid: vi.fn(),
+  waitForResumeCard: resumeCardMock.wait
+}));
 
 import { BossChatSender, createProcessClientMid } from "../src/platform/boss/chat/sender";
 import type { FineJobChatSendAction } from "../src/finejob/types";
+import { bossChatProtocol } from "../src/platform/boss/chat/protocol";
 
 const action = (overrides: Partial<FineJobChatSendAction> = {}): FineJobChatSendAction => ({
   id: "action-1",
@@ -36,6 +44,7 @@ const action = (overrides: Partial<FineJobChatSendAction> = {}): FineJobChatSend
 describe("BOSS 聊天 sender 离线边界", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resumeCardMock.wait.mockResolvedValue({ fromUid: "200", mid: "300000000000001" });
     (window as unknown as { _PAGE: Record<string, unknown> })._PAGE = { uid: "100", token: "test-token" };
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ json: async () => ({ code: 0, zpData: { wt2: "test-wt" } }) }));
   });
@@ -51,11 +60,92 @@ describe("BOSS 聊天 sender 离线边界", () => {
     expect(mqttMock.client.publish).not.toHaveBeenCalled();
   });
 
+  it("简历 dry-run 不读取附件、不请求 exchange、不连接也不 publish", async () => {
+    const result = await new BossChatSender().send(
+      action({ operation_kind: "resume", encrypt_resume_id: "resume-1" }),
+      { dryRun: true }
+    );
+    expect(result).toMatchObject({ outcome: "accepted", statusCode: "dry_run_prepared" });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(mqttMock.connect).not.toHaveBeenCalled();
+    expect(mqttMock.client.publish).not.toHaveBeenCalled();
+  });
+
+  it("附件列表动作只读取列表，不连接 MQTT 或 publish", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      json: async () => ({ code: 0, zpData: { resumeList: [{ encryptResumeId: "resume-1", showName: "候选人.pdf" }] } })
+    }));
+    const result = await new BossChatSender().send(action({ operation_kind: "resume_list" }));
+    expect(result).toMatchObject({ outcome: "accepted", statusCode: "resume_list_loaded" });
+    expect(result.evidence).toMatchObject({ attachments: [{ encryptResumeId: "resume-1", showName: "候选人.pdf" }] });
+    expect(mqttMock.connect).not.toHaveBeenCalled();
+    expect(mqttMock.client.publish).not.toHaveBeenCalled();
+  });
+
+  it("零份附件只返回空列表，不连接 MQTT 或 publish", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      json: async () => ({ code: 0, zpData: { resumeList: [] } })
+    }));
+    const result = await new BossChatSender().send(action({ operation_kind: "resume_list" }));
+    expect(result.evidence).toMatchObject({ attachments: [] });
+    expect(mqttMock.connect).not.toHaveBeenCalled();
+    expect(mqttMock.client.publish).not.toHaveBeenCalled();
+  });
+
+  it("简历先 exchange/request 再经既有 MQTT 管道发送", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ json: async () => ({ code: 0, zpData: { status: 0 } }) })
+      .mockResolvedValueOnce({ json: async () => ({ code: 0, zpData: { wt2: "test-wt" } }) });
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await new BossChatSender().send(
+      action({ operation_kind: "resume", encrypt_resume_id: "resume-1" }),
+      { isSendEnabled: async () => true }
+    );
+    expect(result).toMatchObject({ outcome: "accepted", statusCode: "transport_accepted" });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("https://www.zhipin.com/wapi/zpchat/exchange/request");
+    expect(String(fetchMock.mock.calls[0]?.[1]?.body)).toContain("encryptResumeId=resume-1");
+    const publishCall = mqttMock.client.publish.mock.calls[0];
+    expect(publishCall?.[0]).toBe("chat");
+    expect((publishCall?.[1] as { length?: number }).length).toBeGreaterThan(0);
+    expect(publishCall?.[2]).toEqual({ qos: 1, retain: true });
+    const protocol = bossChatProtocol.decode(publishCall?.[1] as Uint8Array);
+    expect(protocol.protocolType6Payload).toMatchObject({
+      field1Value: "200",
+      field2Value: "300000000000001",
+      field5Value: 0
+    });
+    expect(Number(protocol.protocolType6Payload?.field3Value)).toBeGreaterThan(0);
+    expect(resumeCardMock.wait).toHaveBeenCalledWith("200", 10_000, expect.any(AbortSignal));
+  });
+
+  it("exchange 失败时不 MQTT publish", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      json: async () => ({ code: 1, message: "rejected", zpData: { status: 1 } })
+    }));
+    const result = await new BossChatSender().send(
+      action({ operation_kind: "resume", encrypt_resume_id: "resume-1" }),
+      { isSendEnabled: async () => true }
+    );
+    expect(result).toMatchObject({ outcome: "failed", statusCode: "chat_send_failed" });
+    expect(mqttMock.client.publish).not.toHaveBeenCalled();
+  });
+
   it("身份或发送开关不匹配时不 publish", async () => {
     const mismatch = await new BossChatSender().send(action({ account_uid: "other" }), { isSendEnabled: async () => true });
     const disabled = await new BossChatSender().send(action(), { isSendEnabled: async () => false });
     expect(mismatch.outcome).toBe("failed");
     expect(disabled.outcome).toBe("failed");
+    expect(mqttMock.client.publish).not.toHaveBeenCalled();
+  });
+
+  it("简历发送开关关闭时不请求 exchange 或 MQTT", async () => {
+    const result = await new BossChatSender().send(
+      action({ operation_kind: "resume", encrypt_resume_id: "resume-1" }),
+      { isSendEnabled: async () => false }
+    );
+    expect(result).toMatchObject({ outcome: "failed", statusCode: "chat_send_failed" });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(mqttMock.connect).not.toHaveBeenCalled();
     expect(mqttMock.client.publish).not.toHaveBeenCalled();
   });
 
@@ -92,6 +182,22 @@ describe("BOSS 聊天 sender 离线边界", () => {
     );
     const result = await new BossChatSender().send(action(), { isSendEnabled: async () => true });
     expect(result).toMatchObject({ outcome: "unknown", statusCode: "chat_send_result_unknown" });
+    expect(mqttMock.client.publish).toHaveBeenCalledTimes(1);
+  });
+
+  it("简历 exchange 已成功但 MQTT 失败时结果保持 unknown 且不重试", async () => {
+    mqttMock.client.publish.mockImplementationOnce(
+      (_topic: string, _bytes: Uint8Array, _options: object, callback: (error?: Error) => void) => callback(new Error("offline"))
+    );
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ json: async () => ({ code: 0, zpData: { status: 0 } }) })
+      .mockResolvedValueOnce({ json: async () => ({ code: 0, zpData: { wt2: "test-wt" } }) });
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await new BossChatSender().send(
+      action({ operation_kind: "resume", encrypt_resume_id: "resume-1" }),
+      { isSendEnabled: async () => true }
+    );
+    expect(result).toMatchObject({ outcome: "unknown", statusCode: "resume_send_result_unknown" });
     expect(mqttMock.client.publish).toHaveBeenCalledTimes(1);
   });
 

@@ -10,6 +10,15 @@ const assistantClientMids = new Map<string, number>();
 const observedSockets = new WeakSet<WebSocket>();
 let activeInstallation: { setEnabled(enabled: boolean): void; uninstall(): void } | null = null;
 
+export type ResumeCardReference = { fromUid: string; mid: string };
+type ResumeCardWaiter = {
+  peerUid: string;
+  resolve: (reference: ResumeCardReference) => void;
+  reject: (error: Error) => void;
+  timer: number;
+};
+const resumeCardWaiters = new Set<ResumeCardWaiter>();
+
 export type BossChatDiagnostics = {
   mqttFramesReceived: number;
   mqttPublishReceived: number;
@@ -60,6 +69,58 @@ export const readBossChatIdentity = (): ChatIdentity => ({
   pathname: window.location.pathname,
   observedAt: Date.now()
 });
+
+const notifyResumeCard = (reference: ResumeCardReference): void => {
+  for (const waiter of [...resumeCardWaiters]) {
+    if (waiter.peerUid !== reference.fromUid) continue;
+    window.clearTimeout(waiter.timer);
+    resumeCardWaiters.delete(waiter);
+    waiter.resolve(reference);
+  }
+};
+
+const findResumeCardReferences = async (data: unknown): Promise<ResumeCardReference[]> => {
+  const bytes = await toUint8Array(data);
+  if (!bytes) return [];
+  try {
+    return decodeMqttPackets(bytes).flatMap((packet) => {
+      if (packet.type !== "publish" || packet.topic !== "chat") return [];
+      const protocol = bossChatProtocol.decode(packet.payload);
+      if (protocol.type !== 1) return [];
+      return protocol.messages.flatMap((message) => {
+        const fromUid = String(message.from?.uid ?? "");
+        const mid = String(message.mid ?? "");
+        return Number(message.body?.type) === 12 && fromUid && mid ? [{ fromUid, mid }] : [];
+      });
+    });
+  } catch {
+    return [];
+  }
+};
+
+/** 等待 exchange/request 后页面收到的关联简历卡片，供 protocolType=6 使用其动态字段。 */
+export const waitForResumeCard = (
+  peerUid: string,
+  timeoutMs = 10_000,
+  signal?: AbortSignal
+): Promise<ResumeCardReference> =>
+  new Promise((resolve, reject) => {
+    const waiter: ResumeCardWaiter = {
+      peerUid,
+      resolve,
+      reject,
+      timer: window.setTimeout(() => {
+        resumeCardWaiters.delete(waiter);
+        reject(new Error("未收到关联简历卡片，已阻止 MQTT 简历发布"));
+      }, timeoutMs)
+    };
+    resumeCardWaiters.add(waiter);
+    signal?.addEventListener("abort", () => {
+      window.clearTimeout(waiter.timer);
+      resumeCardWaiters.delete(waiter);
+      reject(new Error("简历卡片等待已取消"));
+    }, { once: true });
+  });
 
 const persistAssistantClientMids = (): void => {
   try {
@@ -227,6 +288,9 @@ const observeSocket = (
   if (observedSockets.has(socket) || !socket.url.includes("chat")) return;
   observedSockets.add(socket);
   socket.addEventListener("message", (event) => {
+    void findResumeCardReferences(event.data).then((references) => {
+      references.forEach(notifyResumeCard);
+    });
     if (!isEnabled()) return;
     void decodeObservedChatFrame(event.data, "remote_message").then((messages) => Promise.all(
       messages.map((message) => onMessage(message))

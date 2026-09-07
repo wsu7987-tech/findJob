@@ -76,7 +76,13 @@ export class ContentService {
     if (command.type === "BOSS_CHAT_SEND") {
       if (command.targetTabId !== this.tabId) return { accepted: false };
       if (command.leaderEpoch !== this.chatLeaderEpoch) return { accepted: false };
-      if (!command.action?.id || command.action.execution_epoch < 1 || !command.action.text) {
+      const operationKind = command.action?.operation_kind ?? "text";
+      if (
+        !command.action?.id
+        || command.action.execution_epoch < 1
+        || (operationKind === "text" && !command.action.text)
+        || (operationKind === "resume" && !command.action.encrypt_resume_id)
+      ) {
         throw new Error("聊天发送命令载荷无效");
       }
     } else if (

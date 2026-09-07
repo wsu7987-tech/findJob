@@ -1357,6 +1357,18 @@ export const api = {
       { method: "POST", body: JSON.stringify(payload) }
     );
   },
+  async refreshFineJobChatResumeAttachments(sessionId: string) {
+    return request<FineJobChatSendActionEnvelope>(
+      `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/resume-attachments/refresh`,
+      { method: "POST" }
+    );
+  },
+  async createFineJobChatResumeAction(sessionId: string, encryptResumeId: string, filename: string) {
+    return request<FineJobChatSendActionEnvelope>(
+      `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/resume-actions`,
+      { method: "POST", body: JSON.stringify({ encrypt_resume_id: encryptResumeId, filename }) }
+    );
+  },
   async cancelFineJobChatReply(taskId: string, reason = "用户取消回复") {
     return request<FineJobChatReplyEnvelope>(
       `/api/fine-job/boss-chat/reply-tasks/${encodeURIComponent(taskId)}/cancel`,

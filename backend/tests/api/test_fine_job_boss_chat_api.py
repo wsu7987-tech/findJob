@@ -931,3 +931,72 @@ def test_incomplete_session_is_reconciled_when_job_identity_arrives(configured_c
     assert len(sessions) == 1
     assert sessions[0]["encrypt_job_id"] == "enc-job-300"
     assert sessions[0]["status"] == "active"
+
+
+def test_resume_action_requires_cached_selection_and_keeps_selected_filename(configured_client) -> None:
+    _, token = _pair(configured_client)
+    headers = {"Authorization": f"Bearer {token}"}
+    configured_client.patch(
+        "/api/fine-job/boss-chat/runtime",
+        json={"listen_enabled": True, "generation_enabled": False, "send_enabled": True},
+    )
+    configured_client.post(
+        "/api/fine-job/boss-chat/executor/heartbeat",
+        headers=headers,
+        json={"account_uid": "geek-100", "tab_id": "tab-resume", "leader_epoch": 1, "is_leader": True},
+    )
+    configured_client.post(
+        "/api/fine-job/boss-chat/executor/events/batch",
+        headers=headers,
+        json={"events": [_message_event("event-resume", "message-resume", "请发送附件简历")]},
+    )
+    session_id = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]["id"]
+    _resume_session(configured_client, session_id)
+
+    refresh = configured_client.post(
+        f"/api/fine-job/boss-chat/sessions/{session_id}/resume-attachments/refresh"
+    )
+    assert refresh.status_code == 200
+    list_action = configured_client.post(
+        "/api/fine-job/boss-chat/executor/actions/claim",
+        headers=headers,
+        json={"account_uid": "geek-100", "tab_id": "tab-resume", "leader_epoch": 1},
+    ).json()["action"]
+    started = configured_client.post(
+        f"/api/fine-job/boss-chat/executor/actions/{list_action['id']}/dispatch-started",
+        headers=headers,
+        json={"execution_epoch": list_action["execution_epoch"]},
+    )
+    assert started.status_code == 200
+    completed = configured_client.post(
+        f"/api/fine-job/boss-chat/executor/actions/{list_action['id']}/complete",
+        headers=headers,
+        json={
+            "execution_epoch": list_action["execution_epoch"],
+            "outcome": "accepted",
+            "client_mid": list_action["client_mid"],
+            "status_code": "resume_list_loaded",
+            "evidence": {"attachments": [
+                {"encryptResumeId": "resume-a", "showName": "简历 A.pdf"},
+                {"encryptResumeId": "resume-b", "showName": "简历 B.pdf"},
+            ]},
+        },
+    )
+    assert completed.status_code == 200
+    assert configured_client.get(f"/api/fine-job/boss-chat/sessions/{session_id}").json()["resume_attachments"] == [
+        {"encryptResumeId": "resume-a", "showName": "简历 A.pdf"},
+        {"encryptResumeId": "resume-b", "showName": "简历 B.pdf"},
+    ]
+
+    missing_choice = configured_client.post(
+        f"/api/fine-job/boss-chat/sessions/{session_id}/resume-actions",
+        json={"encrypt_resume_id": "resume-a", "filename": "已变更名称.pdf"},
+    )
+    assert missing_choice.status_code == 409
+    selected = configured_client.post(
+        f"/api/fine-job/boss-chat/sessions/{session_id}/resume-actions",
+        json={"encrypt_resume_id": "resume-b", "filename": "简历 B.pdf"},
+    )
+    assert selected.status_code == 200
+    assert selected.json()["action"]["encrypt_resume_id"] == "resume-b"
+    assert selected.json()["action"]["resume_filename"] == "简历 B.pdf"

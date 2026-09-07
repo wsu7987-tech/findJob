@@ -30,11 +30,18 @@ message TechwolfMessageSync {
   required int64 clientMid = 1;
   required int64 serverMid = 2;
 }
+message TechwolfProtocolType6Payload {
+  required int64 field1Value = 1;
+  required int64 field2Value = 2;
+  required int64 field3Value = 3;
+  optional int32 field5Value = 5;
+}
 message TechwolfChatProtocol {
   required int32 type = 1;
   optional string version = 2;
   repeated TechwolfMessage messages = 3;
   repeated TechwolfMessageSync messageSync = 7;
+  optional TechwolfProtocolType6Payload protocolType6Payload = 8;
   optional int32 domain = 10;
 }
 `;
@@ -56,6 +63,12 @@ export type DecodedChatProtocol = {
   type?: number;
   messages: DecodedChatMessage[];
   messageSync: Array<{ clientMid?: string; serverMid?: string }>;
+  protocolType6Payload?: {
+    field1Value?: string;
+    field2Value?: string;
+    field3Value?: string;
+    field5Value?: number;
+  };
 };
 
 export class BossChatProtocol {
@@ -109,6 +122,26 @@ export class BossChatProtocol {
     const message = this.protocol.fromObject({ type: 5, messageSync: [{ clientMid, serverMid }] });
     const error = this.protocol.verify(message);
     if (error) throw new Error(`BOSS messageSync 校验失败：${error}`);
+    return this.protocol.encode(message).finish();
+  }
+
+  encodeResume(input: {
+    field1Value: string;
+    field2Value: string;
+    field3Value: string;
+  }): Uint8Array {
+    // field 3 仅确认是动态时间类值，保持中性字段名。
+    const message = this.protocol.fromObject({
+      type: 6,
+      protocolType6Payload: {
+        field1Value: input.field1Value,
+        field2Value: input.field2Value,
+        field3Value: input.field3Value,
+        field5Value: 0
+      }
+    });
+    const error = this.protocol.verify(message);
+    if (error) throw new Error(`BOSS 简历消息校验失败：${error}`);
     return this.protocol.encode(message).finish();
   }
 }

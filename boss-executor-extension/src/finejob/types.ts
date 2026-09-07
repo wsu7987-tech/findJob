@@ -117,6 +117,9 @@ export type FineJobChatSendAction = {
   security_id: string;
   encrypt_job_id: string;
   client_mid: string;
+  operation_kind?: "text" | "resume_list" | "resume";
+  encrypt_resume_id?: string;
+  resume_filename?: string;
 };
 
 export type ChatSendCommand = {

@@ -164,3 +164,8 @@ class BossChatActionCompleteRequest(BaseModel):
     status_code: str = Field(default="", max_length=100)
     message: str = Field(default="", max_length=500)
     evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class BossChatResumeSendRequest(BaseModel):
+    encrypt_resume_id: str = Field(min_length=1, max_length=240)
+    filename: str = Field(min_length=1, max_length=300)

@@ -1452,6 +1452,16 @@ export interface FineJobChatSendAction {
   updated_at: string;
   platform_message_id?: string;
   client_mid?: string;
+  operation_kind?: "text" | "resume_list" | "resume";
+  encrypt_resume_id?: string;
+  resume_filename?: string;
+}
+
+export interface FineJobBossResumeAttachment {
+  encryptResumeId: string;
+  showName: string;
+  resumeSizeDesc: string;
+  suffixName: string;
 }
 
 export interface FineJobConversationInsight {
@@ -1473,6 +1483,7 @@ export interface FineJobChatSessionDetail {
   messages: FineJobChatMessage[];
   reply_tasks: FineJobChatReplyTask[];
   send_actions: FineJobChatSendAction[];
+  resume_attachments?: FineJobBossResumeAttachment[];
   latest_conversation_insight?: FineJobConversationInsight | null;
   messages_truncated?: boolean;
   message_count?: number;

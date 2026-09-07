@@ -22,6 +22,7 @@ from backend.app.schemas.fine_job.boss_chat import (
     BossChatGenerateRequest,
     BossChatHeartbeatRequest,
     BossChatReasonRequest,
+    BossChatResumeSendRequest,
     BossChatReplyConfirmRequest,
     BossChatReplyEditRequest,
     BossChatRuntimeUpdateRequest,
@@ -215,6 +216,25 @@ def session(
     db: Database = Depends(get_database),
 ):
     return boss_chat.get_session(db, session_id)
+
+
+@router.post("/sessions/{session_id}/resume-attachments/refresh")
+def refresh_resume_attachments(
+    session_id: str,
+    db: Database = Depends(get_database),
+):
+    """通过当前 BOSS 领导标签页读取可发送的附件简历。"""
+    return {"action": boss_chat.create_resume_list_action(db, session_id)}
+
+
+@router.post("/sessions/{session_id}/resume-actions")
+def create_resume_action(
+    session_id: str,
+    payload: BossChatResumeSendRequest,
+    db: Database = Depends(get_database),
+):
+    """在用户选择附件并确认后创建同一聊天动作队列中的简历发送动作。"""
+    return {"action": boss_chat.create_resume_send_action(db, session_id, payload.encrypt_resume_id, payload.filename)}
 
 
 @router.post("/sessions/{session_id}/history/refresh", response_model=BossChatHistoryRefreshResponse)
