@@ -42,7 +42,8 @@ export const resolveBossContactContext = async (
     const first = Array.isArray(data.result) ? record(data.result[0]) : {};
     const result: ContactContext = {
       peerUid,
-      encryptPeerUid: text(first.encryptBossId),
+      // 与后端联系人同步保持相同回退顺序，避免字段版本差异导致发送身份缺失。
+      encryptPeerUid: text(first.encryptFriendId) || text(first.encryptUid) || text(first.encryptBossId),
       securityId: text(first.securityId),
       encryptJobId: text(first.encryptJobId),
       jobTitle: [first.brandName, first.title].map(text).filter(Boolean).join("-") ,

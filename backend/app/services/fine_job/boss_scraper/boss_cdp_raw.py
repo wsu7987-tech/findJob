@@ -38,6 +38,7 @@ import shutil
 import signal
 import logging
 import ntpath
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from collections import Counter
@@ -291,6 +292,8 @@ def incr_request():
 # CDP 连接
 # ============================================================
 class CDPSession:
+    EVENT_BUFFER_LIMIT = 4096
+
     def __init__(self, cdp_port=DEFAULT_CDP_PORT):
         if not require_runtime_dependencies("requests", "websocket"):
             raise RuntimeError("缺少 CDP 运行依赖")
@@ -302,8 +305,74 @@ class CDPSession:
         # CDP 事件缓冲：send() 等待命令响应期间到达的事件通知都会存这里，
         # 供 Network 域被动捕获使用（见 NetworkJoblistCapture）。
         self.events = []
+        self._event_sequence = 0
+        self._event_dropped = 0
+        self._cursor_overflow = 0
+        self._pending_responses = {}
+        self._io_lock = threading.Lock()
+
+    def _append_event(self, event):
+        """为事件分配序号并写入有界兼容缓冲。"""
+        self._event_sequence += 1
+        event["_finejobSequence"] = self._event_sequence
+        overflow = len(self.events) - self.EVENT_BUFFER_LIMIT + 1
+        if overflow > 0:
+            del self.events[:overflow]
+            self._event_dropped += overflow
+        self.events.append(event)
+
+    def _route_message(self, message):
+        """将单 reader 收到的消息分流到事件缓冲或命令响应表。"""
+        if "method" in message:
+            self._append_event(message)
+            return "event"
+        response_id = message.get("id")
+        if response_id is not None:
+            self._pending_responses[response_id] = message
+            return "response"
+        return "ignored"
+
+    def create_event_cursor(self):
+        """返回当前事件序号，供 consumer 从此位置独立增量读取。"""
+        return self._event_sequence
+
+    def events_since(self, cursor, session_id=None, methods=None):
+        """读取 cursor 之后的事件，不删除其他 consumer 仍需读取的数据。"""
+        cursor = max(0, int(cursor or 0))
+        next_cursor = self._event_sequence
+        if self.events:
+            earliest = int(self.events[0].get("_finejobSequence") or 0)
+            if cursor < earliest - 1:
+                self._cursor_overflow += earliest - cursor - 1
+        method_filter = set(methods) if methods is not None else None
+        selected = []
+        for event in self.events:
+            sequence = int(event.get("_finejobSequence") or 0)
+            if sequence <= cursor:
+                continue
+            if session_id is not None and str(event.get("sessionId") or "") != str(session_id):
+                continue
+            if method_filter is not None and event.get("method") not in method_filter:
+                continue
+            selected.append(event)
+        return selected, next_cursor
+
+    def event_buffer_diagnostics(self):
+        """返回不包含业务载荷的缓冲容量与淘汰诊断。"""
+        return {
+            "capacity": self.EVENT_BUFFER_LIMIT,
+            "buffered": len(self.events),
+            "latest_sequence": self._event_sequence,
+            "dropped_events": self._event_dropped,
+            "cursor_overflow_events": self._cursor_overflow,
+        }
 
     def send(self, method, params=None, sid=None, timeout=30):
+        """串行发送命令并读取响应，维持每条 CDP 连接单 reader。"""
+        with self._io_lock:
+            return self._send_locked(method, params=params, sid=sid, timeout=timeout)
+
+    def _send_locked(self, method, params=None, sid=None, timeout=30):
         """发送 CDP 命令并等待匹配的响应。
 
         Args:
@@ -323,6 +392,10 @@ class CDPSession:
         if sid:
             msg["sessionId"] = sid
         self.ws.send(json.dumps(msg))
+
+        pending = self._pending_responses.pop(self.mid, None)
+        if pending is not None:
+            return pending
 
         start_time = time.time()
         max_retries = 1000
@@ -350,16 +423,19 @@ class CDPSession:
             if r.get("id") == self.mid:
                 return r
 
-            # 不匹配的消息：事件通知，存入缓冲供被动捕获，避免丢失
-            event_name = r.get("method", "unknown")
-            log.debug(f"缓冲事件消息 (id={r.get('id')}, event={event_name})")
-            self.events.append(r)
+            # 事件和其它命令响应分别进入各自缓冲，避免响应混入 capture。
+            self._route_message(r)
 
         raise TimeoutError(
             f"CDP send({method}) 在 {max_retries} 条消息内未找到匹配响应"
         )
 
     def drain_events(self, duration):
+        """串行读取 CDP 消息并将事件写入有界缓冲。"""
+        with self._io_lock:
+            return self._drain_events_locked(duration)
+
+    def _drain_events_locked(self, duration):
         """在 duration 秒内持续接收并缓冲 CDP 事件，超时或期间无消息则返回。
 
         用于等待页面自身发起的请求完成（Network 域事件），不发送任何命令。
@@ -379,8 +455,7 @@ class CDPSession:
                     r = json.loads(raw)
                 except (json.JSONDecodeError, ValueError):
                     continue
-                if "method" in r:
-                    self.events.append(r)
+                self._route_message(r)
         finally:
             # 恢复默认超时，避免影响后续 send() 的等待
             self.ws.settimeout(60)
@@ -471,24 +546,30 @@ class NetworkJoblistCapture:
         self.cdp = cdp
         self.sid = sid
         self._consumed = set()   # 已返回给调用方的 requestId
+        self._cursor = cdp.create_event_cursor() if cdp is not None else 0
+        self._requests_seen = {}
+        self._finished = set()
 
     def enable(self):
         self.cdp.send("Network.enable", {}, self.sid)
 
     def _next_completed(self):
-        """扫描事件缓冲，返回下一个已完成且未消费的 joblist 响应 requestId。"""
-        requests = {}
-        finished = set()
-        for ev in self.cdp.events:
+        """增量读取事件，返回下一个已完成且未消费的 joblist 响应。"""
+        events, self._cursor = self.cdp.events_since(
+            self._cursor,
+            session_id=self.sid,
+            methods={"Network.requestWillBeSent", "Network.loadingFinished"},
+        )
+        for ev in events:
             method = ev.get("method", "")
             params = ev.get("params", {})
             if method == "Network.requestWillBeSent":
                 if self._is_joblist_url(params.get("request", {}).get("url", "")):
-                    requests[params.get("requestId")] = True
+                    self._requests_seen[params.get("requestId")] = True
             elif method == "Network.loadingFinished":
-                finished.add(params.get("requestId"))
-        for request_id in requests:
-            if request_id in finished and request_id not in self._consumed:
+                self._finished.add(params.get("requestId"))
+        for request_id in self._requests_seen:
+            if request_id in self._finished and request_id not in self._consumed:
                 return request_id
         return None
 
@@ -554,26 +635,32 @@ class NetworkChatFriendListCapture:
         self.cdp = cdp
         self.sid = sid
         self._consumed = set()
+        self._cursor = cdp.create_event_cursor() if cdp is not None else 0
+        self._requests_seen = {}
+        self._finished = set()
 
     def enable(self):
         self.cdp.send("Network.enable", {}, self.sid)
 
     def _next_completed(self):
-        """从 CDP 事件缓冲中找到已完成的聊天联系人列表请求。"""
-        requests_seen = {}
-        finished = set()
-        for event in self.cdp.events:
+        """增量读取聊天联系人列表请求，保留其他 consumer 的读取位置。"""
+        events, self._cursor = self.cdp.events_since(
+            self._cursor,
+            session_id=self.sid,
+            methods={"Network.requestWillBeSent", "Network.loadingFinished"},
+        )
+        for event in events:
             method = event.get("method", "")
             params = event.get("params", {})
             request_id = params.get("requestId")
             if method == "Network.requestWillBeSent":
                 request = params.get("request") or {}
                 if request_id and self._is_friend_list_url(request.get("url", "")):
-                    requests_seen[request_id] = True
+                    self._requests_seen[request_id] = True
             elif method == "Network.loadingFinished" and request_id:
-                finished.add(request_id)
-        for request_id in requests_seen:
-            if request_id in finished and request_id not in self._consumed:
+                self._finished.add(request_id)
+        for request_id in self._requests_seen:
+            if request_id in self._finished and request_id not in self._consumed:
                 return request_id
         return None
 

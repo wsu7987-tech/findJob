@@ -1583,7 +1583,8 @@ CREATE TABLE IF NOT EXISTS fj_execution_evidence (
   CHECK (evidence_type IN (
     'outbound_message_observed', 'inbound_reply_observed',
     'conversation_created', 'greeting_state_changed',
-    'page_state_confirmed', 'protocol_acknowledged', 'rejection_observed'
+    'page_state_confirmed', 'protocol_acknowledged', 'rejection_observed',
+    'transport_write_observed', 'message_sync_observed'
   )),
   CHECK (confidence >= 0 AND confidence <= 1),
   CHECK (evidence_level IN ('direct', 'strong_inferred', 'weak_inferred'))
@@ -2364,7 +2365,7 @@ class Database:
                 for event_type in required_activity_types
             ),
             "pipeline": "waiting_on" not in pipeline_columns,
-            "evidence": "'rejection_observed'" not in table_sql["fj_execution_evidence"],
+            "evidence": "'message_sync_observed'" not in table_sql["fj_execution_evidence"],
             "insights": "run_id TEXT NOT NULL" in table_sql["fj_conversation_insights"],
         }
         if not any(rebuild.values()):
@@ -2505,7 +2506,8 @@ class Database:
                       CHECK (evidence_type IN (
                         'outbound_message_observed', 'inbound_reply_observed',
                         'conversation_created', 'greeting_state_changed',
-                        'page_state_confirmed', 'protocol_acknowledged', 'rejection_observed'
+                        'page_state_confirmed', 'protocol_acknowledged', 'rejection_observed',
+                        'transport_write_observed', 'message_sync_observed'
                       )),
                       CHECK (confidence >= 0 AND confidence <= 1),
                       CHECK (evidence_level IN ('direct', 'strong_inferred', 'weak_inferred'))

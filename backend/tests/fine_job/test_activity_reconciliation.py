@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 from backend.app.services.fine_job.execution_reconciliation import (
@@ -138,10 +139,13 @@ def _insert_outbound(
             """
             INSERT INTO fj_chat_messages (
               id, session_id, platform_message_id, direction, message_type, content,
-              sender_uid, receiver_uid, client_mid, source, sent_at, observed_at, created_at
-            ) VALUES (?, ?, ?, 'outbound', 'text', ?, 'candidate-1', 'boss-1', ?, ?, ?, ?, ?)
+              sender_uid, receiver_uid, client_mid, source, sent_at, observed_at, raw_meta_json, created_at
+            ) VALUES (?, ?, ?, 'outbound', 'text', ?, 'candidate-1', 'boss-1', ?, ?, ?, ?, ?, ?)
             """,
-            (message_id, session_id, f"platform-{message_id}", content, client_mid, source, sent_at, sent_at, sent_at),
+            (
+                message_id, session_id, f"platform-{message_id}", content, client_mid, source,
+                sent_at, sent_at, json.dumps({"evidence_source": "remote_outbound_echo"}), sent_at,
+            ),
         )
 
 

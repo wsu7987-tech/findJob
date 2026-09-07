@@ -78,7 +78,8 @@ describe("Content 服务", () => {
         peer_uid: "peer-1",
         encrypt_peer_uid: "encrypt-peer-1",
         security_id: "security-1",
-        encrypt_job_id: "job-1"
+        encrypt_job_id: "job-1",
+        client_mid: "1000000000000000001"
       }
     };
 
@@ -117,7 +118,8 @@ describe("Content 服务", () => {
         peer_uid: "peer-1",
         encrypt_peer_uid: "encrypt-peer-1",
         security_id: "security-1",
-        encrypt_job_id: "job-1"
+        encrypt_job_id: "job-1",
+        client_mid: "1000000000000000001"
       }
     });
     await service.reportChatIdentity({ ...identity, observedAt: 2 });

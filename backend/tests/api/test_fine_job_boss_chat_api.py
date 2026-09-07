@@ -484,13 +484,14 @@ def test_chat_observe_generate_confirm_and_send(configured_client) -> None:
         json={
             "execution_epoch": epoch,
             "outcome": "accepted",
-            "client_mid": "assistant-mid-1",
-            "status_code": "publish_no_throw",
-            "message": "MQTT publish 已提交",
+            "client_mid": action["client_mid"],
+            "status_code": "transport_accepted",
+            "message": "MQTT QoS 1 已接受传输，等待平台确认",
         },
     )
     assert completed.status_code == 200
     assert completed.json()["action"]["status"] == "accepted"
+    assert completed.json()["action"]["canonical_status"] == "unknown"
     detail = configured_client.get(f"/api/fine-job/boss-chat/sessions/{session_id}").json()
     assert [item["direction"] for item in detail["messages"]] == ["inbound", "inbound", "outbound"]
 
@@ -501,7 +502,9 @@ def test_chat_observe_generate_confirm_and_send(configured_client) -> None:
         direction="outbound",
         source="manual",
     )
-    assistant_echo["message"]["client_mid"] = "assistant-mid-1"  # type: ignore[index]
+    assistant_echo["message"]["client_mid"] = action["client_mid"]  # type: ignore[index]
+    assistant_echo["message"]["frame_origin"] = "remote_message"  # type: ignore[index]
+    assistant_echo["message"]["evidence_source"] = "remote_outbound_echo"  # type: ignore[index]
     echoed = configured_client.post(
         "/api/fine-job/boss-chat/executor/events/batch",
         headers=headers,
@@ -716,6 +719,14 @@ def test_dispatch_timeout_becomes_unknown_and_is_not_reclaimed(configured_client
             "based_on_session_version": task["based_on_session_version"],
         },
     )
+    configured_client.patch("/api/fine-job/boss-chat/runtime", json={"send_enabled": False})
+    blocked_claim = configured_client.post(
+        "/api/fine-job/boss-chat/executor/actions/claim",
+        headers=headers,
+        json={"account_uid": "geek-100", "tab_id": "tab-a", "leader_epoch": 1},
+    )
+    assert blocked_claim.json()["action"] is None
+    configured_client.patch("/api/fine-job/boss-chat/runtime", json={"send_enabled": True})
     action = configured_client.post(
         "/api/fine-job/boss-chat/executor/actions/claim",
         headers=headers,
@@ -742,6 +753,157 @@ def test_dispatch_timeout_becomes_unknown_and_is_not_reclaimed(configured_client
     )
     assert reclaimed.status_code == 200
     assert reclaimed.json()["action"] is None
+
+
+def test_local_transport_write_and_message_sync_do_not_confirm_platform(configured_client) -> None:
+    _, token = _pair(configured_client)
+    headers = {"Authorization": f"Bearer {token}"}
+    configured_client.patch(
+        "/api/fine-job/boss-chat/runtime",
+        json={"listen_enabled": True, "generation_enabled": False, "send_enabled": True},
+    )
+    configured_client.post(
+        "/api/fine-job/boss-chat/executor/heartbeat",
+        headers=headers,
+        json={"account_uid": "geek-100", "tab_id": "tab-a", "leader_epoch": 1, "is_leader": True},
+    )
+    configured_client.post(
+        "/api/fine-job/boss-chat/executor/events/batch",
+        headers=headers,
+        json={"events": [_message_event("p2-inbound", "p2-inbound", "您好")]},
+    )
+    session = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]
+    _resume_session(configured_client, session["id"])
+    task = configured_client.post(
+        f"/api/fine-job/boss-chat/sessions/{session['id']}/generate", json={"instruction": "礼貌回复"}
+    ).json()["reply_task"]
+    configured_client.post(
+        f"/api/fine-job/boss-chat/reply-tasks/{task['id']}/confirm",
+        json={
+            "final_text": task["final_text"],
+            "based_on_message_id": task["based_on_message_id"],
+            "based_on_session_version": task["based_on_session_version"],
+        },
+    )
+    action = configured_client.post(
+        "/api/fine-job/boss-chat/executor/actions/claim",
+        headers=headers,
+        json={"account_uid": "geek-100", "tab_id": "tab-a", "leader_epoch": 1},
+    ).json()["action"]
+    assert action["client_mid"].isdigit()
+    configured_client.post(
+        f"/api/fine-job/boss-chat/executor/actions/{action['id']}/dispatch-started",
+        headers=headers,
+        json={"execution_epoch": action["execution_epoch"]},
+    )
+
+    local = _message_event("p2-local", "p2-local", task["final_text"], direction="outbound", source="assistant")
+    local["message"].update({  # type: ignore[index]
+        "client_mid": action["client_mid"],
+        "frame_origin": "local_send",
+        "evidence_source": "local_transport_write",
+    })
+    configured_client.post("/api/fine-job/boss-chat/executor/events/batch", headers=headers, json={"events": [local]})
+    detail = configured_client.get(f"/api/fine-job/boss-chat/sessions/{session['id']}").json()
+    assert detail["send_actions"][0]["canonical_status"] == "dispatching"
+    assert len(detail["messages"]) == 1
+
+    sync = _message_event("p2-sync", "server-mid-1", "", direction="outbound")
+    sync["message"].update({  # type: ignore[index]
+        "peer_uid": "",
+        "client_mid": action["client_mid"],
+        "server_mid": "server-mid-1",
+        "evidence_source": "message_sync",
+    })
+    configured_client.post("/api/fine-job/boss-chat/executor/events/batch", headers=headers, json={"events": [sync]})
+    detail = configured_client.get(f"/api/fine-job/boss-chat/sessions/{session['id']}").json()
+    assert detail["send_actions"][0]["platform_message_id"] == "server-mid-1"
+    assert detail["send_actions"][0]["canonical_status"] == "dispatching"
+
+    remote_early = _message_event(
+        "p2-remote-early", "remote-echo-1", task["final_text"], direction="outbound", source="assistant"
+    )
+    remote_early["message"].update({  # type: ignore[index]
+        "client_mid": action["client_mid"],
+        "frame_origin": "remote_message",
+        "evidence_source": "remote_outbound_echo",
+    })
+    configured_client.post("/api/fine-job/boss-chat/executor/events/batch", headers=headers, json={"events": [remote_early]})
+    before_complete = configured_client.get(f"/api/fine-job/boss-chat/sessions/{session['id']}").json()
+    assert before_complete["send_actions"][0]["canonical_status"] == "succeeded"
+    assert len(before_complete["messages"]) == 2
+    completed = configured_client.post(
+        f"/api/fine-job/boss-chat/executor/actions/{action['id']}/complete",
+        headers=headers,
+        json={
+            "execution_epoch": action["execution_epoch"],
+            "outcome": "accepted",
+            "client_mid": action["client_mid"],
+            "status_code": "transport_accepted",
+            "message": "MQTT QoS 1 已接受传输，等待平台确认",
+        },
+    )
+    assert completed.status_code == 200
+    after_complete = configured_client.get(f"/api/fine-job/boss-chat/sessions/{session['id']}").json()
+    assert len(after_complete["messages"]) == 2
+
+
+def test_send_enabled_closed_after_claim_requeues_without_dispatch(configured_client) -> None:
+    _, token = _pair(configured_client)
+    headers = {"Authorization": f"Bearer {token}"}
+    configured_client.patch(
+        "/api/fine-job/boss-chat/runtime",
+        json={"listen_enabled": True, "generation_enabled": False, "send_enabled": True},
+    )
+    configured_client.post(
+        "/api/fine-job/boss-chat/executor/heartbeat",
+        headers=headers,
+        json={"account_uid": "geek-100", "tab_id": "tab-a", "leader_epoch": 1, "is_leader": True},
+    )
+    configured_client.post(
+        "/api/fine-job/boss-chat/executor/events/batch",
+        headers=headers,
+        json={"events": [_message_event("p2-disable-inbound", "p2-disable-inbound", "您好")]},
+    )
+    session = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]
+    _resume_session(configured_client, session["id"])
+    task = configured_client.post(
+        f"/api/fine-job/boss-chat/sessions/{session['id']}/generate", json={"instruction": "礼貌回复"}
+    ).json()["reply_task"]
+    configured_client.post(
+        f"/api/fine-job/boss-chat/reply-tasks/{task['id']}/confirm",
+        json={
+            "final_text": task["final_text"],
+            "based_on_message_id": task["based_on_message_id"],
+            "based_on_session_version": task["based_on_session_version"],
+        },
+    )
+    action = configured_client.post(
+        "/api/fine-job/boss-chat/executor/actions/claim",
+        headers=headers,
+        json={"account_uid": "geek-100", "tab_id": "tab-a", "leader_epoch": 1},
+    ).json()["action"]
+    with configured_client.app.state.db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_chat_send_actions SET lease_expires_at = '2000-01-01T00:00:00Z' WHERE id = ?",
+            (action["id"],),
+        )
+    reclaimed_before_dispatch = configured_client.post(
+        "/api/fine-job/boss-chat/executor/actions/claim",
+        headers=headers,
+        json={"account_uid": "geek-100", "tab_id": "tab-a", "leader_epoch": 1},
+    ).json()["action"]
+    assert reclaimed_before_dispatch["client_mid"] == action["client_mid"]
+    action = reclaimed_before_dispatch
+    configured_client.patch("/api/fine-job/boss-chat/runtime", json={"send_enabled": False})
+    blocked = configured_client.post(
+        f"/api/fine-job/boss-chat/executor/actions/{action['id']}/dispatch-started",
+        headers=headers,
+        json={"execution_epoch": action["execution_epoch"]},
+    )
+    assert blocked.status_code == 409
+    detail = configured_client.get(f"/api/fine-job/boss-chat/sessions/{session['id']}").json()
+    assert detail["send_actions"][0]["status"] == "queued"
 
 
 def test_incomplete_session_is_reconciled_when_job_identity_arrives(configured_client) -> None:

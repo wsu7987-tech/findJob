@@ -68,6 +68,17 @@ def _id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex}"
 
 
+def _new_client_mid(connection: sqlite3.Connection) -> str:
+    """生成并保存为字符串，避免 JavaScript number 精度影响 int64 clientMid。"""
+    while True:
+        candidate = str(random.SystemRandom().randint(1_000_000_000_000_000_000, 9_000_000_000_000_000_000))
+        exists = connection.execute(
+            "SELECT 1 FROM fj_chat_send_actions WHERE client_mid = ? LIMIT 1", (candidate,)
+        ).fetchone()
+        if exists is None:
+            return candidate
+
+
 def _loads(value: str | None, fallback: Any) -> Any:
     try:
         return json.loads(value or "")
@@ -635,7 +646,7 @@ def sync_history_messages(
                     receiver_uid,
                     sent_at,
                     now,
-                    json.dumps({"history": True, "platform_type": raw.get("type"), "raw": raw}, ensure_ascii=False),
+                    json.dumps({"history": True, "evidence_source": "history_record", "platform_type": raw.get("type"), "raw": raw}, ensure_ascii=False),
                     now,
                 ),
             )
@@ -988,6 +999,8 @@ def ingest_events(
                         "platform_message_id": event_message.get("platform_message_id") or "",
                         "direction": event_message.get("direction") or "",
                         "message_type": event_message.get("message_type") or "unknown",
+                        "frame_origin": event_message.get("frame_origin") or "remote_message",
+                        "evidence_source": event_message.get("evidence_source") or "remote_message",
                     }
                 connection.execute(
                     """
@@ -1014,11 +1027,84 @@ def ingest_events(
             if event["event_type"] != "message":
                 continue
             message = event.get("message") or {}
+            evidence_source = str(message.get("evidence_source") or "remote_message")
+            if evidence_source == "local_transport_write":
+                # 本机 WebSocket.send 仅能证明写入尝试；不创建聊天消息、更不参与成功校正。
+                action = connection.execute(
+                    """
+                    SELECT a.id FROM fj_chat_send_actions a
+                    JOIN fj_chat_sessions s ON s.id = a.session_id
+                    WHERE s.account_uid = ? AND a.client_mid = ?
+                    ORDER BY a.updated_at DESC LIMIT 1
+                    """,
+                    (event["account_uid"], message.get("client_mid") or ""),
+                ).fetchone()
+                if action is not None:
+                    record_execution_evidence_with_connection(
+                        connection,
+                        action_ref_type="chat_send_action",
+                        action_ref_id=str(action["id"]),
+                        evidence_type="transport_write_observed",
+                        source="local_websocket",
+                        source_ref_type="chat_event",
+                        source_ref_id=str(event["event_id"]),
+                        observed_at=str(message.get("observed_at") or _now()),
+                        confidence=0.5,
+                        evidence_level="weak_inferred",
+                        payload={"confirmed": False, "client_mid": str(message.get("client_mid") or "")},
+                        dedupe_key=f"chat_event:{event['event_id']}:transport_write",
+                    )
+                continue
+            if evidence_source == "message_sync":
+                # 字段号和确认语义仍待 native trace；只保存 clientMid/serverMid 关联，不提升成功。
+                action = connection.execute(
+                    """
+                    SELECT a.id FROM fj_chat_send_actions a
+                    JOIN fj_chat_sessions s ON s.id = a.session_id
+                    WHERE s.account_uid = ? AND a.client_mid = ?
+                    ORDER BY a.updated_at DESC LIMIT 1
+                    """,
+                    (event["account_uid"], message.get("client_mid") or ""),
+                ).fetchone()
+                if action is not None:
+                    record_execution_evidence_with_connection(
+                        connection,
+                        action_ref_type="chat_send_action",
+                        action_ref_id=str(action["id"]),
+                        evidence_type="message_sync_observed",
+                        source="remote_websocket",
+                        source_ref_type="chat_event",
+                        source_ref_id=str(event["event_id"]),
+                        observed_at=str(message.get("observed_at") or _now()),
+                        confidence=0.7,
+                        evidence_level="strong_inferred",
+                        payload={
+                            "confirmed": False,
+                            "reference_only": True,
+                            "client_mid": str(message.get("client_mid") or ""),
+                            "server_mid": str(message.get("server_mid") or ""),
+                        },
+                        dedupe_key=f"chat_event:{event['event_id']}:message_sync",
+                    )
+                    connection.execute(
+                        """
+                        UPDATE fj_chat_send_actions SET platform_message_id = ?, updated_at = ?
+                        WHERE id = ? AND (platform_message_id IS NULL OR platform_message_id = '')
+                        """,
+                        (message.get("server_mid") or "", _now(), action["id"]),
+                    )
+                continue
             session = _find_or_create_session(
                 connection,
                 account_uid=event["account_uid"],
                 message=message,
             )
+            stored_raw_meta = dict(message.get("raw_meta") or {})
+            stored_raw_meta.update({
+                "frame_origin": message.get("frame_origin") or "remote_message",
+                "evidence_source": evidence_source,
+                "server_mid": message.get("server_mid") or "",
+            })
             assistant_echo = None
             if message.get("direction") == "outbound" and message.get("client_mid"):
                 assistant_echo = connection.execute(
@@ -1050,7 +1136,7 @@ def ingest_events(
                             message.get("receiver_uid") or "",
                             message["sent_at"],
                             message["observed_at"],
-                            json.dumps(message.get("raw_meta") or {}, ensure_ascii=False),
+                            json.dumps(stored_raw_meta, ensure_ascii=False),
                             message_id,
                         ),
                     )
@@ -1076,7 +1162,7 @@ def ingest_events(
                             message.get("source") or "websocket",
                             message["sent_at"],
                             message["observed_at"],
-                            json.dumps(message.get("raw_meta") or {}, ensure_ascii=False),
+                            json.dumps(stored_raw_meta, ensure_ascii=False),
                             _now(),
                         ),
                     )
@@ -2150,7 +2236,7 @@ def confirm_reply(db: Database, task_id: str, payload: dict[str, Any]) -> dict[s
 def _action_payload(connection: sqlite3.Connection, action_id: str) -> dict[str, Any]:
     row = connection.execute(
         """
-        SELECT a.*, s.account_uid, s.peer_uid, s.encrypt_peer_uid,
+        SELECT a.*, s.account_uid, s.status AS session_status, s.peer_uid, s.encrypt_peer_uid,
           s.security_id, s.encrypt_job_id, s.job_title, s.peer_name, s.company_name
         FROM fj_chat_send_actions a
         JOIN fj_chat_sessions s ON s.id = a.session_id
@@ -2174,7 +2260,9 @@ def claim_send_action(
     now_dt = datetime.now(timezone.utc)
     now = _now()
     with db.connect() as connection:
-        _ensure_runtime(connection)
+        runtime = _ensure_runtime(connection)
+        if not runtime["send_enabled"]:
+            return None
         _sweep_stale_send_actions(connection)
         leader = connection.execute(
             "SELECT * FROM fj_chat_leaders WHERE account_uid = ?",
@@ -2192,7 +2280,7 @@ def claim_send_action(
             raise AppError(status_code=409, error_category="CHAT_NOT_LEADER", error_message="当前标签页不是有效的聊天领导者。")
         action = connection.execute(
             """
-            SELECT a.id FROM fj_chat_send_actions a
+            SELECT a.id, a.client_mid FROM fj_chat_send_actions a
             JOIN fj_chat_sessions s ON s.id = a.session_id
             WHERE s.account_uid = ? AND (
               a.status = 'queued' OR (a.status = 'leased' AND a.lease_expires_at <= ?)
@@ -2206,12 +2294,13 @@ def claim_send_action(
         next_epoch = int(connection.execute(
             "SELECT execution_epoch FROM fj_chat_send_actions WHERE id = ?", (action["id"],)
         ).fetchone()["execution_epoch"]) + 1
+        client_mid = str(action["client_mid"] or "") or _new_client_mid(connection)
         connection.execute(
             """
             UPDATE fj_chat_send_actions SET status = 'leased', lease_owner = ?,
               lease_expires_at = ?, execution_epoch = ?, attempt_count = attempt_count + 1,
               leader_tab_id = ?, leader_epoch = ?, dispatch_deadline_at = NULL,
-              updated_at = ? WHERE id = ?
+              client_mid = ?, updated_at = ? WHERE id = ?
             """,
             (
                 executor_id,
@@ -2219,6 +2308,7 @@ def claim_send_action(
                 next_epoch,
                 tab_id,
                 leader_epoch,
+                client_mid,
                 now,
                 action["id"],
             ),
@@ -2228,9 +2318,27 @@ def claim_send_action(
 
 def mark_dispatch_started(db: Database, executor_id: str, action_id: str, execution_epoch: int) -> dict[str, Any]:
     with db.connect() as connection:
+        runtime = _ensure_runtime(connection)
         action = _action_payload(connection, action_id)
         if action["lease_owner"] != executor_id or int(action["execution_epoch"]) != execution_epoch or action["status"] != "leased":
             raise AppError(status_code=409, error_category="CHAT_ACTION_LEASE_LOST", error_message="发送动作租约已失效。")
+        if not runtime["send_enabled"]:
+            now = _now()
+            connection.execute(
+                """
+                UPDATE fj_chat_send_actions SET status = 'queued', lease_owner = NULL,
+                  lease_expires_at = NULL, dispatch_deadline_at = NULL,
+                  canonical_status = 'pending', canonical_updated_at = ?,
+                  canonical_reason = '发送开关已关闭', updated_at = ? WHERE id = ?
+                """,
+                (now, now, action_id),
+            )
+            connection.commit()
+            raise AppError(status_code=409, error_category="CHAT_SEND_DISABLED", error_message="自动代聊发送开关已关闭。")
+        if action["session_status"] != "active" or not all(
+            action.get(key) for key in ("account_uid", "peer_uid", "encrypt_peer_uid", "security_id", "encrypt_job_id", "client_mid")
+        ):
+            raise AppError(status_code=409, error_category="CHAT_SEND_CONTEXT_INVALID", error_message="发送上下文或身份已失效。")
         leader = connection.execute(
             "SELECT * FROM fj_chat_leaders WHERE account_uid = ?",
             (action["account_uid"],),
@@ -2269,6 +2377,8 @@ def complete_send_action(
         action = _action_payload(connection, action_id)
         if action["lease_owner"] != executor_id or int(action["execution_epoch"]) != int(payload["execution_epoch"]):
             raise AppError(status_code=409, error_category="CHAT_ACTION_LEASE_LOST", error_message="发送动作租约已失效。")
+        if str(payload.get("client_mid") or "") != str(action["client_mid"] or ""):
+            raise AppError(status_code=409, error_category="CHAT_CLIENT_MID_MISMATCH", error_message="发送结果 clientMid 与领取动作不一致。")
         late_unknown_result = action["status"] == "unknown"
         if action["status"] not in {"leased", "dispatching"} and not late_unknown_result:
             return action
@@ -2361,6 +2471,17 @@ def complete_send_action(
             )
         if outcome == "accepted":
             session = _session_or_404(connection, str(action["session_id"]))
+            existing_assistant = connection.execute(
+                """
+                SELECT id FROM fj_chat_messages
+                WHERE session_id = ? AND client_mid = ? AND source = 'assistant'
+                LIMIT 1
+                """,
+                (session["id"], payload.get("client_mid") or ""),
+            ).fetchone()
+            # 远端回显可能早于发送回执；已有 assistant 记录时不再插入第二条占位消息。
+            if existing_assistant is not None:
+                return _action_payload(connection, action_id)
             platform_message_id = payload.get("platform_message_id") or f"assistant:{action_id}"
             message_id = _id("chat_message")
             try:

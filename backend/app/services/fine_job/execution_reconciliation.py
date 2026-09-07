@@ -207,6 +207,11 @@ def observe_outbound_chat_message(
         return []
     if observed_account_uid and observed_account_uid != message["account_uid"]:
         return []
+    raw_meta = _load_json(message["raw_meta_json"])
+    evidence_source = str(raw_meta.get("evidence_source") or "")
+    # 只有远端回显或历史平台记录才能构成平台确认；本机 send 永不进入这里。
+    if evidence_source not in {"remote_outbound_echo", "history_record"}:
+        return []
 
     observed_time = _parse_time(str(message["sent_at"]))
     if observed_time is None:
@@ -230,7 +235,7 @@ def observe_outbound_chat_message(
     ]
     match_method = "client_mid"
     matches = exact_mid
-    if not matches:
+    if not matches and evidence_source == "history_record":
         normalized = normalize_message_text(str(message["content"] or ""))
         matches = [
             row for row in rows

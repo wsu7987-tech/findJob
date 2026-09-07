@@ -86,6 +86,10 @@ export type ChatObservedMessage = {
   sentAt: string;
   observedAt: string;
   source: "websocket" | "manual" | "assistant";
+  /** 帧由本机 send hook 或远端 message listener 提供，决定其可用证据等级。 */
+  frameOrigin: "local_send" | "remote_message";
+  evidenceSource: "local_transport_write" | "remote_outbound_echo" | "remote_message" | "message_sync";
+  serverMid: string;
   rawMeta: Record<string, unknown>;
 };
 
@@ -112,6 +116,7 @@ export type FineJobChatSendAction = {
   encrypt_peer_uid: string;
   security_id: string;
   encrypt_job_id: string;
+  client_mid: string;
 };
 
 export type ChatSendCommand = {
@@ -132,6 +137,12 @@ export type ChatSendExecutionResult = {
   statusCode: string;
   message: string;
   evidence: Record<string, unknown>;
+};
+
+export type ChatSendOptions = {
+  dryRun?: boolean;
+  /** MAIN World 在真正 publish 前读取当前后端运行时开关。 */
+  isSendEnabled?: () => Promise<boolean>;
 };
 
 export type MainWorldExecutionResult = {

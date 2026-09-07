@@ -1,6 +1,6 @@
 import type { ChatIdentity, ChatObservedMessage } from "../../../finejob/types";
 import { bossChatProtocol, type DecodedChatMessage } from "./protocol";
-import { decodeMqttPublish, toUint8Array } from "./mqtt-packet";
+import { decodeMqttPackets, toUint8Array } from "./mqtt-packet";
 import { resolveBossContactContext } from "./contact-context";
 
 
@@ -8,6 +8,35 @@ const ASSISTANT_CLIENT_MIDS_KEY = "finejobBossChatAssistantClientMidsV1";
 const ASSISTANT_CLIENT_MID_TTL_MS = 24 * 60 * 60_000;
 const assistantClientMids = new Map<string, number>();
 const observedSockets = new WeakSet<WebSocket>();
+let activeInstallation: { setEnabled(enabled: boolean): void; uninstall(): void } | null = null;
+
+export type BossChatDiagnostics = {
+  mqttFramesReceived: number;
+  mqttPublishReceived: number;
+  chatTopicReceived: number;
+  protobufDecodeSuccess: number;
+  protobufDecodeFailure: number;
+  unknownProtocolType: number;
+  unknownBodyType: number;
+  messageSyncReceived: number;
+};
+
+const diagnostics: BossChatDiagnostics = {
+  mqttFramesReceived: 0,
+  mqttPublishReceived: 0,
+  chatTopicReceived: 0,
+  protobufDecodeSuccess: 0,
+  protobufDecodeFailure: 0,
+  unknownProtocolType: 0,
+  unknownBodyType: 0,
+  messageSyncReceived: 0
+};
+
+export const getBossChatDiagnostics = (): BossChatDiagnostics => ({ ...diagnostics });
+
+export const resetBossChatDiagnostics = (): void => {
+  for (const key of Object.keys(diagnostics) as Array<keyof BossChatDiagnostics>) diagnostics[key] = 0;
+};
 
 const pageRecord = (): Record<string, unknown> => {
   const page = (window as unknown as { _PAGE?: unknown })._PAGE;
@@ -65,7 +94,10 @@ export const markAssistantClientMid = (clientMid: string): void => {
   persistAssistantClientMids();
 };
 
-const normalizeMessage = async (message: DecodedChatMessage): Promise<ChatObservedMessage | null> => {
+const normalizeMessage = async (
+  message: DecodedChatMessage,
+  frameOrigin: "local_send" | "remote_message"
+): Promise<ChatObservedMessage | null> => {
   const accountUid = currentAccountUid();
   const senderUid = String(message.from?.uid ?? "");
   const receiverUid = String(message.to?.uid ?? "");
@@ -75,7 +107,8 @@ const normalizeMessage = async (message: DecodedChatMessage): Promise<ChatObserv
   const clientMid = String(message.cmid ?? "");
   pruneAssistantClientMids();
   const assistantObserved = direction === "outbound" && assistantClientMids.has(clientMid);
-  if (assistantObserved) {
+  // 本机 write 只是传输尝试，保留 clientMid 等待远端回显或 messageSync 再消费标记。
+  if (assistantObserved && frameOrigin === "remote_message") {
     assistantClientMids.delete(clientMid);
     persistAssistantClientMids();
   }
@@ -85,7 +118,11 @@ const normalizeMessage = async (message: DecodedChatMessage): Promise<ChatObserv
   const messageEncryptJobId = String(message.bizId ?? "");
   const contact = await resolveBossContactContext(accountUid, peerUid, messageEncryptJobId);
   const bodyType = Number(message.body?.type ?? 0);
-  const messageType = bodyType === 1 ? "text" : bodyType === 3 ? "image" : "system";
+  const messageType = bodyType === 1 ? "text" : bodyType === 3 ? "image" : "unknown";
+  if (messageType === "unknown") diagnostics.unknownBodyType += 1;
+  const evidenceSource = frameOrigin === "local_send"
+    ? "local_transport_write"
+    : direction === "outbound" ? "remote_outbound_echo" : "remote_message";
   return {
     eventId: `${accountUid}:${direction}:${platformMessageId}`,
     accountUid,
@@ -108,20 +145,76 @@ const normalizeMessage = async (message: DecodedChatMessage): Promise<ChatObserv
     sentAt: isoFromMilliseconds(message.time),
     observedAt: new Date().toISOString(),
     source: direction === "outbound" ? (assistantObserved ? "assistant" : "manual") : "websocket",
+    frameOrigin,
+    evidenceSource,
+    serverMid: "",
     rawMeta: { bodyType, messageType: message.type ?? 0 }
   };
 };
 
-export const decodeObservedChatFrame = async (data: unknown): Promise<ChatObservedMessage[]> => {
+const normalizeMessageSync = (
+  clientMid: string,
+  serverMid: string,
+  frameOrigin: "local_send" | "remote_message"
+): ChatObservedMessage | null => {
+  const accountUid = currentAccountUid();
+  if (!accountUid || !clientMid || !serverMid || frameOrigin !== "remote_message") return null;
+  diagnostics.messageSyncReceived += 1;
+  return {
+    eventId: `${accountUid}:message-sync:${clientMid}:${serverMid}`,
+    accountUid,
+    platformMessageId: serverMid,
+    direction: "outbound",
+    messageType: "system",
+    content: "",
+    senderUid: accountUid,
+    receiverUid: "",
+    clientMid,
+    peerUid: "",
+    encryptPeerUid: "",
+    securityId: "",
+    encryptJobId: "",
+    jobTitle: "",
+    peerName: "",
+    companyName: "",
+    sentAt: new Date().toISOString(),
+    observedAt: new Date().toISOString(),
+    source: "websocket",
+    frameOrigin,
+    evidenceSource: "message_sync",
+    serverMid,
+    rawMeta: { protocolEvidence: "reference_only" }
+  };
+};
+
+export const decodeObservedChatFrame = async (
+  data: unknown,
+  frameOrigin: "local_send" | "remote_message" = "remote_message"
+): Promise<ChatObservedMessage[]> => {
   const bytes = await toUint8Array(data);
   if (!bytes) return [];
-  const publish = decodeMqttPublish(bytes);
-  if (!publish || publish.topic !== "chat") return [];
+  diagnostics.mqttFramesReceived += 1;
   try {
-    const protocol = bossChatProtocol.decode(publish.payload);
-    const normalized = await Promise.all(protocol.messages.map(normalizeMessage));
-    return normalized.filter((item): item is ChatObservedMessage => item !== null);
+    const packets = decodeMqttPackets(bytes);
+    const publishes = packets.filter((packet) => packet.type === "publish");
+    diagnostics.mqttPublishReceived += publishes.length;
+    const messages: ChatObservedMessage[] = [];
+    for (const publish of publishes) {
+      if (publish.topic !== "chat") continue;
+      diagnostics.chatTopicReceived += 1;
+      const protocol = bossChatProtocol.decode(publish.payload);
+      diagnostics.protobufDecodeSuccess += 1;
+      if (protocol.type !== 1 && protocol.type !== 5) diagnostics.unknownProtocolType += 1;
+      const normalized = await Promise.all(protocol.messages.map((message) => normalizeMessage(message, frameOrigin)));
+      messages.push(...normalized.filter((item): item is ChatObservedMessage => item !== null));
+      for (const sync of protocol.messageSync) {
+        const normalizedSync = normalizeMessageSync(String(sync.clientMid ?? ""), String(sync.serverMid ?? ""), frameOrigin);
+        if (normalizedSync) messages.push(normalizedSync);
+      }
+    }
+    return messages;
   } catch {
+    diagnostics.protobufDecodeFailure += 1;
     return [];
   }
 };
@@ -135,7 +228,7 @@ const observeSocket = (
   observedSockets.add(socket);
   socket.addEventListener("message", (event) => {
     if (!isEnabled()) return;
-    void decodeObservedChatFrame(event.data).then((messages) => Promise.all(
+    void decodeObservedChatFrame(event.data, "remote_message").then((messages) => Promise.all(
       messages.map((message) => onMessage(message))
     ));
   });
@@ -144,6 +237,7 @@ const observeSocket = (
 export const installBossChatObserver = (
   onMessage: (message: ChatObservedMessage) => Promise<void>
 ): { setEnabled(enabled: boolean): void; uninstall(): void } => {
+  if (activeInstallation) return activeInstallation;
   const NativeWebSocket = window.WebSocket;
   const nativeSend = NativeWebSocket.prototype.send;
   let enabled = false;
@@ -158,7 +252,7 @@ export const installBossChatObserver = (
   NativeWebSocket.prototype.send = function (data: string | ArrayBufferLike | Blob | ArrayBufferView) {
     observeSocket(this, onMessage, () => enabled);
     if (enabled && this.url.includes("chat")) {
-      void decodeObservedChatFrame(data).then((messages) => Promise.all(
+      void decodeObservedChatFrame(data, "local_send").then((messages) => Promise.all(
         messages.map((message) => onMessage(message))
       ));
     }
@@ -166,11 +260,14 @@ export const installBossChatObserver = (
   };
   window.WebSocket = ObservedWebSocket;
 
-  return {
+  const installation = {
     setEnabled(value: boolean) { enabled = value; },
     uninstall() {
       window.WebSocket = NativeWebSocket;
       NativeWebSocket.prototype.send = nativeSend;
+      if (activeInstallation === installation) activeInstallation = null;
     }
   };
+  activeInstallation = installation;
+  return installation;
 };

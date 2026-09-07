@@ -457,6 +457,9 @@ export class FineJobExecutorClient {
             sent_at: message.sentAt,
             observed_at: message.observedAt,
             source: message.source,
+            frame_origin: message.frameOrigin,
+            evidence_source: message.evidenceSource,
+            server_mid: message.serverMid,
             raw_meta: message.rawMeta
           }
         }))

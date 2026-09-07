@@ -64,19 +64,7 @@ export class BossChatCoordinator {
     for (const [accountUid, lease] of Object.entries(stored ?? {})) {
       this.leaders.set(accountUid, lease);
     }
-    // 只在协调器启动时读取一次运行配置，后续由页面事件和发送结果触发处理。
-    try {
-      const currentRuntime = await this.client.getChatRuntime();
-      this.listenEnabled = currentRuntime.listen_enabled;
-      this.runtimeKnown = true;
-      await this.updateRuntimeCache(
-        currentRuntime.listen_enabled,
-        currentRuntime.generation_enabled,
-        currentRuntime.send_enabled
-      );
-    } catch (error) {
-      this.lastError = (error as Error).message || "自动代聊运行配置读取失败";
-    }
+    await this.refreshRuntime();
     await this.processAccounts();
   }
 
@@ -129,6 +117,7 @@ export class BossChatCoordinator {
     if (this.processing) return;
     this.processing = true;
     try {
+      await this.refreshRuntime();
       this.pruneCandidates();
       await this.flushResultOutbox();
       const accounts = new Set<string>();
@@ -155,6 +144,20 @@ export class BossChatCoordinator {
 
   isListeningEnabled(): boolean {
     return this.listenEnabled;
+  }
+
+  async isSendingEnabled(): Promise<boolean> {
+    // MAIN World 的最终发送边界不信任内存快照；读取失败时按关闭处理。
+    try {
+      const runtime = await this.client.getChatRuntime();
+      this.listenEnabled = runtime.listen_enabled;
+      this.runtimeKnown = true;
+      await this.updateRuntimeCache(runtime.listen_enabled, runtime.generation_enabled, runtime.send_enabled);
+      return runtime.send_enabled;
+    } catch (error) {
+      this.lastError = (error as Error).message || "自动代聊发送开关读取失败";
+      return false;
+    }
   }
 
   getStatus(): BossChatCoordinatorStatus {
@@ -253,6 +256,20 @@ export class BossChatCoordinator {
       updatedAt: new Date().toISOString()
     };
     await browser.storage.local.set({ [RUNTIME_CACHE_KEY]: this.runtimeCache });
+  }
+
+  private async refreshRuntime(): Promise<void> {
+    try {
+      const runtime = await this.client.getChatRuntime();
+      this.listenEnabled = runtime.listen_enabled;
+      this.runtimeKnown = true;
+      await this.updateRuntimeCache(runtime.listen_enabled, runtime.generation_enabled, runtime.send_enabled);
+    } catch (error) {
+      // 离线期间仍保留接收 outbox，但发送一律关闭，等待下一次成功读取。
+      this.runtimeKnown = false;
+      if (this.runtimeCache) this.runtimeCache.sendEnabled = false;
+      this.lastError = (error as Error).message || "自动代聊运行配置读取失败";
+    }
   }
 
   private messageBytes(message: ChatObservedMessage): number {

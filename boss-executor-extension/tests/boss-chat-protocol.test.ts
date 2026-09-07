@@ -78,13 +78,13 @@ describe("BOSS 聊天协议", () => {
   });
 
   it("保留带 clientMid 的助手 outbound 平台回显", async () => {
-    markAssistantClientMid("assistant-echo-1");
+    markAssistantClientMid("1000000000000000003");
     const protobuf = bossChatProtocol.encodeText({
       fromUid: "100",
       toUid: "200",
       encryptToUid: "enc-boss",
       friendSource: 0,
-      clientMid: "assistant-echo-1",
+      clientMid: "1000000000000000003",
       text: "你好，我目前还在职"
     });
 
@@ -94,7 +94,7 @@ describe("BOSS 聊天协议", () => {
     expect(messages[0]).toMatchObject({
       direction: "outbound",
       source: "assistant",
-      clientMid: "assistant-echo-1"
+      clientMid: "1000000000000000003"
     });
   });
 });

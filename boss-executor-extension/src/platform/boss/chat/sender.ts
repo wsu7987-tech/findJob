@@ -1,11 +1,20 @@
 import mqtt, { type MqttClient } from "mqtt";
 
-import type { ChatSendExecutionResult, FineJobChatSendAction } from "../../../finejob/types";
+import type { ChatSendExecutionResult, ChatSendOptions, FineJobChatSendAction } from "../../../finejob/types";
 import { markAssistantClientMid } from "./observer";
 import { bossChatProtocol } from "./protocol";
 
 
 type PageIdentity = { uid: string; token: string };
+
+let lastGeneratedClientMid = 0n;
+
+/** 仅用于 dry-run 等没有服务端动作 ID 的场景，始终以字符串保留 int64 数值。 */
+export const createProcessClientMid = (): string => {
+  const candidate = BigInt(Date.now()) * 1000n;
+  lastGeneratedClientMid = candidate > lastGeneratedClientMid ? candidate : lastGeneratedClientMid + 1n;
+  return lastGeneratedClientMid.toString();
+};
 
 const readPageIdentity = (): PageIdentity => {
   const raw = (window as unknown as { _PAGE?: Record<string, unknown> })._PAGE ?? {};
@@ -15,7 +24,7 @@ const readPageIdentity = (): PageIdentity => {
   return { uid, token };
 };
 
-class BossChatSender {
+export class BossChatSender {
   private client: MqttClient | null = null;
   private connecting: Promise<MqttClient> | null = null;
 
@@ -75,18 +84,18 @@ class BossChatSender {
     return this.connecting;
   }
 
-  async send(action: FineJobChatSendAction): Promise<ChatSendExecutionResult> {
-    const clientMid = String(Date.now());
+  async send(action: FineJobChatSendAction, options: ChatSendOptions = {}): Promise<ChatSendExecutionResult> {
+    const clientMid = action.client_mid || (options.dryRun ? createProcessClientMid() : "");
     let publishStarted = false;
     try {
       const identity = readPageIdentity();
       if (identity.uid !== action.account_uid) {
         throw new Error("当前 BOSS 账号与待发送动作不一致");
       }
-      if (!action.peer_uid || !action.encrypt_peer_uid || !action.security_id || !action.encrypt_job_id) {
+      if (!action.session_id || !action.text || !action.peer_uid || !action.encrypt_peer_uid || !action.security_id || !action.encrypt_job_id) {
         throw new Error("聊天对象身份不完整，已阻止发送");
       }
-      const client = await this.connect();
+      if (!clientMid) throw new Error("发送动作缺少稳定 clientMid，已阻止发送");
       const bytes = bossChatProtocol.encodeText({
         fromUid: identity.uid,
         toUid: action.peer_uid,
@@ -95,6 +104,35 @@ class BossChatSender {
         clientMid,
         text: action.text
       });
+      const normalized = {
+        transport: "mqtt",
+        topic: "chat",
+        qos: 1,
+        retain: true,
+        dup: false,
+        techwolf: {
+          protocolType: 1,
+          messageCount: 1,
+          messages: [{ fromUid: "<masked>", toUid: "<masked>", clientMid, bodyType: 1 }]
+        }
+      };
+      if (options.dryRun) {
+        return {
+          actionId: action.id,
+          executionEpoch: action.execution_epoch,
+          outcome: "accepted",
+          platformMessageId: "",
+          clientMid,
+          statusCode: "dry_run_prepared",
+          message: "dry-run 已生成本地发送载荷，未执行网络副作用",
+          evidence: { dry_run: true, normalized, payload_bytes: bytes.byteLength }
+        };
+      }
+      const isSendEnabled = options.isSendEnabled ?? (async () => false);
+      if (!await isSendEnabled()) throw new Error("自动代聊发送开关已关闭，已阻止发送");
+      const client = await this.connect();
+      // connect 期间用户可能关闭开关；publish 前必须重新读取当前授权。
+      if (!await isSendEnabled()) throw new Error("自动代聊发送开关已关闭，已阻止发布");
       markAssistantClientMid(clientMid);
       publishStarted = true;
       await new Promise<void>((resolve, reject) => {
@@ -116,9 +154,13 @@ class BossChatSender {
         outcome: "accepted",
         platformMessageId: "",
         clientMid,
-        statusCode: "mqtt_puback",
-        message: "MQTT 已确认提交发送",
-        evidence: { topic: "chat", qos: 1, retain: true }
+        statusCode: "transport_accepted",
+        message: "MQTT QoS 1 已接受传输，等待平台确认",
+        evidence: {
+          transport_state: "transport_accepted_but_unconfirmed",
+          platform_confirmed: false,
+          normalized
+        }
       };
     } catch (error) {
       return {

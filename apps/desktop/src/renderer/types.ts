@@ -206,18 +206,29 @@ export interface FineJobBossBrowserStatus {
 
 export interface FineJobBossNetworkDebugStatus {
   active: boolean;
+  trace_id: string | null;
   event_count: number;
   request_count: number;
-  output_path?: string | null;
-  started_at?: string | null;
-  finished_at?: string | null;
+  frame_count: number;
+  marker_count: number;
+  dropped_event_count: number;
+  evidence_complete: boolean;
+  gap_reasons: string[];
+  output_path: string | null;
+  started_at: string | null;
+  finished_at: string | null;
   target_count: number;
   targets: Array<{
     target_id: string;
     url: string;
     title: string;
   }>;
-  error_message?: string | null;
+  error_message: string | null;
+  marker: {
+    name: string;
+    markerTimestamp: string;
+    timeOffsetMs: number;
+  } | null;
 }
 
 export interface FineJobBossCity {

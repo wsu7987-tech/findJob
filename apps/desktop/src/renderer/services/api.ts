@@ -720,6 +720,12 @@ export const api = {
       method: "POST"
     });
   },
+  async markFineJobBossNetworkDebug(payload: { marker: string }) {
+    return request<FineJobBossNetworkDebugStatus>("/api/fine-job/boss-network-debug/mark", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  },
   async locateFineJobBossSearchPage(payload: FineJobBossSearchPageRequest) {
     return request<FineJobBossSearchPageResponse>("/api/fine-job/boss-capture/locate", {
       method: "POST",

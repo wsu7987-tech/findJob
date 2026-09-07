@@ -127,8 +127,15 @@ export class ContentService {
     return this.background.isChatListeningEnabled();
   }
 
+  async isChatSendingEnabled(): Promise<boolean> {
+    return this.background.isChatSendingEnabled();
+  }
+
   async reportChatMessage(message: ChatObservedMessage): Promise<{ accepted: boolean }> {
-    if (!message.eventId || !message.accountUid || !message.peerUid || !message.platformMessageId) {
+    if (!message.eventId || !message.accountUid || !message.platformMessageId) {
+      throw new Error("聊天观察消息载荷无效");
+    }
+    if (message.evidenceSource !== "message_sync" && !message.peerUid) {
       throw new Error("聊天观察消息载荷无效");
     }
     return this.background.reportChatMessage(this.tabId, message);

@@ -88,7 +88,7 @@ class BossChatMessageEvent(BaseModel):
     sender_uid: str = Field(default="", max_length=80)
     receiver_uid: str = Field(default="", max_length=80)
     client_mid: str = Field(default="", max_length=160)
-    peer_uid: str = Field(min_length=1, max_length=80)
+    peer_uid: str = Field(default="", max_length=80)
     encrypt_peer_uid: str = Field(default="", max_length=160)
     security_id: str = Field(default="", max_length=240)
     job_id: str | None = Field(default=None, max_length=160)
@@ -99,6 +99,11 @@ class BossChatMessageEvent(BaseModel):
     sent_at: str
     observed_at: str
     source: Literal["websocket", "manual", "assistant"] = "websocket"
+    frame_origin: Literal["local_send", "remote_message"] = "remote_message"
+    evidence_source: Literal[
+        "local_transport_write", "remote_outbound_echo", "remote_message", "message_sync"
+    ] = "remote_message"
+    server_mid: str = Field(default="", max_length=160)
     raw_meta: dict[str, Any] = Field(default_factory=dict)
 
 

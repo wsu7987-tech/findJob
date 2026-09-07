@@ -83,14 +83,19 @@ def _parse_job_fields(html: str) -> dict[str, str]:
 def _capture_detail_html(cdp: engine.CDPSession, sid: str, url: str) -> tuple[str, str]:
     """监听指定详情页的 Document 响应，读取原始 HTML 响应体。"""
     cdp.send("Network.enable", {}, sid)
-    cdp.events.clear()
+    cursor = cdp.create_event_cursor()
     cdp.send("Page.navigate", {"url": url}, sid)
     request_urls: dict[str, str] = {}
     finished: set[str] = set()
     deadline = time.time() + 20
     while time.time() < deadline:
         cdp.drain_events(0.4)
-        for event in cdp.events:
+        events, cursor = cdp.events_since(
+            cursor,
+            session_id=sid,
+            methods={"Network.responseReceived", "Network.loadingFinished"},
+        )
+        for event in events:
             params = event.get("params") or {}
             request_id = _text(params.get("requestId"))
             if event.get("method") == "Network.responseReceived" and request_id:

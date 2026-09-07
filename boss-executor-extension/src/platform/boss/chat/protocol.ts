@@ -26,10 +26,15 @@ message TechwolfMessage {
   optional int32 bizType = 18;
   optional string securityId = 19;
 }
+message TechwolfMessageSync {
+  required int64 clientMid = 1;
+  required int64 serverMid = 2;
+}
 message TechwolfChatProtocol {
   required int32 type = 1;
   optional string version = 2;
   repeated TechwolfMessage messages = 3;
+  repeated TechwolfMessageSync messageSync = 7;
   optional int32 domain = 10;
 }
 `;
@@ -50,6 +55,7 @@ export type DecodedChatMessage = {
 export type DecodedChatProtocol = {
   type?: number;
   messages: DecodedChatMessage[];
+  messageSync: Array<{ clientMid?: string; serverMid?: string }>;
 };
 
 export class BossChatProtocol {
@@ -95,6 +101,14 @@ export class BossChatProtocol {
     const message = this.protocol.fromObject(payload);
     const error = this.protocol.verify(message);
     if (error) throw new Error(`BOSS 文本消息校验失败：${error}`);
+    return this.protocol.encode(message).finish();
+  }
+
+  /** messageSync 字段仅为参考 schema 的离线解码夹具，等待 native trace 校验。 */
+  encodeMessageSync(clientMid: string, serverMid: string): Uint8Array {
+    const message = this.protocol.fromObject({ type: 5, messageSync: [{ clientMid, serverMid }] });
+    const error = this.protocol.verify(message);
+    if (error) throw new Error(`BOSS messageSync 校验失败：${error}`);
     return this.protocol.encode(message).finish();
   }
 }

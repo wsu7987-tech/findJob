@@ -77,6 +77,10 @@ export class BackgroundService {
     return bossChatCoordinator.isListeningEnabled();
   }
 
+  async isChatSendingEnabled(): Promise<boolean> {
+    return bossChatCoordinator.isSendingEnabled();
+  }
+
   async reportChatMessage(tabId: string, message: ChatObservedMessage): Promise<{ accepted: boolean }> {
     return bossChatCoordinator.reportMessage(tabId, message);
   }

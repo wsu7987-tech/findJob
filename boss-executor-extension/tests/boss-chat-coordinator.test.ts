@@ -48,6 +48,9 @@ const message = (
   sentAt: new Date().toISOString(),
   observedAt: new Date().toISOString(),
   source: direction === "outbound" ? "manual" : "websocket",
+  frameOrigin: "remote_message",
+  evidenceSource: direction === "outbound" ? "remote_outbound_echo" : "remote_message",
+  serverMid: "",
   rawMeta: {}
 });
 

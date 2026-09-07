@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { ElMessage } from "element-plus";
 
 import { api } from "@/services/api";
@@ -12,7 +12,18 @@ const captureStore = useFineJobBossCaptureStore();
 const networkDebug = ref<Awaited<ReturnType<typeof api.getFineJobBossNetworkDebugStatus>> | null>(null);
 const networkDebugLoading = ref(false);
 const networkDebugError = ref<string | null>(null);
+const customMarker = ref("");
+let networkDebugPollTimer: number | null = null;
 const canOpenNetworkDebugFile = computed(() => Boolean(window.desktopBridge));
+
+const markerPresets = [
+  { label: "发送消息前", marker: "before_send" },
+  { label: "发送消息后", marker: "after_send" },
+  { label: "发送简历前", marker: "before_resume" },
+  { label: "发送简历后", marker: "after_resume" },
+  { label: "投递前", marker: "before_apply" },
+  { label: "投递后", marker: "after_apply" }
+] as const;
 
 const statusType = computed(() => {
   if (platformStore.bossSession?.status === "ready") return "success";
@@ -26,6 +37,37 @@ const statusLabel = computed(() => {
   return "等待登录";
 });
 
+const stopNetworkDebugPolling = () => {
+  if (networkDebugPollTimer === null) return;
+  window.clearInterval(networkDebugPollTimer);
+  networkDebugPollTimer = null;
+};
+
+// 只有后端报告 Trace active 时才保持轮询，停止后立即释放 timer。
+const startNetworkDebugPolling = () => {
+  if (networkDebugPollTimer !== null || networkDebug.value?.active !== true) return;
+  networkDebugPollTimer = window.setInterval(() => {
+    void loadNetworkDebugStatus();
+  }, 2000);
+};
+
+const syncNetworkDebugPolling = () => {
+  if (networkDebug.value?.active === true) {
+    startNetworkDebugPolling();
+  } else {
+    stopNetworkDebugPolling();
+  }
+};
+
+const loadNetworkDebugStatus = async () => {
+  try {
+    networkDebug.value = await api.getFineJobBossNetworkDebugStatus();
+    syncNetworkDebugPolling();
+  } catch (errorValue) {
+    networkDebugError.value = (errorValue as Error).message || "读取网络监听状态失败。";
+  }
+};
+
 onMounted(() => {
   void Promise.all([
     platformStore.load(),
@@ -34,19 +76,14 @@ onMounted(() => {
   ]);
 });
 
-const loadNetworkDebugStatus = async () => {
-  try {
-    networkDebug.value = await api.getFineJobBossNetworkDebugStatus();
-  } catch (errorValue) {
-    networkDebugError.value = (errorValue as Error).message || "读取网络监听状态失败。";
-  }
-};
+onBeforeUnmount(stopNetworkDebugPolling);
 
 const startNetworkDebug = async () => {
   networkDebugLoading.value = true;
   networkDebugError.value = null;
   try {
     networkDebug.value = await api.startFineJobBossNetworkDebug();
+    syncNetworkDebugPolling();
     ElMessage.success("网络监听已开始，请在专用 Chrome 中操作 BOSS 页面");
   } catch (errorValue) {
     networkDebugError.value = (errorValue as Error).message || "启动网络监听失败。";
@@ -61,6 +98,7 @@ const stopNetworkDebug = async () => {
   networkDebugError.value = null;
   try {
     networkDebug.value = await api.stopFineJobBossNetworkDebug();
+    syncNetworkDebugPolling();
     if (networkDebug.value.output_path) {
       ElMessage.success("网络监听已停止，JSON 文件已生成");
     } else {
@@ -72,6 +110,33 @@ const stopNetworkDebug = async () => {
   } finally {
     networkDebugLoading.value = false;
   }
+};
+
+const markNetworkDebug = async (marker: string) => {
+  if (networkDebug.value?.active !== true) return;
+  networkDebugLoading.value = true;
+  networkDebugError.value = null;
+  try {
+    // Marker 只调用现有 mark API，不触发任何平台页面动作。
+    networkDebug.value = await api.markFineJobBossNetworkDebug({ marker });
+    syncNetworkDebugPolling();
+    ElMessage.success("Trace 标记已添加");
+  } catch (errorValue) {
+    networkDebugError.value = (errorValue as Error).message || "添加 Trace 标记失败。";
+    ElMessage.error(networkDebugError.value);
+  } finally {
+    networkDebugLoading.value = false;
+  }
+};
+
+const addCustomMarker = async () => {
+  const marker = customMarker.value.trim();
+  if (!marker) {
+    ElMessage.warning("请输入自定义 Marker");
+    return;
+  }
+  await markNetworkDebug(marker);
+  if (!networkDebugError.value) customMarker.value = "";
 };
 
 const openNetworkDebugFile = async () => {
@@ -173,41 +238,84 @@ const checkLoginStatus = async () => {
       </div>
     </section>
 
-    <!-- <section class="page-panel network-debug-card">
+    <section class="page-panel network-debug-card">
       <div class="panel-title-row">
         <div>
           <p class="panel-eyebrow">Developer Tool</p>
-          <h2>CDP 网络监听</h2>
+          <h2>CDP / Protocol Trace</h2>
         </div>
         <el-tag :type="networkDebug?.active ? 'success' : 'info'">
-          {{ networkDebug?.active ? "监听中" : "未监听" }}
+          {{ networkDebug?.active ? "正在记录" : "未记录" }}
         </el-tag>
       </div>
 
       <p class="secondary-text">
-        记录专用 Chrome 中已完成的网络请求，并将接口地址、请求方法、状态码和响应正文写入 JSON 文件。
+        控制专用 Chrome 中的 BOSS Protocol Trace，并保留后端生成的原始证据状态。
       </p>
 
       <el-alert
         v-if="networkDebugError"
         type="error"
-        title="网络监听操作失败"
+        title="Protocol Trace 操作失败"
         :description="networkDebugError"
+        show-icon
+      />
+
+      <el-alert
+        v-if="networkDebug?.error_message"
+        type="warning"
+        title="Trace 状态提示"
+        :description="networkDebug.error_message"
         show-icon
       />
 
       <dl class="network-debug-summary">
         <div>
-          <dt>已记录请求</dt>
+          <dt>Trace ID</dt>
+          <dd>{{ networkDebug?.trace_id || "未生成" }}</dd>
+        </div>
+        <div>
+          <dt>Evidence</dt>
+          <dd>
+            <el-tag :type="networkDebug ? (networkDebug.evidence_complete ? 'success' : 'danger') : 'info'">
+              {{ networkDebug ? (networkDebug.evidence_complete ? "证据完整" : "证据不完整") : "待读取" }}
+            </el-tag>
+          </dd>
+        </div>
+        <div>
+          <dt>Events</dt>
+          <dd>{{ networkDebug?.event_count ?? 0 }}</dd>
+        </div>
+        <div>
+          <dt>HTTP</dt>
           <dd>{{ networkDebug?.request_count ?? 0 }}</dd>
         </div>
         <div>
-          <dt>监听页面</dt>
+          <dt>WS Frames</dt>
+          <dd>{{ networkDebug?.frame_count ?? 0 }}</dd>
+        </div>
+        <div>
+          <dt>Markers</dt>
+          <dd>{{ networkDebug?.marker_count ?? 0 }}</dd>
+        </div>
+        <div>
+          <dt>Dropped</dt>
+          <dd>{{ networkDebug?.dropped_event_count ?? 0 }}</dd>
+        </div>
+        <div>
+          <dt>目标页面</dt>
           <dd>{{ networkDebug?.target_count ?? 0 }}</dd>
         </div>
+        <div class="network-debug-gaps">
+          <dt>Gap reasons</dt>
+          <dd>
+            <span v-if="networkDebug?.gap_reasons?.length">{{ networkDebug.gap_reasons.join("、") }}</span>
+            <span v-else>无</span>
+          </dd>
+        </div>
         <div class="network-debug-output">
-          <dt>JSON 文件</dt>
-          <dd>{{ networkDebug?.output_path || "停止监听后生成" }}</dd>
+          <dt>Output</dt>
+          <dd>{{ networkDebug?.output_path || "停止 Trace 后生成" }}</dd>
         </div>
       </dl>
 
@@ -215,28 +323,84 @@ const checkLoginStatus = async () => {
         <el-button
           type="primary"
           :loading="networkDebugLoading"
-          :disabled="networkDebug?.active === true"
+          :disabled="networkDebug?.active === true || networkDebugLoading"
           @click="startNetworkDebug"
         >
-          开始监听
+          开始 Trace
         </el-button>
         <el-button
           type="warning"
           :loading="networkDebugLoading"
-          :disabled="networkDebug?.active !== true"
+          :disabled="networkDebug?.active !== true || networkDebugLoading"
           @click="stopNetworkDebug"
         >
-          停止监听并生成 JSON
+          停止 Trace
         </el-button>
         <el-button
           v-if="networkDebug?.output_path"
           :disabled="!canOpenNetworkDebugFile"
           @click="openNetworkDebugFile"
         >
-          打开 JSON 文件
+          打开 Trace
         </el-button>
       </div>
-    </section> -->
+
+      <div class="marker-group">
+        <div class="marker-group-title">消息</div>
+        <div class="marker-actions">
+          <el-button
+            v-for="preset in markerPresets.slice(0, 2)"
+            :key="preset.marker"
+            :disabled="networkDebug?.active !== true || networkDebugLoading"
+            @click="markNetworkDebug(preset.marker)"
+          >
+            {{ preset.label }}
+          </el-button>
+        </div>
+      </div>
+
+      <div class="marker-group">
+        <div class="marker-group-title">简历</div>
+        <div class="marker-actions">
+          <el-button
+            v-for="preset in markerPresets.slice(2, 4)"
+            :key="preset.marker"
+            :disabled="networkDebug?.active !== true || networkDebugLoading"
+            @click="markNetworkDebug(preset.marker)"
+          >
+            {{ preset.label }}
+          </el-button>
+        </div>
+      </div>
+
+      <div class="marker-group">
+        <div class="marker-group-title">投递</div>
+        <div class="marker-actions">
+          <el-button
+            v-for="preset in markerPresets.slice(4, 6)"
+            :key="preset.marker"
+            :disabled="networkDebug?.active !== true || networkDebugLoading"
+            @click="markNetworkDebug(preset.marker)"
+          >
+            {{ preset.label }}
+          </el-button>
+        </div>
+      </div>
+
+      <div class="marker-group custom-marker-group">
+        <div class="marker-group-title">自定义 Marker</div>
+        <div class="custom-marker-actions">
+          <el-input v-model="customMarker" placeholder="输入 Marker 名称" :disabled="networkDebug?.active !== true" />
+          <el-button
+            type="primary"
+            :disabled="networkDebug?.active !== true || networkDebugLoading"
+            @click="addCustomMarker"
+          >
+            添加标记
+          </el-button>
+        </div>
+      </div>
+    </section>
   </section>
 </template>
 
@@ -289,5 +453,42 @@ const checkLoginStatus = async () => {
 
 .network-debug-output {
   grid-column: 1 / -1;
+}
+
+.network-debug-gaps {
+  grid-column: 1 / -1;
+}
+
+.marker-group {
+  display: grid;
+  gap: 10px;
+}
+
+.marker-group-title {
+  color: var(--el-text-color-secondary);
+  font-weight: 600;
+}
+
+.marker-actions,
+.custom-marker-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.custom-marker-actions .el-input {
+  max-width: 360px;
+}
+
+@media (max-width: 720px) {
+  .session-summary,
+  .network-debug-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .network-debug-output,
+  .network-debug-gaps {
+    grid-column: auto;
+  }
 }
 </style>

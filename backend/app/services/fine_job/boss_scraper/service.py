@@ -77,6 +77,116 @@ class BossScraperService:
     def smoke_test(self, *, cdp_port: int = engine.DEFAULT_CDP_PORT) -> int:
         return engine.run_smoke_test(cdp_port)
 
+    def get_network_trace_status(self) -> dict[str, object]:
+        """通过稳定服务边界读取现有网络监听生命周期状态。"""
+        from backend.app.services.fine_job.boss_network_debug import boss_network_debug_manager
+
+        return boss_network_debug_manager.status()
+
+    def start_network_trace(
+        self,
+        *,
+        output_dir: Path,
+        cdp_port: int = engine.DEFAULT_CDP_PORT,
+    ) -> dict[str, object]:
+        """复用 BossNetworkDebugRun 启动 CDP Network Trace。"""
+        from backend.app.services.fine_job.boss_network_debug import boss_network_debug_manager
+
+        return boss_network_debug_manager.start(output_dir, cdp_port=cdp_port)
+
+    def mark_network_trace(self, marker: str) -> dict[str, object]:
+        """只记录本地时间与步骤标记，不执行页面或平台动作。"""
+        from backend.app.services.fine_job.boss_network_debug import boss_network_debug_manager
+
+        return boss_network_debug_manager.mark(marker)
+
+    def stop_network_trace(self) -> dict[str, object]:
+        """停止现有监听生命周期并写出 raw-first forensic trace。"""
+        from backend.app.services.fine_job.boss_network_debug import boss_network_debug_manager
+
+        return boss_network_debug_manager.stop()
+
+    def diff_network_traces(
+        self,
+        expected_path: Path,
+        actual_path: Path,
+    ) -> dict[str, object]:
+        """比较两个 normalized trace，同时保留关键协议字段差异。"""
+        from backend.app.services.fine_job.boss_network_trace import diff_normalized_traces
+
+        expected = json.loads(expected_path.read_text(encoding="utf-8"))
+        actual = json.loads(actual_path.read_text(encoding="utf-8"))
+        return diff_normalized_traces(expected, actual)
+
+    def read_network_trace_window(
+        self,
+        trace_path: Path,
+        marker: str,
+        *,
+        before_ms: int = 2000,
+        after_ms: int = 2000,
+    ) -> dict[str, object]:
+        """从已落盘 Trace 读取指定 marker 的前后时间窗。"""
+        from backend.app.services.fine_job.boss_network_trace import (
+            filter_trace_marker_window,
+        )
+
+        trace = json.loads(trace_path.read_text(encoding="utf-8"))
+        return filter_trace_marker_window(
+            trace,
+            marker,
+            before_ms=before_ms,
+            after_ms=after_ms,
+        )
+
+    def read_network_trace_range(
+        self,
+        trace_path: Path,
+        before_marker: str,
+        after_marker: str,
+        *,
+        before_ms: int = 2000,
+        after_ms: int = 2000,
+    ) -> dict[str, object]:
+        """从起止 marker 区间读取 HTTP、WebSocket 与协议事件。"""
+        from backend.app.services.fine_job.boss_network_trace import (
+            filter_trace_marker_range,
+        )
+
+        trace = json.loads(trace_path.read_text(encoding="utf-8"))
+        return filter_trace_marker_range(
+            trace,
+            before_marker,
+            after_marker,
+            before_ms=before_ms,
+            after_ms=after_ms,
+        )
+
+    def build_network_trace_candidate_report(
+        self,
+        trace_path: Path,
+        marker: str,
+        *,
+        before_ms: int = 2000,
+        after_ms: int = 2000,
+    ) -> dict[str, object]:
+        """读取 marker 窗口并生成脱敏候选接口审阅文本。"""
+        from backend.app.services.fine_job.boss_network_trace import (
+            candidate_http_requests_from_events,
+            filter_trace_marker_window,
+            render_candidate_http_report,
+        )
+
+        trace = json.loads(trace_path.read_text(encoding="utf-8"))
+        events = filter_trace_marker_window(
+            trace,
+            marker,
+            before_ms=before_ms,
+            after_ms=after_ms,
+        )
+        candidates = candidate_http_requests_from_events(events)
+        return render_candidate_http_report(marker, candidates)
+
     def start_browser(
         self,
         *,
