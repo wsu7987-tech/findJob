@@ -25,6 +25,7 @@ from backend.app.services.fine_job.codex_authorization import (
     classify_outbound_content,
     resolve_codex_authorization,
 )
+from backend.app.services.fine_job.action_store import sync_legacy_action_authorization
 from backend.app.services.fine_job.resumes import list_resume_facts, list_resumes
 from backend.app.schemas.fine_job.resume_analysis_v2 import ResumeAnalysisRunCreate
 from backend.app.services.fine_job import (
@@ -1573,6 +1574,11 @@ class CodexToolService:
                 """,
                 (json.dumps(classification.categories, ensure_ascii=False), classification.classification_version, action_id),
             )
+            sync_legacy_action_authorization(
+                connection,
+                source_table="fj_automation_actions",
+                source_id=action_id,
+            )
         return _result(
             result_type="action",
             status=str(action["status"]),
@@ -1631,6 +1637,11 @@ class CodexToolService:
                   classification_version = ? WHERE id = ?
                 """,
                 (json.dumps(classification.categories, ensure_ascii=False), classification.classification_version, action_id),
+            )
+            sync_legacy_action_authorization(
+                connection,
+                source_table="fj_chat_send_actions",
+                source_id=action_id,
             )
         return _result(
             result_type="action",

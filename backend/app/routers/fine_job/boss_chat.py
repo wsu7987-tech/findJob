@@ -15,6 +15,7 @@ from backend.app.schemas.fine_job.boss_chat import (
     BossChatBatchTaskResponse,
     BossChatClaimActionRequest,
     BossChatDispatchStartedRequest,
+    BossChatPreflightRequest,
     BossChatEventBatchRequest,
     BossChatFriendListRefreshResponse,
     BossChatHistoryRefreshResponse,
@@ -22,12 +23,14 @@ from backend.app.schemas.fine_job.boss_chat import (
     BossChatGenerateRequest,
     BossChatHeartbeatRequest,
     BossChatReasonRequest,
+    BossChatResumeListSnapshotRequest,
     BossChatResumeSendRequest,
     BossChatReplyConfirmRequest,
     BossChatReplyEditRequest,
     BossChatRuntimeUpdateRequest,
 )
 from backend.app.services.fine_job import boss_chat
+from backend.app.services.fine_job import action_scheduler
 from backend.app.services.fine_job import job_hunt_analysis
 from backend.app.services.fine_job.boss_scraper.service import boss_scraper_service
 
@@ -148,13 +151,55 @@ def claim_action(
     db: Database = Depends(get_database),
 ):
     executor = _executor(db, authorization)
-    return {"action": boss_chat.claim_send_action(
-        db,
-        str(executor["id"]),
-        account_uid=payload.account_uid,
-        tab_id=payload.tab_id,
-        leader_epoch=payload.leader_epoch,
-    )}
+    # 领取只接受插件基于当前真实页面匹配出的明确 Action ID。
+    action = action_scheduler.claim_unified_action(
+        db, str(executor["id"]), action_id=payload.action_id, account_uid=payload.account_uid,
+    )
+    # resume_list 是只读页面探针，不属于三类统一业务 Action；保留其兼容执行入口。
+    if action is None:
+        action = boss_chat.claim_resume_list_action(
+            db, str(executor["id"]), action_id=payload.action_id, account_uid=payload.account_uid,
+            tab_id=payload.tab_id, leader_epoch=payload.leader_epoch,
+        )
+    return {"action": action}
+
+
+@router.get("/executor/actions")
+def eligible_actions(
+    account_uid: str = Query(min_length=1, max_length=80),
+    authorization: str = Header(default=""),
+    db: Database = Depends(get_database),
+):
+    _executor(db, authorization)
+    return {"actions": action_scheduler.list_eligible_actions(db, account_uid=account_uid)}
+
+
+@router.get("/executor/resume-list-actions")
+def pending_resume_list_actions(
+    account_uid: str = Query(min_length=1, max_length=80),
+    authorization: str = Header(default=""),
+    db: Database = Depends(get_database),
+):
+    """返回可在当前聊天领导页读取的只读附件 helper。"""
+    _executor(db, authorization)
+    return {"actions": boss_chat.list_pending_resume_list_actions(db, account_uid=account_uid)}
+
+
+@router.post("/executor/actions/{action_id}/preflight")
+def preflight_action(
+    action_id: str,
+    payload: BossChatPreflightRequest,
+    authorization: str = Header(default=""),
+    config: AppConfig = Depends(get_config),
+    db: Database = Depends(get_database),
+):
+    executor = _executor(db, authorization)
+    snapshot = boss_chat.prepare_unified_chat_preflight(db, config, action_id, payload.snapshot)
+    # relation 规划在 preflight 期间创建的新任务同样进入既有防抖生成调度。
+    boss_chat.schedule_pending_generation(db, config)
+    return action_scheduler.preflight_action(
+        db, str(executor["id"]), action_id, payload.execution_epoch, snapshot
+    )
 
 
 @router.post("/executor/actions/{action_id}/dispatch-started")
@@ -165,9 +210,13 @@ def dispatch_started(
     db: Database = Depends(get_database),
 ):
     executor = _executor(db, authorization)
-    return {"action": boss_chat.mark_dispatch_started(
-        db, str(executor["id"]), action_id, payload.execution_epoch
-    )}
+    with db.connect() as connection:
+        unified = connection.execute("SELECT 1 FROM fj_actions WHERE id=?", (action_id,)).fetchone() is not None
+    if unified:
+        return {"action": action_scheduler.mark_dispatch_started(
+            db, str(executor["id"]), action_id, payload.execution_epoch, payload.dispatch_token
+        )}
+    return {"action": boss_chat.mark_dispatch_started(db, str(executor["id"]), action_id, payload.execution_epoch)}
 
 
 @router.post("/executor/actions/{action_id}/complete")
@@ -178,7 +227,25 @@ def complete_action(
     db: Database = Depends(get_database),
 ):
     executor = _executor(db, authorization)
-    return {"action": boss_chat.complete_send_action(
+    with db.connect() as connection:
+        unified = connection.execute("SELECT 1 FROM fj_actions WHERE id=?", (action_id,)).fetchone() is not None
+    if unified:
+        return {"action": action_scheduler.complete_action(
+            db, str(executor["id"]), action_id, payload.model_dump()
+        )}
+    return {"action": boss_chat.complete_send_action(db, str(executor["id"]), action_id, payload.model_dump())}
+
+
+@router.post("/executor/resume-list-actions/{action_id}/snapshot")
+def complete_resume_list_snapshot(
+    action_id: str,
+    payload: BossChatResumeListSnapshotRequest,
+    authorization: str = Header(default=""),
+    db: Database = Depends(get_database),
+):
+    """持久化 Main World 的只读附件快照，不进入发送 completion。"""
+    executor = _executor(db, authorization)
+    return {"action": boss_chat.complete_resume_list_snapshot(
         db, str(executor["id"]), action_id, payload.model_dump()
     )}
 

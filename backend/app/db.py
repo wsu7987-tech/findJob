@@ -1377,6 +1377,8 @@ CREATE TABLE IF NOT EXISTS fj_chat_messages (
   direction TEXT NOT NULL,
   message_type TEXT NOT NULL DEFAULT 'text',
   content TEXT NOT NULL DEFAULT '',
+  raw_content TEXT NOT NULL DEFAULT '',
+  raw_body_json TEXT NOT NULL DEFAULT '{}',
   sender_uid TEXT NOT NULL DEFAULT '',
   receiver_uid TEXT NOT NULL DEFAULT '',
   client_mid TEXT NOT NULL DEFAULT '',
@@ -1394,6 +1396,135 @@ CREATE TABLE IF NOT EXISTS fj_chat_messages (
 
 CREATE INDEX IF NOT EXISTS idx_fj_chat_messages_session_sent_at
   ON fj_chat_messages(session_id, sent_at ASC, id ASC);
+
+-- 原始消息、语义和交互状态分层保存，原始平台内容始终可追溯。
+CREATE TABLE IF NOT EXISTS fj_chat_message_semantics (
+  raw_message_id TEXT PRIMARY KEY,
+  semantic_type TEXT NOT NULL,
+  display_text TEXT NOT NULL DEFAULT '',
+  reply_required INTEGER NOT NULL DEFAULT 0,
+  classifier_version TEXT NOT NULL,
+  semantic_context_json TEXT NOT NULL DEFAULT '{}',
+  derived_at TEXT NOT NULL,
+  FOREIGN KEY (raw_message_id) REFERENCES fj_chat_messages(id) ON DELETE CASCADE,
+  CHECK (semantic_type IN (
+    'resume_sent', 'resume_read_receipt', 'resume_viewed',
+    'resume_received_confirmation', 'platform_ad', 'recruiter_text',
+    'platform_event_unknown'
+  )),
+  CHECK (reply_required IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS fj_chat_message_states (
+  raw_message_id TEXT PRIMARY KEY,
+  read_state TEXT NOT NULL DEFAULT 'unknown',
+  read_subject TEXT NOT NULL DEFAULT 'not_applicable',
+  reply_state TEXT NOT NULL DEFAULT 'not_required',
+  read_at TEXT,
+  reply_planned_at TEXT,
+  replied_at TEXT,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (raw_message_id) REFERENCES fj_chat_messages(id) ON DELETE CASCADE,
+  CHECK (read_state IN ('unknown', 'unread', 'read', 'not_applicable')),
+  CHECK (read_subject IN ('candidate', 'recruiter', 'not_applicable')),
+  CHECK (reply_state IN ('not_required', 'unanswered', 'reply_planned', 'queued', 'replied'))
+);
+
+CREATE TABLE IF NOT EXISTS fj_actions (
+  id TEXT PRIMARY KEY,
+  action_type TEXT NOT NULL,
+  account_uid TEXT NOT NULL DEFAULT '',
+  job_id TEXT,
+  session_id TEXT,
+  target_page_kind TEXT NOT NULL DEFAULT '',
+  target_page_key TEXT NOT NULL DEFAULT '',
+  target_context_key TEXT NOT NULL DEFAULT '',
+  session_sequence INTEGER,
+  revision_no INTEGER NOT NULL DEFAULT 1,
+  supersedes_action_id TEXT,
+  priority INTEGER NOT NULL DEFAULT 100,
+  priority_source TEXT NOT NULL DEFAULT 'stage1_default',
+  authorization_mode TEXT NOT NULL DEFAULT 'manual',
+  text TEXT NOT NULL DEFAULT '',
+  encrypt_resume_id TEXT NOT NULL DEFAULT '',
+  resume_filename TEXT NOT NULL DEFAULT '',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  base_raw_message_id TEXT,
+  base_message_mid TEXT NOT NULL DEFAULT '',
+  base_conversation_revision INTEGER,
+  base_cursor TEXT NOT NULL DEFAULT '',
+  planned_at TEXT,
+  status TEXT NOT NULL DEFAULT 'queued',
+  available_at TEXT,
+  waiting_reason_code TEXT NOT NULL DEFAULT '',
+  waiting_reason_detail TEXT NOT NULL DEFAULT '',
+  waiting_since_at TEXT,
+  lease_owner TEXT,
+  lease_expires_at TEXT,
+  execution_epoch INTEGER NOT NULL DEFAULT 0,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  preflight_state TEXT NOT NULL DEFAULT 'not_required',
+  preflight_observed_revision INTEGER,
+  preflight_completed_at TEXT,
+  preflight_reason_code TEXT NOT NULL DEFAULT '',
+  dispatch_token TEXT NOT NULL DEFAULT '',
+  dispatch_deadline_at TEXT,
+  dispatched_at TEXT,
+  canonical_status TEXT NOT NULL DEFAULT 'pending',
+  outcome TEXT,
+  status_code TEXT NOT NULL DEFAULT '',
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  source_table TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE SET NULL,
+  FOREIGN KEY (session_id) REFERENCES fj_chat_sessions(id) ON DELETE CASCADE,
+  FOREIGN KEY (base_raw_message_id) REFERENCES fj_chat_messages(id) ON DELETE SET NULL,
+  FOREIGN KEY (supersedes_action_id) REFERENCES fj_actions(id) ON DELETE SET NULL,
+  UNIQUE (source_table, source_id),
+  CHECK (action_type IN ('greeting', 'chat_message', 'resume_send')),
+  CHECK (authorization_mode IN ('manual', 'preauthorized', 'automatic')),
+  CHECK (status IN (
+    'awaiting_confirmation', 'queued', 'claimed', 'preflighting', 'dispatching',
+    'accepted', 'succeeded', 'superseded', 'stale', 'cancelled', 'failed', 'blocked', 'unknown'
+  ))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_actions_session_created
+  ON fj_actions(session_id, session_sequence, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_fj_actions_status_created
+  ON fj_actions(status, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS fj_greeting_account_bindings (
+  job_id TEXT PRIMARY KEY,
+  account_uid TEXT NOT NULL,
+  binding_source TEXT NOT NULL,
+  bound_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+  CHECK (binding_source IN ('chat_session', 'explicit_binding'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_actions_active_session_sequence
+  ON fj_actions(session_id, session_sequence)
+  WHERE session_id IS NOT NULL AND session_sequence IS NOT NULL
+    AND status IN ('awaiting_confirmation', 'queued', 'claimed', 'preflighting', 'dispatching', 'accepted');
+
+CREATE TABLE IF NOT EXISTS fj_action_message_links (
+  action_id TEXT NOT NULL,
+  raw_message_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  ordinal INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (action_id, raw_message_id, role),
+  FOREIGN KEY (action_id) REFERENCES fj_actions(id) ON DELETE CASCADE,
+  FOREIGN KEY (raw_message_id) REFERENCES fj_chat_messages(id) ON DELETE CASCADE,
+  CHECK (role IN ('trigger', 'covered', 'new_context', 'outbound_result'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_action_message_links_message
+  ON fj_action_message_links(raw_message_id, role, ordinal);
 
 CREATE TABLE IF NOT EXISTS fj_chat_reply_tasks (
   id TEXT PRIMARY KEY,
@@ -2097,6 +2228,7 @@ class Database:
             self._ensure_fj_boss_executor_schema(connection)
             self._ensure_fj_company_governance_schema(connection)
             self._ensure_fj_execution_observability_schema(connection)
+            self._ensure_fj_action_foundation_schema(connection)
             self._ensure_codex_integration_schema(connection)
             self._ensure_resume_analysis_v2_schema(connection)
             self._ensure_resume_analysis_v3_schema(connection)
@@ -2108,9 +2240,42 @@ class Database:
             from backend.app.services.fine_job.execution_reconciliation import (
                 initialize_execution_observability,
             )
+            from backend.app.services.fine_job.action_store import backfill_legacy_actions
 
             migrate_legacy_job_activity(connection)
             initialize_execution_observability(connection)
+            backfill_legacy_actions(connection)
+
+            from backend.app.services.fine_job.message_semantics import backfill_message_derivations
+
+            backfill_message_derivations(connection)
+            # 语义状态建好后再次投影既有 coverage，确保历史待回复消息保留排队状态。
+            backfill_legacy_actions(connection)
+
+    def _ensure_fj_action_foundation_schema(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """为既有聊天记录补齐原始内容列，新增表由 DDL 以加法方式创建。"""
+        message_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(fj_chat_messages)")
+        }
+        for column, definition in (
+            ("raw_content", "TEXT NOT NULL DEFAULT ''"),
+            ("raw_body_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ):
+            if column not in message_columns:
+                connection.execute(
+                    f"ALTER TABLE fj_chat_messages ADD COLUMN {column} {definition}"
+                )
+        # 旧版只有 content；首次升级时复制为可审计的原始文本，不再由派生摘要覆盖。
+        connection.execute(
+            """
+            UPDATE fj_chat_messages
+            SET raw_content = content
+            WHERE raw_content = '' AND content <> ''
+            """
+        )
 
     def _ensure_job_hunt_refresh_schema(self, connection: sqlite3.Connection) -> None:
         """为已有数据库补齐 Refresh Scope 与 Run 关联字段。"""

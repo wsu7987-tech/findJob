@@ -1238,6 +1238,7 @@ export interface FineJobBossExecutorInstance {
   queue_state: "running" | "paused" | "risk_paused";
   risk_state: string;
   browser_connected: boolean;
+  pairing_state?: "paired" | "revoked";
   last_heartbeat_at?: string | null;
   task_cooldown_max_seconds: number;
   page_load_wait_max_seconds: number;
@@ -1279,6 +1280,7 @@ export interface FineJobBossExecutorDashboard {
   executor: FineJobBossExecutorInstance | null;
   current_task?: FineJobBossExecutorQueueAction | null;
   queue: { actions: FineJobBossExecutorQueueAction[]; total: number };
+  unified_queue?: { actions: FineJobUnifiedAction[]; total: number };
   protocol_version: string;
 }
 
@@ -1292,6 +1294,7 @@ export interface FineJobOperationsDashboard {
   executor: FineJobBossExecutorInstance | null;
   current_task?: FineJobBossExecutorQueueAction | null;
   queue: { actions: FineJobBossExecutorQueueAction[]; total: number };
+  unified_queue?: { actions: FineJobUnifiedAction[]; total: number };
   recent_issues: FineJobActionLog[];
   legacy_runs: FineJobDeliveryRun[];
 }
@@ -1457,6 +1460,32 @@ export interface FineJobChatSendAction {
   resume_filename?: string;
 }
 
+export interface FineJobUnifiedAction {
+  id: string;
+  account_uid?: string;
+  action_type: "greeting" | "chat_message" | "resume_send" | string;
+  status: string;
+  outcome?: string | null;
+  status_code?: string;
+  text?: string;
+  encrypt_resume_id?: string;
+  resume_filename?: string;
+  execution_epoch?: number;
+  waiting_reason_code?: string;
+  waiting_reason_detail?: string;
+  preflight_reason_code?: string;
+  session_sequence?: number | null;
+  supersedes_action_id?: string | null;
+  base_raw_message_id?: string | null;
+  payload?: Record<string, unknown>;
+  peer_name?: string;
+  company_name?: string;
+  job_title?: string;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string | null;
+}
+
 export interface FineJobBossResumeAttachment {
   encryptResumeId: string;
   showName: string;
@@ -1483,6 +1512,7 @@ export interface FineJobChatSessionDetail {
   messages: FineJobChatMessage[];
   reply_tasks: FineJobChatReplyTask[];
   send_actions: FineJobChatSendAction[];
+  unified_actions?: FineJobUnifiedAction[];
   resume_attachments?: FineJobBossResumeAttachment[];
   latest_conversation_insight?: FineJobConversationInsight | null;
   messages_truncated?: boolean;

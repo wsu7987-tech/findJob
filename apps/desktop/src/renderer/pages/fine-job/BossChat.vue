@@ -5,13 +5,18 @@ import { useRoute, useRouter } from "vue-router";
 
 import { formatDateTime } from "@/services/format";
 import {
+  fineJobActionReasonLabel,
+  fineJobActionStatusLabel,
+  fineJobActionStatusType,
+  fineJobActionTypeLabel
+} from "@/services/fineJobActionPresentation";
+import {
   canConfirmFineJobChatReply,
-  fineJobChatConfirmBlocker,
-  fineJobChatSendStatusLabel
+  fineJobChatConfirmBlocker
 } from "@/services/fineJobChatPolicy";
 import { resolveFineJobResumeSelection } from "@/services/fineJobResumeSelection";
 import { useFineJobBossChatStore } from "@/stores/fineJobBossChat";
-import type { FineJobChatSession } from "@/types";
+import type { FineJobChatSession, FineJobUnifiedAction } from "@/types";
 
 
 const store = useFineJobBossChatStore();
@@ -73,13 +78,23 @@ const defaultMessageActionKind = computed<"reply" | "followup" | "ask_rejection_
   if (progress.value?.waiting_on === "recruiter") return "followup";
   return "reply";
 });
-const latestAction = computed(() => store.detail?.send_actions[0] ?? null);
+const unifiedActions = computed(() => store.detail?.unified_actions ?? []);
+const visibleUnifiedActions = computed(() => unifiedActions.value
+  .filter((item) => item.status !== "superseded")
+  .sort((left, right) => (left.session_sequence ?? Number.MAX_SAFE_INTEGER) - (right.session_sequence ?? Number.MAX_SAFE_INTEGER)
+    || left.created_at.localeCompare(right.created_at)));
+const supersededUnifiedActions = computed(() => unifiedActions.value.filter((item) => item.status === "superseded"));
+const sessionActionOrder = computed(() => visibleUnifiedActions.value
+  .filter((item) => item.session_sequence !== null && item.session_sequence !== undefined)
+  .map((item) => `${fineJobActionTypeLabel(item.action_type)} #${item.session_sequence}`)
+  .join(" → "));
+const latestAction = computed(() => unifiedActions.value.find((item) => item.action_type === "chat_message") ?? null);
 const resumeAttachments = computed(() => store.detail?.resume_attachments ?? []);
 const latestResumeListAction = computed(() => store.detail?.send_actions.find((item) => item.operation_kind === "resume_list") ?? null);
-const latestResumeSendAction = computed(() => store.detail?.send_actions.find((item) => item.operation_kind === "resume") ?? null);
+const latestResumeSendAction = computed(() => unifiedActions.value.find((item) => item.action_type === "resume_send") ?? null);
 const resumeListLoading = computed(() => ["queued", "leased", "dispatching"].includes(latestResumeListAction.value?.status ?? ""));
 const resumeListFailed = computed(() => latestResumeListAction.value?.outcome === "failed");
-const resumeListLoaded = computed(() => latestResumeListAction.value?.outcome === "accepted");
+const resumeListLoaded = computed(() => latestResumeListAction.value?.status_code === "resume_list_loaded");
 const selectedResume = computed(() => resumeAttachments.value.find((item) => item.encryptResumeId === selectedResumeId.value) ?? null);
 const canConfirmResume = computed(() => Boolean(
   session.value
@@ -137,6 +152,18 @@ const confirmBlocker = computed(() => fineJobChatConfirmBlocker({
   finalText: finalText.value,
   leaderAvailable: leaderAvailable.value
 }));
+const classificationUncertainAction = computed(() => unifiedActions.value.find((item) =>
+  item.waiting_reason_code === "classification_uncertain" || item.preflight_reason_code === "classification_uncertain"
+));
+const inboundForAction = (action: FineJobUnifiedAction) =>
+  store.detail?.messages.find((message) => message.id === action.base_raw_message_id) ?? null;
+const actionReason = (action: FineJobUnifiedAction) => fineJobActionReasonLabel(
+  action.waiting_reason_code || action.preflight_reason_code || action.status_code,
+  action.waiting_reason_detail
+);
+const actionStatusLabel = fineJobActionStatusLabel;
+const actionStatusType = fineJobActionStatusType;
+const actionTypeLabel = fineJobActionTypeLabel;
 
 const saveEditor = (sessionId = store.selectedSessionId, dirty = true) => {
   if (!sessionId) return;
@@ -182,7 +209,6 @@ watch(resumeAttachments, (attachments) => {
   selectedResumeId.value = resolveFineJobResumeSelection(attachments, selectedResumeId.value);
 }, { immediate: true });
 
-const sendStatusLabel = fineJobChatSendStatusLabel;
 const warningLabel = (warning: string) => ({
   send_contact_info: "联系方式",
   send_commitment_reply: "薪资、到岗或承诺",
@@ -904,6 +930,27 @@ onBeforeUnmount(() => {
             </div>
           </el-alert>
           <el-alert
+            v-else-if="session.status === 'paused'"
+            type="warning"
+            :closable="false"
+            title="当前会话已暂停，自动动作已暂停。"
+          >
+            <el-button
+              size="small"
+              type="warning"
+              plain
+              :loading="store.mutating"
+              @click="resumeAutomation"
+            >恢复自动代聊</el-button>
+          </el-alert>
+          <el-alert
+            v-if="classificationUncertainAction"
+            type="warning"
+            :closable="false"
+            title="系统无法可靠判断新消息与当前回复的关系，自动发送已暂停。"
+            :description="actionReason(classificationUncertainAction)"
+          />
+          <el-alert
             v-if="store.detail?.messages_truncated"
             type="info"
             :closable="false"
@@ -931,6 +978,34 @@ onBeforeUnmount(() => {
               拒绝原因：{{ progress.outcome.rejection_reason_summary || rejectionCategoryLabel(progress.outcome.rejection_reason_category) }}
               · 来源：{{ rejectionSourceLabel(progress.outcome.rejection_reason_source) }}
             </p>
+          </section>
+          <section v-if="visibleUnifiedActions.length" class="unified-action-panel">
+            <div class="section-heading">
+              <div><h3>当前 Action</h3><p class="secondary-text">状态与执行顺序均来自后端统一 Action。</p></div>
+            </div>
+            <article v-for="action in visibleUnifiedActions" :key="action.id" class="unified-action-card">
+              <div class="unified-action-card__head">
+                <strong>{{ actionTypeLabel(action.action_type) }}</strong>
+                <el-tag :type="actionStatusType(action.status)">{{ actionStatusLabel(action.status) }}</el-tag>
+              </div>
+              <p v-if="action.text" class="unified-action-card__text">{{ action.text }}</p>
+              <p v-if="action.resume_filename">已选简历：{{ action.resume_filename }}</p>
+              <p v-if="action.session_sequence !== null && action.session_sequence !== undefined">会话执行顺序：{{ action.session_sequence }}</p>
+              <p v-if="action.waiting_reason_code === 'independent_followup_pending'">当前回复 A 正在等待后续回复 B 准备完成，A 未取消。</p>
+              <p v-if="inboundForAction(action)">关联 HR 消息：{{ inboundForAction(action)?.content || "[非文本消息]" }}</p>
+              <el-alert
+                v-if="actionReason(action)"
+                :type="action.status === 'unknown' || action.status === 'blocked' ? 'error' : 'info'"
+                :closable="false"
+                :description="actionReason(action)"
+              />
+              <small class="secondary-text">创建：{{ formatDateTime(action.created_at) }} · 更新：{{ formatDateTime(action.updated_at) }}</small>
+            </article>
+            <p v-if="sessionActionOrder" class="secondary-text">执行顺序：{{ sessionActionOrder }}</p>
+            <details v-if="supersededUnifiedActions.length" class="unified-action-history">
+              <summary>已被新消息替代（{{ supersededUnifiedActions.length }}）</summary>
+              <p v-for="action in supersededUnifiedActions" :key="action.id">{{ actionTypeLabel(action.action_type) }} · {{ actionStatusLabel(action.status) }}</p>
+            </details>
           </section>
           <div class="message-timeline">
             <article
@@ -985,15 +1060,15 @@ onBeforeUnmount(() => {
             :loading="latestResumeSendAction?.status === 'queued' || latestResumeSendAction?.status === 'leased' || latestResumeSendAction?.status === 'dispatching'"
             @click="confirmResume"
           >确认发送所选简历</el-button>
-          <p v-if="latestResumeSendAction?.status === 'queued' || latestResumeSendAction?.status === 'leased' || latestResumeSendAction?.status === 'dispatching'" class="secondary-text">简历发送进行中…</p>
-          <el-alert v-else-if="latestResumeSendAction?.outcome === 'accepted'" type="success" :closable="false" show-icon>
+          <p v-if="['queued', 'claimed', 'preflighting', 'dispatching'].includes(latestResumeSendAction?.status ?? '')" class="secondary-text">简历发送进行中…</p>
+          <el-alert v-else-if="latestResumeSendAction?.status === 'accepted'" type="info" :closable="false" show-icon>
             简历已提交传输，等待 BOSS 平台后续状态。
           </el-alert>
-          <el-alert v-else-if="latestResumeSendAction?.outcome === 'unknown'" type="warning" :closable="false" show-icon>
-            {{ latestResumeSendAction.error_message || "发送结果待确认，系统不会自动重试。" }}
+          <el-alert v-else-if="latestResumeSendAction?.status === 'unknown'" type="warning" :closable="false" show-icon>
+            {{ actionReason(latestResumeSendAction) || "发送结果待确认，系统不会自动重试。" }}
           </el-alert>
-          <el-alert v-else-if="latestResumeSendAction?.outcome === 'failed'" type="error" :closable="false" show-icon>
-            {{ latestResumeSendAction.error_message || "简历发送失败。" }}
+          <el-alert v-else-if="['failed', 'blocked', 'stale'].includes(latestResumeSendAction?.status ?? '')" type="error" :closable="false" show-icon>
+            {{ actionReason(latestResumeSendAction) || "简历发送失败。" }}
           </el-alert>
         </section>
         <h2>AI 回复草稿</h2>
@@ -1077,8 +1152,8 @@ onBeforeUnmount(() => {
         </details>
 
         <div v-if="latestAction" class="send-result">
-          <strong>{{ sendStatusLabel(latestAction.status) }}</strong>
-          <span>{{ latestAction.error_message || latestAction.status_code }}</span>
+          <strong>{{ actionStatusLabel(latestAction.status) }}</strong>
+          <span>{{ actionReason(latestAction) }}</span>
         </div>
 
         <details v-if="resumeFacts.length" class="context-facts">
@@ -1152,6 +1227,34 @@ onBeforeUnmount(() => {
   padding: 0;
   overflow: hidden;
 }
+
+.unified-action-panel {
+  display: grid;
+  gap: 10px;
+  margin: 16px 0;
+  padding: 14px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+}
+
+.unified-action-card {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--el-fill-color-light);
+}
+
+.unified-action-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.unified-action-card p { margin: 0; white-space: pre-wrap; }
+.unified-action-card__text { color: var(--el-text-color-regular); }
+.unified-action-history summary { cursor: pointer; color: var(--el-text-color-secondary); }
 
 .session-list,
 .conversation-panel,

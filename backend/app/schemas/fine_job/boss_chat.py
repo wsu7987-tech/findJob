@@ -104,6 +104,7 @@ class BossChatMessageEvent(BaseModel):
         "local_transport_write", "remote_outbound_echo", "remote_message", "message_sync"
     ] = "remote_message"
     server_mid: str = Field(default="", max_length=160)
+    raw_body: dict[str, Any] = Field(default_factory=dict)
     raw_meta: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -147,6 +148,7 @@ class BossChatReasonRequest(BaseModel):
 
 
 class BossChatClaimActionRequest(BaseModel):
+    action_id: str = Field(min_length=1, max_length=160)
     account_uid: str = Field(min_length=1, max_length=80)
     tab_id: str = Field(min_length=1, max_length=120)
     leader_epoch: int = Field(ge=1)
@@ -154,6 +156,12 @@ class BossChatClaimActionRequest(BaseModel):
 
 class BossChatDispatchStartedRequest(BaseModel):
     execution_epoch: int = Field(ge=1)
+    dispatch_token: str = Field(default="", max_length=200)
+
+
+class BossChatPreflightRequest(BaseModel):
+    execution_epoch: int = Field(ge=1)
+    snapshot: dict[str, Any] = Field(default_factory=dict)
 
 
 class BossChatActionCompleteRequest(BaseModel):
@@ -164,6 +172,14 @@ class BossChatActionCompleteRequest(BaseModel):
     status_code: str = Field(default="", max_length=100)
     message: str = Field(default="", max_length=500)
     evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class BossChatResumeListSnapshotRequest(BaseModel):
+    """只读附件快照回传，独立于真实 chat/resume 外发结果。"""
+    execution_epoch: int = Field(ge=1)
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    observed_at: str = Field(min_length=1, max_length=80)
+    error: str = Field(default="", max_length=500)
 
 
 class BossChatResumeSendRequest(BaseModel):

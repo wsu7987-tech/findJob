@@ -209,7 +209,8 @@ const normalizeMessage = async (
     frameOrigin,
     evidenceSource,
     serverMid: "",
-    rawMeta: { bodyType, messageType: message.type ?? 0 }
+    rawBody: message.body as Record<string, unknown> || {},
+    rawMeta: { bodyType, messageType: message.type ?? 0, message: message as Record<string, unknown> }
   };
 };
 
@@ -244,6 +245,7 @@ const normalizeMessageSync = (
     frameOrigin,
     evidenceSource: "message_sync",
     serverMid,
+    rawBody: {},
     rawMeta: { protocolEvidence: "reference_only" }
   };
 };

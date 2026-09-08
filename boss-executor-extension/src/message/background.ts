@@ -2,14 +2,14 @@ import type { Adapter, Message, OnMessage, SendMessage } from "comctx";
 
 import { browser } from "#imports";
 
-import { fineJobExecutorClient } from "../finejob/client";
-import { bossChatCoordinator } from "../finejob/chat-coordinator";
+import { bossChatCoordinator, fineJobExecutorClient } from "../finejob/runtime";
 import type {
   ChatObservedMessage,
   ChatSendExecutionResult,
   ChatTabHeartbeat,
   ExecutorRuntimeState,
-  MainWorldExecutionResult
+  MainWorldExecutionResult,
+  ResumeSnapshotResult
 } from "../finejob/types";
 import type { BossPageIdentity } from "../platform/boss/types";
 
@@ -87,6 +87,11 @@ export class BackgroundService {
 
   async reportChatSendResult(result: ChatSendExecutionResult): Promise<{ accepted: true }> {
     await bossChatCoordinator.reportSendResult(result);
+    return { accepted: true };
+  }
+
+  async reportResumeSnapshot(result: ResumeSnapshotResult): Promise<{ accepted: true }> {
+    await bossChatCoordinator.reportResumeSnapshot(result);
     return { accepted: true };
   }
 }

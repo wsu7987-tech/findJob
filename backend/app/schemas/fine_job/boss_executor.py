@@ -57,6 +57,8 @@ class BossTaskCompleteRequest(BaseModel):
     status_code: str = Field(default="", max_length=100)
     message: str = Field(default="", max_length=500)
     evidence: dict[str, Any] = Field(default_factory=dict)
+    unified_action_id: str = Field(default="", max_length=160)
+    unified_execution_epoch: int = Field(default=0, ge=0)
 
 
 class BossTestTaskCreateRequest(BaseModel):

@@ -8,6 +8,7 @@ import {
   installBossChatObserver,
   readBossChatIdentity
 } from "../../platform/boss/chat/observer";
+import { readResumeAttachmentSnapshot } from "../../platform/boss/chat/resume-snapshot";
 import { bossChatSender } from "../../platform/boss/chat/sender";
 
 const currentStatus = (): MainWorldStatus => ({
@@ -48,6 +49,10 @@ export default defineUnlistedScript(async () => {
         if (!command) return;
         if (command.type === "BOSS_PAGE_PROBE") {
           await contentService.reportBossPageIdentity(readBossPageIdentity());
+        } else if (command.type === "BOSS_RESUME_SNAPSHOT_REQUEST") {
+          await contentService.reportResumeSnapshot(
+            await readResumeAttachmentSnapshot(command, bossChatSender)
+          );
         } else if (command.type === "BOSS_DEFAULT_GREETING") {
           const result = await executeDefaultGreeting(command);
           await contentService.reportExecutionResult(result);

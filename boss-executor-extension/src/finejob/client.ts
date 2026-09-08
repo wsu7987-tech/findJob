@@ -7,10 +7,13 @@ import type {
   ChatTabHeartbeat,
   ExecutorRuntimeState,
   FineJobChatSendAction,
+  ResumeSnapshotResult,
+  UnifiedPreflightDecision,
   FineJobQueueAction,
   MainWorldExecutionResult
 } from "./types";
 import type { BossPageIdentity } from "../platform/boss/types";
+import { SharedActionGate } from "./shared-action-gate";
 
 const API_ROOT = "http://127.0.0.1:8000/api/fine-job/boss-executor";
 const CREDENTIALS_KEY = "finejobBossExecutorCredentialsV1";
@@ -59,11 +62,14 @@ export class FineJobExecutorClient {
   private dispatchingTaskId = "";
   private resultSyncingTaskId = "";
   private pendingDispatch: { task: FineJobQueueAction; tabId?: string } | null = null;
+  private dispatchedGreeting: { task: FineJobQueueAction; unifiedActionId: string; unifiedExecutionEpoch: number } | null = null;
   private resultSyncTimers: Record<string, number> = {};
   private taskCooldownTimer: number | null = null;
   private pageLoadWaitTimer: number | null = null;
   private executionTimeoutTimer: number | null = null;
   private timedOutResultKeys = new Set<string>();
+
+  constructor(private readonly actionGate = new SharedActionGate()) {}
 
   async start(): Promise<void> {
     if (this.startupPromise) return this.startupPromise;
@@ -178,6 +184,7 @@ export class FineJobExecutorClient {
         void this.clearLocalConnection();
         return;
       }
+      this.closeLocalExecutionForReconnect();
       this.scheduleControlReconnect();
     });
   }
@@ -189,6 +196,32 @@ export class FineJobExecutorClient {
       this.controlReconnectTimer = null;
       this.connectControlChannel();
     }, 2000) as unknown as number;
+  }
+
+  private closeLocalExecutionForReconnect(): void {
+    this.state.connected = false;
+    this.stopPageChecks();
+    this.stopPageOpenTimer();
+    // 普通断线保留既有 cooldown，避免重连快于原定间隔时提前开始下一动作。
+    this.stopPageLoadWait();
+    this.waitingForPageOpen = false;
+
+    // match_task 已送出但未收到 bridge 回执时，后端可能已跨过 dispatch 边界，按不确定结果保守收口。
+    const executionUncertain = Boolean(
+      this.pendingDispatch || this.dispatchedGreeting || this.dispatchingTaskId
+    );
+    if (executionUncertain) {
+      this.stopExecutionTimeout();
+      this.currentPageTaskId = "";
+      this.dispatchingTaskId = "";
+      this.pendingDispatch = null;
+      this.dispatchedGreeting = null;
+      this.state.detail = "运行通道异常断开，正在等待执行结果收口";
+      // 后端断开处理会将未知副作用收口为 unknown；本地只保留共享 cooldown，避免重连后立即并发下一动作。
+      this.enterTaskCooldown();
+      return;
+    }
+    this.state.detail = "运行通道异常断开，正在重新连接";
   }
 
   private async handleControlMessage(socket: WebSocket, rawMessage: string): Promise<void> {
@@ -204,7 +237,8 @@ export class FineJobExecutorClient {
       if (this.state.executor?.queue_state !== "running") {
         this.stopPageChecks();
         this.stopPageOpenTimer();
-        this.stopExecutionWaits();
+        const stoppedCooldown = this.stopExecutionWaits();
+        if (stoppedCooldown) this.actionGate.finishCooldown();
         this.waitingForPageOpen = false;
         this.state.detail = "自动打招呼已暂停";
         return;
@@ -271,7 +305,7 @@ export class FineJobExecutorClient {
         this.dispatchTestDelay(task);
         return;
       }
-      this.startPageChecks();
+      if (task) this.schedulePageLoadWait(task, () => this.startPageChecks());
       return;
     }
     if (message.type === "task_match_synced") {
@@ -325,13 +359,24 @@ export class FineJobExecutorClient {
     this.suppressNextReconnect = false;
     this.stopPageChecks();
     this.stopPageOpenTimer();
-    this.stopExecutionWaits();
+    const stoppedCooldown = this.stopExecutionWaits();
+    if (stoppedCooldown) this.actionGate.finishCooldown();
     this.stopExecutionTimeout();
+    const pendingDispatch = this.pendingDispatch;
+    const dispatchedGreeting = this.dispatchedGreeting;
+    if (dispatchedGreeting) {
+      // dispatch 后断连由后端按 unknown 收口；本地保留一次共享 cooldown，阻止立即接续动作。
+      this.enterTaskCooldown();
+    } else if (pendingDispatch) {
+      // 尚未收到 unified dispatch 授权时没有平台副作用，可直接释放本地 gate。
+      this.actionGate.releaseBusy();
+    }
     this.waitingForPageOpen = false;
     this.currentPageTaskId = "";
     this.dispatchingTaskId = "";
     this.resultSyncingTaskId = "";
     this.pendingDispatch = null;
+    this.dispatchedGreeting = null;
     this.consecutivePageMatchFailures = 0;
     this.timedOutResultKeys.clear();
     if (socket) socket.close();
@@ -356,11 +401,16 @@ export class FineJobExecutorClient {
     if (queueState === "paused") {
       this.stopPageChecks();
       this.stopPageOpenTimer();
-      this.stopExecutionWaits();
-      this.stopExecutionTimeout();
+      const stoppedCooldown = this.stopExecutionWaits();
+      if (stoppedCooldown) this.actionGate.finishCooldown();
       this.waitingForPageOpen = false;
-      this.dispatchingTaskId = "";
-      this.pendingDispatch = null;
+      if (!this.dispatchedGreeting) {
+        this.stopExecutionTimeout();
+        const pendingDispatch = this.pendingDispatch;
+        this.dispatchingTaskId = "";
+        this.pendingDispatch = null;
+        if (pendingDispatch) this.actionGate.releaseBusy();
+      }
       this.reportRuntimeState("idle");
     }
   }
@@ -369,8 +419,10 @@ export class FineJobExecutorClient {
     if (this.timedOutResultKeys.has(this.resultKey(result)) && result.statusCode !== "TASK_EXECUTION_TIMEOUT") return;
     this.stopExecutionTimeout();
     this.dispatchingTaskId = "";
+    if (this.dispatchedGreeting?.task.id === result.taskId) this.dispatchedGreeting = null;
     this.resultSyncingTaskId = result.taskId;
-    const succeeded = result.outcome === "accepted" || result.outcome === "succeeded";
+    // accepted 仅表示平台受理，沿成功通道回写以保留 unified 的 accepted 语义。
+    const succeeded = result.outcome === "succeeded" || result.outcome === "accepted";
     await this.persistPendingResult(result);
     if (succeeded) {
       this.waitingForPageOpen = true;
@@ -389,6 +441,8 @@ export class FineJobExecutorClient {
       status_code: result.statusCode,
       outcome: result.outcome,
       contacted: result.contacted,
+      unified_action_id: result.unifiedActionId || "",
+      unified_execution_epoch: result.unifiedExecutionEpoch || 0,
       platform_result: result.evidence,
       completed_at: new Date().toISOString(),
       failed_at: new Date().toISOString()
@@ -460,6 +514,7 @@ export class FineJobExecutorClient {
             frame_origin: message.frameOrigin,
             evidence_source: message.evidenceSource,
             server_mid: message.serverMid,
+            raw_body: message.rawBody,
             raw_meta: message.rawMeta
           }
         }))
@@ -468,6 +523,7 @@ export class FineJobExecutorClient {
   }
 
   async claimChatSendAction(
+    actionId: string,
     accountUid: string,
     tabId: string,
     leaderEpoch: number
@@ -477,6 +533,7 @@ export class FineJobExecutorClient {
       {
         method: "POST",
         body: JSON.stringify({
+          action_id: actionId,
           account_uid: accountUid,
           tab_id: tabId,
           leader_epoch: leaderEpoch
@@ -486,10 +543,55 @@ export class FineJobExecutorClient {
     return response.action;
   }
 
-  async markChatDispatchStarted(action: FineJobChatSendAction): Promise<void> {
+  async listEligibleChatSendActions(accountUid: string): Promise<FineJobChatSendAction[]> {
+    const response = await this.chatRequest<{ actions: FineJobChatSendAction[] }>(
+      `/executor/actions?account_uid=${encodeURIComponent(accountUid)}`,
+      { method: "GET" }
+    );
+    return response.actions;
+  }
+
+  async listPendingResumeListActions(accountUid: string): Promise<FineJobChatSendAction[]> {
+    const response = await this.chatRequest<{ actions: FineJobChatSendAction[] }>(
+      `/executor/resume-list-actions?account_uid=${encodeURIComponent(accountUid)}`,
+      { method: "GET" }
+    );
+    return response.actions;
+  }
+
+  async completeResumeListSnapshot(
+    action: FineJobChatSendAction,
+    snapshot: ResumeSnapshotResult
+  ): Promise<void> {
+    await this.chatRequest(`/executor/resume-list-actions/${encodeURIComponent(action.id)}/snapshot`, {
+      method: "POST",
+      body: JSON.stringify({
+        execution_epoch: action.execution_epoch,
+        attachments: snapshot.attachments,
+        observed_at: snapshot.observedAt,
+        error: snapshot.error
+      })
+    });
+  }
+
+  async preflightChatSend(
+    action: FineJobChatSendAction,
+    snapshot: Record<string, unknown>
+  ): Promise<UnifiedPreflightDecision> {
+    return this.chatRequest<UnifiedPreflightDecision>(`/executor/actions/${encodeURIComponent(action.id)}/preflight`, {
+      method: "POST",
+      body: JSON.stringify({
+        execution_epoch: action.execution_epoch,
+        // 最近页面观测已在领取前上传；页面发送器仍会在副作用边界读取运行开关。
+        snapshot
+      })
+    });
+  }
+
+  async markChatDispatchStarted(action: FineJobChatSendAction, dispatchToken: string): Promise<void> {
     await this.chatRequest(`/executor/actions/${encodeURIComponent(action.id)}/dispatch-started`, {
       method: "POST",
-      body: JSON.stringify({ execution_epoch: action.execution_epoch })
+      body: JSON.stringify({ execution_epoch: action.execution_epoch, dispatch_token: dispatchToken })
     });
   }
 
@@ -521,7 +623,7 @@ export class FineJobExecutorClient {
       this.waitingForPageOpen = false;
       this.currentPageTaskId = matched.id;
       this.consecutivePageMatchFailures = 0;
-      await this.dispatchDefaultGreeting(tabId, matched);
+      await this.dispatchDefaultGreeting(tabId, matched, identity);
       return;
     }
     if (
@@ -634,24 +736,52 @@ export class FineJobExecutorClient {
     this.controlSocket?.close();
   }
 
-  private async dispatchDefaultGreeting(tabId: string, task: FineJobQueueAction): Promise<void> {
+  private async dispatchDefaultGreeting(tabId: string, task: FineJobQueueAction, pageIdentity: BossPageIdentity): Promise<void> {
     if (this.isTaskBusy()) return;
+    if (!this.actionGate.tryEnterBusy()) return;
     if (!this.sendControlMessage({
       type: "match_task",
       task_id: task.id,
-      execution_epoch: task.execution_epoch
-    })) return;
+      execution_epoch: task.execution_epoch,
+      page_identity: pageIdentity
+    })) {
+      this.actionGate.releaseBusy();
+      return;
+    }
     this.dispatchingTaskId = task.id;
     this.pendingDispatch = { task, tabId };
     this.state.detail = `正在锁定任务：${task.job_title}`;
   }
 
-  private startDefaultGreetingAfterMatch(tabId: string, task: FineJobQueueAction): void {
+  private startDefaultGreetingAfterMatch(
+    tabId: string,
+    task: FineJobQueueAction,
+    bridge: { unifiedActionId: string; unifiedExecutionEpoch: number }
+  ): void {
+    // bridge 已完成统一 Action 的 dispatch_started；后续 WS 交接失败必须以该身份收口。
+    this.dispatchedGreeting = {
+      task,
+      unifiedActionId: bridge.unifiedActionId,
+      unifiedExecutionEpoch: bridge.unifiedExecutionEpoch
+    };
     if (!this.sendControlMessage({
       type: "task_dispatch_started",
       task_id: task.id,
       execution_epoch: task.execution_epoch
-    })) return;
+    })) {
+      void this.reportExecutionResult({
+        taskId: task.id,
+        executionEpoch: task.execution_epoch,
+        unifiedActionId: bridge.unifiedActionId,
+        unifiedExecutionEpoch: bridge.unifiedExecutionEpoch,
+        outcome: "unknown",
+        contacted: null,
+        statusCode: "GREETING_DISPATCH_HANDOFF_FAILED",
+        message: "统一招呼已开始 dispatch，但运行通道交接失败",
+        evidence: {}
+      });
+      return;
+    }
     this.state.detail = `正在执行任务：${task.job_title}`;
     this.startExecutionTimeout(task);
     void browser.tabs.query({ url: ["*://zhipin.com/*", "*://*.zhipin.com/*"] }).then(async (tabs) => {
@@ -664,6 +794,8 @@ export class FineJobExecutorClient {
             taskId: task.id,
             executionEpoch: task.execution_epoch,
             encryptJobId: task.encrypt_job_id,
+            unifiedActionId: bridge.unifiedActionId,
+            unifiedExecutionEpoch: bridge.unifiedExecutionEpoch,
             targetTabId: tabId
           }
         }).catch(() => undefined);
@@ -673,11 +805,15 @@ export class FineJobExecutorClient {
 
   private dispatchTestDelay(task: FineJobQueueAction): void {
     if (this.isTaskBusy()) return;
+    if (!this.actionGate.tryEnterBusy()) return;
     if (!this.sendControlMessage({
       type: "match_task",
       task_id: task.id,
       execution_epoch: task.execution_epoch
-    })) return;
+    })) {
+      this.actionGate.releaseBusy();
+      return;
+    }
     this.dispatchingTaskId = task.id;
     this.pendingDispatch = { task };
     this.state.detail = `正在锁定任务：${task.job_title}`;
@@ -708,8 +844,22 @@ export class FineJobExecutorClient {
     return Math.min(600, Math.max(1, delaySeconds));
   }
 
-  private scheduleTaskCooldown(): void {
-    if (this.taskCooldownTimer !== null || this.state.queue.length === 0) return;
+  isTaskCooldownActive(): boolean {
+    return this.actionGate.isCooldownActive();
+  }
+
+  enterTaskCooldown(onComplete?: () => void, completedTaskId = ""): void {
+    if (!this.actionGate.enterCooldown()) return;
+    this.scheduleTaskCooldown(() => {
+      // 当前任务结果已确认同步，下一轮当前页匹配不再受旧任务 ID 限制。
+      if (completedTaskId && this.currentPageTaskId === completedTaskId) this.currentPageTaskId = "";
+      this.actionGate.finishCooldown();
+      onComplete?.();
+    });
+  }
+
+  private scheduleTaskCooldown(onComplete?: () => void): void {
+    if (this.taskCooldownTimer !== null) return;
     const seconds = this.randomDelaySeconds(4, this.state.executor?.task_cooldown_max_seconds ?? 4);
     const detail = `任务间隔冷却等待 ${seconds} 秒`;
     this.waitingForPageOpen = false;
@@ -719,9 +869,11 @@ export class FineJobExecutorClient {
     this.taskCooldownTimer = globalThis.setTimeout(() => {
       this.taskCooldownTimer = null;
       this.reportRuntimeState("idle");
+      onComplete?.();
       if (this.state.executor?.queue_state === "running" && this.state.queue.length > 0) {
         this.state.detail = "正在匹配任务页面";
-        this.requestTaskPage(false);
+        // 页面仍保留时先重新读取并匹配，只有无匹配才由现有超时逻辑请求下一页。
+        this.startPageChecks();
       }
     }, seconds * 1000) as unknown as number;
   }
@@ -732,16 +884,27 @@ export class FineJobExecutorClient {
     this.state.detail = `页面加载冷却等待 ${seconds} 秒：${task.job_title}`;
     this.pageLoadWaitTimer = globalThis.setTimeout(() => {
       this.pageLoadWaitTimer = null;
-      if (this.dispatchingTaskId !== task.id || this.state.executor?.queue_state !== "running") return;
+      if (this.currentPageTaskId !== task.id || this.state.executor?.queue_state !== "running") return;
       void run();
     }, seconds * 1000) as unknown as number;
   }
 
-  private stopExecutionWaits(): void {
+  private stopExecutionWaits(): boolean {
+    const stoppedCooldown = this.stopTaskCooldown();
+    this.stopPageLoadWait();
+    return stoppedCooldown;
+  }
+
+  private stopTaskCooldown(): boolean {
     if (this.taskCooldownTimer !== null) {
       globalThis.clearTimeout(this.taskCooldownTimer);
       this.taskCooldownTimer = null;
+      return true;
     }
+    return false;
+  }
+
+  private stopPageLoadWait(): void {
     if (this.pageLoadWaitTimer !== null) {
       globalThis.clearTimeout(this.pageLoadWaitTimer);
       this.pageLoadWaitTimer = null;
@@ -776,7 +939,8 @@ export class FineJobExecutorClient {
 
   private isTaskBusy(includeActiveQueue = true): boolean {
     return Boolean(
-      this.dispatchingTaskId
+      this.actionGate.isActive()
+      || this.dispatchingTaskId
       || this.resultSyncingTaskId
       || this.pendingDispatch
       || this.taskCooldownTimer !== null
@@ -829,7 +993,23 @@ export class FineJobExecutorClient {
       this.startTestDelayAfterMatch(task);
       return;
     }
-    if (pending.tabId) this.startDefaultGreetingAfterMatch(pending.tabId, task);
+    const rawBridge = message.bridge;
+    const bridge = rawBridge && typeof rawBridge === "object"
+      ? rawBridge as { ok?: unknown; unified_action_id?: unknown; unified_execution_epoch?: unknown }
+      : undefined;
+    if (
+      !bridge || bridge.ok !== true || typeof bridge.unified_action_id !== "string"
+      || !Number.isInteger(Number(bridge.unified_execution_epoch))
+    ) {
+      this.dispatchingTaskId = "";
+      this.actionGate.releaseBusy();
+      this.state.detail = "统一招呼动作未获授权，已停止发送";
+      return;
+    }
+    if (pending.tabId) this.startDefaultGreetingAfterMatch(pending.tabId, task, {
+      unifiedActionId: bridge.unified_action_id,
+      unifiedExecutionEpoch: Number(bridge.unified_execution_epoch)
+    });
   }
 
   private shouldKeepDetailAfterHeartbeat(): boolean {
@@ -852,15 +1032,13 @@ export class FineJobExecutorClient {
     if (!this.resultSyncingTaskId || this.resultSyncingTaskId === taskId) {
       this.resultSyncingTaskId = "";
     }
+    if (this.dispatchedGreeting?.task.id === taskId) this.dispatchedGreeting = null;
     const queue = message.queue as { actions?: FineJobQueueAction[] } | undefined;
     if (Array.isArray(queue?.actions)) this.state.queue = queue.actions;
     this.waitingForPageOpen = false;
-    if (this.state.queue.length === 0) {
-      this.state.detail = "当前没有待执行任务";
-      return;
-    }
+    if (this.state.queue.length === 0) this.state.detail = "当前没有待执行任务";
     if (this.state.executor?.queue_state === "running") {
-      this.scheduleTaskCooldown();
+      this.enterTaskCooldown(undefined, taskId);
     }
   }
 
@@ -873,6 +1051,7 @@ export class FineJobExecutorClient {
         this.dispatchingTaskId = "";
         this.pendingDispatch = null;
       }
+      this.actionGate.releaseBusy();
       this.state.detail = `任务锁定失败：${String(message.message || "FineJob 未能锁定任务")}`;
       return;
     }
@@ -966,7 +1145,9 @@ export class FineJobExecutorClient {
           contacted: result.contacted,
           status_code: result.statusCode,
           message: result.message,
-          evidence: result.evidence
+          evidence: result.evidence,
+          unified_action_id: result.unifiedActionId || "",
+          unified_execution_epoch: result.unifiedExecutionEpoch || 0
         })
       }
     );
@@ -975,8 +1156,8 @@ export class FineJobExecutorClient {
     this.state.detail = "状态已通过补偿接口同步";
     this.state.queue = response.queue.actions;
     this.waitingForPageOpen = false;
-    if (this.state.executor?.queue_state === "running" && this.state.queue.length > 0) {
-      this.scheduleTaskCooldown();
+    if (this.state.executor?.queue_state === "running") {
+      this.enterTaskCooldown(undefined, result.taskId);
     }
   }
 
@@ -1037,5 +1218,3 @@ export class FineJobExecutorClient {
     return body as T;
   }
 }
-
-export const fineJobExecutorClient = new FineJobExecutorClient();

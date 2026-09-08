@@ -11,7 +11,8 @@ import type {
   ChatObservedMessage,
   ChatSendExecutionResult,
   MainWorldCommand,
-  MainWorldExecutionResult
+  MainWorldExecutionResult,
+  ResumeSnapshotResult
 } from "../finejob/types";
 
 export const CONTENT_NAMESPACE = "fine-job:boss-executor:content:v1";
@@ -73,6 +74,13 @@ export class ContentService {
       if (!alreadyQueued) this.mainCommands.push(command);
       return { accepted: true };
     }
+    if (command.type === "BOSS_RESUME_SNAPSHOT_REQUEST") {
+      if (command.targetTabId !== this.tabId || command.leaderEpoch !== this.chatLeaderEpoch || !command.requestId || !command.actionId) {
+        return { accepted: false };
+      }
+      this.mainCommands.push(command);
+      return { accepted: true };
+    }
     if (command.type === "BOSS_CHAT_SEND") {
       if (command.targetTabId !== this.tabId) return { accepted: false };
       if (command.leaderEpoch !== this.chatLeaderEpoch) return { accepted: false };
@@ -87,6 +95,7 @@ export class ContentService {
       }
     } else if (
       !command.taskId || command.executionEpoch < 0 || !command.encryptJobId
+      || !command.unifiedActionId || command.unifiedExecutionEpoch < 1
     ) throw new Error("执行命令载荷无效");
     if (command.type === "BOSS_DEFAULT_GREETING" && command.targetTabId && command.targetTabId !== this.tabId) {
       return { accepted: false };
@@ -115,6 +124,11 @@ export class ContentService {
 
   async reportExecutionResult(result: MainWorldExecutionResult): Promise<{ accepted: true }> {
     await this.background.reportExecutionResult(result);
+    return { accepted: true };
+  }
+
+  async reportResumeSnapshot(result: ResumeSnapshotResult): Promise<{ accepted: true }> {
+    await this.background.reportResumeSnapshot(result);
     return { accepted: true };
   }
 

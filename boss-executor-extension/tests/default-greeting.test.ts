@@ -9,7 +9,9 @@ const command = {
   type: "BOSS_DEFAULT_GREETING" as const,
   taskId: "task-1",
   executionEpoch: 0,
-  encryptJobId: "job-1"
+  encryptJobId: "job-1",
+  unifiedActionId: "unified-1",
+  unifiedExecutionEpoch: 1
 };
 
 const identity = (overrides: Record<string, unknown> = {}) => ({
@@ -60,8 +62,25 @@ describe("BOSS默认招呼任务", () => {
     const result = await executeDefaultGreeting(command);
 
     expect(fetchSpy).toHaveBeenCalledTimes(1);
-    expect(result.outcome).toBe("unknown");
-    expect(result.statusCode).toBe("BOSS_REQUEST_NETWORK_UNKNOWN");
+    expect(result).toMatchObject({
+      outcome: "unknown",
+      statusCode: "BOSS_REQUEST_NETWORK_UNKNOWN",
+      unifiedActionId: "unified-1",
+      unifiedExecutionEpoch: 1
+    });
+  });
+
+  it("sender 内部异常仍保留 unified 执行身份", async () => {
+    readBossPageIdentity.mockImplementation(() => { throw new Error("probe failed"); });
+
+    const result = await executeDefaultGreeting(command);
+
+    expect(result).toMatchObject({
+      outcome: "unknown",
+      statusCode: "BOSS_REQUEST_NETWORK_UNKNOWN",
+      unifiedActionId: "unified-1",
+      unifiedExecutionEpoch: 1
+    });
   });
 
   it("平台成功响应后回传成功", async () => {

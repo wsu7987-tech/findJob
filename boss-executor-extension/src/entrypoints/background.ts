@@ -7,8 +7,7 @@ import {
   BackgroundService,
   ProvideBackgroundAdapter
 } from "../message/background";
-import { fineJobExecutorClient } from "../finejob/client";
-import { bossChatCoordinator } from "../finejob/chat-coordinator";
+import { bossChatCoordinator, fineJobExecutorClient } from "../finejob/runtime";
 
 export default defineBackground({
   main() {

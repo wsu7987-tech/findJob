@@ -108,6 +108,22 @@ def test_pair_auth_control_and_manual_navigation(configured_client, monkeypatch)
     assert opened.json()["navigation"]["browser_target_id"] == "target-api"
 
 
+def test_executor_status_exposes_revoked_pairing_for_ui(configured_client) -> None:
+    code = configured_client.post("/api/fine-job/boss-executor/pairing-code").json()["code"]
+    paired = configured_client.post(
+        "/api/fine-job/boss-executor/pair",
+        json={"code": code, "plugin_version": "0.1.0", "protocol_version": "1.1", "capabilities": []},
+    )
+    assert paired.status_code == 200
+    assert configured_client.get("/api/fine-job/boss-executor/status").json()["executor"]["pairing_state"] == "paired"
+
+    disconnected = configured_client.post("/api/fine-job/boss-executor/desktop-disconnect")
+    assert disconnected.status_code == 200
+    runtime = configured_client.get("/api/fine-job/boss-executor/status").json()
+    assert runtime["executor"]["browser_connected"] is False
+    assert runtime["executor"]["pairing_state"] == "revoked"
+
+
 def test_test_jobs_can_be_edited_and_create_delay_task(configured_client, monkeypatch) -> None:
     listed = configured_client.get("/api/fine-job/boss-executor/test-jobs")
     assert listed.status_code == 200

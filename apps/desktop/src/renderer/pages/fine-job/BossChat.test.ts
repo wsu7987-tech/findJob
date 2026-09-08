@@ -85,7 +85,8 @@ describe("BossChat 进展操作", () => {
       },
       messages: [],
       reply_tasks: [],
-      send_actions: []
+      send_actions: [],
+      unified_actions: []
     };
   });
 
@@ -143,7 +144,8 @@ describe("BossChat 进展操作", () => {
         created_at: "2026-09-06T00:00:00Z",
         updated_at: "2026-09-06T00:00:00Z"
       }],
-      send_actions: []
+      send_actions: [],
+      unified_actions: []
     };
     mocks.store.currentTask = null;
 

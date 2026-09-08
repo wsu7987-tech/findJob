@@ -9,7 +9,10 @@ const { storageData, browser } = vi.hoisted(() => {
           const selected = Array.isArray(keys) ? keys : [keys];
           return Object.fromEntries(selected.filter((key) => key in data).map((key) => [key, data[key]]));
         }),
-        set: vi.fn(async (values: Record<string, unknown>) => { Object.assign(data, values); })
+        set: vi.fn(async (values: Record<string, unknown>) => { Object.assign(data, values); }),
+        remove: vi.fn(async (keys: string | string[]) => {
+          for (const key of (Array.isArray(keys) ? keys : [keys])) delete data[key];
+        })
       }
     },
     tabs: { query: vi.fn().mockResolvedValue([]), sendMessage: vi.fn() }
@@ -19,6 +22,7 @@ const { storageData, browser } = vi.hoisted(() => {
 });
 
 import { FineJobExecutorClient } from "../src/finejob/client";
+import { SharedActionGate } from "../src/finejob/shared-action-gate";
 import type { FineJobQueueAction, MainWorldExecutionResult } from "../src/finejob/types";
 
 const response = (body: unknown) => ({
@@ -47,6 +51,11 @@ class TestWebSocket {
 
   close(): void {
     this.readyState = 3;
+  }
+
+  closeEvent(code: number): void {
+    this.readyState = 3;
+    for (const listener of this.listeners.get("close") ?? []) listener({ code });
   }
 
   send(data: string): void {
@@ -358,7 +367,7 @@ describe("FineJob执行结果可靠回写", () => {
     );
   });
 
-  it("任务回写确认后先进入任务间隔冷却再请求下一页", async () => {
+  it("任务回写确认后先进入任务间隔冷却，再匹配当前页后请求下一页", async () => {
     const nextTask: FineJobQueueAction = {
       id: "task-next-1",
       job_id: "job-1",
@@ -391,6 +400,7 @@ describe("FineJob执行结果可靠回写", () => {
     if (!socket) throw new Error("测试 WebSocket 未建立");
     socket.readyState = TestWebSocket.OPEN;
     socket.sent.length = 0;
+    (client as unknown as { currentPageTaskId: string }).currentPageTaskId = "task-done-1";
 
     socket.message({
       type: "task_result_synced",
@@ -413,9 +423,15 @@ describe("FineJob执行结果可靠回写", () => {
 
     await vi.advanceTimersByTimeAsync(1);
     await Promise.resolve();
+    expect((client as unknown as { currentPageTaskId: string }).currentPageTaskId).toBe("");
     const sentMessages = socket.sent.map((item) => JSON.parse(item));
     expect(sentMessages).toContainEqual(expect.objectContaining({ type: "runtime_state", phase: "idle" }));
-    expect(sentMessages).toContainEqual(expect.objectContaining({ type: "open_task_page" }));
+    expect(sentMessages).not.toContainEqual(expect.objectContaining({ type: "open_task_page" }));
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await Promise.resolve();
+    const afterPageMatch = socket.sent.map((item) => JSON.parse(item));
+    expect(afterPageMatch).toContainEqual(expect.objectContaining({ type: "open_task_page" }));
   });
 
   it("测试任务按队列下发的运行时间延迟回传成功", async () => {
@@ -479,5 +495,335 @@ describe("FineJob执行结果可靠回写", () => {
       execution_result: "测试任务已等待 7 秒并完成",
       platform_result: { delaySeconds: 7, closePageAfterCompletion: true }
     }));
+  });
+
+  it("岗位页打开后等待既有 loading 完成才 probe", async () => {
+    const task: FineJobQueueAction = {
+      id: "greeting-load-1",
+      job_id: "job-1",
+      review_item_id: "review-1",
+      action_type: "BOSS_DEFAULT_GREETING",
+      task_type: "BOSS_DEFAULT_GREETING",
+      status: "queued",
+      execution_state: "queued",
+      execution_epoch: 0,
+      job_title: "测试岗位",
+      company_name: "测试公司",
+      encrypt_job_id: "encrypt-1",
+      close_page_after_completion: false,
+      delay_seconds: 0
+    };
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response({
+      executor: {
+        id: "executor-1", plugin_version: "0.1.0", protocol_version: "1.1",
+        permission_state: "paused", queue_state: "running", risk_state: "none",
+        browser_connected: true, task_cooldown_max_seconds: 4, page_load_wait_max_seconds: 3,
+        runtime_phase: "idle"
+      },
+      queue: { actions: [task] }
+    }));
+    browser.tabs.query.mockResolvedValue([{ id: 12 }]);
+    const client = new FineJobExecutorClient();
+    await client.start();
+    const socket = sockets[0];
+    if (!socket) throw new Error("测试 WebSocket 未建立");
+    socket.readyState = TestWebSocket.OPEN;
+    browser.tabs.sendMessage.mockClear();
+
+    socket.message({ type: "page_opened", task_id: task.id, success: true, page: {} });
+    await Promise.resolve();
+    expect(browser.tabs.sendMessage).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(2_999);
+    expect(browser.tabs.sendMessage).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(browser.tabs.sendMessage).toHaveBeenCalledWith(12, { type: "finejob:boss-executor:probe:v1" });
+  });
+
+  it("chat busy 时 greeting 保留页面匹配结果且不进入 unified claim", async () => {
+    const task: FineJobQueueAction = {
+      id: "greeting-gated-1", job_id: "job-1", review_item_id: "review-1",
+      action_type: "BOSS_DEFAULT_GREETING", task_type: "BOSS_DEFAULT_GREETING",
+      status: "queued", execution_state: "queued", execution_epoch: 1,
+      job_title: "测试岗位", company_name: "测试公司", encrypt_job_id: "encrypt-1",
+      close_page_after_completion: false, delay_seconds: 0
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response({
+      executor: {
+        id: "executor-1", plugin_version: "0.1.0", protocol_version: "1.1",
+        permission_state: "paused", queue_state: "running", risk_state: "none",
+        browser_connected: true, task_cooldown_max_seconds: 4, page_load_wait_max_seconds: 3,
+        runtime_phase: "idle"
+      },
+      queue: { actions: [task] }
+    }));
+    const gate = new SharedActionGate();
+    const client = new FineJobExecutorClient(gate);
+    await client.start();
+    const socket = sockets[0];
+    if (!socket) throw new Error("测试 WebSocket 未建立");
+    socket.readyState = TestWebSocket.OPEN;
+    socket.sent.length = 0;
+    expect(gate.tryEnterBusy()).toBe(true);
+
+    await client.reportBossPageIdentity("tab-1", {
+      component: "boss-page-identity", pathname: "/web/geek/job/1", pageKind: "detail", state: "ready",
+      loggedIn: true, reason: "", job: {
+        encryptJobId: "encrypt-1", securityId: "security-1", encryptBossId: "boss-1",
+        jobName: "测试岗位", bossName: "王经理", bossTitle: "招聘", lid: "lid-1",
+        contacted: false, identitySource: "standalone-job-info", bossIdentifierVerified: true
+      }
+    });
+
+    expect(socket.sent.map((item) => JSON.parse(item))).not.toContainEqual(
+      expect.objectContaining({ type: "match_task", task_id: task.id })
+    );
+  });
+
+  it("cooldown 后清除完成任务 ID，以当前页匹配下一任务而不重新开页", async () => {
+    const nextTask: FineJobQueueAction = {
+      id: "greeting-next-1", job_id: "job-next", review_item_id: "review-next",
+      action_type: "BOSS_DEFAULT_GREETING", task_type: "BOSS_DEFAULT_GREETING",
+      status: "queued", execution_state: "queued", execution_epoch: 1,
+      job_title: "下一个岗位", company_name: "测试公司", encrypt_job_id: "encrypt-next",
+      close_page_after_completion: false, delay_seconds: 0
+    };
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response({
+      executor: {
+        id: "executor-1", plugin_version: "0.1.0", protocol_version: "1.1",
+        permission_state: "paused", queue_state: "running", risk_state: "none",
+        browser_connected: true, task_cooldown_max_seconds: 4, page_load_wait_max_seconds: 3,
+        runtime_phase: "idle"
+      },
+      queue: { actions: [] }
+    }));
+    browser.tabs.query.mockResolvedValue([{ id: 12 }] as never);
+    const gate = new SharedActionGate();
+    const client = new FineJobExecutorClient(gate);
+    await client.start();
+    const socket = sockets[0];
+    if (!socket) throw new Error("测试 WebSocket 未建立");
+    socket.readyState = TestWebSocket.OPEN;
+    socket.sent.length = 0;
+    const internal = client as unknown as { currentPageTaskId: string };
+    internal.currentPageTaskId = "greeting-done-1";
+    expect(gate.tryEnterBusy()).toBe(true);
+
+    socket.message({
+      type: "task_result_synced", task_id: "greeting-done-1", execution_epoch: 1,
+      queue: { actions: [nextTask] }
+    });
+    await Promise.resolve();
+    expect(gate.isCooldownActive()).toBe(true);
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(internal.currentPageTaskId).toBe("");
+
+    await client.reportBossPageIdentity("tab-1", {
+      component: "boss-page-identity", pathname: "/web/geek/job/next", pageKind: "detail", state: "ready",
+      loggedIn: true, reason: "", job: {
+        encryptJobId: "encrypt-next", securityId: "security-next", encryptBossId: "boss-next",
+        jobName: "下一个岗位", bossName: "李经理", bossTitle: "招聘", lid: "lid-next",
+        contacted: false, identitySource: "standalone-job-info", bossIdentifierVerified: true
+      }
+    });
+
+    const messages = socket.sent.map((item) => JSON.parse(item));
+    expect(messages).toContainEqual(expect.objectContaining({ type: "match_task", task_id: nextTask.id }));
+    expect(messages).not.toContainEqual(expect.objectContaining({ type: "open_task_page" }));
+  });
+
+  it("greeting 结果回写后即使队列为空也进入共享 cooldown，并阻止 queue update 开页", async () => {
+    const queuedTask: FineJobQueueAction = {
+      id: "queued-during-cooldown", job_id: "job-queued", review_item_id: "review-queued",
+      action_type: "BOSS_DEFAULT_GREETING", task_type: "BOSS_DEFAULT_GREETING",
+      status: "queued", execution_state: "queued", execution_epoch: 1,
+      job_title: "冷却中岗位", company_name: "测试公司", encrypt_job_id: "encrypt-queued",
+      close_page_after_completion: false, delay_seconds: 0
+    };
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response({
+      executor: {
+        id: "executor-1", plugin_version: "0.1.0", protocol_version: "1.1",
+        permission_state: "paused", queue_state: "running", risk_state: "none",
+        browser_connected: true, task_cooldown_max_seconds: 4, page_load_wait_max_seconds: 3,
+        runtime_phase: "idle"
+      },
+      queue: { actions: [] }
+    }));
+    const gate = new SharedActionGate();
+    const client = new FineJobExecutorClient(gate);
+    await client.start();
+    const socket = sockets[0];
+    if (!socket) throw new Error("测试 WebSocket 未建立");
+    socket.readyState = TestWebSocket.OPEN;
+    socket.sent.length = 0;
+    expect(gate.tryEnterBusy()).toBe(true);
+
+    socket.message({
+      type: "task_result_synced", task_id: "greeting-done-empty", execution_epoch: 1,
+      queue: { actions: [] }
+    });
+    await Promise.resolve();
+    expect(gate.isCooldownActive()).toBe(true);
+    socket.message({ type: "task_queue", tasks: [queuedTask] });
+    await Promise.resolve();
+
+    expect(socket.sent.map((item) => JSON.parse(item))).not.toContainEqual(
+      expect.objectContaining({ type: "open_task_page" })
+    );
+  });
+
+  it("cooldown 中 pause 清 timer 后结束 shared gate cooldown", () => {
+    const gate = new SharedActionGate();
+    const client = new FineJobExecutorClient(gate);
+    const internal = client as unknown as {
+      enterTaskCooldown: () => void;
+      applyQueueState: (state: "paused") => void;
+    };
+    expect(gate.tryEnterBusy()).toBe(true);
+    internal.enterTaskCooldown();
+    expect(gate.isCooldownActive()).toBe(true);
+
+    internal.applyQueueState("paused");
+
+    expect(gate.isActive()).toBe(false);
+  });
+
+  it("未 dispatch 的 disconnect 释放 shared gate", async () => {
+    const gate = new SharedActionGate();
+    const client = new FineJobExecutorClient(gate);
+    const task = {
+      id: "greeting-pending", execution_epoch: 1
+    } as FineJobQueueAction;
+    const internal = client as unknown as {
+      pendingDispatch: { task: FineJobQueueAction } | null;
+      clearLocalConnection: () => Promise<void>;
+    };
+    expect(gate.tryEnterBusy()).toBe(true);
+    internal.pendingDispatch = { task };
+
+    await internal.clearLocalConnection();
+
+    expect(gate.isActive()).toBe(false);
+  });
+
+  it("已 dispatch 的 disconnect 保持 identity 收口并进入 shared cooldown", async () => {
+    const gate = new SharedActionGate();
+    const client = new FineJobExecutorClient(gate);
+    const task = {
+      id: "greeting-dispatched", execution_epoch: 2
+    } as FineJobQueueAction;
+    const internal = client as unknown as {
+      dispatchedGreeting: { task: FineJobQueueAction; unifiedActionId: string; unifiedExecutionEpoch: number } | null;
+      clearLocalConnection: () => Promise<void>;
+    };
+    expect(gate.tryEnterBusy()).toBe(true);
+    internal.dispatchedGreeting = {
+      task,
+      unifiedActionId: "unified-greeting-1",
+      unifiedExecutionEpoch: 3
+    };
+
+    await internal.clearLocalConnection();
+
+    expect(gate.isCooldownActive()).toBe(true);
+  });
+
+  it("greeting dispatch_started 后 WS handoff 失败时以 unified identity 回写 unknown 并进入 cooldown", async () => {
+    const task: FineJobQueueAction = {
+      id: "greeting-handoff", job_id: "job-1", review_item_id: "review-1",
+      action_type: "BOSS_DEFAULT_GREETING", task_type: "BOSS_DEFAULT_GREETING",
+      status: "leased", execution_state: "running", execution_epoch: 2,
+      job_title: "测试岗位", company_name: "测试公司", encrypt_job_id: "encrypt-1",
+      close_page_after_completion: false, delay_seconds: 0
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response({
+      executor: {
+        id: "executor-1", plugin_version: "0.1.0", protocol_version: "1.1",
+        permission_state: "paused", queue_state: "running", risk_state: "none",
+        browser_connected: true, task_cooldown_max_seconds: 4, page_load_wait_max_seconds: 3,
+        runtime_phase: "idle"
+      },
+      queue: { actions: [] },
+      task
+    }));
+    const gate = new SharedActionGate();
+    const client = new FineJobExecutorClient(gate);
+    const internal = client as unknown as {
+      dispatchingTaskId: string;
+      startDefaultGreetingAfterMatch: (
+        tabId: string,
+        task: FineJobQueueAction,
+        bridge: { unifiedActionId: string; unifiedExecutionEpoch: number }
+      ) => void;
+    };
+    await client.start();
+    expect(gate.tryEnterBusy()).toBe(true);
+    internal.dispatchingTaskId = task.id;
+
+    internal.startDefaultGreetingAfterMatch("tab-1", task, {
+      unifiedActionId: "unified-greeting-1",
+      unifiedExecutionEpoch: 3
+    });
+
+    await vi.waitFor(() => expect(gate.isCooldownActive()).toBe(true));
+    const completeCall = vi.mocked(globalThis.fetch).mock.calls.find(([url]) => String(url).includes("/complete"));
+    expect(completeCall).toBeDefined();
+    expect(JSON.parse(String(completeCall?.[1]?.body))).toMatchObject({
+      outcome: "unknown",
+      unified_action_id: "unified-greeting-1",
+      unified_execution_epoch: 3
+    });
+  });
+
+  it("cooldown 中非 4001 close 重连后，cooldown 结束前不打开下一任务页面", async () => {
+    const queuedTask: FineJobQueueAction = {
+      id: "queued-after-reconnect", job_id: "job-1", review_item_id: "review-1",
+      action_type: "BOSS_DEFAULT_GREETING", task_type: "BOSS_DEFAULT_GREETING",
+      status: "queued", execution_state: "queued", execution_epoch: 1,
+      job_title: "重连冷却岗位", company_name: "测试公司", encrypt_job_id: "encrypt-1",
+      close_page_after_completion: false, delay_seconds: 0
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response({
+      executor: {
+        id: "executor-1", plugin_version: "0.1.0", protocol_version: "1.1",
+        permission_state: "paused", queue_state: "running", risk_state: "none",
+        browser_connected: true, task_cooldown_max_seconds: 4, page_load_wait_max_seconds: 3,
+        runtime_phase: "idle"
+      },
+      queue: { actions: [] }
+    }));
+    const gate = new SharedActionGate();
+    const client = new FineJobExecutorClient(gate);
+    browser.tabs.query.mockResolvedValue([]);
+    const internal = client as unknown as { enterTaskCooldown: () => void };
+    await client.start();
+    const firstSocket = sockets[0];
+    if (!firstSocket) throw new Error("测试 WebSocket 未建立");
+    expect(gate.tryEnterBusy()).toBe(true);
+    internal.enterTaskCooldown();
+    firstSocket.closeEvent(1006);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    const reconnectSocket = sockets[1];
+    if (!reconnectSocket) throw new Error("重连 WebSocket 未建立");
+    reconnectSocket.readyState = TestWebSocket.OPEN;
+    reconnectSocket.message({ type: "task_queue", tasks: [queuedTask] });
+    await Promise.resolve();
+    expect(gate.isCooldownActive()).toBe(true);
+    expect(reconnectSocket.sent.map((item) => JSON.parse(item))).not.toContainEqual(
+      expect.objectContaining({ type: "open_task_page" })
+    );
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    reconnectSocket.message({ type: "task_queue", tasks: [queuedTask] });
+    await Promise.resolve();
+    expect(gate.isActive()).toBe(false);
+    expect(reconnectSocket.sent.map((item) => JSON.parse(item))).toContainEqual(
+      expect.objectContaining({ type: "open_task_page" })
+    );
   });
 });
