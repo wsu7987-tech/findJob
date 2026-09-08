@@ -15,6 +15,8 @@ from backend.app.services.fine_job.execution_reconciliation import (
     set_canonical_from_raw,
 )
 from backend.app.services.fine_job.job_activity import append_job_activity_with_connection
+from backend.app.services.fine_job.action_store import sync_legacy_action
+from backend.app.services.fine_job import action_scheduler
 from backend.app.utils import new_id, utc_now
 
 
@@ -256,12 +258,17 @@ async def _handle_executor_channel_message(db: Database, executor_id: str, messa
             else task["execution_epoch"] or 0
         )
         result = match_task(db, executor_id, task_id, execution_epoch)
+        bridge: dict[str, object] | None = None
+        if str(result["task"].get("task_type") or "") == "BOSS_DEFAULT_GREETING":
+            page_identity = message.get("page_identity") if isinstance(message.get("page_identity"), dict) else {}
+            bridge = prepare_greeting_unified_bridge(db, executor_id, task_id, page_identity)
         await _send_executor_message(executor_id, {
             "type": "task_match_synced",
             "task_id": task_id,
             "execution_epoch": execution_epoch,
             "task": result["task"],
             "queue": result["queue"],
+            "bridge": bridge,
         })
         await notify_queue_changed(db)
         return
@@ -490,8 +497,35 @@ def executor_status(db: Database, executor_id: str | None = None) -> dict[str, o
         "executor": _serialize_executor(executor) if executor else None,
         "current_task": _current_task(db),
         "queue": list_queue(db),
+        "unified_queue": _list_unified_display_queue(db),
         "protocol_version": PROTOCOL_VERSION,
     }
+
+
+def _list_unified_display_queue(db: Database) -> dict[str, object]:
+    """为桌面端提供统一 Action 的只读展示队列，不参与领取或调度。"""
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT a.id, a.account_uid, a.action_type, a.status, a.waiting_reason_code,
+                   a.waiting_reason_detail, a.session_sequence, a.created_at, a.updated_at,
+                   a.text, a.resume_filename, a.job_id, a.session_id,
+                   COALESCE(s.peer_name, '') AS peer_name,
+                   COALESCE(s.company_name, j.company_name, '') AS company_name,
+                   COALESCE(s.job_title, j.title, '') AS job_title
+            FROM fj_actions a
+            LEFT JOIN fj_chat_sessions s ON s.id = a.session_id
+            LEFT JOIN fj_boss_jobs j ON j.id = a.job_id
+            WHERE a.status IN (
+              'waiting', 'awaiting_confirmation', 'queued', 'claimed', 'preflighting',
+              'dispatching', 'accepted', 'unknown'
+            )
+            -- 展示顺序沿用调度器候选动作的排序字段，并按账号分组。
+            ORDER BY a.account_uid ASC, a.priority DESC, a.created_at ASC, a.id ASC
+            """
+        ).fetchall()
+    actions = [dict(row) for row in rows]
+    return {"actions": actions, "total": len(actions)}
 
 
 def list_queue(db: Database) -> dict[str, object]:
@@ -705,6 +739,9 @@ def match_task(
                 """,
                 (running_status, executor_id, now, now, now, task_id),
             )
+            # greeting 的 unified claim 必须在页面匹配后执行，此处不提前用 legacy shadow 占用它。
+            if str(task["task_type"]) != "BOSS_DEFAULT_GREETING":
+                sync_legacy_action(connection, source_table="fj_automation_actions", source_id=task_id)
     if not already_locked:
         _update_runtime_state(db, executor_id, "idle")
         _audit(db, "boss_task_matched", "岗位页面已匹配执行任务。", {"task_id": task_id})
@@ -716,6 +753,8 @@ def mark_task_dispatch_started(
     executor_id: str,
     task_id: str,
     execution_epoch: int,
+    *,
+    sync_unified_shadow: bool = True,
 ) -> None:
     now = utc_now()
     with db.connect() as connection:
@@ -739,6 +778,130 @@ def mark_task_dispatch_started(
             """,
             (now, now, now, task_id),
         )
+        if sync_unified_shadow:
+            sync_legacy_action(connection, source_table="fj_automation_actions", source_id=task_id)
+
+
+def _close_greeting_bridge_rejection(
+    db: Database,
+    legacy_task_id: str,
+    reason_code: str,
+    *,
+    unified_status: str = "",
+    requeue: bool = False,
+) -> None:
+    """在 bridge 拒绝后收口 legacy 兼容任务，避免它遗留在运行态。"""
+    now = utc_now()
+    if requeue:
+        status = "queued"
+        canonical_status = "pending"
+        completed_at = None
+    elif unified_status == "succeeded":
+        status = "succeeded"
+        canonical_status = "succeeded"
+        completed_at = now
+    elif unified_status == "unknown":
+        status = "unknown"
+        canonical_status = "unknown"
+        completed_at = now
+    elif unified_status == "failed":
+        status = "failed"
+        canonical_status = "failed"
+        completed_at = now
+    else:
+        status = "blocked"
+        canonical_status = "blocked"
+        completed_at = now
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """UPDATE fj_automation_actions
+               SET status=?, execution_state=?, executor_id=NULL,
+                   last_status_code=?, last_error=?, result_json=?, completed_at=?,
+                   canonical_status=?, canonical_updated_at=?, canonical_reason=?, updated_at=?
+               WHERE id=? AND status IN ('running', 'leased')""",
+            (
+                status,
+                status,
+                f"GREETING_BRIDGE_{reason_code.upper()}",
+                reason_code,
+                json.dumps({"bridge_reason": reason_code}, ensure_ascii=False),
+                completed_at,
+                canonical_status,
+                now,
+                f"统一 greeting bridge 拒绝：{reason_code}",
+                now,
+                legacy_task_id,
+            ),
+        )
+        connection.commit()
+
+
+def prepare_greeting_unified_bridge(
+    db: Database,
+    executor_id: str,
+    legacy_task_id: str,
+    page_identity: dict[str, object],
+) -> dict[str, object]:
+    """页面匹配完成后，将旧 greeting 导航任务桥接到其唯一统一 Action。"""
+    with db.connect() as connection:
+        rows = connection.execute(
+            """SELECT * FROM fj_actions WHERE action_type='greeting'
+               AND source_table='fj_automation_actions' AND source_id=?""",
+            (legacy_task_id,),
+        ).fetchall()
+    if len(rows) != 1:
+        reason_code = "mapping_missing" if not rows else "mapping_ambiguous"
+        _close_greeting_bridge_rejection(db, legacy_task_id, reason_code)
+        return {"ok": False, "reason_code": reason_code}
+    action = rows[0]
+    if str(action["status"]) in {"succeeded", "unknown", "cancelled", "superseded", "stale", "failed", "blocked"}:
+        _close_greeting_bridge_rejection(
+            db, legacy_task_id, "unified_action_terminal", unified_status=str(action["status"]),
+        )
+        return {"ok": False, "reason_code": "unified_action_terminal"}
+    unified_id = str(action["id"])
+    claimed = action_scheduler.claim_unified_action(
+        db, executor_id, action_id=unified_id, account_uid=str(action["account_uid"] or ""),
+    )
+    if claimed is None:
+        _close_greeting_bridge_rejection(db, legacy_task_id, "unified_claim_failed", requeue=True)
+        return {"ok": False, "reason_code": "unified_claim_failed"}
+    job = page_identity.get("job") if isinstance(page_identity.get("job"), dict) else {}
+    preflight = action_scheduler.preflight_action(
+        db,
+        executor_id,
+        unified_id,
+        int(claimed["execution_epoch"]),
+        {
+            "encrypt_job_id": str(job.get("encryptJobId") or ""),
+            "security_id": str(job.get("securityId") or ""),
+            "contacted": job.get("contacted"),
+        },
+    )
+    if preflight.get("decision") != "dispatch":
+        decision = str(preflight.get("decision") or "")
+        reason_code = "preflight_waiting" if decision == "waiting" else (
+            "preflight_uncertain" if decision == "replan" else "preflight_blocked"
+        )
+        latest = preflight.get("action") if isinstance(preflight.get("action"), dict) else {}
+        _close_greeting_bridge_rejection(
+            db,
+            legacy_task_id,
+            reason_code,
+            unified_status=str(latest.get("status") or ""),
+            requeue=decision == "waiting",
+        )
+        return {"ok": False, "reason_code": reason_code}
+    action_scheduler.mark_dispatch_started(
+        db, executor_id, unified_id, int(claimed["execution_epoch"]), str(preflight["dispatch_token"]),
+    )
+    # unified dispatch 已授权后再写入 legacy 的兼容 dispatch 状态。
+    legacy = _require_action(db, legacy_task_id)
+    mark_task_dispatch_started(
+        db, executor_id, legacy_task_id, int(legacy["execution_epoch"] or 0), sync_unified_shadow=False,
+    )
+    return {"ok": True, "unified_action_id": unified_id, "unified_execution_epoch": int(claimed["execution_epoch"])}
 
 
 def complete_task(
@@ -753,7 +916,8 @@ def complete_task(
     if int(task["execution_epoch"] or 0) != execution_epoch:
         raise AppError(409, "STALE_EXECUTION_EPOCH", "该任务执行轮次已经失效。")
     outcome = str(payload.get("outcome") or "unknown")
-    status = "succeeded" if outcome in {"accepted", "succeeded"} else outcome
+    # 平台受理仍需页面可信观察，不能直接提升为业务成功。
+    status = "succeeded" if outcome == "succeeded" else ("unknown" if outcome == "accepted" else outcome)
     if status not in {"succeeded", "failed", "unknown"}:
         status = "unknown"
     if task["status"] not in {"queued", "running", "leased"}:
@@ -763,6 +927,47 @@ def complete_task(
                 "queue": list_queue(db),
             }
         raise AppError(409, "INVALID_TASK_ASSIGNMENT", "任务当前状态不能回写执行结果。")
+    unified_action_id = str(payload.get("unified_action_id") or "")
+    unified_execution_epoch = int(payload.get("unified_execution_epoch") or 0)
+    if str(task["task_type"] or "") == "BOSS_DEFAULT_GREETING" and not unified_action_id:
+        with db.connect() as connection:
+            mapped = connection.execute(
+                """SELECT 1 FROM fj_actions WHERE action_type='greeting'
+                   AND source_table='fj_automation_actions' AND source_id=?""",
+                (task_id,),
+            ).fetchone()
+        if mapped is not None:
+            raise AppError(409, "UNIFIED_EXECUTION_IDENTITY_REQUIRED", "统一 greeting 执行结果缺少身份。")
+    if unified_action_id:
+        unified = action_scheduler.complete_action(
+            db,
+            executor_id,
+            unified_action_id,
+            {
+                "execution_epoch": unified_execution_epoch,
+                "outcome": outcome,
+                "status_code": str(payload.get("status_code") or ""),
+            },
+        )
+        # 统一 Action 是业务权威；legacy 只写兼容终态，避免 shadow 回写覆盖 canonical outcome。
+        legacy_status = "unknown" if str(unified["status"]) == "accepted" else str(unified["status"])
+        now = utc_now()
+        with db.connect() as connection:
+            connection.execute(
+                """UPDATE fj_automation_actions SET status=?, execution_state=?, last_status_code=?,
+                   last_error=?, result_json=?, completed_at=?, updated_at=? WHERE id=?""",
+                (
+                    legacy_status,
+                    legacy_status,
+                    str(payload.get("status_code") or "") or None,
+                    None if legacy_status == "succeeded" else (str(payload.get("message") or "") or None),
+                    json.dumps({"outcome": outcome, "unified_action_id": unified_action_id}, ensure_ascii=False),
+                    now,
+                    now,
+                    task_id,
+                ),
+            )
+        return {"task": _serialize_action(_require_action(db, task_id), include_payload=False), "queue": list_queue(db)}
     now = utc_now()
     message = str(payload.get("message") or "")
     result = {
@@ -878,6 +1083,7 @@ def complete_task(
                 updated_at=now,
                 reason=message or str(payload.get("status_code") or status),
             )
+        sync_legacy_action(connection, source_table="fj_automation_actions", source_id=task_id)
     _audit(
         db,
         "boss_task_completed",
@@ -1245,7 +1451,7 @@ async def _handle_task_completion_message(
     if succeeded and outcome not in {"accepted", "succeeded"}:
         outcome = "succeeded"
     if not succeeded and outcome not in {"failed", "unknown"}:
-        outcome = "failed"
+        outcome = "unknown" if outcome == "accepted" else "failed"
     payload = {
         "execution_epoch": execution_epoch,
         "outcome": outcome,
@@ -1256,6 +1462,8 @@ async def _handle_task_completion_message(
             "platform_result": message.get("platform_result"),
             "completed_at": message.get("completed_at") or message.get("failed_at"),
         },
+        "unified_action_id": str(message.get("unified_action_id") or ""),
+        "unified_execution_epoch": int(message.get("unified_execution_epoch") or 0),
     }
     result = complete_task(db, executor_id, task_id, payload)
     if succeeded and _should_close_task(task):
@@ -1421,6 +1629,7 @@ def _record_retriable_task_failure(
                 message=message,
                 observed_at=now,
             )
+            sync_legacy_action(connection, source_table="fj_automation_actions", source_id=task_id)
         _audit(db, "boss_task_retry_failed", "任务页面连续失败，已标记任务失败。", {"task_id": task_id, "status_code": final_status_code}, level="warning")
         return
     created_at_sql = ", created_at = ?" if move_to_tail else ""
@@ -1447,6 +1656,7 @@ def _record_retriable_task_failure(
                 ),
             ),
         )
+        sync_legacy_action(connection, source_table="fj_automation_actions", source_id=task_id)
 
 
 def _finish_active_tasks_as_unknown(db: Database, message: str, status_code: str) -> int:
@@ -1481,6 +1691,8 @@ def _finish_active_tasks_as_unknown(db: Database, message: str, status_code: str
             """,
             (status_code, message, json.dumps(result, ensure_ascii=False), now, now, now, message),
         )
+        for row in rows:
+            sync_legacy_action(connection, source_table="fj_automation_actions", source_id=str(row["id"]))
     _audit(
         db,
         "boss_active_tasks_finished_unknown",
@@ -1514,6 +1726,7 @@ def _record_execution_error(db: Database, task_id: str, message: str) -> None:
             message=message,
             observed_at=now,
         )
+        sync_legacy_action(connection, source_table="fj_automation_actions", source_id=task_id)
 
 
 def _current_task(db: Database) -> dict[str, object] | None:
@@ -1541,6 +1754,7 @@ def return_to_review(db: Database, action_id: str, *, reason: str, executor_id: 
             "UPDATE fj_automation_actions SET status = 'cancelled', execution_state = 'cancelled', last_status_code = 'RETURNED_TO_REVIEW', last_error = ?, updated_at = ?, completed_at = ? WHERE id = ?",
             (reason.strip(), now, now, action_id),
         )
+        sync_legacy_action(connection, source_table="fj_automation_actions", source_id=action_id)
         connection.execute(
             "UPDATE fj_review_items SET status = 'pending', resolved_at = NULL, resolution_note = ?, updated_at = ? WHERE id = ?",
             (reason.strip(), now, task["review_item_id"]),
@@ -1672,6 +1886,8 @@ def _serialize_executor(row) -> dict[str, object]:
         "queue_state": row["queue_state"],
         "risk_state": row["risk_state"],
         "browser_connected": bool(row["browser_connected"]),
+        # 主动断开会撤销配对凭据，UI 据此区分主动断开与临时掉线。
+        "pairing_state": "revoked" if str(row["token_hash"] or "").startswith("revoked:") else "paired",
         "last_heartbeat_at": row["last_heartbeat_at"],
         "task_cooldown_max_seconds": int(row["task_cooldown_max_seconds"]) if "task_cooldown_max_seconds" in keys else 4,
         "page_load_wait_max_seconds": int(row["page_load_wait_max_seconds"]) if "page_load_wait_max_seconds" in keys else 3,

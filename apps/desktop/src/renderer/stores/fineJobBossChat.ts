@@ -278,7 +278,7 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
       detailCache.value[sessionId] = loaded;
       detail.value = loaded;
       const action = loaded.send_actions.find((item) => item.id === actionId) ?? null;
-      if (!action || ["accepted", "failed", "unknown"].includes(action.outcome ?? "")) return action;
+      if (!action || action.status === "cancelled" || ["accepted", "failed", "unknown"].includes(action.outcome ?? "")) return action;
     }
     return null;
   };

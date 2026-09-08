@@ -62,7 +62,7 @@ describe("BOSS 聊天 sender 离线边界", () => {
 
   it("简历 dry-run 不读取附件、不请求 exchange、不连接也不 publish", async () => {
     const result = await new BossChatSender().send(
-      action({ operation_kind: "resume", encrypt_resume_id: "resume-1" }),
+      action({ operation_kind: "resume", encrypt_resume_id: "resume-1", resume_filename: "候选人.pdf" }),
       { dryRun: true }
     );
     expect(result).toMatchObject({ outcome: "accepted", statusCode: "dry_run_prepared" });
@@ -94,16 +94,18 @@ describe("BOSS 聊天 sender 离线边界", () => {
 
   it("简历先 exchange/request 再经既有 MQTT 管道发送", async () => {
     const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ json: async () => ({ code: 0, zpData: { resumeList: [{ encryptResumeId: "resume-1", showName: "候选人.pdf" }] } }) })
       .mockResolvedValueOnce({ json: async () => ({ code: 0, zpData: { status: 0 } }) })
       .mockResolvedValueOnce({ json: async () => ({ code: 0, zpData: { wt2: "test-wt" } }) });
     vi.stubGlobal("fetch", fetchMock);
     const result = await new BossChatSender().send(
-      action({ operation_kind: "resume", encrypt_resume_id: "resume-1" }),
+      action({ operation_kind: "resume", encrypt_resume_id: "resume-1", resume_filename: "候选人.pdf" }),
       { isSendEnabled: async () => true }
     );
     expect(result).toMatchObject({ outcome: "accepted", statusCode: "transport_accepted" });
-    expect(fetchMock.mock.calls[0]?.[0]).toBe("https://www.zhipin.com/wapi/zpchat/exchange/request");
-    expect(String(fetchMock.mock.calls[0]?.[1]?.body)).toContain("encryptResumeId=resume-1");
+    expect(fetchMock.mock.calls[0]?.[0]).toContain("resume/attachment/checkbox.json");
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("https://www.zhipin.com/wapi/zpchat/exchange/request");
+    expect(String(fetchMock.mock.calls[1]?.[1]?.body)).toContain("encryptResumeId=resume-1");
     const publishCall = mqttMock.client.publish.mock.calls[0];
     expect(publishCall?.[0]).toBe("chat");
     expect((publishCall?.[1] as { length?: number }).length).toBeGreaterThan(0);
@@ -119,11 +121,12 @@ describe("BOSS 聊天 sender 离线边界", () => {
   });
 
   it("exchange 失败时不 MQTT publish", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-      json: async () => ({ code: 1, message: "rejected", zpData: { status: 1 } })
-    }));
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce({ json: async () => ({ code: 0, zpData: { resumeList: [{ encryptResumeId: "resume-1", showName: "候选人.pdf" }] } }) })
+      .mockResolvedValueOnce({ json: async () => ({ code: 1, message: "rejected", zpData: { status: 1 } }) })
+    );
     const result = await new BossChatSender().send(
-      action({ operation_kind: "resume", encrypt_resume_id: "resume-1" }),
+      action({ operation_kind: "resume", encrypt_resume_id: "resume-1", resume_filename: "候选人.pdf" }),
       { isSendEnabled: async () => true }
     );
     expect(result).toMatchObject({ outcome: "failed", statusCode: "chat_send_failed" });
@@ -140,12 +143,24 @@ describe("BOSS 聊天 sender 离线边界", () => {
 
   it("简历发送开关关闭时不请求 exchange 或 MQTT", async () => {
     const result = await new BossChatSender().send(
-      action({ operation_kind: "resume", encrypt_resume_id: "resume-1" }),
+      action({ operation_kind: "resume", encrypt_resume_id: "resume-1", resume_filename: "候选人.pdf" }),
       { isSendEnabled: async () => false }
     );
     expect(result).toMatchObject({ outcome: "failed", statusCode: "chat_send_failed" });
     expect(fetch).not.toHaveBeenCalled();
     expect(mqttMock.connect).not.toHaveBeenCalled();
+    expect(mqttMock.client.publish).not.toHaveBeenCalled();
+  });
+
+  it("执行时附件不存在即阻止，不自动更换简历", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      json: async () => ({ code: 0, zpData: { resumeList: [{ encryptResumeId: "other", showName: "另一份.pdf" }] } })
+    }));
+    const result = await new BossChatSender().send(
+      action({ operation_kind: "resume", encrypt_resume_id: "resume-1", resume_filename: "候选人.pdf" }),
+      { isSendEnabled: async () => true }
+    );
+    expect(result).toMatchObject({ outcome: "failed", statusCode: "resume_attachment_invalid" });
     expect(mqttMock.client.publish).not.toHaveBeenCalled();
   });
 
@@ -190,11 +205,12 @@ describe("BOSS 聊天 sender 离线边界", () => {
       (_topic: string, _bytes: Uint8Array, _options: object, callback: (error?: Error) => void) => callback(new Error("offline"))
     );
     const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ json: async () => ({ code: 0, zpData: { resumeList: [{ encryptResumeId: "resume-1", showName: "候选人.pdf" }] } }) })
       .mockResolvedValueOnce({ json: async () => ({ code: 0, zpData: { status: 0 } }) })
       .mockResolvedValueOnce({ json: async () => ({ code: 0, zpData: { wt2: "test-wt" } }) });
     vi.stubGlobal("fetch", fetchMock);
     const result = await new BossChatSender().send(
-      action({ operation_kind: "resume", encrypt_resume_id: "resume-1" }),
+      action({ operation_kind: "resume", encrypt_resume_id: "resume-1", resume_filename: "候选人.pdf" }),
       { isSendEnabled: async () => true }
     );
     expect(result).toMatchObject({ outcome: "unknown", statusCode: "resume_send_result_unknown" });

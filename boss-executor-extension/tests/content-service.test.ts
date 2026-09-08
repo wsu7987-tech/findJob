@@ -13,6 +13,7 @@ const createBackground = (ok = true): BackgroundService =>
       realActionsEnabled: true
     }),
     reportExecutionResult: vi.fn().mockResolvedValue({ accepted: true }),
+    reportResumeSnapshot: vi.fn().mockResolvedValue({ accepted: true }),
     reportChatTabHeartbeat: vi.fn().mockResolvedValue({ isLeader: true, leaderEpoch: 1 })
   }) as unknown as BackgroundService;
 
@@ -62,7 +63,9 @@ describe("Content 服务", () => {
       type: "BOSS_DEFAULT_GREETING" as const,
       taskId: "greeting-1",
       executionEpoch: 1,
-      encryptJobId: "job-1"
+      encryptJobId: "job-1",
+      unifiedActionId: "unified-1",
+      unifiedExecutionEpoch: 1
     };
     const chat = {
       type: "BOSS_CHAT_SEND" as const,
@@ -125,5 +128,38 @@ describe("Content 服务", () => {
     await service.reportChatIdentity({ ...identity, observedAt: 2 });
 
     await expect(service.takeMainCommand()).resolves.toBeNull();
+  });
+
+  it("简历 snapshot 命令与结果独立于动作完成结果", async () => {
+    const status = createFrameworkStatus("/web/geek/chat");
+    const background = createBackground();
+    const service = new ContentService(background, status);
+    await service.reportChatIdentity({
+      accountUid: "account-1",
+      loggedIn: true,
+      pathname: "/web/geek/chat",
+      observedAt: 1
+    });
+    const tabId = vi.mocked(background.reportChatTabHeartbeat).mock.calls[0]?.[0].tabId ?? "";
+    const command = {
+      type: "BOSS_RESUME_SNAPSHOT_REQUEST" as const,
+      targetTabId: tabId,
+      leaderEpoch: 1,
+      requestId: "request-1",
+      actionId: "resume-action-1"
+    };
+
+    await expect(service.enqueueMainCommand(command)).resolves.toEqual({ accepted: true });
+    await expect(service.takeMainCommand()).resolves.toEqual(command);
+    await service.reportResumeSnapshot({
+      requestId: "request-1",
+      actionId: "resume-action-1",
+      attachments: [{ encryptResumeId: "resume-1", filename: "候选人.pdf" }],
+      observedAt: "2026-09-08T00:00:00Z",
+      error: ""
+    });
+
+    expect(background.reportResumeSnapshot).toHaveBeenCalledOnce();
+    expect(background.reportExecutionResult).not.toHaveBeenCalled();
   });
 });

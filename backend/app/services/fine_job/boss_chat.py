@@ -30,6 +30,20 @@ from backend.app.services.fine_job.execution_reconciliation import (
     set_canonical_from_raw,
 )
 from backend.app.services.fine_job.job_activity import append_job_activity_with_connection
+from backend.app.services.fine_job.action_store import (
+    create_legacy_action,
+    link_action_messages,
+    mark_messages_reply_planned,
+    observe_action_outbound_result,
+    reconcile_action_coverage_state,
+    reconcile_reply_task_coverage,
+    sync_legacy_action,
+    transfer_action_coverage,
+)
+from backend.app.services.fine_job.action_scheduler import create_action as create_unified_action
+from backend.app.services.fine_job.action_scheduler import observe_outbound_result as observe_unified_outbound_result
+from backend.app.services.fine_job.message_semantics import derive_message_semantics
+from backend.app.services.fine_job.message_relation import classify_pending_reply_delta
 from backend.app.services.reasoning.codex_exec import run_codex_exec
 
 
@@ -120,6 +134,38 @@ def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
             result[key.removesuffix("_json")] = _loads(result.pop(key), fallback)
     if "requires_user_input" in result:
         result["requires_user_input"] = bool(result["requires_user_input"])
+    return result
+
+
+def _message_payload(row: sqlite3.Row) -> dict[str, Any]:
+    """合并 raw、semantic 与 state，同时保留旧消息字段供现有界面使用。"""
+    result = _row(row) or {}
+    semantic_context = _loads(str(result.pop("semantic_context_json", "{}")), {})
+    raw_body = _loads(str(result.pop("raw_body_json", "{}")), {})
+    semantic_type = result.pop("semantic_type", None)
+    if semantic_type is not None:
+        result["semantic"] = {
+            "semantic_type": semantic_type,
+            "display_text": result.pop("display_text", ""),
+            "reply_required": bool(result.pop("reply_required", 0)),
+            "classifier_version": result.pop("classifier_version", ""),
+            "context": semantic_context,
+            "derived_at": result.pop("derived_at", None),
+        }
+    result["state"] = {
+        "read_state": result.pop("read_state", "unknown"),
+        "read_subject": result.pop("read_subject", "not_applicable"),
+        "reply_state": result.pop("reply_state", "not_required"),
+        "read_at": result.pop("read_at", None),
+        "reply_planned_at": result.pop("reply_planned_at", None),
+        "replied_at": result.pop("replied_at", None),
+        "updated_at": result.pop("state_updated_at", None),
+    }
+    result["raw"] = {
+        "content": result.get("raw_content", result.get("content", "")),
+        "body": raw_body,
+        "meta": result.get("raw_meta", {}),
+    }
     return result
 
 
@@ -631,9 +677,9 @@ def sync_history_messages(
                 """
                 INSERT OR IGNORE INTO fj_chat_messages (
                   id, session_id, platform_message_id, direction, message_type,
-                  content, sender_uid, receiver_uid, client_mid, source,
+                  content, raw_content, raw_body_json, sender_uid, receiver_uid, client_mid, source,
                   sent_at, observed_at, raw_meta_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 'websocket', ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 'websocket', ?, ?, ?, ?)
                 """,
                 (
                     local_message_id,
@@ -642,6 +688,8 @@ def sync_history_messages(
                     direction,
                     message_type,
                     _history_message_content(raw),
+                    str(body.get("text") or raw.get("pushText") or ""),
+                    json.dumps(body, ensure_ascii=False),
                     sender_uid,
                     receiver_uid,
                     sent_at,
@@ -652,6 +700,7 @@ def sync_history_messages(
             )
             inserted_count += int(cursor.rowcount > 0)
             if cursor.rowcount > 0:
+                derive_message_semantics(connection, local_message_id)
                 _record_message_activity(
                     connection,
                     session_id=session_id,
@@ -843,6 +892,10 @@ def _queue_reply_task(
     session: sqlite3.Row,
     message_id: str,
     trigger_source: str,
+    *,
+    preserve_existing_pending: bool = False,
+    replacement_for_action_id: str = "",
+    covered_message_ids: list[str] | None = None,
 ) -> str | None:
     if session["status"] != "active":
         return None
@@ -862,7 +915,46 @@ def _queue_reply_task(
             (now, session["id"]),
         )
         return None
+    # 独立 B 与相关 B 重规划均保留现有 Action；默认入口继续使旧草稿失效。
+    if preserve_existing_pending:
+        now = _now()
+        task_id = _id("chat_reply")
+        input_message_ids = list(dict.fromkeys(
+            [str(item) for item in (covered_message_ids or [message_id]) if item]
+        ))
+        if message_id not in input_message_ids:
+            input_message_ids.append(message_id)
+        context: dict[str, Any] = {"preserve_existing_pending": True}
+        if replacement_for_action_id:
+            # 生成完成后据此创建同一会话序列的 replacement Action。
+            context.update({
+                "replacement_for_action_id": replacement_for_action_id,
+                "replacement_source_action_ids": [replacement_for_action_id],
+                "preserve_session_sequence": True,
+            })
+        connection.execute(
+            """INSERT INTO fj_chat_reply_tasks (
+                 id, session_id, trigger_source, status, based_on_message_id,
+                 based_on_session_version, generation_due_at, input_message_ids_json, context_json,
+                 created_at, updated_at
+               ) VALUES (?, ?, ?, 'pending_generation', ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                task_id, session["id"], trigger_source, message_id, int(session["session_version"]),
+                _after(REPLY_DEBOUNCE_SECONDS), json.dumps(input_message_ids, ensure_ascii=False),
+                json.dumps(context, ensure_ascii=False), now, now,
+            ),
+        )
+        mark_messages_reply_planned(connection, input_message_ids)
+        return task_id
     # 还没有开始真实发送的旧动作可以安全取消，禁止新消息到达后发送旧草稿。
+    cancelled_rows = connection.execute(
+        """
+        SELECT a.id FROM fj_chat_send_actions a
+        JOIN fj_chat_reply_tasks t ON t.id = a.reply_task_id
+        WHERE t.session_id = ? AND a.status IN ('queued', 'leased')
+        """,
+        (session["id"],),
+    ).fetchall()
     connection.execute(
         """
         UPDATE fj_chat_send_actions SET status = 'cancelled', updated_at = ?, completed_at = ?,
@@ -874,6 +966,15 @@ def _queue_reply_task(
         """,
         (now, now, now, session["id"]),
     )
+    replacement_action_ids = [
+        action_id
+        for row in cancelled_rows
+        if (action_id := sync_legacy_action(
+            connection,
+            source_table="fj_chat_send_actions",
+            source_id=str(row["id"]),
+        )) is not None
+    ]
     pending = connection.execute(
         """
         SELECT * FROM fj_chat_reply_tasks
@@ -883,6 +984,11 @@ def _queue_reply_task(
         (session["id"],),
     ).fetchone()
     # 已开始生成或等待确认的旧草稿立即失效；防抖窗口内的待生成任务直接延后。
+    stale_rows = connection.execute(
+        """SELECT id FROM fj_chat_reply_tasks
+           WHERE session_id = ? AND status IN ('generating', 'awaiting_review', 'confirmed')""",
+        (session["id"],),
+    ).fetchall()
     connection.execute(
         """
         UPDATE fj_chat_reply_tasks
@@ -892,16 +998,26 @@ def _queue_reply_task(
         """,
         (now, now, session["id"]),
     )
+    for row in stale_rows:
+        reconcile_reply_task_coverage(connection, reply_task_id=str(row["id"]))
     generation_due_at = _after(REPLY_DEBOUNCE_SECONDS)
     if pending is not None:
         input_message_ids = _loads(pending["input_message_ids_json"], [])
         if message_id not in input_message_ids:
             input_message_ids.append(message_id)
+        context = _loads(str(pending["context_json"] or "{}"), {})
+        context = context if isinstance(context, dict) else {}
+        previous_ids = context.get("replacement_source_action_ids")
+        inherited_ids = [str(item) for item in previous_ids if isinstance(item, str)] if isinstance(previous_ids, list) else []
+        context["replacement_source_action_ids"] = list(dict.fromkeys([
+            *inherited_ids,
+            *replacement_action_ids,
+        ]))
         connection.execute(
             """
             UPDATE fj_chat_reply_tasks
             SET trigger_source = ?, based_on_message_id = ?, based_on_session_version = ?,
-                generation_due_at = ?, input_message_ids_json = ?, updated_at = ?
+                generation_due_at = ?, input_message_ids_json = ?, context_json = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -910,19 +1026,21 @@ def _queue_reply_task(
                 int(session["session_version"]),
                 generation_due_at,
                 json.dumps(input_message_ids, ensure_ascii=False),
+                json.dumps(context, ensure_ascii=False),
                 now,
                 pending["id"],
             ),
         )
+        mark_messages_reply_planned(connection, input_message_ids)
         return str(pending["id"])
     task_id = _id("chat_reply")
     connection.execute(
         """
         INSERT INTO fj_chat_reply_tasks (
           id, session_id, trigger_source, status, based_on_message_id,
-          based_on_session_version, generation_due_at, input_message_ids_json,
+          based_on_session_version, generation_due_at, input_message_ids_json, context_json,
           created_at, updated_at
-        ) VALUES (?, ?, ?, 'pending_generation', ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, 'pending_generation', ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id,
@@ -932,11 +1050,132 @@ def _queue_reply_task(
             int(session["session_version"]),
             generation_due_at,
             json.dumps([message_id], ensure_ascii=False),
+            json.dumps({"replacement_source_action_ids": replacement_action_ids}, ensure_ascii=False),
             now,
             now,
         ),
     )
+    mark_messages_reply_planned(connection, [message_id])
     return task_id
+
+
+def prepare_unified_chat_preflight(
+    db: Database,
+    config: AppConfig,
+    action_id: str,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """以已保存 raw/semantic 生成统一 Preflight 的关系判定输入。"""
+    with db.connect() as connection:
+        action = connection.execute("SELECT * FROM fj_actions WHERE id=? AND action_type='chat_message'", (action_id,)).fetchone()
+        if action is None:
+            return snapshot
+        session = _session_or_404(connection, str(action["session_id"]))
+        revision = int(session["session_version"] or 0)
+        rows = connection.execute(
+            """SELECT m.id, m.direction, m.content, semantic.semantic_type, semantic.reply_required,
+                      semantic.semantic_context_json
+                 FROM fj_chat_messages m
+                 LEFT JOIN fj_chat_message_semantics semantic ON semantic.raw_message_id=m.id
+                 WHERE m.session_id=? AND m.direction='inbound' AND m.id NOT IN
+                   (SELECT raw_message_id FROM fj_action_message_links WHERE action_id=? AND role IN ('trigger','covered'))
+                 ORDER BY m.observed_at, m.id""",
+            (action["session_id"], action_id),
+        ).fetchall()
+        messages = [
+            {
+                "id": str(row["id"]), "direction": str(row["direction"]), "content": str(row["content"] or ""),
+                "semantic_type": str(row["semantic_type"] or ""), "reply_required": bool(row["reply_required"]),
+                "semantic_context": _loads(str(row["semantic_context_json"] or "{}"), {}),
+            }
+            for row in rows
+        ]
+        base_ids = [str(row["raw_message_id"]) for row in connection.execute(
+            "SELECT raw_message_id FROM fj_action_message_links WHERE action_id=? AND role IN ('trigger','covered') ORDER BY ordinal", (action_id,)
+        ).fetchall()]
+        relation = classify_pending_reply_delta(
+            config, action_id=action_id, session_id=str(action["session_id"]), planned_reply=str(action["text"]),
+            base_message_ids=base_ids, messages=messages, conversation_revision=revision,
+        )
+        payload = _loads(str(action["payload_json"] or "{}"), {})
+        payload = payload if isinstance(payload, dict) else {}
+        previous_relation = payload.get("relation_audit")
+        previous_relation = previous_relation if isinstance(previous_relation, dict) else {}
+        same_relation_input = (
+            previous_relation.get("decision") == relation["decision"]
+            and previous_relation.get("message_ids") == relation["message_ids"]
+        )
+        if relation["decision"] in {"independent_reply_required", "relevant_to_existing_reply"} and messages:
+            task_field = (
+                "independent_reply_task_id"
+                if relation["decision"] == "independent_reply_required"
+                else "replacement_reply_task_id"
+            )
+            task_id = str(previous_relation.get(task_field) or "") if same_relation_input else ""
+            task = connection.execute("SELECT status FROM fj_chat_reply_tasks WHERE id=?", (task_id,)).fetchone() if task_id else None
+            if task is None:
+                # raw ingest 已按既有入口为 B 建立草稿时，接管同一任务，避免破坏单会话唯一活跃任务约束。
+                task = connection.execute(
+                    """SELECT * FROM fj_chat_reply_tasks
+                       WHERE session_id=? AND based_on_message_id=?
+                         AND based_on_session_version=?
+                         AND status IN ('pending_generation', 'generating', 'awaiting_review', 'confirmed')
+                       ORDER BY updated_at DESC, created_at DESC LIMIT 1""",
+                    (session["id"], str(messages[-1]["id"]), revision),
+                ).fetchone()
+                if task is not None:
+                    task_id = str(task["id"])
+                    task_context = _loads(str(task["context_json"] or "{}"), {})
+                    task_context = task_context if isinstance(task_context, dict) else {}
+                    task_context["preserve_existing_pending"] = True
+                    if relation["decision"] == "relevant_to_existing_reply":
+                        task_context.update({
+                            "replacement_for_action_id": action_id,
+                            "replacement_source_action_ids": [action_id],
+                            "preserve_session_sequence": True,
+                        })
+                    message_ids = [str(item["id"]) for item in messages]
+                    connection.execute(
+                        """UPDATE fj_chat_reply_tasks SET input_message_ids_json=?, context_json=?, updated_at=?
+                           WHERE id=?""",
+                        (json.dumps(message_ids, ensure_ascii=False), json.dumps(task_context, ensure_ascii=False), _now(), task_id),
+                    )
+            if task is None or str(task["status"]) in {"failed", "cancelled", "stale"}:
+                task_id = _queue_reply_task(
+                    connection,
+                    session,
+                    str(messages[-1]["id"]),
+                    "realtime",
+                    preserve_existing_pending=True,
+                    replacement_for_action_id=action_id if relation["decision"] == "relevant_to_existing_reply" else "",
+                    covered_message_ids=[str(item["id"]) for item in messages],
+                ) or ""
+            relation[task_field] = task_id
+        elif relation["decision"] == "classification_uncertain" and messages:
+            # 语义或 provider 不可靠时，撤销 raw ingest 预建的草稿，A 保持等待。
+            stale_tasks = connection.execute(
+                """SELECT id FROM fj_chat_reply_tasks WHERE session_id=?
+                   AND based_on_message_id=?
+                   AND status IN ('pending_generation', 'generating', 'awaiting_review', 'confirmed')""",
+                (session["id"], str(messages[-1]["id"])),
+            ).fetchall()
+            connection.execute(
+                """UPDATE fj_chat_reply_tasks SET status='stale', cancelled_at=?, updated_at=?
+                   WHERE session_id=? AND based_on_message_id=?
+                     AND status IN ('pending_generation', 'generating', 'awaiting_review', 'confirmed')""",
+                (_now(), _now(), session["id"], str(messages[-1]["id"])),
+            )
+            for task in stale_tasks:
+                reconcile_reply_task_coverage(connection, reply_task_id=str(task["id"]))
+        connection.execute(
+            "UPDATE fj_actions SET payload_json=?, updated_at=? WHERE id=?",
+            (json.dumps({**payload, "relation_audit": relation}, ensure_ascii=False), _now(), action_id),
+        )
+    result = dict(snapshot)
+    result["conversation_revision"] = revision
+    result["message_decisions"] = {message_id: relation["decision"] for message_id in relation["message_ids"]}
+    result["relation"] = relation
+    return result
 
 
 def _cancel_session_send_actions(
@@ -945,6 +1184,10 @@ def _cancel_session_send_actions(
     status_code: str,
 ) -> None:
     now = _now()
+    action_rows = connection.execute(
+        "SELECT id FROM fj_chat_send_actions WHERE session_id = ? AND status IN ('queued', 'leased', 'dispatching')",
+        (session_id,),
+    ).fetchall()
     connection.execute(
         """
         UPDATE fj_chat_send_actions
@@ -956,6 +1199,8 @@ def _cancel_session_send_actions(
         """,
         (status_code, now, now, now, session_id),
     )
+    for row in action_rows:
+        sync_legacy_action(connection, source_table="fj_chat_send_actions", source_id=str(row["id"]))
     # 已进入页面发送边界的动作只收口为未知，禁止再次领取和自动重发。
     connection.execute(
         """
@@ -969,6 +1214,61 @@ def _cancel_session_send_actions(
         """,
         (status_code, now, now, now, session_id),
     )
+    for row in action_rows:
+        sync_legacy_action(connection, source_table="fj_chat_send_actions", source_id=str(row["id"]))
+
+
+def _cancel_pending_unified_session_actions(
+    connection: sqlite3.Connection,
+    session_id: str,
+    status_code: str,
+) -> None:
+    """暂停前以条件更新收口尚未进入真实 dispatch 的统一聊天动作。"""
+    now = _now()
+    action_rows = connection.execute(
+        """SELECT id FROM fj_actions
+           WHERE session_id=? AND action_type IN ('chat_message', 'resume_send')
+             AND (status IN ('awaiting_confirmation', 'queued')
+                  OR (status IN ('claimed', 'preflighting') AND dispatched_at IS NULL))""",
+        (session_id,),
+    ).fetchall()
+    for row in action_rows:
+        cursor = connection.execute(
+            """UPDATE fj_actions
+               SET status='cancelled', canonical_status='cancelled', outcome=NULL,
+                   status_code=?, completed_at=?, updated_at=?, lease_owner=NULL,
+                   lease_expires_at=NULL, dispatch_token='', dispatch_deadline_at=NULL
+               WHERE id=? AND (status IN ('awaiting_confirmation', 'queued')
+                    OR (status IN ('claimed', 'preflighting') AND dispatched_at IS NULL))""",
+            (status_code, now, now, str(row["id"])),
+        )
+        if cursor.rowcount == 1:
+            reconcile_action_coverage_state(connection, action_id=str(row["id"]))
+
+
+def _cancel_session_pending_actions(
+    connection: sqlite3.Connection,
+    session_id: str,
+    status_code: str,
+) -> None:
+    """暂停或人工接管时统一收口草稿、旧队列与尚未 dispatch 的统一动作。"""
+    now = _now()
+    tasks = connection.execute(
+        """SELECT id FROM fj_chat_reply_tasks WHERE session_id=?
+           AND status IN ('pending_generation', 'generating', 'awaiting_review', 'confirmed')""",
+        (session_id,),
+    ).fetchall()
+    connection.execute(
+        """UPDATE fj_chat_reply_tasks SET status='cancelled', cancelled_at=?, updated_at=?
+           WHERE session_id=? AND status IN (
+             'pending_generation', 'generating', 'awaiting_review', 'confirmed'
+           )""",
+        (now, now, session_id),
+    )
+    _cancel_session_send_actions(connection, session_id, status_code)
+    _cancel_pending_unified_session_actions(connection, session_id, status_code)
+    for task in tasks:
+        reconcile_reply_task_coverage(connection, reply_task_id=str(task["id"]))
 
 
 def ingest_events(
@@ -988,9 +1288,7 @@ def ingest_events(
             "manual": "manual",
         }.get(str(runtime["trigger_mode"]), "interval")
         for event in events:
-            if event["event_type"] == "message" and not runtime["listen_enabled"]:
-                ignored += 1
-                continue
+            # 原始消息采集与自动生成开关分离：关闭监听只停止生成，不丢弃 preflight 所需 freshness 事实。
             try:
                 event_payload = event.get("payload") or {}
                 if event["event_type"] == "message":
@@ -1105,6 +1403,11 @@ def ingest_events(
                 "evidence_source": evidence_source,
                 "server_mid": message.get("server_mid") or "",
             })
+            raw_body = message.get("raw_body")
+            if not isinstance(raw_body, dict):
+                raw_body = stored_raw_meta.get("raw_body")
+            raw_body = raw_body if isinstance(raw_body, dict) else {}
+            raw_content = str(message.get("content") or "")
             assistant_echo = None
             if message.get("direction") == "outbound" and message.get("client_mid"):
                 assistant_echo = connection.execute(
@@ -1123,6 +1426,7 @@ def ingest_events(
                         """
                         UPDATE fj_chat_messages
                         SET platform_message_id = ?, direction = ?, message_type = ?, content = ?,
+                            raw_content = ?, raw_body_json = ?,
                             sender_uid = ?, receiver_uid = ?, source = 'assistant', sent_at = ?,
                             observed_at = ?, raw_meta_json = ?
                         WHERE id = ?
@@ -1131,7 +1435,9 @@ def ingest_events(
                             message["platform_message_id"],
                             message["direction"],
                             message.get("message_type") or "text",
-                            message.get("content") or "",
+                            raw_content,
+                            raw_content,
+                            json.dumps(raw_body, ensure_ascii=False),
                             message.get("sender_uid") or "",
                             message.get("receiver_uid") or "",
                             message["sent_at"],
@@ -1145,9 +1451,9 @@ def ingest_events(
                         """
                         INSERT INTO fj_chat_messages (
                           id, session_id, platform_message_id, direction, message_type,
-                          content, sender_uid, receiver_uid, client_mid, source,
+                          content, raw_content, raw_body_json, sender_uid, receiver_uid, client_mid, source,
                           sent_at, observed_at, raw_meta_json, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             message_id,
@@ -1155,7 +1461,9 @@ def ingest_events(
                             message["platform_message_id"],
                             message["direction"],
                             message.get("message_type") or "text",
-                            message.get("content") or "",
+                            raw_content,
+                            raw_content,
+                            json.dumps(raw_body, ensure_ascii=False),
                             message.get("sender_uid") or "",
                             message.get("receiver_uid") or "",
                             message.get("client_mid") or "",
@@ -1169,6 +1477,11 @@ def ingest_events(
             except sqlite3.IntegrityError:
                 duplicates += 1
                 continue
+            derive_message_semantics(connection, message_id)
+            semantic = connection.execute(
+                "SELECT reply_required FROM fj_chat_message_semantics WHERE raw_message_id = ?",
+                (message_id,),
+            ).fetchone()
             _record_message_activity(
                 connection,
                 session_id=str(session["id"]),
@@ -1183,6 +1496,29 @@ def ingest_events(
                     message_id=message_id,
                     observed_account_uid=str(event["account_uid"]),
                 )
+                if message.get("client_mid"):
+                    source_action = connection.execute(
+                        """
+                        SELECT id FROM fj_chat_send_actions
+                        WHERE session_id = ? AND client_mid = ?
+                        ORDER BY updated_at DESC LIMIT 1
+                        """,
+                        (session["id"], str(message.get("client_mid") or "")),
+                    ).fetchone()
+                    if source_action is not None:
+                        observe_action_outbound_result(
+                            connection,
+                            source_table="fj_chat_send_actions",
+                            source_id=str(source_action["id"]),
+                            raw_message_id=message_id,
+                        )
+                        derive_message_semantics(connection, message_id)
+                    observe_unified_outbound_result(
+                        connection,
+                        session_id=str(session["id"]),
+                        client_mid=str(message.get("client_mid") or ""),
+                        raw_message_id=message_id,
+                    )
             next_version = int(session["session_version"]) + 1
             inbound_id = message_id if message["direction"] == "inbound" else session["latest_inbound_message_id"]
             next_status = "human_takeover" if (
@@ -1208,22 +1544,8 @@ def ingest_events(
                 ),
             )
             if next_status == "human_takeover":
-                connection.execute(
-                    """
-                    UPDATE fj_chat_reply_tasks
-                    SET status = 'cancelled', cancelled_at = ?, updated_at = ?
-                    WHERE session_id = ? AND status IN (
-                      'pending_generation', 'generating', 'awaiting_review', 'confirmed'
-                    )
-                    """,
-                    (_now(), _now(), session["id"]),
-                )
-                _cancel_session_send_actions(
-                    connection,
-                    str(session["id"]),
-                    "manual_message_takeover",
-                )
-            elif message["direction"] == "inbound" and message.get("message_type", "text") == "text":
+                _cancel_session_pending_actions(connection, str(session["id"]), "human_takeover")
+            elif message["direction"] == "inbound" and semantic is not None and bool(semantic["reply_required"]):
                 refreshed = connection.execute(
                     "SELECT * FROM fj_chat_sessions WHERE id = ?", (session["id"],)
                 ).fetchone()
@@ -1409,9 +1731,15 @@ def get_session(db: Database, session_id: str) -> dict[str, Any]:
         session = _session_or_404(connection, session_id)
         messages = connection.execute(
             """
-            SELECT * FROM fj_chat_messages
-            WHERE session_id = ?
-            ORDER BY sent_at ASC, rowid ASC
+            SELECT m.*, semantic.semantic_type, semantic.display_text, semantic.reply_required,
+                   semantic.classifier_version, semantic.semantic_context_json, semantic.derived_at,
+                   state.read_state, state.read_subject, state.reply_state, state.read_at,
+                   state.reply_planned_at, state.replied_at, state.updated_at AS state_updated_at
+            FROM fj_chat_messages m
+            LEFT JOIN fj_chat_message_semantics semantic ON semantic.raw_message_id = m.id
+            LEFT JOIN fj_chat_message_states state ON state.raw_message_id = m.id
+            WHERE m.session_id = ?
+            ORDER BY m.sent_at ASC, m.rowid ASC
             """,
             (session_id,),
         ).fetchall()
@@ -1421,6 +1749,15 @@ def get_session(db: Database, session_id: str) -> dict[str, Any]:
         ).fetchall()
         actions = connection.execute(
             "SELECT * FROM fj_chat_send_actions WHERE session_id = ? ORDER BY created_at DESC LIMIT 20",
+            (session_id,),
+        ).fetchall()
+        unified_actions = connection.execute(
+            """SELECT id, action_type, status, outcome, status_code, text, encrypt_resume_id,
+                      resume_filename, execution_epoch, created_at, updated_at, completed_at,
+                      waiting_reason_code, waiting_reason_detail, preflight_reason_code,
+                      session_sequence, supersedes_action_id, base_raw_message_id, payload_json
+               FROM fj_actions WHERE session_id=? AND action_type IN ('chat_message', 'resume_send')
+               ORDER BY created_at DESC LIMIT 20""",
             (session_id,),
         ).fetchall()
         resume_attachments: list[dict[str, Any]] = []
@@ -1448,9 +1785,14 @@ def get_session(db: Database, session_id: str) -> dict[str, Any]:
         ).fetchone()
         return {
             "session": _session_payload(session, connection),
-            "messages": [_row(item) for item in messages],
+            "messages": [_message_payload(item) for item in messages],
             "reply_tasks": [_row(item) for item in tasks],
+            # 兼容表仅服务附件列表 helper；统一业务 Action 单独提供给 UI。
             "send_actions": [_row(item) for item in actions],
+            "unified_actions": [
+                {**(_row(item) or {}), "payload": _loads(str(item["payload_json"] or "{}"), {})}
+                for item in unified_actions
+            ],
             "resume_attachments": resume_attachments,
             "latest_conversation_insight": _row(insight),
             "messages_truncated": False,
@@ -1909,6 +2251,7 @@ def _generate_reply(
                     "UPDATE fj_chat_reply_tasks SET status = 'stale', cancelled_at = ?, updated_at = ? WHERE id = ?",
                     (now, now, current["id"]),
                 )
+                reconcile_reply_task_coverage(connection, reply_task_id=str(current["id"]))
             task_id = _id("chat_reply")
             try:
                 connection.execute(
@@ -1969,6 +2312,11 @@ def _generate_reply(
             )
         context = _build_context(db, connection, session)
         candidate_context = context["candidate_profile_context"]
+        saved_context = _loads(str(connection.execute(
+            "SELECT context_json FROM fj_chat_reply_tasks WHERE id=?", (task_id,)
+        ).fetchone()["context_json"] or "{}"), {})
+        saved_context = saved_context if isinstance(saved_context, dict) else {}
+        saved_context.update(context)
         connection.execute(
             """
             UPDATE fj_chat_reply_tasks
@@ -1976,7 +2324,7 @@ def _generate_reply(
             WHERE id = ?
             """,
             (
-                json.dumps(context, ensure_ascii=False),
+                json.dumps(saved_context, ensure_ascii=False),
                 candidate_context["profile_id"],
                 candidate_context["artifact_version"],
                 task_id,
@@ -1990,6 +2338,7 @@ def _generate_reply(
                 "UPDATE fj_chat_reply_tasks SET status = 'failed', generation_error = ?, updated_at = ? WHERE id = ?",
                 (str(exc)[:500], _now(), task_id),
             )
+            reconcile_reply_task_coverage(connection, reply_task_id=task_id)
         raise
     with db.connect() as connection:
         task = _task_or_404(connection, task_id)
@@ -2006,6 +2355,7 @@ def _generate_reply(
                 "UPDATE fj_chat_reply_tasks SET status = 'stale', cancelled_at = ?, updated_at = ? WHERE id = ?",
                 (_now(), _now(), task_id),
             )
+            reconcile_reply_task_coverage(connection, reply_task_id=task_id)
             raise AppError(status_code=409, error_category="CHAT_CONTEXT_CHANGED", error_message="生成期间收到新消息，请基于最新对话重新生成。")
         now = _now()
         text = str(completion["reply_text"])
@@ -2039,6 +2389,55 @@ def _generate_reply(
                 task_id,
             ),
         )
+        # 相关 B 已由现有生成流程产生新正文，此时建立 A' 并保留人工确认步骤。
+        replacement_context = _loads(str(task["context_json"] or "{}"), {})
+        replacement_context = replacement_context if isinstance(replacement_context, dict) else {}
+        replacement_for_action_id = str(replacement_context.get("replacement_for_action_id") or "")
+        if replacement_for_action_id:
+            previous = connection.execute(
+                "SELECT * FROM fj_actions WHERE id=? AND action_type='chat_message'",
+                (replacement_for_action_id,),
+            ).fetchone()
+            if previous is not None:
+                connection.execute(
+                    "UPDATE fj_actions SET status='superseded', updated_at=? WHERE id=?",
+                    (now, replacement_for_action_id),
+                )
+                base_message = connection.execute(
+                    "SELECT platform_message_id FROM fj_chat_messages WHERE id=?",
+                    (task["based_on_message_id"],),
+                ).fetchone()
+                replacement_action_id = create_unified_action(
+                    connection,
+                    action_type="chat_message",
+                    account_uid=str(previous["account_uid"]),
+                    job_id=str(previous["job_id"]) if previous["job_id"] else None,
+                    session_id=str(previous["session_id"]),
+                    text=text,
+                    payload={"reply_task_id": task_id, "replacement_for_action_id": replacement_for_action_id},
+                    base_raw_message_id=str(task["based_on_message_id"]),
+                    base_message_mid=str(base_message["platform_message_id"] or "") if base_message else "",
+                    base_conversation_revision=int(session["session_version"]),
+                    authorization_mode=str(previous["authorization_mode"]),
+                    status="awaiting_confirmation",
+                    session_sequence=int(previous["session_sequence"]),
+                    revision_no=int(previous["revision_no"] or 1) + 1,
+                    supersedes_action_id=replacement_for_action_id,
+                    source_table="fj_actions_chat_replacement",
+                )
+                coverage_ids = _loads(str(task["input_message_ids_json"] or "[]"), [])
+                coverage_ids = [str(item) for item in coverage_ids if isinstance(item, str) and item]
+                link_action_messages(connection, action_id=replacement_action_id, message_ids=coverage_ids, role="new_context")
+                transfer_action_coverage(
+                    connection,
+                    previous_action_id=replacement_for_action_id,
+                    replacement_action_id=replacement_action_id,
+                )
+                replacement_context["replacement_action_id"] = replacement_action_id
+                connection.execute(
+                    "UPDATE fj_chat_reply_tasks SET context_json=?, updated_at=? WHERE id=?",
+                    (json.dumps(replacement_context, ensure_ascii=False), now, task_id),
+                )
         task_result = _row(connection.execute(
             "SELECT * FROM fj_chat_reply_tasks WHERE id = ?", (task_id,)
         ).fetchone()) or {}
@@ -2114,27 +2513,15 @@ def edit_reply(db: Database, task_id: str, final_text: str) -> dict[str, Any]:
 def set_session_status(db: Database, session_id: str, status: str) -> dict[str, Any]:
     with db.connect() as connection:
         _session_or_404(connection, session_id)
+        # 与 unified claim/preflight 争用同一写事务边界，dispatch 后的动作保留原状态。
+        connection.execute("BEGIN IMMEDIATE")
         now = _now()
         connection.execute(
             "UPDATE fj_chat_sessions SET status = ?, updated_at = ? WHERE id = ?",
             (status, now, session_id),
         )
-        if status != "active":
-            connection.execute(
-                """
-                UPDATE fj_chat_reply_tasks SET status = 'cancelled', cancelled_at = ?, updated_at = ?
-                WHERE session_id = ? AND status IN ('pending_generation', 'generating', 'awaiting_review')
-                """,
-                (now, now, session_id),
-            )
-            connection.execute(
-                """
-                UPDATE fj_chat_reply_tasks SET status = 'cancelled', cancelled_at = ?, updated_at = ?
-                WHERE session_id = ? AND status = 'confirmed'
-                """,
-                (now, now, session_id),
-            )
-            _cancel_session_send_actions(
+        if status in {"paused", "human_takeover"}:
+            _cancel_session_pending_actions(
                 connection,
                 session_id,
                 "session_paused" if status == "paused" else "human_takeover",
@@ -2152,14 +2539,12 @@ def cancel_reply(db: Database, task_id: str) -> dict[str, Any]:
             "UPDATE fj_chat_reply_tasks SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE id = ?",
             (now, now, task_id),
         )
+        reconcile_reply_task_coverage(connection, reply_task_id=task_id)
         return _row(connection.execute("SELECT * FROM fj_chat_reply_tasks WHERE id = ?", (task_id,)).fetchone()) or {}
 
 
 def confirm_reply(db: Database, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     with db.connect() as connection:
-        runtime = _ensure_runtime(connection)
-        if not runtime["send_enabled"]:
-            raise AppError(status_code=409, error_category="CHAT_SEND_DISABLED", error_message="请先在自动代聊设置中启用发送。")
         task = _task_or_404(connection, task_id)
         session = _session_or_404(connection, str(task["session_id"]))
         if task["status"] != "awaiting_review":
@@ -2170,8 +2555,8 @@ def confirm_reply(db: Database, task_id: str, payload: dict[str, Any]) -> dict[s
                 error_category="CHAT_IDENTITY_INCOMPLETE",
                 error_message="聊天对象身份不完整，请先在 BOSS 打开对应会话后重试。",
             )
-        if session["status"] != "active":
-            raise AppError(status_code=409, error_category="CHAT_SESSION_TAKEN_OVER", error_message="该会话已由人工接管。")
+        if session["status"] not in {"active", "human_takeover"}:
+            raise AppError(status_code=409, error_category="CHAT_SESSION_UNAVAILABLE", error_message="暂停的会话不能确认发送。")
         if not session["encrypt_peer_uid"] or not session["security_id"] or not session["encrypt_job_id"]:
             raise AppError(
                 status_code=409,
@@ -2195,9 +2580,9 @@ def confirm_reply(db: Database, task_id: str, payload: dict[str, Any]) -> dict[s
                 "UPDATE fj_chat_reply_tasks SET status = 'stale', cancelled_at = ?, updated_at = ? WHERE id = ?",
                 (_now(), _now(), task_id),
             )
+            reconcile_reply_task_coverage(connection, reply_task_id=task_id)
             raise AppError(status_code=409, error_category="CHAT_CONTEXT_CHANGED", error_message="确认前收到新消息，请重新生成回复。")
         now = _now()
-        action_id = _id("chat_send")
         final_text = str(payload["final_text"]).strip()
         classification = classify_outbound_content(final_text, base_operation="send_chat_reply")
         warnings = [item for item in classification.categories if item != "send_chat_reply"]
@@ -2219,28 +2604,60 @@ def confirm_reply(db: Database, task_id: str, payload: dict[str, Any]) -> dict[s
                 task_id,
             ),
         )
-        connection.execute(
-            """
-            INSERT INTO fj_chat_send_actions (
-              id, reply_task_id, session_id, status, text,
-              content_categories_json, classification_version,
-              canonical_status, canonical_updated_at, canonical_reason,
-              created_at, updated_at
-            ) VALUES (?, ?, ?, 'queued', ?, ?, ?, 'pending', ?, '等待执行', ?, ?)
-            """,
-            (
-                action_id,
-                task_id,
-                session["id"],
-                final_text,
-                json.dumps(classification.categories, ensure_ascii=False),
-                classification.classification_version,
-                now,
-                now,
-                now,
-            ),
-        )
-        return _action_payload(connection, action_id)
+        replacement_context = _loads(str(task["context_json"] or "{}"), {})
+        replacement_context = replacement_context if isinstance(replacement_context, dict) else {}
+        replacement_action_id = str(replacement_context.get("replacement_action_id") or "")
+        base_message = connection.execute(
+            "SELECT platform_message_id FROM fj_chat_messages WHERE id = ?",
+            (task["based_on_message_id"],),
+        ).fetchone()
+        replacement = connection.execute(
+            "SELECT id FROM fj_actions WHERE id=? AND status='awaiting_confirmation'",
+            (replacement_action_id,),
+        ).fetchone() if replacement_action_id else None
+        if replacement is not None:
+            unified_action_id = str(replacement["id"])
+            connection.execute(
+                """UPDATE fj_actions SET text=?, status='queued', authorization_mode='manual',
+                   payload_json=?, updated_at=? WHERE id=?""",
+                (
+                    final_text,
+                    json.dumps({"reply_task_id": task_id, "replacement_for_action_id": replacement_context.get("replacement_for_action_id", ""), "classification": classification.categories}, ensure_ascii=False),
+                    now,
+                    unified_action_id,
+                ),
+            )
+        else:
+            unified_action_id = create_unified_action(
+                connection,
+                action_type="chat_message",
+                account_uid=str(session["account_uid"] or ""),
+                job_id=str(session["job_id"]) if session["job_id"] else None,
+                session_id=str(session["id"]),
+                text=final_text,
+                payload={"reply_task_id": task_id, "classification": classification.categories},
+                base_raw_message_id=str(task["based_on_message_id"]),
+                base_message_mid=str(base_message["platform_message_id"] or "") if base_message else "",
+                base_conversation_revision=int(session["session_version"]),
+                source_table="fj_actions_chat_confirm",
+            )
+        coverage_ids = _loads(str(task["input_message_ids_json"] or "[]"), [])
+        coverage_ids = [str(item) for item in coverage_ids if isinstance(item, str) and item]
+        if str(task["based_on_message_id"]) not in coverage_ids:
+            coverage_ids.append(str(task["based_on_message_id"]))
+        link_action_messages(connection, action_id=unified_action_id, message_ids=coverage_ids, role="covered")
+        # 创建快照已连接回复任务的全部输入消息；替换链继续承接旧 Action 的 coverage。
+        replacement_context = _loads(str(task["context_json"] or "{}"), {})
+        replacement_ids = replacement_context.get("replacement_source_action_ids") if isinstance(replacement_context, dict) else []
+        for previous_action_id in replacement_ids if isinstance(replacement_ids, list) else []:
+            previous = connection.execute("SELECT id FROM fj_actions WHERE id=?", (previous_action_id,)).fetchone()
+            if previous is not None and str(previous_action_id) != unified_action_id:
+                transfer_action_coverage(
+                    connection,
+                    previous_action_id=str(previous_action_id),
+                    replacement_action_id=unified_action_id,
+                )
+        return _unified_action_payload(connection, unified_action_id)
 
 
 def _create_resume_support_task(connection: sqlite3.Connection, session: sqlite3.Row) -> str:
@@ -2270,19 +2687,17 @@ def _create_resume_action(
     resume_filename: str = "",
 ) -> dict[str, Any]:
     with db.connect() as connection:
-        runtime = _ensure_runtime(connection)
         session = _session_or_404(connection, session_id)
-        if session["status"] != "active":
-            raise AppError(status_code=409, error_category="CHAT_SESSION_TAKEN_OVER", error_message="该会话当前不允许执行简历动作。")
+        if session["status"] not in {"active", "human_takeover"}:
+            raise AppError(status_code=409, error_category="CHAT_SESSION_UNAVAILABLE", error_message="暂停的会话不能创建简历动作。")
         if not all(session[key] for key in ("account_uid", "peer_uid", "encrypt_peer_uid", "security_id", "encrypt_job_id")):
             raise AppError(status_code=409, error_category="CHAT_IDENTITY_INCOMPLETE", error_message="聊天对象身份不完整，请先在 BOSS 打开对应会话后重试。")
-        if operation_kind == "resume" and not runtime["send_enabled"]:
-            raise AppError(status_code=409, error_category="CHAT_SEND_DISABLED", error_message="请先在自动代聊设置中启用发送。")
         if operation_kind == "resume":
             latest_list = connection.execute(
                 """
                 SELECT evidence_json FROM fj_chat_send_actions
-                WHERE session_id = ? AND operation_kind = 'resume_list' AND outcome = 'accepted'
+                WHERE session_id = ? AND operation_kind = 'resume_list'
+                  AND status = 'cancelled' AND status_code = 'resume_list_loaded'
                 ORDER BY completed_at DESC, created_at DESC LIMIT 1
                 """,
                 (session_id,),
@@ -2292,29 +2707,84 @@ def _create_resume_action(
             if not isinstance(attachments, list):
                 attachments = []
             known_attachments = {
-                str(item.get("encryptResumeId") or ""): str(item.get("showName") or "")
+                str(item.get("encryptResumeId") or ""): str(item.get("filename") or item.get("showName") or "")
                 for item in attachments if isinstance(item, dict) and item.get("encryptResumeId")
             }
             if known_attachments.get(encrypt_resume_id) != resume_filename:
                 raise AppError(status_code=409, error_category="CHAT_RESUME_NOT_SELECTED", error_message="请先读取并选择当前 BOSS 附件简历。")
         task_id = _create_resume_support_task(connection, session)
         now = _now()
+        if operation_kind == "resume":
+            support_task = connection.execute(
+                "SELECT based_on_message_id FROM fj_chat_reply_tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            base_message_id = str(support_task["based_on_message_id"]) if support_task else ""
+            base_message = connection.execute(
+                "SELECT platform_message_id FROM fj_chat_messages WHERE id = ?",
+                (base_message_id,),
+            ).fetchone() if base_message_id else None
+            unified_action_id = create_unified_action(
+                connection,
+                action_type="resume_send",
+                account_uid=str(session["account_uid"] or ""),
+                job_id=str(session["job_id"]) if session["job_id"] else None,
+                session_id=str(session["id"]),
+                encrypt_resume_id=encrypt_resume_id,
+                resume_filename=resume_filename,
+                payload={"reply_task_id": task_id, "operation_kind": operation_kind},
+                base_raw_message_id=base_message_id or None,
+                base_message_mid=str(base_message["platform_message_id"] or "") if base_message else "",
+                base_conversation_revision=int(session["session_version"]),
+                source_table="fj_actions_resume_confirm",
+            )
+            for role in ("trigger", "covered"):
+                link_action_messages(
+                    connection,
+                    action_id=unified_action_id,
+                    message_ids=[base_message_id],
+                    role=role,
+                )
+            return _unified_action_payload(connection, unified_action_id)
+        # 附件列表读取是只读辅助动作，保留旧表兼容既有页面探针。
         action_id = _id("chat_resume")
         connection.execute(
-            """
-            INSERT INTO fj_chat_send_actions (
-              id, reply_task_id, session_id, operation_kind, encrypt_resume_id, resume_filename,
-              status, text, canonical_status, canonical_updated_at, canonical_reason,
-              created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'queued', '', 'pending', ?, '等待执行', ?, ?)
-            """,
-            (action_id, task_id, session_id, operation_kind, encrypt_resume_id, resume_filename, now, now, now),
+            """INSERT INTO fj_chat_send_actions (
+                 id, reply_task_id, session_id, operation_kind, status, text,
+                 canonical_status, canonical_updated_at, canonical_reason, created_at, updated_at
+               ) VALUES (?, ?, ?, 'resume_list', 'queued', '', 'pending', ?, '等待执行', ?, ?)""",
+            (action_id, task_id, session_id, now, now, now),
         )
         return _action_payload(connection, action_id)
 
 
+def _unified_action_payload(connection: sqlite3.Connection, action_id: str) -> dict[str, Any]:
+    action = connection.execute("SELECT * FROM fj_actions WHERE id=?", (action_id,)).fetchone()
+    if action is None:
+        raise AppError(status_code=404, error_category="UNIFIED_ACTION_NOT_FOUND", error_message="统一动作不存在。")
+    payload = _row(action) or {}
+    payload["operation_kind"] = "text" if action["action_type"] == "chat_message" else "resume"
+    return payload
+
+
 def create_resume_list_action(db: Database, session_id: str) -> dict[str, Any]:
     return _create_resume_action(db, session_id, "resume_list")
+
+
+def list_pending_resume_list_actions(db: Database, *, account_uid: str) -> list[dict[str, Any]]:
+    """发现待读取附件的 helper；它不参与统一业务 Action 的 eligible 队列。"""
+    now = _now()
+    with db.connect() as connection:
+        rows = connection.execute(
+            """SELECT a.id FROM fj_chat_send_actions a
+               JOIN fj_chat_sessions s ON s.id=a.session_id
+               WHERE s.account_uid=? AND s.status IN ('active', 'human_takeover')
+                 AND a.operation_kind='resume_list'
+                 AND (a.status='queued' OR (a.status='leased' AND a.lease_expires_at <= ?))
+               ORDER BY a.created_at, a.id""",
+            (account_uid, now),
+        ).fetchall()
+        return [_action_payload(connection, str(row["id"])) for row in rows]
 
 
 def create_resume_send_action(db: Database, session_id: str, encrypt_resume_id: str, resume_filename: str) -> dict[str, Any]:
@@ -2344,10 +2814,13 @@ def claim_send_action(
     account_uid: str,
     tab_id: str,
     leader_epoch: int,
+    action_id: str | None = None,
 ) -> dict[str, Any] | None:
     now_dt = datetime.now(timezone.utc)
     now = _now()
     with db.connect() as connection:
+        # 与暂停共用写事务边界，领取后才可能获得附件读取租约。
+        connection.execute("BEGIN IMMEDIATE")
         runtime = _ensure_runtime(connection)
         _sweep_stale_send_actions(connection)
         leader = connection.execute(
@@ -2368,12 +2841,13 @@ def claim_send_action(
             """
             SELECT a.id, a.client_mid FROM fj_chat_send_actions a
             JOIN fj_chat_sessions s ON s.id = a.session_id
-            WHERE s.account_uid = ?
-              AND (a.operation_kind = 'resume_list' OR ? = 1)
+            WHERE s.account_uid = ? AND s.status IN ('active', 'human_takeover')
+              AND a.operation_kind = 'resume_list'
+              AND (? IS NULL OR a.id = ?)
               AND (a.status = 'queued' OR (a.status = 'leased' AND a.lease_expires_at <= ?))
             ORDER BY a.created_at ASC LIMIT 1
             """,
-            (account_uid, int(bool(runtime["send_enabled"])), now),
+            (account_uid, action_id, action_id, now),
         ).fetchone()
         if action is None:
             return None
@@ -2381,12 +2855,13 @@ def claim_send_action(
             "SELECT execution_epoch FROM fj_chat_send_actions WHERE id = ?", (action["id"],)
         ).fetchone()["execution_epoch"]) + 1
         client_mid = str(action["client_mid"] or "") or _new_client_mid(connection)
-        connection.execute(
+        cursor = connection.execute(
             """
             UPDATE fj_chat_send_actions SET status = 'leased', lease_owner = ?,
               lease_expires_at = ?, execution_epoch = ?, attempt_count = attempt_count + 1,
               leader_tab_id = ?, leader_epoch = ?, dispatch_deadline_at = NULL,
-              client_mid = ?, updated_at = ? WHERE id = ?
+              client_mid = ?, updated_at = ?
+            WHERE id = ? AND (status = 'queued' OR (status = 'leased' AND lease_expires_at <= ?))
             """,
             (
                 executor_id,
@@ -2397,9 +2872,101 @@ def claim_send_action(
                 client_mid,
                 now,
                 action["id"],
+                now,
             ),
         )
-        return _action_payload(connection, str(action["id"]))
+        if cursor.rowcount != 1:
+            return None
+        sync_legacy_action(connection, source_table="fj_chat_send_actions", source_id=str(action["id"]))
+    return _action_payload(connection, str(action["id"]))
+
+
+def claim_resume_list_action(
+    db: Database,
+    executor_id: str,
+    *,
+    action_id: str,
+    account_uid: str,
+    tab_id: str,
+    leader_epoch: int,
+) -> dict[str, Any] | None:
+    """只领取附件读取探针；chat/resume 业务发送已完成统一调度切换。"""
+    # helper 必须领取插件 discover 到的同一 ID，避免后端自行换领另一份附件读取任务。
+    return claim_send_action(
+        db,
+        executor_id,
+        account_uid=account_uid,
+        tab_id=tab_id,
+        leader_epoch=leader_epoch,
+        action_id=action_id,
+    )
+
+
+def complete_resume_list_snapshot(
+    db: Database,
+    executor_id: str,
+    action_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """写入只读附件快照，完成 helper 而不产生业务发送结果。"""
+    with db.connect() as connection:
+        action = _action_payload(connection, action_id)
+        if (
+            action["operation_kind"] != "resume_list"
+            or action["status"] != "leased"
+            or action["lease_owner"] != executor_id
+            or int(action["execution_epoch"] or 0) != int(payload["execution_epoch"])
+        ):
+            raise AppError(status_code=409, error_category="CHAT_RESUME_LIST_LEASE_LOST", error_message="附件读取任务租约已失效。")
+        now = _now()
+        error = str(payload.get("error") or "")
+        if error:
+            cursor = connection.execute(
+                """UPDATE fj_chat_send_actions
+                   SET status='failed', outcome='failed', status_code='resume_list_snapshot_failed',
+                       error_message=?, evidence_json='{}', completed_at=?, updated_at=?,
+                       lease_expires_at=NULL, dispatch_deadline_at=NULL,
+                       canonical_status='failed', canonical_updated_at=?, canonical_reason='附件读取失败'
+                   WHERE id=? AND status='leased' AND lease_owner=? AND execution_epoch=?""",
+                (error, now, now, now, action_id, executor_id, int(payload["execution_epoch"])),
+            )
+        else:
+            attachments: list[dict[str, str]] = []
+            raw_attachments = payload.get("attachments")
+            for item in raw_attachments if isinstance(raw_attachments, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                encrypt_resume_id = str(item.get("encryptResumeId") or "")
+                filename = str(item.get("filename") or "")
+                if not encrypt_resume_id or not filename:
+                    continue
+                attachments.append({
+                    "encryptResumeId": encrypt_resume_id,
+                    "filename": filename,
+                    "showName": filename,
+                    "resumeSizeDesc": "",
+                    "suffixName": filename.rsplit(".", 1)[-1] if "." in filename else "",
+                })
+            cursor = connection.execute(
+                """UPDATE fj_chat_send_actions
+                   SET status='cancelled', outcome=NULL, status_code='resume_list_loaded',
+                       error_message='', evidence_json=?, completed_at=?, updated_at=?,
+                       lease_expires_at=NULL, dispatch_deadline_at=NULL,
+                       canonical_status='cancelled', canonical_updated_at=?, canonical_reason='附件读取完成'
+                   WHERE id=? AND status='leased' AND lease_owner=? AND execution_epoch=?""",
+                (
+                    json.dumps({"attachments": attachments, "observedAt": str(payload.get("observed_at") or now)}, ensure_ascii=False),
+                    now,
+                    now,
+                    now,
+                    action_id,
+                    executor_id,
+                    int(payload["execution_epoch"]),
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise AppError(status_code=409, error_category="CHAT_RESUME_LIST_LEASE_LOST", error_message="附件读取任务租约已失效。")
+        return _action_payload(connection, action_id)
 
 
 def mark_dispatch_started(db: Database, executor_id: str, action_id: str, execution_epoch: int) -> dict[str, Any]:
@@ -2419,9 +2986,10 @@ def mark_dispatch_started(db: Database, executor_id: str, action_id: str, execut
                 """,
                 (now, now, action_id),
             )
+            sync_legacy_action(connection, source_table="fj_chat_send_actions", source_id=action_id)
             connection.commit()
             raise AppError(status_code=409, error_category="CHAT_SEND_DISABLED", error_message="自动代聊发送开关已关闭。")
-        if action["session_status"] != "active" or not all(
+        if action["session_status"] not in {"active", "human_takeover"} or not all(
             action.get(key) for key in ("account_uid", "peer_uid", "encrypt_peer_uid", "security_id", "encrypt_job_id", "client_mid")
         ):
             raise AppError(status_code=409, error_category="CHAT_SEND_CONTEXT_INVALID", error_message="发送上下文或身份已失效。")
@@ -2450,6 +3018,7 @@ def mark_dispatch_started(db: Database, executor_id: str, action_id: str, execut
             """,
             (now, _after(SEND_DISPATCH_TIMEOUT_SECONDS), now, now, action_id),
         )
+        sync_legacy_action(connection, source_table="fj_chat_send_actions", source_id=action_id)
         return _action_payload(connection, action_id)
 
 
@@ -2503,6 +3072,7 @@ def complete_send_action(
                 else str(payload.get("message") or payload.get("status_code") or outcome)
             ),
         )
+        sync_legacy_action(connection, source_table="fj_chat_send_actions", source_id=action_id)
         if outcome == "accepted" and action["operation_kind"] == "text":
             record_execution_evidence_with_connection(
                 connection,
@@ -2575,14 +3145,15 @@ def complete_send_action(
                     """
                     INSERT INTO fj_chat_messages (
                       id, session_id, platform_message_id, direction, message_type,
-                      content, sender_uid, receiver_uid, client_mid, source,
+                      content, raw_content, raw_body_json, sender_uid, receiver_uid, client_mid, source,
                       sent_at, observed_at, raw_meta_json, created_at
-                    ) VALUES (?, ?, ?, 'outbound', 'text', ?, ?, ?, ?, 'assistant', ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, 'outbound', 'text', ?, ?, '{}', ?, ?, ?, 'assistant', ?, ?, ?, ?)
                     """,
                     (
                         message_id,
                         session["id"],
                         platform_message_id,
+                        action["text"],
                         action["text"],
                         session["account_uid"],
                         session["peer_uid"],
@@ -2593,6 +3164,7 @@ def complete_send_action(
                         now,
                     ),
                 )
+                derive_message_semantics(connection, message_id)
                 connection.execute(
                     """
                     UPDATE fj_chat_sessions SET session_version = session_version + 1,
@@ -2607,6 +3179,10 @@ def complete_send_action(
 
 def _sweep_stale_send_actions(connection: sqlite3.Connection) -> int:
     now = _now()
+    rows = connection.execute(
+        "SELECT id FROM fj_chat_send_actions WHERE status = 'dispatching' AND dispatch_deadline_at IS NOT NULL AND dispatch_deadline_at <= ?",
+        (now,),
+    ).fetchall()
     cursor = connection.execute(
         """
         UPDATE fj_chat_send_actions
@@ -2620,6 +3196,8 @@ def _sweep_stale_send_actions(connection: sqlite3.Connection) -> int:
         """,
         (now, now, now, now),
     )
+    for row in rows:
+        sync_legacy_action(connection, source_table="fj_chat_send_actions", source_id=str(row["id"]))
     return int(cursor.rowcount)
 
 

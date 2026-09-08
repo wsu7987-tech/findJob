@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from backend.app.db import Database
 from backend.app.errors import AppError
 from backend.app.services.fine_job.boss_capture_history import build_job_dedupe_key
+from backend.app.services.fine_job.action_store import create_legacy_action
 from backend.app.utils import new_id, utc_now
 
 
@@ -731,6 +732,16 @@ def _enqueue_action(
                     (action_id,),
                 ).fetchone()
                 requested_epoch = int(epoch_row["execution_epoch"])
+        create_legacy_action(
+            connection,
+            source_table="fj_automation_actions",
+            source_id=action_id,
+            action_type="greeting",
+            job_id=job_id,
+            text=message,
+            payload=payload,
+            authorization_mode="manual",
+        )
         if requested_epoch is not None:
             from backend.app.services.fine_job.job_activity import append_job_activity_with_connection
 

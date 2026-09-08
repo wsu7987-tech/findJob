@@ -903,7 +903,47 @@ def test_send_enabled_closed_after_claim_requeues_without_dispatch(configured_cl
     )
     assert blocked.status_code == 409
     detail = configured_client.get(f"/api/fine-job/boss-chat/sessions/{session['id']}").json()
-    assert detail["send_actions"][0]["status"] == "queued"
+    assert detail["unified_actions"][0]["status"] == "queued"
+    assert "waiting_reason_code" in detail["unified_actions"][0]
+
+
+def test_session_detail_exposes_unified_action_fields_for_ui(configured_client) -> None:
+    _, token = _pair(configured_client)
+    headers = {"Authorization": f"Bearer {token}"}
+    configured_client.patch(
+        "/api/fine-job/boss-chat/runtime",
+        json={"listen_enabled": True, "generation_enabled": False, "send_enabled": True},
+    )
+    configured_client.post(
+        "/api/fine-job/boss-chat/executor/heartbeat",
+        headers=headers,
+        json={"account_uid": "geek-100", "tab_id": "tab-ui", "leader_epoch": 1, "is_leader": True},
+    )
+    configured_client.post(
+        "/api/fine-job/boss-chat/executor/events/batch",
+        headers=headers,
+        json={"events": [_message_event("ui-detail-event", "ui-detail-message", "您好")]},
+    )
+    session = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]
+    _resume_session(configured_client, session["id"])
+    task = configured_client.post(
+        f"/api/fine-job/boss-chat/sessions/{session['id']}/generate", json={"instruction": "礼貌回复"}
+    ).json()["reply_task"]
+    configured_client.post(
+        f"/api/fine-job/boss-chat/reply-tasks/{task['id']}/confirm",
+        json={
+            "final_text": task["final_text"],
+            "based_on_message_id": task["based_on_message_id"],
+            "based_on_session_version": task["based_on_session_version"],
+        },
+    )
+    detail = configured_client.get(f"/api/fine-job/boss-chat/sessions/{session['id']}").json()
+    action = detail["unified_actions"][0]
+    assert action["action_type"] == "chat_message"
+    assert action["status"] == "queued"
+    assert "waiting_reason_code" in action
+    assert "session_sequence" in action
+    assert action["base_raw_message_id"] == task["based_on_message_id"]
 
 
 def test_incomplete_session_is_reconciled_when_job_identity_arrives(configured_client) -> None:

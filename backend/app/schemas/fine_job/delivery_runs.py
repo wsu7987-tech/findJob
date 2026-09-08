@@ -114,5 +114,6 @@ class FineJobOperationsDashboardResponse(BaseModel):
     executor: dict[str, Any] | None = None
     current_task: dict[str, Any] | None = None
     queue: dict[str, Any]
+    unified_queue: dict[str, Any] = Field(default_factory=lambda: {"actions": [], "total": 0})
     recent_issues: list[FineJobActionLogResponse]
     legacy_runs: list[FineJobDeliveryRunResponse]

@@ -18,6 +18,10 @@ from backend.app.services.fine_job.boss_capture_history import (
 from backend.app.services.fine_job.execution_reconciliation import (
     record_execution_evidence_with_connection,
 )
+from backend.app.services.fine_job.action_store import (
+    reconcile_reply_task_coverage,
+    sync_legacy_action,
+)
 from backend.app.services.fine_job.job_activity import (
     append_contact_origin_for_session_with_connection,
     append_job_activity_with_connection,
@@ -1244,6 +1248,11 @@ def _sync_tasks_from_facts(
                     (now, now, action["id"]),
                 )
                 result["automation_actions_cancelled"] += 1
+                sync_legacy_action(
+                    connection,
+                    source_table="fj_automation_actions",
+                    source_id=str(action["id"]),
+                )
                 continue
             evidence, _inserted, reconciliation = record_execution_evidence_with_connection(
                 connection,
@@ -1264,6 +1273,11 @@ def _sync_tasks_from_facts(
                 dedupe_key=f"chat_message:{greeting['message_id']}:automation_action:{action['id']}:conversation_created",
             )
             result["actions_reconciled"] += int(reconciliation is not None or bool(evidence))
+            sync_legacy_action(
+                connection,
+                source_table="fj_automation_actions",
+                source_id=str(action["id"]),
+            )
 
     resume = facts.get("resume_submitted")
     if isinstance(resume, dict):
@@ -1296,6 +1310,11 @@ def _sync_tasks_from_facts(
     candidate_reply = facts.get("latest_candidate_reply")
     if isinstance(candidate_reply, dict):
         candidate_time = str(candidate_reply["occurred_at"])
+        stale_task_rows = connection.execute(
+            """SELECT id FROM fj_chat_reply_tasks WHERE session_id = ?
+               AND status IN ('pending_generation', 'generating', 'awaiting_review') AND created_at < ?""",
+            (session["id"], candidate_time),
+        ).fetchall()
         cursor = connection.execute(
             """
             UPDATE fj_chat_reply_tasks
@@ -1308,6 +1327,13 @@ def _sync_tasks_from_facts(
             (now, now, session["id"], candidate_time),
         )
         result["reply_tasks_staled"] += int(cursor.rowcount)
+        for task in stale_task_rows:
+            reconcile_reply_task_coverage(connection, reply_task_id=str(task["id"]))
+        send_action_rows = connection.execute(
+            """SELECT id FROM fj_chat_send_actions
+               WHERE session_id = ? AND status IN ('queued', 'leased') AND created_at < ?""",
+            (session["id"], candidate_time),
+        ).fetchall()
         cursor = connection.execute(
             """
             UPDATE fj_chat_send_actions
@@ -1321,6 +1347,12 @@ def _sync_tasks_from_facts(
             (now, now, session["id"], candidate_time),
         )
         result["send_actions_cancelled"] += int(cursor.rowcount)
+        for action in send_action_rows:
+            sync_legacy_action(
+                connection,
+                source_table="fj_chat_send_actions",
+                source_id=str(action["id"]),
+            )
     return result
 
 
@@ -2392,6 +2424,11 @@ def _cancel_open_progress_tasks_for_rejection(
     evidence_message_id: str,
 ) -> None:
     now = utc_now()
+    stale_task_rows = connection.execute(
+        """SELECT id FROM fj_chat_reply_tasks WHERE session_id = ?
+           AND status IN ('pending_generation', 'generating', 'awaiting_review')""",
+        (session_id,),
+    ).fetchall()
     connection.execute(
         """
         UPDATE fj_review_items
@@ -2411,6 +2448,8 @@ def _cancel_open_progress_tasks_for_rejection(
         """,
         (now, now, session_id),
     )
+    for task in stale_task_rows:
+        reconcile_reply_task_coverage(connection, reply_task_id=str(task["id"]))
     for action in connection.execute(
         """
         SELECT id, status
@@ -2429,6 +2468,11 @@ def _cancel_open_progress_tasks_for_rejection(
             WHERE id = ?
             """,
             (now, now, action["id"]),
+        )
+        sync_legacy_action(
+            connection,
+            source_table="fj_automation_actions",
+            source_id=str(action["id"]),
         )
         record_execution_evidence_with_connection(
             connection,

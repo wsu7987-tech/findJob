@@ -3,6 +3,21 @@ import { readBossPageIdentity } from "./read-only-probe";
 
 type BossCookieApi = { get(name: string): string | undefined };
 
+export const defaultGreetingUnknownResult = (
+  command: DefaultGreetingCommand,
+  error: unknown
+): MainWorldExecutionResult => ({
+  taskId: command.taskId,
+  executionEpoch: command.executionEpoch,
+  unifiedActionId: command.unifiedActionId,
+  unifiedExecutionEpoch: command.unifiedExecutionEpoch,
+  outcome: "unknown",
+  contacted: null,
+  statusCode: "BOSS_REQUEST_NETWORK_UNKNOWN",
+  message: `请求结果未知：${(error as Error).message}`,
+  evidence: {}
+});
+
 const readBossToken = (): string => {
   const cookieApi = (window as unknown as { Cookie?: BossCookieApi }).Cookie;
   return cookieApi?.get("bst") ?? "";
@@ -14,6 +29,7 @@ const readBossToken = (): string => {
 export const executeDefaultGreeting = async (
   command: DefaultGreetingCommand
 ): Promise<MainWorldExecutionResult> => {
+  try {
   const identity = readBossPageIdentity();
   if (
     identity.state !== "ready" ||
@@ -24,6 +40,8 @@ export const executeDefaultGreeting = async (
     return {
       taskId: command.taskId,
       executionEpoch: command.executionEpoch,
+      unifiedActionId: command.unifiedActionId,
+      unifiedExecutionEpoch: command.unifiedExecutionEpoch,
       outcome: "failed",
       contacted: identity.job?.contacted ?? null,
       statusCode: "PRE_DISPATCH_PAGE_MISMATCH",
@@ -37,6 +55,8 @@ export const executeDefaultGreeting = async (
     return {
       taskId: command.taskId,
       executionEpoch: command.executionEpoch,
+      unifiedActionId: command.unifiedActionId,
+      unifiedExecutionEpoch: command.unifiedExecutionEpoch,
       outcome: "failed",
       contacted: false,
       statusCode: "BOSS_TOKEN_MISSING",
@@ -67,6 +87,8 @@ export const executeDefaultGreeting = async (
       return {
         taskId: command.taskId,
         executionEpoch: command.executionEpoch,
+        unifiedActionId: command.unifiedActionId,
+        unifiedExecutionEpoch: command.unifiedExecutionEpoch,
         outcome: "failed",
         contacted: false,
         statusCode,
@@ -78,6 +100,8 @@ export const executeDefaultGreeting = async (
     return {
       taskId: command.taskId,
       executionEpoch: command.executionEpoch,
+      unifiedActionId: command.unifiedActionId,
+      unifiedExecutionEpoch: command.unifiedExecutionEpoch,
       outcome: "accepted",
       contacted: null,
       statusCode: "BOSS_REQUEST_ACCEPTED",
@@ -85,14 +109,9 @@ export const executeDefaultGreeting = async (
       evidence: { responseCode: body.code, httpStatus: response.status }
     };
   } catch (error) {
-    return {
-      taskId: command.taskId,
-      executionEpoch: command.executionEpoch,
-      outcome: "unknown",
-      contacted: null,
-      statusCode: "BOSS_REQUEST_NETWORK_UNKNOWN",
-      message: `请求结果未知：${(error as Error).message}`,
-      evidence: {}
-    };
+    return defaultGreetingUnknownResult(command, error);
+  }
+  } catch (error) {
+    return defaultGreetingUnknownResult(command, error);
   }
 };

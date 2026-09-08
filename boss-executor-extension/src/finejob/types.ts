@@ -59,11 +59,29 @@ export type DefaultGreetingCommand = {
   taskId: string;
   executionEpoch: number;
   encryptJobId: string;
+  unifiedActionId: string;
+  unifiedExecutionEpoch: number;
   targetTabId?: string;
 };
 
 export type BossPageProbeCommand = {
   type: "BOSS_PAGE_PROBE";
+};
+
+export type ResumeSnapshotCommand = {
+  type: "BOSS_RESUME_SNAPSHOT_REQUEST";
+  targetTabId: string;
+  leaderEpoch: number;
+  requestId: string;
+  actionId: string;
+};
+
+export type ResumeSnapshotResult = {
+  requestId: string;
+  actionId: string;
+  attachments: Array<{ encryptResumeId: string; filename: string }>;
+  observedAt: string;
+  error: string;
 };
 
 export type ChatObservedMessage = {
@@ -90,6 +108,7 @@ export type ChatObservedMessage = {
   frameOrigin: "local_send" | "remote_message";
   evidenceSource: "local_transport_write" | "remote_outbound_echo" | "remote_message" | "message_sync";
   serverMid: string;
+  rawBody: Record<string, unknown>;
   rawMeta: Record<string, unknown>;
 };
 
@@ -107,10 +126,12 @@ export type ChatTabHeartbeat = ChatIdentity & {
 
 export type FineJobChatSendAction = {
   id: string;
+  action_type?: "greeting" | "chat_message" | "resume_send";
   session_id: string;
   status: string;
   text: string;
   execution_epoch: number;
+  base_conversation_revision?: number;
   account_uid: string;
   peer_uid: string;
   encrypt_peer_uid: string;
@@ -122,6 +143,14 @@ export type FineJobChatSendAction = {
   resume_filename?: string;
 };
 
+export type UnifiedPreflightDecision = {
+  decision: "dispatch" | "waiting" | "replan" | "blocked";
+  reason_code?: string;
+  dispatch_token?: string;
+  dispatch_deadline_at?: string;
+  action: FineJobChatSendAction;
+};
+
 export type ChatSendCommand = {
   type: "BOSS_CHAT_SEND";
   targetTabId: string;
@@ -129,7 +158,7 @@ export type ChatSendCommand = {
   action: FineJobChatSendAction;
 };
 
-export type MainWorldCommand = DefaultGreetingCommand | ChatSendCommand | BossPageProbeCommand;
+export type MainWorldCommand = DefaultGreetingCommand | ChatSendCommand | BossPageProbeCommand | ResumeSnapshotCommand;
 
 export type ChatSendExecutionResult = {
   actionId: string;
@@ -151,6 +180,8 @@ export type ChatSendOptions = {
 export type MainWorldExecutionResult = {
   taskId: string;
   executionEpoch: number;
+  unifiedActionId?: string;
+  unifiedExecutionEpoch?: number;
   outcome: "accepted" | "succeeded" | "failed" | "unknown";
   contacted: boolean | null;
   statusCode: string;

@@ -4,6 +4,13 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { CopyDocument } from "@element-plus/icons-vue";
 
 import { formatDateTime } from "@/services/format";
+import {
+  fineJobActionReasonLabel,
+  fineJobActionStatusLabel,
+  fineJobActionStatusType,
+  fineJobActionTypeLabel
+} from "@/services/fineJobActionPresentation";
+import { fineJobExecutorStatusLabel } from "@/services/fineJobExecutorPresentation";
 import { useFineJobBossExecutorStore } from "@/stores/fineJobBossExecutor";
 import { useFineJobDeliveryRunsStore } from "@/stores/fineJobDeliveryRuns";
 import type { FineJobBossExecutorQueueAction, FineJobDeliveryRun } from "@/types";
@@ -34,6 +41,7 @@ const filteredQueue = computed(() => (dashboard.value?.queue.actions ?? []).filt
   const matchesState = !queueState.value || item.execution_state === queueState.value;
   return matchesKeyword && matchesState;
 }));
+const unifiedQueue = computed(() => dashboard.value?.unified_queue?.actions ?? []);
 const filteredIssues = computed(() => (dashboard.value?.recent_issues ?? []).filter((item) => {
   const keyword = issueQuery.value.trim().toLowerCase();
   const matchesKeyword = !keyword || `${item.message} ${item.action_type} ${item.job_title ?? ""}`.toLowerCase().includes(keyword);
@@ -54,14 +62,11 @@ const load = async () => {
 };
 
 const executorStatusLabel = computed(() => {
-  if (!executor.value) return "未配对";
-  if (!executor.value.browser_connected) return "FineJob未连接";
-  if (executor.value.risk_state !== "none") return "风险暂停";
-  return executor.value.queue_state === "running" ? "运行中" : "已暂停";
+  return fineJobExecutorStatusLabel(executor.value, Boolean(currentTask.value));
 });
 
 const executorStatusType = computed(() =>
-  executorStatusLabel.value === "运行中" ? "success" : executorStatusLabel.value === "风险暂停" ? "danger" : "warning"
+  ["运行中", "执行中"].includes(executorStatusLabel.value) ? "success" : executorStatusLabel.value === "风险暂停" ? "danger" : "warning"
 );
 
 const executorProgressText = computed(() => {
@@ -80,6 +85,11 @@ const executionLabel = (state: string) => ({
   queued: "待处理", running: "执行中", succeeded: "已完成", cancelled: "已取消",
   blocked: "已阻断", failed: "执行失败", unknown: "结果未知"
 } as Record<string, string>)[state] ?? state;
+const actionStatusLabel = fineJobActionStatusLabel;
+const actionStatusType = fineJobActionStatusType;
+const actionTypeLabel = fineJobActionTypeLabel;
+const actionReason = (action: { waiting_reason_code?: string; waiting_reason_detail?: string; status_code?: string }) =>
+  fineJobActionReasonLabel(action.waiting_reason_code || action.status_code, action.waiting_reason_detail);
 
 const control = async (command: "start" | "pause") => {
   try {
@@ -315,20 +325,19 @@ onBeforeUnmount(() => {
         <div class="executor-main">
           <div v-if="!executor || !executor.browser_connected" class="connection-box">
             <div>
-              <strong>{{ executor ? "等待插件控制通道" : "尚未配对插件" }}</strong>
+              <strong>{{ !executor ? "尚未配对插件" : executor.pairing_state === "revoked" ? "已断开，需重新配对" : "插件连接已中断" }}</strong>
               <p class="secondary-text">
-                {{ executor ? "插件配对后会自动建立连接；也可以手动发起心跳测试。" : "先生成配对码，再到 BOSS 插件面板输入。" }}
+                {{ !executor ? "先生成配对码，再到 BOSS 插件面板输入。" : executor.pairing_state === "revoked" ? "该执行器的配对已撤销，生成新配对码后重新连接。" : "现有配对仍有效，打开插件后会自动恢复连接。" }}
               </p>
             </div>
             <div class="connection-actions">
-              <el-button :loading="executorStore.heartbeatTesting" @click="testHeartbeat">心跳测试</el-button>
-              <el-button v-if="executor" @click="disconnect">断开连接</el-button>
+              <el-button v-if="executor?.pairing_state !== 'revoked'" :loading="executorStore.heartbeatTesting" @click="testHeartbeat">检查插件连接</el-button>
               <el-button type="primary" @click="createPairingCode">生成配对码</el-button>
             </div>
           </div>
           <template v-else>
             <el-descriptions :column="3" border>
-              <el-descriptions-item label="队列状态">{{ executor.queue_state }}</el-descriptions-item>
+              <el-descriptions-item label="队列状态">{{ executor.queue_state === 'running' ? '运行中' : executor.queue_state === 'risk_paused' ? '风险暂停' : '已暂停' }}</el-descriptions-item>
               <el-descriptions-item label="风险状态">{{ executor.risk_state }}</el-descriptions-item>
               <el-descriptions-item label="最近心跳">{{ formatDateTime(executor.last_heartbeat_at || '') }}</el-descriptions-item>
             </el-descriptions>
@@ -340,8 +349,8 @@ onBeforeUnmount(() => {
               class="current-task-alert"
             />
             <div class="executor-actions">
-              <el-button :loading="executorStore.heartbeatTesting" @click="testHeartbeat">心跳测试</el-button>
-              <el-button @click="disconnect">断开连接</el-button>
+              <el-button :loading="executorStore.heartbeatTesting" @click="testHeartbeat">检查插件连接</el-button>
+              <el-button @click="disconnect">断开连接1</el-button>
               <el-button
                 :type="executor.queue_state === 'running' ? 'warning' : 'primary'"
                 @click="control(executor.queue_state === 'running' ? 'pause' : 'start')"
@@ -400,7 +409,21 @@ onBeforeUnmount(() => {
     </section>
 
     <section class="table-panel">
-      <div class="panel-title-row"><div><p class="panel-eyebrow">Action Queue</p><h2>执行队列</h2></div><el-tag type="info">{{ dashboard?.queue.total ?? 0 }} 项</el-tag></div>
+      <div class="panel-title-row"><div><p class="panel-eyebrow">Unified Action Queue</p><h2>当前 Action 队列</h2><p class="secondary-text">顺序由后端返回，页面不重新计算优先级。</p></div><el-tag type="info">{{ dashboard?.unified_queue?.total ?? 0 }} 项</el-tag></div>
+      <el-table :data="unifiedQueue" empty-text="当前没有待展示的统一 Action">
+        <el-table-column label="顺序" width="90"><template #default="{ row, $index }">{{ row.session_sequence ?? $index + 1 }}</template></el-table-column>
+        <el-table-column label="动作" min-width="120"><template #default="{ row }">{{ actionTypeLabel(row.action_type) }}</template></el-table-column>
+        <el-table-column label="目标" min-width="220"><template #default="{ row }"><strong>{{ row.job_title || row.peer_name || '待确认目标' }}</strong><p class="secondary-text">{{ row.company_name }}</p></template></el-table-column>
+        <el-table-column label="状态" min-width="160"><template #default="{ row }"><el-tag :type="actionStatusType(row.status)">{{ actionStatusLabel(row.status) }}</el-tag></template></el-table-column>
+        <el-table-column label="等待/阻止原因" min-width="260"><template #default="{ row }">{{ actionReason(row) || '—' }}</template></el-table-column>
+        <el-table-column label="更新时间" width="180"><template #default="{ row }">{{ formatDateTime(row.updated_at) }}</template></el-table-column>
+      </el-table>
+    </section>
+
+    <section class="table-panel">
+      <details>
+        <summary>技术详情 / 兼容队列（{{ dashboard?.queue.total ?? 0 }}）</summary>
+        <p class="secondary-text">用于现有测试任务与兼容诊断；业务 Action 以当前统一 Action 队列为准。</p>
       <div class="inline-filters">
         <el-input v-model="queueQuery" clearable placeholder="筛选岗位或公司" />
         <el-select v-model="queueState" clearable placeholder="全部执行状态">
@@ -421,6 +444,7 @@ onBeforeUnmount(() => {
           </template>
         </el-table-column>
       </el-table>
+      </details>
     </section>
 
     <el-drawer v-model="testTaskDrawerOpen" title="新建测试任务" size="440px">

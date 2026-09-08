@@ -90,7 +90,7 @@ export class BossChatSender {
     return this.connecting;
   }
 
-  private async listResumeAttachments(): Promise<ResumeAttachment[]> {
+  async listResumeAttachments(): Promise<ResumeAttachment[]> {
     const response = await fetch("https://www.zhipin.com/wapi/zpgeek/resume/attachment/checkbox.json?from=2", {
       credentials: "include"
     });
@@ -182,6 +182,24 @@ export class BossChatSender {
       if (!await isSendEnabled()) throw new Error("自动代聊发送开关已关闭，已阻止发送");
       let payload: Uint8Array;
       if (operationKind === "resume") {
+        // 真正执行前重新读取附件列表，只允许发送 Action 固定保存的同一份简历。
+        const attachments = await this.listResumeAttachments();
+        const attachmentPresent = attachments.some((item) =>
+          item.encryptResumeId === action.encrypt_resume_id
+          && item.showName === action.resume_filename
+        );
+        if (!attachmentPresent) {
+          return {
+            actionId: action.id,
+            executionEpoch: action.execution_epoch,
+            outcome: "failed",
+            platformMessageId: "",
+            clientMid,
+            statusCode: "resume_attachment_invalid",
+            message: "当前 BOSS 附件列表中不存在已选择的简历，已阻止发送",
+            evidence: { attachments }
+          };
+        }
         // 先注册监听，避免 exchange 成功后简历卡片到达过快而丢失关联依据。
         const abortController = new AbortController();
         const resumeCardPromise = waitForResumeCard(action.peer_uid, 10_000, abortController.signal);

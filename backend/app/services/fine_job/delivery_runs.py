@@ -517,6 +517,7 @@ def get_operations_dashboard(db: Database) -> dict[str, object]:
         }
     runtime = executor_status(db)
     queue = runtime.get("queue") if isinstance(runtime.get("queue"), dict) else {"actions": [], "total": 0}
+    unified_queue = runtime.get("unified_queue") if isinstance(runtime.get("unified_queue"), dict) else {"actions": [], "total": 0}
     warnings = query_action_logs(db, level="warning", page_size=8)["logs"]
     errors = query_action_logs(db, level="error", page_size=8)["logs"]
     recent_issues = sorted(
@@ -532,6 +533,7 @@ def get_operations_dashboard(db: Database) -> dict[str, object]:
         "executor": runtime.get("executor"),
         "current_task": runtime.get("current_task"),
         "queue": queue,
+        "unified_queue": unified_queue,
         "recent_issues": recent_issues,
         "legacy_runs": list_delivery_runs(db, limit=20),
     }
