@@ -26,10 +26,6 @@
   FineJobStrategySearchKeywordEnvelope,
   FineJobStrategySearchKeywordListEnvelope,
   FineJobActionLogListEnvelope,
-  FineJobDeliveryCandidateListEnvelope,
-  FineJobDeliveryRunCreateRequest,
-  FineJobDeliveryRunEnvelope,
-  FineJobDeliveryRunListEnvelope,
   FineJobPlatformSession,
   FineJobPlatformSessionEnvelope,
   FineJobPlatformLoginActionEnvelope,
@@ -614,39 +610,12 @@ export const api = {
       { method: "POST", body: JSON.stringify(payload) }
     );
   },
-  async listFineJobDeliveryRuns() {
-    return request<FineJobDeliveryRunListEnvelope>("/api/fine-job/delivery-runs");
-  },
-  async createFineJobDeliveryRun(payload: FineJobDeliveryRunCreateRequest) {
-    return request<FineJobDeliveryRunEnvelope>("/api/fine-job/delivery-runs", {
-      method: "POST",
-      body: JSON.stringify(payload)
-    });
-  },
-  async getFineJobDeliveryRun(runId: string) {
-    return request<FineJobDeliveryRunEnvelope>(`/api/fine-job/delivery-runs/${runId}`);
-  },
-  async deleteFineJobDeliveryRun(runId: string) {
-    return request<{ deleted: boolean; id: string; candidates_deleted: number; logs_deleted: number }>(
-      `/api/fine-job/delivery-runs/${runId}`,
-      { method: "DELETE" }
-    );
-  },
-  async listFineJobDeliveryCandidates(runId: string) {
-    return request<FineJobDeliveryCandidateListEnvelope>(
-      `/api/fine-job/delivery-runs/${runId}/candidates`
-    );
-  },
-  async listFineJobDeliveryRunLogs(runId: string) {
-    return request<FineJobActionLogListEnvelope>(`/api/fine-job/delivery-runs/${runId}/logs`);
-  },
   async listFineJobRecentActionLogs(query: {
     query?: string;
     level?: string;
     action_type?: string;
     category?: string;
     outcome?: string;
-    source?: string;
     created_from?: string;
     created_to?: string;
     page?: number;
@@ -660,10 +629,7 @@ export const api = {
       `/api/fine-job/delivery-runs/logs/recent${search.size ? `?${search.toString()}` : ""}`
     );
   },
-  async cleanupFineJobActionLogs(payload: {
-    before: string;
-    source: "all" | "legacy_run" | "main_workflow";
-  }) {
+  async cleanupFineJobActionLogs(payload: { before: string }) {
     return request<{ deleted: number; before: string }>(
       "/api/fine-job/delivery-runs/logs/cleanup",
       { method: "POST", body: JSON.stringify(payload) }
@@ -1058,6 +1024,18 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(payload)
     });
+  },
+  async markFineJobBossActionCompleted(actionId: string) {
+    return request<FineJobAutomationActionEnvelope>(
+      `/api/fine-job/automation-actions/${actionId}/mark-completed`,
+      { method: "POST" }
+    );
+  },
+  async requeueFineJobBossAction(actionId: string) {
+    return request<FineJobAutomationActionEnvelope>(
+      `/api/fine-job/automation-actions/${actionId}/requeue`,
+      { method: "POST" }
+    );
   },
   async getFineJobChatMessageTransformConfig() {
     return request<FineJobChatMessageTransformConfig>(

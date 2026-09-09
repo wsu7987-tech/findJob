@@ -38,7 +38,7 @@ const navigation = [
   { label: "历史采集", routeName: "fine-job-capture-history", icon: Clock },
   { label: "公司管理", routeName: "fine-job-companies", icon: User },
   { label: "策略管理", routeName: "fine-job-strategy", icon: Wallet },
-  { label: "运行状态", routeName: "fine-job-runs", icon: List },
+  { label: "执行队列", routeName: "fine-job-runs", icon: List },
   { label: "待确认", routeName: "fine-job-review", icon: User },
   { label: "自动代聊", routeName: "fine-job-chat", icon: ChatDotRound },
   { label: "求职数据更新", routeName: "fine-job-refresh", icon: Clock },

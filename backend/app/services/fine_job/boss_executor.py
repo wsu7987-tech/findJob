@@ -553,6 +553,21 @@ def list_queue(db: Database) -> dict[str, object]:
 def list_display_queue(db: Database) -> dict[str, object]:
     """汇总岗位招呼和自动代聊的已确认执行任务，供桌面端展示。"""
     greeting_queue = list_queue(db)["actions"]
+    with db.connect() as connection:
+        terminal_rows = connection.execute(
+            """
+            SELECT a.*, j.title AS job_title, j.company_name, j.encrypt_job_id, j.job_link
+            FROM fj_automation_actions a
+            JOIN fj_boss_jobs j ON j.id = a.job_id
+            WHERE a.task_type IN ('BOSS_DEFAULT_GREETING', 'TEST_DELAY')
+              AND a.status IN ('blocked', 'unknown')
+              AND a.execution_state IN ('blocked', 'unknown')
+            ORDER BY a.created_at ASC, a.id ASC
+            """
+        ).fetchall()
+    greeting_queue.extend(
+        _serialize_action(row, include_payload=False) for row in terminal_rows
+    )
     display_actions: list[dict[str, object]] = []
     for action in greeting_queue:
         if action.get("task_source") == "chat":
@@ -571,7 +586,15 @@ def list_display_queue(db: Database) -> dict[str, object]:
             "task_source": "test" if action["task_type"] == "TEST_DELAY" else "greeting",
             "task_detail": detail or ("延时测试任务" if action["task_type"] == "TEST_DELAY" else "待发送招呼语"),
         })
-    display_actions.sort(key=lambda action: (str(action["created_at"]), str(action["id"])))
+    # 执行队列按处置优先级展示，同一状态内保留创建顺序。
+    execution_order = {"running": 0, "queued": 1, "blocked": 2, "unknown": 3}
+    display_actions.sort(
+        key=lambda action: (
+            execution_order.get(str(action["execution_state"]), 4),
+            str(action["created_at"]),
+            str(action["id"]),
+        )
+    )
     return {"actions": display_actions, "total": len(display_actions)}
 
 
@@ -1718,6 +1741,57 @@ def return_to_review(db: Database, action_id: str, *, reason: str, executor_id: 
     return _serialize_action(_require_action(db, action_id))
 
 
+def mark_completed(db: Database, action_id: str) -> dict[str, object]:
+    task = _require_action(db, action_id)
+    if task["status"] not in {"blocked", "unknown"}:
+        raise AppError(409, "MARK_COMPLETED_FORBIDDEN", "仅未知或阻断任务可标记为已完成。")
+    now = utc_now()
+    result = {
+        "outcome": "succeeded",
+        "statusCode": "MANUAL_COMPLETED",
+        "message": "用户确认任务已完成。",
+        "evidence": {"manual_completed": True},
+    }
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_automation_actions
+            SET status = 'succeeded', execution_state = 'succeeded',
+                last_status_code = 'MANUAL_COMPLETED', last_error = NULL,
+                result_json = ?, updated_at = ?, completed_at = ?,
+                canonical_status = 'succeeded', canonical_updated_at = ?,
+                canonical_reason = '用户标记已完成'
+            WHERE id = ?
+            """,
+            (json.dumps(result, ensure_ascii=False), now, now, now, action_id),
+        )
+    _audit(db, "boss_task_manually_completed", "用户将未知或阻断任务标记为已完成。", {"task_id": action_id})
+    return _serialize_action(_require_action(db, action_id))
+
+
+def requeue_action(db: Database, action_id: str) -> dict[str, object]:
+    task = _require_action(db, action_id)
+    if task["status"] not in {"blocked", "unknown"}:
+        raise AppError(409, "REQUEUE_FORBIDDEN", "仅未知或阻断任务可重新进入执行队列。")
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_automation_actions
+            SET status = 'queued', execution_state = 'queued',
+                execution_epoch = execution_epoch + 1,
+                last_status_code = 'MANUAL_REQUEUED', last_error = NULL,
+                result_json = '{}', completed_at = NULL,
+                canonical_status = 'pending', canonical_updated_at = ?,
+                canonical_reason = '用户重新加入执行队列', updated_at = ?
+            WHERE id = ?
+            """,
+            (now, now, action_id),
+        )
+    _audit(db, "boss_task_requeued", "用户将未知或阻断任务重新加入执行队列。", {"task_id": action_id})
+    return _serialize_action(_require_action(db, action_id))
+
+
 def get_navigation(db: Database, task_id: str) -> dict[str, object]:
     with db.connect() as connection:
         row = connection.execute("SELECT * FROM fj_boss_navigation_tasks WHERE id = ?", (task_id,)).fetchone()
@@ -1900,6 +1974,6 @@ def _audit(
 ) -> None:
     with db.connect() as connection:
         connection.execute(
-            "INSERT INTO fj_action_logs (id, run_id, level, action_type, message, detail_json, created_at) VALUES (?, NULL, ?, ?, ?, ?, ?)",
+            "INSERT INTO fj_action_logs (id, level, action_type, message, detail_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (new_id(), level, action_type, message, json.dumps(detail, ensure_ascii=False), utc_now()),
         )

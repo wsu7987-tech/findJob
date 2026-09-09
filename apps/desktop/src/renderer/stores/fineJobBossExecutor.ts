@@ -168,6 +168,30 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
     }
   };
 
+  const markCompleted = async (actionId: string) => {
+    error.value = null;
+    try {
+      const result = await api.markFineJobBossActionCompleted(actionId);
+      await load();
+      return result.action;
+    } catch (value) {
+      error.value = mapError(value);
+      throw value;
+    }
+  };
+
+  const requeue = async (actionId: string) => {
+    error.value = null;
+    try {
+      const result = await api.requeueFineJobBossAction(actionId);
+      await load();
+      return result.action;
+    } catch (value) {
+      error.value = mapError(value);
+      throw value;
+    }
+  };
+
   const loadTestJobs = async () => {
     error.value = null;
     try {
@@ -238,6 +262,8 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
     disconnect,
     openJob,
     returnToReview,
+    markCompleted,
+    requeue,
     loadTestJobs,
     updateTestJob,
     updateSettings,

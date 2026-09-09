@@ -207,8 +207,8 @@ def _record_resume_claim_log(
     """记录自动代聊简历任务领取过程，供动作日志页面直接展示。"""
     connection.execute(
         """
-        INSERT INTO fj_action_logs (id, run_id, level, action_type, message, detail_json, created_at)
-        VALUES (?, NULL, ?, 'boss_chat_resume_claim', ?, ?, ?)
+        INSERT INTO fj_action_logs (id, level, action_type, message, detail_json, created_at)
+        VALUES (?, ?, 'boss_chat_resume_claim', ?, ?, ?)
         """,
         (uuid4().hex, level, message, json.dumps(detail, ensure_ascii=False), _now()),
     )

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
+import { useRoute } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 
 import { formatDateTime } from "@/services/format";
@@ -7,38 +8,39 @@ import { useFineJobDeliveryRunsStore } from "@/stores/fineJobDeliveryRuns";
 import type { FineJobActionLog } from "@/types";
 
 const runsStore = useFineJobDeliveryRunsStore();
+const route = useRoute();
 const filters = ref({
   query: "",
   level: "",
   category: "",
   outcome: "",
-  source: "",
   actionType: "",
   dateRange: null as [string, string] | null
 });
 const selectedLog = ref<FineJobActionLog | null>(null);
 const detailDrawerOpen = ref(false);
 const cleanupBefore = ref("");
-const cleanupSource = ref<"all" | "legacy_run" | "main_workflow">("legacy_run");
+const routeLogId = () => typeof route.query.logId === "string" ? route.query.logId : "";
 
 const load = async (page = runsStore.logPage) => {
-  await runsStore.loadRecentLogs({
+  const logs = await runsStore.loadRecentLogs({
     query: filters.value.query,
     level: filters.value.level,
     category: filters.value.category,
     outcome: filters.value.outcome,
-    source: filters.value.source,
     action_type: filters.value.actionType,
     created_from: filters.value.dateRange?.[0],
     created_to: filters.value.dateRange?.[1],
     page,
     page_size: runsStore.logPageSize
   });
+  const selected = logs.find((item) => item.id === routeLogId());
+  if (selected) showDetail(selected);
 };
 
 const search = () => load(1);
 const reset = () => {
-  filters.value = { query: "", level: "", category: "", outcome: "", source: "", actionType: "", dateRange: null };
+  filters.value = { query: "", level: "", category: "", outcome: "", actionType: "", dateRange: null };
   void search();
 };
 const applyQuickView = (value: "issues" | "review" | "execution" | "capture") => {
@@ -47,7 +49,6 @@ const applyQuickView = (value: "issues" | "review" | "execution" | "capture") =>
     level: value === "issues" ? "issue" : "",
     category: value === "issues" ? "" : value,
     outcome: "",
-    source: "",
     actionType: "",
     dateRange: null
   };
@@ -70,7 +71,7 @@ const cleanup = async () => {
       "清理旧日志",
       { type: "warning", confirmButtonText: "确认清理" }
     );
-    const result = await runsStore.cleanupLogs(cleanupBefore.value, cleanupSource.value);
+    const result = await runsStore.cleanupLogs(cleanupBefore.value);
     await search();
     ElMessage.success(`已清理 ${result.deleted} 条日志`);
   } catch (value) {
@@ -81,7 +82,6 @@ const cleanup = async () => {
 const categoryLabel = (value?: string) => ({
   review: "审批", execution: "执行", capture: "采集", chat: "代聊", system: "系统"
 } as Record<string, string>)[value ?? ""] ?? value ?? "系统";
-const sourceLabel = (value?: string) => value === "legacy_run" ? "旧任务" : "当前主链路";
 const outcomeLabel = (value?: string) => ({
   succeeded: "成功", failed: "失败", warning: "警告", info: "信息"
 } as Record<string, string>)[value ?? ""] ?? value ?? "信息";
@@ -93,12 +93,13 @@ const actionLabel = (value: string) => ({
   boss_page_open_failed: "打开任务页面失败",
   boss_page_match_failed: "任务页面匹配失败",
   boss_task_matched: "匹配执行任务", boss_task_completed: "任务完成",
-  boss_return_to_review: "退回待确认", executor_control: "执行器控制", boss_executor_risk: "执行器风险",
-  run_created: "创建旧任务", boss_search_started: "开始采集", boss_search_finished: "完成采集",
-  boss_collection_paused: "采集暂停", dry_run_guard: "旧任务保护"
+  boss_return_to_review: "退回待确认", executor_control: "执行器控制", boss_executor_risk: "执行器风险"
 } as Record<string, string>)[value] ?? value;
 
-onMounted(() => void load(1));
+onMounted(() => {
+  if (route.query.level === "issue") filters.value.level = "issue";
+  void load(1);
+});
 </script>
 
 <template>
@@ -145,11 +146,6 @@ onMounted(() => void load(1));
               <el-option label="警告" value="warning" /><el-option label="错误" value="error" />
             </el-select>
           </el-form-item>
-          <el-form-item label="来源">
-            <el-select v-model="filters.source" clearable placeholder="全部来源">
-              <el-option label="当前主链路" value="main_workflow" /><el-option label="旧版任务" value="legacy_run" />
-            </el-select>
-          </el-form-item>
           <el-form-item label="具体动作">
             <el-select v-model="filters.actionType" filterable clearable placeholder="全部动作">
               <el-option v-for="item in runsStore.logActionTypes" :key="item" :label="actionLabel(item)" :value="item" />
@@ -173,13 +169,12 @@ onMounted(() => void load(1));
       <el-table v-loading="runsStore.loading" :data="runsStore.logs" empty-text="当前筛选条件下暂无动作日志" @row-click="showDetail">
         <el-table-column label="时间" width="180"><template #default="{ row }">{{ formatDateTime(row.created_at) }}</template></el-table-column>
         <el-table-column label="对象" min-width="180">
-          <template #default="{ row }"><strong>{{ row.job_title || row.run_id || "系统" }}</strong><p class="secondary-text log-company">{{ row.company_name || "" }}</p></template>
+          <template #default="{ row }"><strong>{{ row.job_title || "系统" }}</strong><p class="secondary-text log-company">{{ row.company_name || "" }}</p></template>
         </el-table-column>
         <el-table-column label="分类" width="95"><template #default="{ row }">{{ categoryLabel(row.category) }}</template></el-table-column>
         <el-table-column label="动作" min-width="170"><template #default="{ row }">{{ actionLabel(row.action_type) }}</template></el-table-column>
         <el-table-column label="结果" width="95"><template #default="{ row }"><el-tag :type="outcomeType(row.outcome)">{{ outcomeLabel(row.outcome) }}</el-tag></template></el-table-column>
         <el-table-column prop="message" label="说明" min-width="320" show-overflow-tooltip />
-        <el-table-column label="来源" width="110"><template #default="{ row }">{{ sourceLabel(row.source) }}</template></el-table-column>
         <el-table-column label="操作" width="80"><template #default="{ row }"><el-button link type="primary" @click.stop="showDetail(row)">详情</el-button></template></el-table-column>
       </el-table>
       <div class="log-pagination">
@@ -195,9 +190,8 @@ onMounted(() => void load(1));
     </section>
 
     <section class="page-panel cleanup-panel">
-      <div><h2>清理旧日志</h2><p class="secondary-text">按截止时间清理历史记录，当前筛选结果不影响清理范围。</p></div>
+      <div><h2>清理日志</h2><p class="secondary-text">按截止时间清理历史记录，当前筛选结果不影响清理范围。</p></div>
       <div class="cleanup-actions">
-        <el-select v-model="cleanupSource"><el-option label="仅旧版任务" value="legacy_run" /><el-option label="仅当前主链路" value="main_workflow" /><el-option label="全部来源" value="all" /></el-select>
         <el-date-picker v-model="cleanupBefore" type="date" value-format="YYYY-MM-DDT00:00:00[Z]" placeholder="删除此日期之前" />
         <el-button type="danger" plain @click="cleanup">清理</el-button>
       </div>
@@ -209,7 +203,6 @@ onMounted(() => void load(1));
           <el-descriptions-item label="时间">{{ formatDateTime(selectedLog.created_at) }}</el-descriptions-item>
           <el-descriptions-item label="结果">{{ outcomeLabel(selectedLog.outcome) }}</el-descriptions-item>
           <el-descriptions-item label="分类">{{ categoryLabel(selectedLog.category) }}</el-descriptions-item>
-          <el-descriptions-item label="来源">{{ sourceLabel(selectedLog.source) }}</el-descriptions-item>
           <el-descriptions-item label="岗位">{{ selectedLog.job_title || "-" }}</el-descriptions-item>
           <el-descriptions-item label="公司">{{ selectedLog.company_name || "-" }}</el-descriptions-item>
         </el-descriptions>

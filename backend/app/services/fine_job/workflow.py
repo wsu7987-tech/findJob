@@ -929,8 +929,8 @@ def _log(
     with db.connect() as connection:
         connection.execute(
             """
-            INSERT INTO fj_action_logs (id, run_id, level, action_type, message, detail_json, created_at)
-            VALUES (?, NULL, ?, ?, ?, ?, ?)
+            INSERT INTO fj_action_logs (id, level, action_type, message, detail_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (new_id(), level, action_type, message, _json(detail or {}), utc_now()),
         )

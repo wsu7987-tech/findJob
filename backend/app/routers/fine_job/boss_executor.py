@@ -253,3 +253,23 @@ async def desktop_return(
     action = boss_executor.return_to_review(db, action_id, reason=payload.reason)
     await boss_executor.notify_queue_changed(db)
     return {"action": action}
+
+
+@router.post("/automation-actions/{action_id}/mark-completed")
+async def desktop_mark_completed(
+    action_id: str,
+    db: Database = Depends(get_database),
+):
+    action = boss_executor.mark_completed(db, action_id)
+    await boss_executor.notify_queue_changed(db)
+    return {"action": action}
+
+
+@router.post("/automation-actions/{action_id}/requeue")
+async def desktop_requeue(
+    action_id: str,
+    db: Database = Depends(get_database),
+):
+    action = boss_executor.requeue_action(db, action_id)
+    await boss_executor.notify_queue_changed(db)
+    return {"action": action}

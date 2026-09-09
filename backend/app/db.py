@@ -929,55 +929,6 @@ CREATE TABLE IF NOT EXISTS fj_job_recommendation_strategies (
 CREATE INDEX IF NOT EXISTS idx_fj_job_recommendation_strategies_updated_at
   ON fj_job_recommendation_strategies(updated_at DESC);
 
-CREATE TABLE IF NOT EXISTS fj_delivery_runs (
-  id TEXT PRIMARY KEY,
-  mode TEXT NOT NULL DEFAULT 'dry_run',
-  status TEXT NOT NULL,
-  stage TEXT NOT NULL,
-  intent_snapshot_json TEXT NOT NULL DEFAULT '{}',
-  strategy_snapshot_json TEXT NOT NULL DEFAULT '{}',
-  searched_count INTEGER NOT NULL DEFAULT 0,
-  skipped_count INTEGER NOT NULL DEFAULT 0,
-  greeted_count INTEGER NOT NULL DEFAULT 0,
-  error_count INTEGER NOT NULL DEFAULT 0,
-  started_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  finished_at TEXT,
-  error_message TEXT,
-  CHECK (mode IN ('dry_run', 'live')),
-  CHECK (status IN ('pending', 'running', 'completed', 'failed', 'paused', 'cancelled'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_fj_delivery_runs_started_at
-  ON fj_delivery_runs(started_at DESC);
-
-CREATE TABLE IF NOT EXISTS fj_delivery_candidates (
-  id TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL,
-  platform TEXT NOT NULL DEFAULT 'boss',
-  keyword TEXT NOT NULL,
-  city TEXT NOT NULL,
-  job_url TEXT NOT NULL DEFAULT '',
-  job_title TEXT NOT NULL DEFAULT '',
-  company_name TEXT NOT NULL DEFAULT '',
-  salary_text TEXT NOT NULL DEFAULT '',
-  location_text TEXT NOT NULL DEFAULT '',
-  experience_text TEXT NOT NULL DEFAULT '',
-  education_text TEXT NOT NULL DEFAULT '',
-  hr_active_text TEXT NOT NULL DEFAULT '',
-  jd_text TEXT NOT NULL DEFAULT '',
-  match_score REAL,
-  decision TEXT NOT NULL DEFAULT 'pending',
-  reason TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  FOREIGN KEY (run_id) REFERENCES fj_delivery_runs(id) ON DELETE CASCADE,
-  CHECK (decision IN ('pending', 'would_greet', 'skipped', 'needs_review'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_fj_delivery_candidates_run_id
-  ON fj_delivery_candidates(run_id);
-
 CREATE TABLE IF NOT EXISTS fj_boss_capture_batches (
   id TEXT PRIMARY KEY,
   keyword TEXT NOT NULL,
@@ -1283,18 +1234,16 @@ CREATE INDEX IF NOT EXISTS idx_fj_boss_navigation_action
 
 CREATE TABLE IF NOT EXISTS fj_action_logs (
   id TEXT PRIMARY KEY,
-  run_id TEXT,
   level TEXT NOT NULL DEFAULT 'info',
   action_type TEXT NOT NULL,
   message TEXT NOT NULL,
   detail_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL,
-  FOREIGN KEY (run_id) REFERENCES fj_delivery_runs(id) ON DELETE CASCADE,
   CHECK (level IN ('info', 'warning', 'error'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_fj_action_logs_run_created_at
-  ON fj_action_logs(run_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fj_action_logs_created_at
+  ON fj_action_logs(created_at DESC);
 
 -- 自动代聊运行开关。首版默认全部关闭，必须由桌面端显式启用。
 CREATE TABLE IF NOT EXISTS fj_chat_runtime (
@@ -2116,6 +2065,7 @@ class Database:
             self._ensure_fj_boss_executor_schema(connection)
             self._ensure_fj_company_governance_schema(connection)
             self._ensure_fj_execution_observability_schema(connection)
+            self._remove_legacy_dry_run_schema(connection)
             self._ensure_fj_chat_message_transform_schema(connection)
             self._ensure_codex_integration_schema(connection)
             self._ensure_resume_analysis_v2_schema(connection)
@@ -2222,6 +2172,51 @@ class Database:
                 connection.execute(
                     f"ALTER TABLE fj_chat_send_actions ADD COLUMN {column} {definition}"
                 )
+
+    def _remove_legacy_dry_run_schema(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """删除旧 dry-run 数据，并将动作日志升级为独立表。"""
+        tables = {
+            str(row["name"])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "fj_delivery_runs" not in tables:
+            return
+
+        # 旧任务日志与任务记录一起清理，当前工作流日志完整保留。
+        connection.execute("DELETE FROM fj_action_logs WHERE run_id IS NOT NULL")
+        connection.execute("DROP INDEX IF EXISTS idx_fj_action_logs_run_created_at")
+        connection.execute(
+            """
+            CREATE TABLE fj_action_logs_current (
+              id TEXT PRIMARY KEY,
+              level TEXT NOT NULL DEFAULT 'info',
+              action_type TEXT NOT NULL,
+              message TEXT NOT NULL,
+              detail_json TEXT NOT NULL DEFAULT '{}',
+              created_at TEXT NOT NULL,
+              CHECK (level IN ('info', 'warning', 'error'))
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO fj_action_logs_current (id, level, action_type, message, detail_json, created_at)
+            SELECT id, level, action_type, message, detail_json, created_at
+            FROM fj_action_logs
+            """
+        )
+        connection.execute("DROP TABLE fj_action_logs")
+        connection.execute("ALTER TABLE fj_action_logs_current RENAME TO fj_action_logs")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fj_action_logs_created_at ON fj_action_logs(created_at DESC)"
+        )
+        connection.execute("DROP TABLE IF EXISTS fj_delivery_candidates")
+        connection.execute("DROP TABLE IF EXISTS fj_delivery_runs")
 
     def _ensure_fj_chat_message_transform_schema(
         self,
@@ -2773,20 +2768,6 @@ class Database:
             connection.execute(
                 "ALTER TABLE fj_platform_sessions ADD COLUMN profile_path TEXT NOT NULL DEFAULT ''"
             )
-
-        candidate_columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(fj_delivery_candidates)")
-        }
-        for column, ddl in {
-            "job_url": "ALTER TABLE fj_delivery_candidates ADD COLUMN job_url TEXT NOT NULL DEFAULT ''",
-            "salary_text": "ALTER TABLE fj_delivery_candidates ADD COLUMN salary_text TEXT NOT NULL DEFAULT ''",
-            "location_text": "ALTER TABLE fj_delivery_candidates ADD COLUMN location_text TEXT NOT NULL DEFAULT ''",
-            "experience_text": "ALTER TABLE fj_delivery_candidates ADD COLUMN experience_text TEXT NOT NULL DEFAULT ''",
-            "education_text": "ALTER TABLE fj_delivery_candidates ADD COLUMN education_text TEXT NOT NULL DEFAULT ''",
-            "hr_active_text": "ALTER TABLE fj_delivery_candidates ADD COLUMN hr_active_text TEXT NOT NULL DEFAULT ''",
-        }.items():
-            if column not in candidate_columns:
-                connection.execute(ddl)
 
     def _ensure_fj_boss_job_columns(
         self,

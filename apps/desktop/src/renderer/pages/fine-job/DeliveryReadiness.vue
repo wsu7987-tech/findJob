@@ -167,12 +167,10 @@ const handleItemAction = async (item: (typeof requiredItems.value)[number]) => {
   }
 };
 
-const startDryRun = async () => {
-  if (!canStart.value) {
-    return;
+const startDelivery = async () => {
+  if (canStart.value) {
+    await router.push({ name: "fine-job-capture" });
   }
-  const run = await runsStore.createDryRun();
-  await router.push({ name: "fine-job-runs", query: { runId: run.id } });
 };
 </script>
 
@@ -191,9 +189,8 @@ const startDryRun = async () => {
           type="primary"
           size="large"
           :disabled="!canStart"
-          :loading="runsStore.creating"
           :icon="Promotion"
-          @click="startDryRun"
+          @click="startDelivery"
         >
           开始投递
         </el-button>

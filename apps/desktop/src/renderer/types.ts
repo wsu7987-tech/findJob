@@ -669,78 +669,13 @@ export interface FineJobStrategyChangeSetEnvelope {
   change_set: FineJobStrategyChangeSet;
 }
 
-export type FineJobDeliveryRunMode = "dry_run" | "live";
-export type FineJobDeliveryRunStatus =
-  | "pending"
-  | "running"
-  | "completed"
-  | "failed"
-  | "paused"
-  | "cancelled";
-
-export interface FineJobDeliveryRun {
-  id: string;
-  mode: FineJobDeliveryRunMode;
-  status: FineJobDeliveryRunStatus;
-  stage: string;
-  searched_count: number;
-  skipped_count: number;
-  greeted_count: number;
-  error_count: number;
-  started_at: string;
-  updated_at: string;
-  finished_at?: string | null;
-  error_message?: string | null;
-}
-
-export interface FineJobDeliveryRunListEnvelope {
-  runs: FineJobDeliveryRun[];
-}
-
-export interface FineJobDeliveryRunEnvelope {
-  run: FineJobDeliveryRun;
-}
-
-export interface FineJobDeliveryRunCreateRequest {
-  mode: FineJobDeliveryRunMode;
-  real_collect?: boolean;
-}
-
-export interface FineJobDeliveryCandidate {
-  id: string;
-  run_id: string;
-  platform: string;
-  keyword: string;
-  city: string;
-  job_url: string;
-  job_title: string;
-  company_name: string;
-  salary_text: string;
-  location_text: string;
-  experience_text: string;
-  education_text: string;
-  hr_active_text: string;
-  jd_text: string;
-  match_score?: number | null;
-  decision: string;
-  reason: string;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface FineJobDeliveryCandidateListEnvelope {
-  candidates: FineJobDeliveryCandidate[];
-}
-
 export interface FineJobActionLog {
   id: string;
-  run_id?: string | null;
   level: "info" | "warning" | "error" | string;
   action_type: string;
   message: string;
   detail: Record<string, unknown>;
   created_at: string;
-  source?: "legacy_run" | "main_workflow";
   category?: string;
   outcome?: string;
   job_id?: string | null;
@@ -1303,7 +1238,6 @@ export interface FineJobOperationsDashboard {
   current_task?: FineJobBossExecutorQueueAction | null;
   queue: { actions: FineJobBossExecutorQueueAction[]; total: number };
   recent_issues: FineJobActionLog[];
-  legacy_runs: FineJobDeliveryRun[];
 }
 
 export interface FineJobBossNavigationTask {

@@ -73,7 +73,7 @@ export const router = createRouter({
       path: "/fine-job/runs",
       name: "fine-job-runs",
       component: DeliveryRunStatusPage,
-      meta: { title: "运行状态" }
+      meta: { title: "执行队列" }
     },
     {
       path: "/fine-job/review",
