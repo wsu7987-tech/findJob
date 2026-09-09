@@ -19,6 +19,7 @@ from backend.app.schemas.fine_job.boss_chat import (
     BossChatFriendListRefreshResponse,
     BossChatHistoryRefreshResponse,
     BossChatJobUpdateResponse,
+    BossChatMessageTransformConfigRequest,
     BossChatGenerateRequest,
     BossChatHeartbeatRequest,
     BossChatReasonRequest,
@@ -50,6 +51,27 @@ def update_runtime(
     runtime = boss_chat.update_runtime(db, payload.model_dump(exclude_none=True))
     boss_chat.schedule_pending_generation(db, config)
     return {"runtime": runtime}
+
+
+@router.get("/message-transform-config")
+def get_message_transform_config(db: Database = Depends(get_database)):
+    return boss_chat.get_message_transform_config(db)
+
+
+@router.put("/message-transform-config")
+def save_message_transform_config(
+    payload: BossChatMessageTransformConfigRequest,
+    db: Database = Depends(get_database),
+):
+    return boss_chat.save_message_transform_config(
+        db,
+        [rule.model_dump() for rule in payload.rules],
+    )
+
+
+@router.post("/message-transform-config/reset")
+def reset_message_transform_config(db: Database = Depends(get_database)):
+    return boss_chat.reset_message_transform_config(db)
 
 
 @router.get("/batch/summary", response_model=BossChatBatchSummaryResponse)
@@ -252,6 +274,14 @@ def session(
     return boss_chat.get_session(db, session_id)
 
 
+@router.post("/sessions/{session_id}/messages/retransform")
+def retransform_session_messages(
+    session_id: str,
+    db: Database = Depends(get_database),
+):
+    return boss_chat.retransform_session_messages(db, session_id)
+
+
 @router.post("/sessions/{session_id}/resume-attachments/refresh")
 def refresh_resume_attachments(
     session_id: str,
@@ -340,6 +370,28 @@ def refresh_history(
             error_message=str(exc),
         ) from exc
     return BossChatHistoryRefreshResponse(**result)
+
+
+@router.post("/sessions/{session_id}/history/force-refresh")
+def force_refresh_history(
+    session_id: str,
+    db: Database = Depends(get_database),
+):
+    """直接从 BOSS 页面获取消息并清洗入库，不读取本地更新状态。"""
+    try:
+        return boss_chat.force_refresh_session_history(db, session_id)
+    except ValueError as exc:
+        raise AppError(
+            status_code=400,
+            error_category="BOSS_CHAT_HISTORY_INVALID",
+            error_message=str(exc),
+        ) from exc
+    except RuntimeError as exc:
+        raise AppError(
+            status_code=409,
+            error_category="BOSS_CHAT_HISTORY_CAPTURE_FAILED",
+            error_message=str(exc),
+        ) from exc
 
 
 @router.post(

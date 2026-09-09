@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import sqlite3
 import threading
 import time
@@ -37,6 +38,150 @@ RUNTIME_ID = "boss"
 SEND_LEASE_SECONDS = 30
 SEND_DISPATCH_TIMEOUT_SECONDS = 45
 REPLY_DEBOUNCE_SECONDS = 3
+
+MESSAGE_TRANSFORM_CONFIG_ID = "boss"
+DEFAULT_MESSAGE_TRANSFORM_RULES = [
+    {
+        "id": "job-context",
+        "label": "岗位沟通卡片",
+        "enabled": True,
+        "direction": "inbound",
+        "match_mode": "regex",
+        "pattern": r"^\s*岗位：\s*(.+?)\s*·\s*(.+?)\s*$",
+        "output_kind": "action",
+        "display_content": "沟通岗位",
+        "action_type": "job_context",
+        "requires_resume_sent": False,
+        "condition_rule_id": "",
+        "condition_branch": "always",
+    },
+    {
+        "id": "competitor-pk",
+        "label": "竞争者 PK 推广",
+        "enabled": True,
+        "direction": "inbound",
+        "match_mode": "contains",
+        "pattern": "你与该职位竞争者PK情况",
+        "output_kind": "discard",
+        "display_content": "",
+        "action_type": "",
+        "requires_resume_sent": False,
+        "condition_rule_id": "",
+        "condition_branch": "always",
+    },
+    {
+        "id": "resume-withdraw-requested",
+        "label": "条件线：附件简历请求已撤回",
+        "enabled": True,
+        "direction": "inbound",
+        "match_mode": "exact",
+        "pattern": "附件简历请求已撤回",
+        "output_kind": "action",
+        "display_content": "我已执行简历撤回操作",
+        "action_type": "resume_withdraw_requested",
+        "requires_resume_sent": False,
+        "condition_rule_id": "",
+        "condition_branch": "always",
+    },
+    {
+        "id": "resume-withdrawn",
+        "label": "简历已撤回",
+        "enabled": True,
+        "direction": "outbound",
+        "match_mode": "exact",
+        "pattern": "附件状态更新",
+        "output_kind": "action",
+        "display_content": "简历已撤回",
+        "action_type": "resume_withdrawn",
+        "requires_resume_sent": False,
+        "condition_rule_id": "resume-withdraw-requested",
+        "condition_branch": "if",
+    },
+    {
+        "id": "resume-sent",
+        "label": "我发送附件简历",
+        "enabled": True,
+        "direction": "outbound",
+        "match_mode": "exact",
+        "pattern": "附件状态更新",
+        "output_kind": "action",
+        "display_content": "我已发送附件简历",
+        "action_type": "resume_sent",
+        "requires_resume_sent": False,
+        "condition_rule_id": "resume-withdraw-requested",
+        "condition_branch": "else",
+    },
+    {
+        "id": "resume-withdrawn-by-hr",
+        "label": "简历已于 HR 端成功撤回",
+        "enabled": True,
+        "direction": "inbound",
+        "match_mode": "exact",
+        "pattern": "附件状态更新",
+        "output_kind": "action",
+        "display_content": "简历已于HR端成功撤回",
+        "action_type": "resume_withdrawn_by_hr",
+        "requires_resume_sent": False,
+        "condition_rule_id": "resume-withdraw-requested",
+        "condition_branch": "if",
+    },
+    {
+        "id": "resume-viewed",
+        "label": "HR 已读发送简历的消息",
+        "enabled": True,
+        "direction": "inbound",
+        "match_mode": "exact",
+        "pattern": "附件状态更新",
+        "output_kind": "action",
+        "display_content": "HR已读我发送简历的消息",
+        "action_type": "resume_message_read",
+        "requires_resume_sent": False,
+        "condition_rule_id": "resume-withdraw-requested",
+        "condition_branch": "else",
+    },
+    {
+        "id": "resume-read",
+        "label": "简历已成功发送",
+        "enabled": True,
+        "direction": "inbound",
+        "match_mode": "regex",
+        "pattern": r"^\s*.+\.pdf\s*$",
+        "output_kind": "action",
+        "display_content": "我的简历已成功发送出去",
+        "action_type": "resume_sent_confirmed",
+        "requires_resume_sent": False,
+        "condition_rule_id": "",
+        "condition_branch": "always",
+    },
+    {
+        "id": "resume-viewed-by-hr",
+        "label": "HR 查看附件简历",
+        "enabled": True,
+        "direction": "inbound",
+        "match_mode": "exact",
+        "pattern": "对方已查看了您的附件简历",
+        "output_kind": "action",
+        "display_content": "HR已查看我的简历",
+        "action_type": "resume_viewed",
+        "requires_resume_sent": False,
+        "condition_rule_id": "",
+        "condition_branch": "always",
+    },
+    {
+        "id": "resume-received",
+        "label": "HR 接收附件简历",
+        "enabled": True,
+        "direction": "inbound",
+        "match_mode": "exact",
+        "pattern": "对方已同意，您的附件简历已发送给对方",
+        "output_kind": "action",
+        "display_content": "HR已接收附件简历",
+        "action_type": "resume_received",
+        "requires_resume_sent": False,
+        "condition_rule_id": "",
+        "condition_branch": "always",
+    },
+]
 
 _generation_timers: dict[str, threading.Timer] = {}
 _generation_timers_lock = threading.Lock()
@@ -138,6 +283,259 @@ def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if "requires_user_input" in result:
         result["requires_user_input"] = bool(result["requires_user_input"])
     return result
+
+
+def _default_message_transform_rules() -> list[dict[str, Any]]:
+    return [dict(rule) for rule in DEFAULT_MESSAGE_TRANSFORM_RULES]
+
+
+def _upgrade_legacy_default_transform_rules(rules: list[dict[str, Any]]) -> bool:
+    """升级未改动的旧内置规则，保留用户自定义过的规则内容。"""
+    changed = False
+    defaults_by_id = {str(rule["id"]): rule for rule in _default_message_transform_rules()}
+    legacy_contents = {
+        "job-context": {r"沟通岗位：\1 · \2"},
+        "resume-sent": {"已发送附件简历"},
+        "resume-viewed": {"HR 已查看附件简历", "HR已查看附件简历"},
+        "resume-read": {"HR 已阅读附件简历", "HR已读附件简历"},
+        "resume-received": {"HR 已接收附件简历", "HR已接收附件简历"},
+    }
+    for rule in rules:
+        rule_id = str(rule.get("id") or "")
+        default = defaults_by_id.get(rule_id)
+        if default is None:
+            continue
+        if str(rule.get("display_content") or "") in legacy_contents.get(rule_id, set()):
+            for key in ("label", "direction", "match_mode", "pattern", "output_kind", "display_content", "action_type", "requires_resume_sent"):
+                if rule.get(key) != default[key]:
+                    rule[key] = default[key]
+                    changed = True
+        if rule_id == "resume-withdraw-requested" and str(rule.get("label") or "") == "我执行简历撤回操作":
+            rule["label"] = str(default["label"])
+            changed = True
+        legacy_condition_rule_ids = {
+            "resume_withdraw_requested": "resume-withdraw-requested",
+        }
+        legacy_condition_action_type = str(rule.pop("condition_action_type", "") or "")
+        if "condition_rule_id" not in rule:
+            rule["condition_rule_id"] = (
+                legacy_condition_rule_ids.get(legacy_condition_action_type)
+                or str(default["condition_rule_id"] or "")
+            )
+            changed = True
+        elif legacy_condition_action_type:
+            changed = True
+        for key in ("condition_branch",):
+            if key not in rule:
+                rule[key] = default[key]
+                changed = True
+    existing_rule_ids = {str(rule.get("id") or "") for rule in rules}
+    for rule_id in ("resume-viewed-by-hr", "resume-withdraw-requested", "resume-withdrawn", "resume-withdrawn-by-hr"):
+        if rule_id not in existing_rule_ids:
+            rules.append(dict(defaults_by_id[rule_id]))
+            changed = True
+    return changed
+
+
+def _message_transform_config(connection: sqlite3.Connection) -> dict[str, Any]:
+    row = connection.execute(
+        "SELECT rules_json, updated_at FROM fj_chat_message_transform_settings WHERE id = ?",
+        (MESSAGE_TRANSFORM_CONFIG_ID,),
+    ).fetchone()
+    if row is not None:
+        rules = _loads(str(row["rules_json"] or "[]"), [])
+        if isinstance(rules, list) and rules:
+            normalized_rules = [dict(rule) for rule in rules if isinstance(rule, dict)]
+            if _upgrade_legacy_default_transform_rules(normalized_rules):
+                now = _now()
+                connection.execute(
+                    "UPDATE fj_chat_message_transform_settings SET rules_json = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(normalized_rules, ensure_ascii=False), now, MESSAGE_TRANSFORM_CONFIG_ID),
+                )
+                return {"rules": normalized_rules, "updated_at": now}
+            return {"rules": normalized_rules, "updated_at": row["updated_at"]}
+    now = _now()
+    rules = _default_message_transform_rules()
+    connection.execute(
+        """
+        INSERT INTO fj_chat_message_transform_settings (id, rules_json, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET rules_json = excluded.rules_json, updated_at = excluded.updated_at
+        """,
+        (MESSAGE_TRANSFORM_CONFIG_ID, json.dumps(rules, ensure_ascii=False), now),
+    )
+    return {"rules": rules, "updated_at": now}
+
+
+def get_message_transform_config(db: Database) -> dict[str, Any]:
+    with db.connect() as connection:
+        return _message_transform_config(connection)
+
+
+def save_message_transform_config(db: Database, rules: list[dict[str, Any]]) -> dict[str, Any]:
+    rules_by_id = {str(rule.get("id") or ""): rule for rule in rules}
+    for rule in rules:
+        condition_branch = str(rule.get("condition_branch") or "always")
+        condition_rule_id = str(rule.get("condition_rule_id") or "").strip()
+        if condition_branch not in {"always", "if", "else"}:
+            raise AppError(
+                status_code=400,
+                error_category="CHAT_MESSAGE_TRANSFORM_CONDITION_INVALID",
+                error_message=f"规则“{rule.get('label') or rule.get('id')}”的条件分支无效。",
+            )
+        condition_rule = rules_by_id.get(condition_rule_id)
+        if condition_branch != "always" and not condition_rule_id:
+            raise AppError(
+                status_code=400,
+                error_category="CHAT_MESSAGE_TRANSFORM_CONDITION_RULE_REQUIRED",
+                error_message=f"规则“{rule.get('label') or rule.get('id')}”需要选择条件线。",
+            )
+        if condition_branch != "always" and (
+            condition_rule is None
+            or condition_rule.get("output_kind") != "action"
+            or not str(condition_rule.get("action_type") or "").strip()
+        ):
+            raise AppError(
+                status_code=400,
+                error_category="CHAT_MESSAGE_TRANSFORM_CONDITION_RULE_INVALID",
+                error_message=f"规则“{rule.get('label') or rule.get('id')}”选择的条件线无效。",
+            )
+        if str(rule.get("match_mode") or "") == "regex":
+            try:
+                re.compile(str(rule.get("pattern") or ""))
+            except re.error as exc:
+                raise AppError(
+                    status_code=400,
+                    error_category="CHAT_MESSAGE_TRANSFORM_REGEX_INVALID",
+                    error_message=f"规则“{rule.get('label') or rule.get('id')}”的正则表达式无效：{exc}",
+                ) from exc
+    now = _now()
+    with db.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO fj_chat_message_transform_settings (id, rules_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET rules_json = excluded.rules_json, updated_at = excluded.updated_at
+            """,
+            (MESSAGE_TRANSFORM_CONFIG_ID, json.dumps(rules, ensure_ascii=False), now),
+        )
+    return {"rules": rules, "updated_at": now}
+
+
+def reset_message_transform_config(db: Database) -> dict[str, Any]:
+    return save_message_transform_config(db, _default_message_transform_rules())
+
+
+def _has_sent_resume(connection: sqlite3.Connection, session_id: str) -> bool:
+    return connection.execute(
+        """
+        SELECT 1 FROM fj_chat_messages
+        WHERE session_id = ? AND direction = 'outbound'
+          AND (action_type = 'resume_sent' OR content = '附件状态更新')
+        LIMIT 1
+        """,
+        (session_id,),
+    ).fetchone() is not None
+
+
+def _has_prior_condition(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    condition_rule_id: str,
+    rules: list[dict[str, Any]],
+    occurred_at: str | None,
+) -> bool:
+    """判断当前消息之前是否已命中配置的条件线。"""
+    condition_rule = next(
+        (rule for rule in rules if str(rule.get("id") or "") == condition_rule_id),
+        None,
+    )
+    action_type = str(condition_rule.get("action_type") or "").strip() if condition_rule else ""
+    if not action_type:
+        return False
+    params: list[Any] = [session_id, action_type]
+    time_clause = ""
+    if occurred_at:
+        time_clause = " AND sent_at < ?"
+        params.append(occurred_at)
+    return connection.execute(
+        f"""
+        SELECT 1 FROM fj_chat_messages
+        WHERE session_id = ? AND display_kind = 'action' AND action_type = ?
+        {time_clause}
+        LIMIT 1
+        """,
+        tuple(params),
+    ).fetchone() is not None
+
+
+def _transform_message(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    direction: str,
+    message_type: str,
+    content: str,
+    rules: list[dict[str, Any]],
+    occurred_at: str | None = None,
+) -> dict[str, str] | None:
+    """将平台提示转为中立动作，避免它们被视作 HR 文本消息。"""
+    clean_content = content.strip()
+    for rule in rules:
+        if not rule.get("enabled") or rule.get("direction") != direction:
+            continue
+        pattern = str(rule.get("pattern") or "")
+        match_mode = str(rule.get("match_mode") or "")
+        matched = False
+        match: re.Match[str] | None = None
+        if match_mode == "exact":
+            matched = clean_content == pattern.strip()
+        elif match_mode == "contains":
+            matched = bool(pattern and pattern in clean_content)
+        elif match_mode == "regex":
+            try:
+                match = re.search(pattern, clean_content)
+            except re.error:
+                continue
+            matched = match is not None
+        if not matched:
+            continue
+        if rule.get("requires_resume_sent") and not _has_sent_resume(connection, session_id):
+            continue
+        condition_branch = str(rule.get("condition_branch") or "always")
+        condition_rule_id = str(rule.get("condition_rule_id") or "").strip()
+        has_prior_action = _has_prior_condition(
+            connection,
+            session_id=session_id,
+            condition_rule_id=condition_rule_id,
+            rules=rules,
+            occurred_at=occurred_at,
+        )
+        if condition_branch == "if" and not has_prior_action:
+            continue
+        if condition_branch == "else" and has_prior_action:
+            continue
+        if rule.get("output_kind") == "discard":
+            return None
+        display_content = str(rule.get("display_content") or clean_content)
+        if match is not None:
+            try:
+                display_content = match.expand(display_content)
+            except re.error:
+                display_content = str(rule.get("display_content") or clean_content)
+        return {
+            "message_type": "system",
+            "content": display_content.strip() or clean_content,
+            "display_kind": "action",
+            "action_type": str(rule.get("action_type") or ""),
+        }
+    return {
+        "message_type": message_type,
+        "content": clean_content,
+        "display_kind": "chat",
+        "action_type": "",
+    }
 
 
 def save_resume_attachment_snapshot(db: Database, captured: dict[str, Any]) -> dict[str, Any]:
@@ -356,6 +754,16 @@ def _resolve_job_id(connection: sqlite3.Connection, message: dict[str, Any]) -> 
     return None
 
 
+def _local_job_title(connection: sqlite3.Connection, job_id: str | None) -> str:
+    """只返回本地岗位库中的岗位标题。"""
+    if not job_id:
+        return ""
+    row = connection.execute(
+        "SELECT title FROM fj_boss_jobs WHERE id = ?", (job_id,)
+    ).fetchone()
+    return str(row["title"] or "") if row is not None else ""
+
+
 def _epoch_ms_to_iso(value: Any) -> str | None:
     """把 BOSS 列表中的毫秒时间戳转换为统一的 UTC 时间。"""
     try:
@@ -433,6 +841,7 @@ def sync_friend_list(
     created_session_ids: list[str] = []
     synced_at = _now()
     with db.connect() as connection:
+        transform_rules = _message_transform_config(connection)["rules"]
         # 保存 BOSS 原始数组位置，列表展示和批量队列共用这个顺序。
         for platform_list_index, raw in enumerate(items):
             if not isinstance(raw, dict) or not raw.get("uid"):
@@ -456,18 +865,14 @@ def sync_friend_list(
                     "encrypt_job_id": encrypt_job_id,
                 },
             )
-            job_title = str(raw.get("jobName") or raw.get("jobTitle") or "")
-            if not job_title and job_id:
-                job_row = connection.execute(
-                    "SELECT title FROM fj_boss_jobs WHERE id = ?", (job_id,)
-                ).fetchone()
-                job_title = str(job_row["title"] or "") if job_row else ""
             existing = _friend_session_row(
                 connection,
                 account_uid=account_uid,
                 peer_uid=peer_uid,
                 encrypt_job_id=encrypt_job_id,
             )
+            effective_job_id = job_id or (str(existing["job_id"] or "") if existing else "")
+            job_title = _local_job_title(connection, effective_job_id)
             latest_msg_id = str(info.get("msgId") or "")
             previous_msg_id = str(existing["platform_latest_msg_id"] or "") if existing else ""
             message_changed = bool(previous_msg_id and latest_msg_id and previous_msg_id != latest_msg_id)
@@ -477,10 +882,22 @@ def sync_friend_list(
             latest_message_text = str(
                 raw.get("lastMsg") or info.get("showText") or ""
             )
+            session_id = str(existing["id"]) if existing else _id("chat_session")
+            latest_direction = "outbound" if str(info.get("fromId") or "") == account_uid else "inbound"
+            transformed = _transform_message(
+                connection,
+                session_id=session_id,
+                direction=latest_direction,
+                message_type="text",
+                content=latest_message_text,
+                rules=transform_rules,
+                occurred_at=latest_message_at,
+            )
+            latest_display_kind = transformed["display_kind"] if transformed is not None else "chat"
+            latest_message_text = transformed["content"] if transformed is not None else ""
             identity_complete = bool(encrypt_peer_uid and security_id and encrypt_job_id)
             status = "active" if identity_complete else "unsupported"
             if existing is None:
-                session_id = _id("chat_session")
                 connection.execute(
                     """
                     INSERT INTO fj_chat_sessions (
@@ -489,10 +906,11 @@ def sync_friend_list(
                       peer_title,
                       platform_latest_msg_id, platform_latest_message_status,
                       platform_relation_type, platform_chat_status, platform_latest_message_text,
+                      platform_latest_display_kind,
                       platform_latest_message_at, platform_latest_from_id, platform_latest_to_id,
                       platform_synced_at, platform_list_index, message_update_required, status, session_version,
                       created_at, updated_at
-                    ) VALUES (?, 'boss', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                    ) VALUES (?, 'boss', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                     """,
                     (
                         session_id,
@@ -511,6 +929,7 @@ def sync_friend_list(
                         _optional_int(raw.get("relationType")),
                         _optional_int(raw.get("chatStatus")),
                         latest_message_text,
+                        latest_display_kind,
                         latest_message_at,
                         str(info.get("fromId") or ""),
                         str(info.get("toId") or ""),
@@ -539,7 +958,7 @@ def sync_friend_list(
                   security_id = CASE WHEN ? <> '' THEN ? ELSE security_id END,
                   job_id = COALESCE(?, job_id),
                   encrypt_job_id = CASE WHEN encrypt_job_id = '' AND ? <> '' THEN ? ELSE encrypt_job_id END,
-                  job_title = CASE WHEN ? <> '' THEN ? ELSE job_title END,
+                  job_title = ?,
                   peer_name = CASE WHEN ? <> '' THEN ? ELSE peer_name END,
                   peer_title = CASE WHEN ? <> '' THEN ? ELSE peer_title END,
                   company_name = CASE WHEN ? <> '' THEN ? ELSE company_name END,
@@ -548,6 +967,7 @@ def sync_friend_list(
                   platform_relation_type = ?,
                   platform_chat_status = ?,
                   platform_latest_message_text = ?,
+                  platform_latest_display_kind = ?,
                   platform_latest_message_at = ?,
                   platform_latest_from_id = ?,
                   platform_latest_to_id = ?,
@@ -567,7 +987,6 @@ def sync_friend_list(
                     encrypt_job_id,
                     encrypt_job_id,
                     job_title,
-                    job_title,
                     str(raw.get("name") or ""),
                     str(raw.get("name") or ""),
                     str(raw.get("title") or ""),
@@ -579,6 +998,7 @@ def sync_friend_list(
                     _optional_int(raw.get("relationType")),
                     _optional_int(raw.get("chatStatus")),
                     latest_message_text,
+                    latest_display_kind,
                     latest_message_at,
                     str(info.get("fromId") or ""),
                     str(info.get("toId") or ""),
@@ -675,6 +1095,71 @@ def refresh_session_history(db: Database, session_id: str) -> dict[str, Any]:
     )
 
 
+def force_refresh_session_history(db: Database, session_id: str) -> dict[str, Any]:
+    """绕过本地更新判断，直接读取页面消息并按当前规则刷新展示。"""
+    result = refresh_session_history(db, session_id)
+    retransformed = retransform_session_messages(db, session_id)
+    return {
+        **result,
+        "retransformed_count": retransformed["updated_count"],
+        "discarded_count": retransformed["discarded_count"],
+    }
+
+
+def _history_client_mid(raw: dict[str, Any]) -> str:
+    """读取历史记录可能携带的客户端消息 ID。"""
+    for key in ("cmid", "clientMid", "client_mid"):
+        value = raw.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _history_message_status(raw: dict[str, Any]) -> int | None:
+    """读取历史消息的送达和已读状态。"""
+    status = _optional_int(raw.get("status"))
+    return status if status in {0, 1, 2} else None
+
+
+def _find_provisional_message_for_history(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    platform_message_id: str,
+    direction: str,
+    client_mid: str,
+) -> sqlite3.Row | None:
+    """根据同一 client_mid 将临时消息关联到 BOSS 官方 mid。"""
+    candidate_client_mids = [client_mid] if client_mid else []
+    if direction == "outbound" and not candidate_client_mids:
+        action = connection.execute(
+            """
+            SELECT client_mid FROM fj_chat_send_actions
+            WHERE session_id = ? AND platform_message_id = ? AND client_mid <> ''
+            ORDER BY updated_at DESC LIMIT 1
+            """,
+            (session_id, platform_message_id),
+        ).fetchone()
+        if action is not None:
+            candidate_client_mids.append(str(action["client_mid"]))
+
+    for candidate_client_mid in candidate_client_mids:
+        row = connection.execute(
+            """
+            SELECT * FROM fj_chat_messages
+            WHERE session_id = ?
+              AND client_mid = ?
+              AND platform_message_id <> ?
+              AND (platform_message_id = client_mid OR platform_message_id LIKE 'assistant:%')
+            ORDER BY rowid DESC LIMIT 1
+            """,
+            (session_id, candidate_client_mid, platform_message_id),
+        ).fetchone()
+        if row is not None:
+            return row
+    return None
+
+
 def sync_history_messages(
     db: Database,
     *,
@@ -685,14 +1170,20 @@ def sync_history_messages(
 ) -> dict[str, Any]:
     """保存一页历史消息，按平台 mid 去重并更新会话分页状态。"""
     inserted_count = 0
+    reconciled_count = 0
     now = _now()
     with db.connect() as connection:
         session = _session_or_404(connection, session_id)
         account_uid = str(session["account_uid"] or "")
-        for raw in messages:
-            if not isinstance(raw, dict) or not raw.get("mid"):
-                continue
+        transform_rules = _message_transform_config(connection)["rules"]
+        processed_platform_message_ids: set[str] = set()
+        ordered_messages = sorted(
+            (raw for raw in messages if isinstance(raw, dict) and raw.get("mid")),
+            key=lambda raw: (str(raw.get("time") or ""), str(raw.get("mid") or "")),
+        )
+        for raw in ordered_messages:
             message_id = str(raw["mid"])
+            processed_platform_message_ids.add(message_id)
             sender = raw.get("from") if isinstance(raw.get("from"), dict) else {}
             receiver = raw.get("to") if isinstance(raw.get("to"), dict) else {}
             sender_uid = str(sender.get("uid") or "")
@@ -702,41 +1193,164 @@ def sync_history_messages(
             body_type = _optional_int(body.get("type"))
             message_type = "text" if body_type == 1 else "system"
             sent_at = _epoch_ms_to_iso(raw.get("time")) or now
+            message_status = _history_message_status(raw)
+            transformed = _transform_message(
+                connection,
+                session_id=session_id,
+                direction=direction,
+                message_type=message_type,
+                content=_history_message_content(raw),
+                rules=transform_rules,
+                occurred_at=sent_at,
+            )
+            if transformed is None:
+                # 命中过滤规则的历史消息需同步隐藏已保存的旧展示记录。
+                connection.execute(
+                    """
+                    UPDATE fj_chat_messages
+                    SET message_type = 'system', content = '', display_kind = 'discard', action_type = '',
+                        status = COALESCE(?, status), observed_at = ?
+                    WHERE session_id = ? AND platform_message_id = ?
+                    """,
+                    (message_status, now, session_id, message_id),
+                )
+                continue
+            client_mid = _history_client_mid(raw)
+            existing = connection.execute(
+                """
+                SELECT id FROM fj_chat_messages
+                WHERE session_id = ? AND platform_message_id = ?
+                LIMIT 1
+                """,
+                (session_id, message_id),
+            ).fetchone()
+            provisional = _find_provisional_message_for_history(
+                connection,
+                session_id=session_id,
+                platform_message_id=message_id,
+                direction=direction,
+                client_mid=client_mid,
+            )
+            if existing is not None and provisional is None:
+                # 历史消息按当前规则重写展示语义，并补充平台返回的状态。
+                connection.execute(
+                    """
+                    UPDATE fj_chat_messages
+                    SET message_type = ?, content = ?, display_kind = ?, action_type = ?,
+                        status = COALESCE(?, status), observed_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        transformed["message_type"],
+                        transformed["content"],
+                        transformed["display_kind"],
+                        transformed["action_type"],
+                        message_status,
+                        now,
+                        existing["id"],
+                    ),
+                )
+                continue
+            if provisional is not None:
+                if existing is not None:
+                    # 旧版本已插入两行时，保留临时行的本地引用并移除官方 mid 的重复行。
+                    connection.execute(
+                        """
+                        UPDATE fj_chat_reply_tasks SET based_on_message_id = ?
+                        WHERE based_on_message_id = ?
+                        """,
+                        (provisional["id"], existing["id"]),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE fj_chat_sessions
+                        SET latest_message_id = CASE WHEN latest_message_id = ? THEN ? ELSE latest_message_id END,
+                            latest_inbound_message_id = CASE WHEN latest_inbound_message_id = ? THEN ? ELSE latest_inbound_message_id END
+                        WHERE id = ?
+                        """,
+                        (existing["id"], provisional["id"], existing["id"], provisional["id"], session_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE fj_job_activity_events SET source_ref_id = ?
+                        WHERE source_ref_type = 'chat_message' AND source_ref_id = ?
+                        """,
+                        (provisional["id"], existing["id"]),
+                    )
+                    connection.execute(
+                        "DELETE FROM fj_chat_messages WHERE id = ?",
+                        (existing["id"],),
+                    )
+                # 官方 mid 到达时只回填同一条临时消息，保留本地消息和活动记录的关联。
+                connection.execute(
+                    """
+                    UPDATE fj_chat_messages
+                    SET platform_message_id = ?, direction = ?, message_type = ?, content = ?,
+                        display_kind = ?, action_type = ?, status = ?, sender_uid = ?, receiver_uid = ?,
+                        client_mid = CASE WHEN ? <> '' THEN ? ELSE client_mid END,
+                        sent_at = ?, observed_at = ?, raw_meta_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        message_id,
+                        direction,
+                        transformed["message_type"],
+                        transformed["content"],
+                        transformed["display_kind"],
+                        transformed["action_type"],
+                        message_status,
+                        sender_uid,
+                        receiver_uid,
+                        client_mid,
+                        client_mid,
+                        sent_at,
+                        now,
+                        json.dumps({"history": True, "evidence_source": "history_record", "platform_type": raw.get("type")}, ensure_ascii=False),
+                        provisional["id"],
+                    ),
+                )
+                reconciled_count += 1
+                continue
             local_message_id = _id("chat_message")
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO fj_chat_messages (
                   id, session_id, platform_message_id, direction, message_type,
-                  content, sender_uid, receiver_uid, client_mid, source,
+                  content, display_kind, action_type, status, sender_uid, receiver_uid, client_mid, source,
                   sent_at, observed_at, raw_meta_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 'websocket', ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'websocket', ?, ?, ?, ?)
                 """,
                 (
                     local_message_id,
                     session_id,
                     message_id,
                     direction,
-                    message_type,
-                    _history_message_content(raw),
+                    transformed["message_type"],
+                    transformed["content"],
+                    transformed["display_kind"],
+                    transformed["action_type"],
+                    message_status,
                     sender_uid,
                     receiver_uid,
+                    client_mid,
                     sent_at,
                     now,
-                    json.dumps({"history": True, "evidence_source": "history_record", "platform_type": raw.get("type"), "raw": raw}, ensure_ascii=False),
+                    json.dumps({"history": True, "evidence_source": "history_record", "platform_type": raw.get("type")}, ensure_ascii=False),
                     now,
                 ),
             )
             inserted_count += int(cursor.rowcount > 0)
             if cursor.rowcount > 0:
-                _record_message_activity(
-                    connection,
-                    session_id=session_id,
-                    message_id=local_message_id,
-                    direction=direction,
-                    occurred_at=sent_at,
-                    platform_message_id=message_id,
-                )
-                if direction == "outbound":
+                if transformed["display_kind"] == "chat":
+                    _record_message_activity(
+                        connection,
+                        session_id=session_id,
+                        message_id=local_message_id,
+                        direction=direction,
+                        occurred_at=sent_at,
+                        platform_message_id=message_id,
+                    )
+                if direction == "outbound" and transformed["display_kind"] == "chat":
                     observe_outbound_chat_message(connection, message_id=local_message_id)
 
         latest = connection.execute(
@@ -750,16 +1364,19 @@ def sync_history_messages(
         latest_inbound = connection.execute(
             """
             SELECT id FROM fj_chat_messages
-            WHERE session_id = ? AND direction = 'inbound'
+            WHERE session_id = ? AND direction = 'inbound' AND display_kind = 'chat'
             ORDER BY sent_at DESC, rowid DESC LIMIT 1
             """,
             (session_id,),
         ).fetchone()
         current_platform_msg_id = str(session["platform_latest_msg_id"] or "")
-        current_message_loaded = bool(current_platform_msg_id and connection.execute(
-            "SELECT 1 FROM fj_chat_messages WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
-            (session_id, current_platform_msg_id),
-        ).fetchone())
+        current_message_loaded = bool(
+            current_platform_msg_id in processed_platform_message_ids
+            or (current_platform_msg_id and connection.execute(
+                "SELECT 1 FROM fj_chat_messages WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
+                (session_id, current_platform_msg_id),
+            ).fetchone())
+        )
         next_version = int(session["session_version"] or 0) + inserted_count
         assignments = [
             "session_version = ?",
@@ -798,6 +1415,7 @@ def sync_history_messages(
             "session_id": session_id,
             "fetched_count": len(messages),
             "inserted_count": inserted_count,
+            "reconciled_count": reconciled_count,
             "message_update_required": bool(current_platform_msg_id and not current_message_loaded),
             "has_more": bool(updated_session["history_has_more"]),
         }
@@ -835,6 +1453,7 @@ def _find_or_create_session(
             row = related[0]
     now = _now()
     job_id = _resolve_job_id(connection, message)
+    job_title = _local_job_title(connection, job_id)
     identity_complete = bool(
         encrypt_job_id
         and message.get("encrypt_peer_uid")
@@ -858,7 +1477,7 @@ def _find_or_create_session(
                 message.get("security_id") or "",
                 job_id,
                 encrypt_job_id,
-                message.get("job_title") or "",
+                job_title,
                 message.get("peer_name") or "",
                 message.get("company_name") or "",
                 "active" if identity_complete else "unsupported",
@@ -878,7 +1497,7 @@ def _find_or_create_session(
           security_id = CASE WHEN ? <> '' THEN ? ELSE security_id END,
           encrypt_job_id = CASE WHEN encrypt_job_id = '' AND ? <> '' THEN ? ELSE encrypt_job_id END,
           job_id = COALESCE(?, job_id),
-          job_title = CASE WHEN ? <> '' THEN ? ELSE job_title END,
+          job_title = CASE WHEN ? IS NOT NULL THEN ? ELSE job_title END,
           peer_name = CASE WHEN ? <> '' THEN ? ELSE peer_name END,
           company_name = CASE WHEN ? <> '' THEN ? ELSE company_name END,
           status = CASE
@@ -896,8 +1515,8 @@ def _find_or_create_session(
             encrypt_job_id,
             encrypt_job_id,
             job_id,
-            message.get("job_title") or "",
-            message.get("job_title") or "",
+            job_id,
+            job_title,
             message.get("peer_name") or "",
             message.get("peer_name") or "",
             message.get("company_name") or "",
@@ -1058,6 +1677,7 @@ def ingest_events(
     queued_task_ids: list[str] = []
     with db.connect() as connection:
         runtime = _ensure_runtime(connection)
+        transform_rules = _message_transform_config(connection)["rules"]
         trigger = {
             "immediate": "realtime",
             "interval": "interval",
@@ -1175,6 +1795,22 @@ def ingest_events(
                 account_uid=event["account_uid"],
                 message=message,
             )
+            transformed = _transform_message(
+                connection,
+                session_id=str(session["id"]),
+                direction=str(message.get("direction") or "inbound"),
+                message_type=str(message.get("message_type") or "text"),
+                content=str(message.get("content") or ""),
+                rules=transform_rules,
+                occurred_at=str(message.get("sent_at") or "") or None,
+            )
+            if transformed is None:
+                ignored += 1
+                continue
+            message = {
+                **message,
+                **transformed,
+            }
             stored_raw_meta = dict(message.get("raw_meta") or {})
             stored_raw_meta.update({
                 "frame_origin": message.get("frame_origin") or "remote_message",
@@ -1199,7 +1835,7 @@ def ingest_events(
                         """
                         UPDATE fj_chat_messages
                         SET platform_message_id = ?, direction = ?, message_type = ?, content = ?,
-                            sender_uid = ?, receiver_uid = ?, source = 'assistant', sent_at = ?,
+                            display_kind = ?, action_type = ?, sender_uid = ?, receiver_uid = ?, source = 'assistant', sent_at = ?,
                             observed_at = ?, raw_meta_json = ?
                         WHERE id = ?
                         """,
@@ -1208,6 +1844,8 @@ def ingest_events(
                             message["direction"],
                             message.get("message_type") or "text",
                             message.get("content") or "",
+                            message.get("display_kind") or "chat",
+                            message.get("action_type") or "",
                             message.get("sender_uid") or "",
                             message.get("receiver_uid") or "",
                             message["sent_at"],
@@ -1221,9 +1859,9 @@ def ingest_events(
                         """
                         INSERT INTO fj_chat_messages (
                           id, session_id, platform_message_id, direction, message_type,
-                          content, sender_uid, receiver_uid, client_mid, source,
+                          content, display_kind, action_type, sender_uid, receiver_uid, client_mid, source,
                           sent_at, observed_at, raw_meta_json, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             message_id,
@@ -1232,6 +1870,8 @@ def ingest_events(
                             message["direction"],
                             message.get("message_type") or "text",
                             message.get("content") or "",
+                            message.get("display_kind") or "chat",
+                            message.get("action_type") or "",
                             message.get("sender_uid") or "",
                             message.get("receiver_uid") or "",
                             message.get("client_mid") or "",
@@ -1245,22 +1885,27 @@ def ingest_events(
             except sqlite3.IntegrityError:
                 duplicates += 1
                 continue
-            _record_message_activity(
-                connection,
-                session_id=str(session["id"]),
-                message_id=message_id,
-                direction=str(message["direction"]),
-                occurred_at=str(message["sent_at"]),
-                platform_message_id=str(message["platform_message_id"]),
-            )
-            if message["direction"] == "outbound":
+            if message.get("display_kind") == "chat":
+                _record_message_activity(
+                    connection,
+                    session_id=str(session["id"]),
+                    message_id=message_id,
+                    direction=str(message["direction"]),
+                    occurred_at=str(message["sent_at"]),
+                    platform_message_id=str(message["platform_message_id"]),
+                )
+            if message["direction"] == "outbound" and message.get("display_kind") == "chat":
                 observe_outbound_chat_message(
                     connection,
                     message_id=message_id,
                     observed_account_uid=str(event["account_uid"]),
                 )
             next_version = int(session["session_version"]) + 1
-            inbound_id = message_id if message["direction"] == "inbound" else session["latest_inbound_message_id"]
+            inbound_id = (
+                message_id
+                if message["direction"] == "inbound" and message.get("display_kind") == "chat"
+                else session["latest_inbound_message_id"]
+            )
             next_status = session["status"]
             connection.execute(
                 """
@@ -1279,7 +1924,11 @@ def ingest_events(
                     session["id"],
                 ),
             )
-            if message["direction"] == "inbound" and message.get("message_type", "text") == "text":
+            if (
+                message["direction"] == "inbound"
+                and message.get("display_kind") == "chat"
+                and message.get("message_type", "text") == "text"
+            ):
                 refreshed = connection.execute(
                     "SELECT * FROM fj_chat_sessions WHERE id = ?", (session["id"],)
                 ).fetchone()
@@ -1318,6 +1967,8 @@ def _session_payload(
 ) -> dict[str, Any]:
     payload = _row(row) or {}
     if connection is not None:
+        # 聊天侧岗位标题不参与页面展示，始终从本地岗位关联重新计算。
+        payload["job_title"] = ""
         history = None
         if payload.get("job_id"):
             history = connection.execute(
@@ -1330,9 +1981,7 @@ def _session_payload(
             ).fetchone()
         if history is not None:
             payload["job_id"] = str(history["id"])
-            # 历史岗位已拿到标题时，优先补齐旧会话留下的空标题。
-            if not payload.get("job_title"):
-                payload["job_title"] = str(history["title"] or "")
+            payload["job_title"] = str(history["title"] or "")
         if "attention_status" not in payload:
             attention = connection.execute(
                 """
@@ -1409,13 +2058,22 @@ def list_sessions(
         rows = connection.execute(
             f"""
             SELECT s.*,
-              COALESCE(NULLIF(s.platform_latest_message_text, ''), m.content) AS latest_message_content,
+              CASE
+                WHEN m.platform_message_id = s.platform_latest_msg_id THEN m.content
+                WHEN s.platform_latest_msg_id <> '' THEN s.platform_latest_message_text
+                ELSE m.content
+              END AS latest_message_content,
               CASE
                 WHEN s.platform_latest_msg_id <> '' AND s.platform_latest_from_id = s.account_uid THEN 'outbound'
                 WHEN s.platform_latest_msg_id <> '' AND s.platform_latest_to_id = s.account_uid THEN 'inbound'
                 WHEN m.id IS NOT NULL THEN m.direction
                 ELSE NULL
               END AS latest_message_direction,
+              CASE
+                WHEN m.platform_message_id = s.platform_latest_msg_id THEN m.display_kind
+                WHEN s.platform_latest_msg_id <> '' THEN s.platform_latest_display_kind
+                ELSE 'chat'
+              END AS latest_message_display_kind,
               s.platform_latest_msg_id AS latest_platform_msg_id,
               s.platform_latest_message_status,
               s.platform_relation_type,
@@ -1466,7 +2124,8 @@ def get_session(db: Database, session_id: str) -> dict[str, Any]:
         messages = connection.execute(
             """
             SELECT * FROM fj_chat_messages
-            WHERE session_id = ?
+            WHERE session_id = ? AND display_kind <> 'discard'
+              AND (message_type <> 'text' OR TRIM(content) <> '')
             ORDER BY sent_at ASC, rowid ASC
             """,
             (session_id,),
@@ -1489,7 +2148,11 @@ def get_session(db: Database, session_id: str) -> dict[str, Any]:
                 resume_attachments = [item for item in attachments if isinstance(item, dict)]
                 break
         message_count = int(connection.execute(
-            "SELECT COUNT(*) FROM fj_chat_messages WHERE session_id = ?",
+            """
+            SELECT COUNT(*) FROM fj_chat_messages
+            WHERE session_id = ? AND display_kind <> 'discard'
+              AND (message_type <> 'text' OR TRIM(content) <> '')
+            """,
             (session_id,),
         ).fetchone()[0])
         insight = connection.execute(
@@ -1511,6 +2174,154 @@ def get_session(db: Database, session_id: str) -> dict[str, Any]:
             "latest_conversation_insight": _row(insight),
             "messages_truncated": False,
             "message_count": message_count,
+        }
+
+
+def retransform_session_messages(db: Database, session_id: str) -> dict[str, Any]:
+    """按当前全局规则重写当前会话已保存消息的展示语义。"""
+    with db.connect() as connection:
+        session = _session_or_404(connection, session_id)
+        rules = _message_transform_config(connection)["rules"]
+        rows = connection.execute(
+            """
+            SELECT * FROM fj_chat_messages
+            WHERE session_id = ?
+            ORDER BY sent_at ASC, rowid ASC
+            """,
+            (session_id,),
+        ).fetchall()
+        updated_count = 0
+        discarded_count = 0
+        reclassified_message_ids: list[str] = []
+        latest_platform_content: str | None = None
+        latest_platform_display_kind: str | None = None
+        for row in rows:
+            # 已完成转义或已过滤的记录没有保留原始正文，保持当前展示语义。
+            current_display_kind = str(row["display_kind"] or "chat")
+            if current_display_kind == "action":
+                current_action_type = str(row["action_type"] or "")
+                current_content = str(row["content"] or "")
+                if current_action_type == "resume_read" and current_content in {"HR 已阅读附件简历", "HR已读附件简历"}:
+                    current_action_type = "resume_sent_confirmed"
+                elif current_action_type == "resume_viewed" and current_content in {"HR 已查看附件简历", "HR已查看附件简历"}:
+                    current_action_type = "resume_message_read"
+                action_rule = next((
+                    rule for rule in rules
+                    if rule.get("enabled")
+                    and rule.get("output_kind") == "action"
+                    and str(rule.get("action_type") or "") == current_action_type
+                ), None)
+                if action_rule is not None:
+                    next_content = str(action_rule.get("display_content") or row["content"])
+                    if str(row["content"]) != next_content or str(row["action_type"] or "") != current_action_type:
+                        connection.execute(
+                            "UPDATE fj_chat_messages SET content = ?, action_type = ? WHERE id = ?",
+                            (next_content, current_action_type, row["id"]),
+                        )
+                        updated_count += 1
+                        if str(row["platform_message_id"]) == str(session["platform_latest_msg_id"] or ""):
+                            latest_platform_content = next_content
+                            latest_platform_display_kind = "action"
+                continue
+            if current_display_kind != "chat":
+                continue
+            transformed = _transform_message(
+                connection,
+                session_id=session_id,
+                direction=str(row["direction"]),
+                message_type=str(row["message_type"]),
+                content=str(row["content"]),
+                rules=rules,
+                occurred_at=str(row["sent_at"] or "") or None,
+            )
+            if transformed is None:
+                next_message_type = "system"
+                next_content = ""
+                next_display_kind = "discard"
+                next_action_type = ""
+                discarded_count += 1
+            else:
+                next_message_type = transformed["message_type"]
+                next_content = transformed["content"]
+                next_display_kind = transformed["display_kind"]
+                next_action_type = transformed["action_type"]
+            if (
+                str(row["message_type"]) == next_message_type
+                and str(row["content"]) == next_content
+                and str(row["display_kind"] or "chat") == next_display_kind
+                and str(row["action_type"] or "") == next_action_type
+            ):
+                continue
+            connection.execute(
+                """
+                UPDATE fj_chat_messages
+                SET message_type = ?, content = ?, display_kind = ?, action_type = ?
+                WHERE id = ?
+                """,
+                (next_message_type, next_content, next_display_kind, next_action_type, row["id"]),
+            )
+            updated_count += 1
+            if next_display_kind != "chat":
+                reclassified_message_ids.append(str(row["id"]))
+            if str(row["platform_message_id"]) == str(session["platform_latest_msg_id"] or ""):
+                latest_platform_content = next_content
+                latest_platform_display_kind = next_display_kind
+
+        latest = connection.execute(
+            """
+            SELECT * FROM fj_chat_messages
+            WHERE session_id = ? AND display_kind <> 'discard'
+            ORDER BY sent_at DESC, rowid DESC LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        latest_inbound = connection.execute(
+            """
+            SELECT id FROM fj_chat_messages
+            WHERE session_id = ? AND direction = 'inbound' AND display_kind = 'chat'
+            ORDER BY sent_at DESC, rowid DESC LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        if reclassified_message_ids:
+            placeholders = ", ".join("?" for _ in reclassified_message_ids)
+            connection.execute(
+                f"""
+                UPDATE fj_chat_reply_tasks
+                SET status = 'stale', cancelled_at = ?, updated_at = ?
+                WHERE based_on_message_id IN ({placeholders})
+                  AND status IN ('pending_generation', 'generating', 'awaiting_review')
+                """,
+                (_now(), _now(), *reclassified_message_ids),
+            )
+        assignments = [
+            "latest_message_id = ?",
+            "latest_inbound_message_id = ?",
+            "last_message_at = ?",
+            "session_version = ?",
+            "updated_at = ?",
+        ]
+        params: list[Any] = [
+            latest["id"] if latest else None,
+            latest_inbound["id"] if latest_inbound else None,
+            latest["sent_at"] if latest else None,
+            int(session["session_version"] or 0) + int(updated_count > 0),
+            _now(),
+        ]
+        if latest_platform_content is not None:
+            assignments.extend([
+                "platform_latest_message_text = ?",
+                "platform_latest_display_kind = ?",
+            ])
+            params.extend([latest_platform_content, latest_platform_display_kind])
+        connection.execute(
+            f"UPDATE fj_chat_sessions SET {', '.join(assignments)} WHERE id = ?",
+            (*params, session_id),
+        )
+        return {
+            "session_id": session_id,
+            "updated_count": updated_count,
+            "discarded_count": discarded_count,
         }
 
 
@@ -1610,7 +2421,7 @@ def _derive_chat_application_status(
             """
             SELECT 1 FROM fj_chat_messages
             WHERE session_id = ? AND direction = 'outbound'
-              AND content = '附件状态更新'
+              AND (action_type = 'resume_sent' OR content = '附件状态更新')
             LIMIT 1
             """,
             (session_id,),
@@ -1646,8 +2457,10 @@ def _derive_chat_application_status(
 def _build_context(db: Database, connection: sqlite3.Connection, session: sqlite3.Row) -> dict[str, Any]:
     messages = [dict(row) for row in connection.execute(
         """
-        SELECT direction, message_type, content, sent_at
-        FROM fj_chat_messages WHERE session_id = ?
+        SELECT direction, message_type, display_kind, action_type, content, sent_at
+        FROM fj_chat_messages
+        WHERE session_id = ? AND display_kind <> 'discard'
+          AND (message_type <> 'text' OR TRIM(content) <> '')
         ORDER BY sent_at DESC, rowid DESC LIMIT 20
         """,
         (session["id"],),

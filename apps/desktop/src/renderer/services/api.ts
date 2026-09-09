@@ -63,6 +63,10 @@
   FineJobBossNavigationTask,
   FineJobOperationsDashboard,
   FineJobChatRuntime,
+  FineJobChatMessageRetransformResponse,
+  FineJobChatForceRefreshResponse,
+  FineJobChatMessageTransformConfig,
+  FineJobChatMessageTransformRule,
   FineJobConversationInsight,
   FineJobChatRuntimeEnvelope,
   FineJobChatSessionDetail,
@@ -1049,6 +1053,23 @@ export const api = {
       body: JSON.stringify(payload)
     });
   },
+  async getFineJobChatMessageTransformConfig() {
+    return request<FineJobChatMessageTransformConfig>(
+      "/api/fine-job/boss-chat/message-transform-config"
+    );
+  },
+  async saveFineJobChatMessageTransformConfig(rules: FineJobChatMessageTransformRule[]) {
+    return request<FineJobChatMessageTransformConfig>(
+      "/api/fine-job/boss-chat/message-transform-config",
+      { method: "PUT", body: JSON.stringify({ rules }) }
+    );
+  },
+  async resetFineJobChatMessageTransformConfig() {
+    return request<FineJobChatMessageTransformConfig>(
+      "/api/fine-job/boss-chat/message-transform-config/reset",
+      { method: "POST" }
+    );
+  },
   async checkFineJobChatNow() {
     return request<{ generated: number }>("/api/fine-job/boss-chat/check", { method: "POST" });
   },
@@ -1083,9 +1104,21 @@ export const api = {
       `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}`
     );
   },
+  async retransformFineJobChatMessages(sessionId: string) {
+    return request<FineJobChatMessageRetransformResponse>(
+      `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/messages/retransform`,
+      { method: "POST" }
+    );
+  },
   async refreshFineJobChatHistory(sessionId: string) {
     return request<FineJobChatHistoryRefreshResponse>(
       `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/history/refresh`,
+      { method: "POST" }
+    );
+  },
+  async forceRefreshFineJobChatHistory(sessionId: string) {
+    return request<FineJobChatForceRefreshResponse>(
+      `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/history/force-refresh`,
       { method: "POST" }
     );
   },

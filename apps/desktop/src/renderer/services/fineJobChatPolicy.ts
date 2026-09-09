@@ -10,7 +10,6 @@ export const canConfirmFineJobChatReply = (input: {
   session: FineJobChatSession | null;
   task: FineJobChatReplyTask | null;
   finalText: string;
-  leaderAvailable: boolean;
 }): boolean => fineJobChatConfirmBlocker(input) === "";
 
 export const fineJobChatConfirmBlocker = (input: {
@@ -18,7 +17,6 @@ export const fineJobChatConfirmBlocker = (input: {
   session: FineJobChatSession | null;
   task: FineJobChatReplyTask | null;
   finalText: string;
-  leaderAvailable: boolean;
 }): string => {
   if (!input.session) return "请先选择聊天会话。";
   if (input.session.status === "unsupported") return "聊天对象身份不完整，请先在 BOSS 打开对应会话。";
@@ -28,7 +26,6 @@ export const fineJobChatConfirmBlocker = (input: {
   }
   if (!input.finalText.trim()) return "回复正文不能为空。";
   if (!input.runtime?.send_enabled) return "发送权限尚未开启。";
-  if (!input.leaderAvailable) return "等待对应 BOSS 账号的插件领导标签页上线。";
   return "";
 };
 

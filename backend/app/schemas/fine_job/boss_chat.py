@@ -19,6 +19,31 @@ class BossChatRuntimeUpdateRequest(BaseModel):
         return self
 
 
+class BossChatMessageTransformRule(BaseModel):
+    id: str = Field(min_length=1, max_length=80)
+    label: str = Field(min_length=1, max_length=80)
+    enabled: bool = True
+    direction: Literal["inbound", "outbound"]
+    match_mode: Literal["exact", "contains", "regex"]
+    pattern: str = Field(min_length=1, max_length=500)
+    output_kind: Literal["action", "discard"]
+    display_content: str = Field(default="", max_length=500)
+    action_type: str = Field(default="", max_length=80)
+    requires_resume_sent: bool = False
+    condition_rule_id: str = Field(default="", max_length=80)
+    condition_branch: Literal["always", "if", "else"] = "always"
+
+    @model_validator(mode="after")
+    def validate_condition(self):
+        if self.condition_branch != "always" and not self.condition_rule_id.strip():
+            raise ValueError("条件分支需要选择条件线")
+        return self
+
+
+class BossChatMessageTransformConfigRequest(BaseModel):
+    rules: list[BossChatMessageTransformRule] = Field(min_length=1, max_length=30)
+
+
 class BossChatFriendListRefreshResponse(BaseModel):
     account_uid: str
     count: int

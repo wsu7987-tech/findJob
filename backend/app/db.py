@@ -1347,6 +1347,7 @@ CREATE TABLE IF NOT EXISTS fj_chat_sessions (
   platform_relation_type INTEGER,
   platform_chat_status INTEGER,
   platform_latest_message_text TEXT NOT NULL DEFAULT '',
+  platform_latest_display_kind TEXT NOT NULL DEFAULT 'chat',
   platform_latest_message_at TEXT,
   platform_latest_from_id TEXT NOT NULL DEFAULT '',
   platform_latest_to_id TEXT NOT NULL DEFAULT '',
@@ -1388,6 +1389,9 @@ CREATE TABLE IF NOT EXISTS fj_chat_messages (
   direction TEXT NOT NULL,
   message_type TEXT NOT NULL DEFAULT 'text',
   content TEXT NOT NULL DEFAULT '',
+  display_kind TEXT NOT NULL DEFAULT 'chat',
+  action_type TEXT NOT NULL DEFAULT '',
+  status INTEGER,
   sender_uid TEXT NOT NULL DEFAULT '',
   receiver_uid TEXT NOT NULL DEFAULT '',
   client_mid TEXT NOT NULL DEFAULT '',
@@ -2109,6 +2113,7 @@ class Database:
             self._ensure_fj_boss_executor_schema(connection)
             self._ensure_fj_company_governance_schema(connection)
             self._ensure_fj_execution_observability_schema(connection)
+            self._ensure_fj_chat_message_transform_schema(connection)
             self._ensure_codex_integration_schema(connection)
             self._ensure_resume_analysis_v2_schema(connection)
             self._ensure_resume_analysis_v3_schema(connection)
@@ -2214,6 +2219,40 @@ class Database:
                 connection.execute(
                     f"ALTER TABLE fj_chat_send_actions ADD COLUMN {column} {definition}"
                 )
+
+    def _ensure_fj_chat_message_transform_schema(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """补齐自动代聊消息转义配置与展示字段。"""
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fj_chat_message_transform_settings (
+              id TEXT PRIMARY KEY,
+              rules_json TEXT NOT NULL DEFAULT '[]',
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(fj_chat_messages)")
+        }
+        for column, definition in (
+            ("display_kind", "TEXT NOT NULL DEFAULT 'chat'"),
+            ("action_type", "TEXT NOT NULL DEFAULT ''"),
+            ("status", "INTEGER"),
+        ):
+            if column not in columns:
+                connection.execute(
+                    f"ALTER TABLE fj_chat_messages ADD COLUMN {column} {definition}"
+                )
+        session_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(fj_chat_sessions)")
+        }
+        if "platform_latest_display_kind" not in session_columns:
+            connection.execute(
+                "ALTER TABLE fj_chat_sessions ADD COLUMN platform_latest_display_kind TEXT NOT NULL DEFAULT 'chat'"
+            )
 
     def _ensure_job_hunt_analysis_schema(self, connection: sqlite3.Connection) -> None:
         """补齐求职数据更新的会话分析、列表提示和单项状态表。"""
@@ -2963,7 +3002,7 @@ class Database:
                       SELECT s.id FROM fj_chat_sessions s WHERE s.job_id = old.job_id
                     )
                     AND m.direction = 'outbound'
-                    AND m.content = '附件状态更新'
+                    AND (m.action_type = 'resume_sent' OR m.content = '附件状态更新')
                   ) THEN 'communicating'
                   ELSE 'pending_application'
                 END

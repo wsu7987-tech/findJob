@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
+import { Delete, Plus, Setting } from "@element-plus/icons-vue";
 import { useRoute, useRouter } from "vue-router";
 
 import { formatDateTime } from "@/services/format";
@@ -11,7 +12,7 @@ import {
 } from "@/services/fineJobChatPolicy";
 import { resolveFineJobResumeSelection } from "@/services/fineJobResumeSelection";
 import { useFineJobBossChatStore } from "@/stores/fineJobBossChat";
-import type { FineJobChatSession } from "@/types";
+import type { FineJobChatMessageTransformRule, FineJobChatSession } from "@/types";
 
 
 const store = useFineJobBossChatStore();
@@ -21,6 +22,9 @@ const instruction = ref("");
 const finalText = ref("");
 const selectedResumeId = ref("");
 const resumeListRefreshing = ref(false);
+const messageTransformDialogVisible = ref(false);
+const messageTransformSaving = ref(false);
+const messageTransformRules = ref<FineJobChatMessageTransformRule[]>([]);
 const preferredReplyTaskId = ref<string | null>(null);
 const expandedMessages = ref<Record<string, boolean>>({});
 const messagePreviewNeedsExpand = ref<Record<string, boolean>>({});
@@ -124,15 +128,13 @@ const canConfirm = computed(() => canConfirmFineJobChatReply({
   runtime: store.runtime,
   session: session.value,
   task: task.value,
-  finalText: finalText.value,
-  leaderAvailable: leaderAvailable.value
+  finalText: finalText.value
 }));
 const confirmBlocker = computed(() => fineJobChatConfirmBlocker({
   runtime: store.runtime,
   session: session.value,
   task: task.value,
-  finalText: finalText.value,
-  leaderAvailable: leaderAvailable.value
+  finalText: finalText.value
 }));
 
 const saveEditor = (sessionId = store.selectedSessionId, dirty = true) => {
@@ -188,8 +190,8 @@ const warningLabel = (warning: string) => ({
   interview_time: "面试时间"
 })[warning] ?? warning;
 const latestMessageStatusLabel = (value?: number | null) => ({
-  0: "【new】",
-  1: "【已送达】",
+  0: "【已读】",
+  1: "【未读】",
   2: "【已读】"
 }[value ?? -1] ?? "");
 const attentionLabel = (item?: FineJobChatSession | null) =>
@@ -300,6 +302,85 @@ const updateInterval = async () => {
   }
 };
 
+// 配置弹窗使用独立草稿，取消时不改动已经保存的全局规则。
+const openMessageTransformSettings = async () => {
+  try {
+    const config = store.messageTransformConfig ?? await store.loadMessageTransformConfig();
+    messageTransformRules.value = config.rules.map((rule) => ({ ...rule }));
+    messageTransformDialogVisible.value = true;
+  } catch {
+    ElMessage.error(store.error ?? "消息转义配置加载失败");
+  }
+};
+
+const addMessageTransformRule = () => {
+  const customRuleId = `custom-${Date.now()}`;
+  messageTransformRules.value.push({
+    id: customRuleId,
+    label: "自定义规则",
+    enabled: true,
+    direction: "inbound",
+    match_mode: "exact",
+    pattern: "",
+    output_kind: "action",
+    display_content: "中立消息",
+    action_type: customRuleId.replaceAll("-", "_"),
+    requires_resume_sent: false,
+    condition_rule_id: "",
+    condition_branch: "always"
+  });
+};
+
+// 条件线只能引用其他可转义为中立动作的规则，避免规则引用自身。
+const conditionLineRules = (currentRuleId: string) => messageTransformRules.value.filter((rule) =>
+  rule.id !== currentRuleId
+  && rule.output_kind === "action"
+  && Boolean(rule.action_type.trim())
+);
+
+const removeMessageTransformRule = (index: number) => {
+  messageTransformRules.value.splice(index, 1);
+};
+
+const saveMessageTransformSettings = async () => {
+  if (!messageTransformRules.value.length) {
+    ElMessage.warning("请至少保留一条转义规则");
+    return;
+  }
+  messageTransformSaving.value = true;
+  try {
+    await store.saveMessageTransformConfig(messageTransformRules.value);
+    messageTransformDialogVisible.value = false;
+    ElMessage.success("全局消息转义配置已保存，将用于后续同步消息");
+  } catch {
+    ElMessage.error(store.error ?? "消息转义配置保存失败");
+  } finally {
+    messageTransformSaving.value = false;
+  }
+};
+
+const resetMessageTransformSettings = async () => {
+  try {
+    await ElMessageBox.confirm(
+      "将恢复内置的全局转义规则，当前未保存的编辑也会丢失。",
+      "恢复默认配置",
+      { type: "warning", confirmButtonText: "恢复默认" }
+    );
+  } catch {
+    return;
+  }
+  messageTransformSaving.value = true;
+  try {
+    const config = await store.resetMessageTransformConfig();
+    messageTransformRules.value = config.rules.map((rule) => ({ ...rule }));
+    ElMessage.success("已恢复默认消息转义配置");
+  } catch {
+    ElMessage.error(store.error ?? "恢复默认配置失败");
+  } finally {
+    messageTransformSaving.value = false;
+  }
+};
+
 const checkNow = async () => {
   try {
     const generated = await store.checkNow();
@@ -372,6 +453,30 @@ const refreshHistory = async () => {
     ElMessage.success(`聊天消息已获取，本次新增 ${result.inserted_count} 条`);
   } catch {
     ElMessage.error(store.error ?? "聊天消息获取失败");
+  }
+};
+
+const retransformMessages = async () => {
+  try {
+    const result = await store.retransformMessages();
+    ElMessage.success(
+      result.updated_count
+        ? `已重新转义 ${result.updated_count} 条消息，过滤 ${result.discarded_count} 条推广消息`
+        : "当前会话没有需要重新转义的消息"
+    );
+  } catch {
+    ElMessage.error(store.error ?? "消息重新转义失败");
+  }
+};
+
+const forceRefreshHistory = async () => {
+  try {
+    const result = await store.forceRefreshHistory();
+    ElMessage.success(
+      `已强制更新：读取 ${result.fetched_count} 条，新增 ${result.inserted_count} 条，关联 ${result.reconciled_count} 条临时消息，重新转义 ${result.retransformed_count} 条`
+    );
+  } catch {
+    ElMessage.error(store.error ?? "强制更新消息失败");
   }
 };
 
@@ -716,7 +821,10 @@ onBeforeUnmount(() => {
       <aside class="session-list">
         <div class="section-heading">
           <h2>会话</h2>
-          <el-button link :loading="store.loading" @click="store.load">刷新</el-button>
+          <div class="session-heading-actions">
+            <el-button circle :icon="Setting" aria-label="消息转义设置" @click="openMessageTransformSettings" />
+            <el-button link :loading="store.loading" @click="store.load">刷新</el-button>
+          </div>
         </div>
         <div class="session-filters">
           <el-input
@@ -796,14 +904,16 @@ onBeforeUnmount(() => {
               class="session-card__preview"
               :ref="(element) => setMessagePreviewElement(item.id, element)"
               :class="[
-                item.latest_message_direction === 'inbound'
+                item.latest_message_display_kind === 'action'
+                  ? 'session-card__preview--action'
+                  : item.latest_message_direction === 'inbound'
                   ? 'session-card__preview--inbound'
                   : 'session-card__preview--outbound',
                 { 'session-card__preview--expanded': expandedMessages[item.id] }
               ]"
             >
               <span
-                v-if="latestMessageStatusLabel(item.platform_latest_message_status)"
+                v-if="item.latest_message_display_kind !== 'action' && latestMessageStatusLabel(item.platform_latest_message_status)"
                 class="session-card__message-tag"
               >{{ latestMessageStatusLabel(item.platform_latest_message_status) }}</span>
               <span>{{ item.latest_message_content || "暂无文本消息" }}</span>
@@ -884,6 +994,19 @@ onBeforeUnmount(() => {
                 @click="analyzeProgress"
               >{{ analysisButtonLabel }}</el-button>
               <el-button
+                size="small"
+                plain
+                :loading="store.mutating"
+                @click="retransformMessages"
+              >重新转义消息</el-button>
+              <el-button
+                size="small"
+                type="primary"
+                plain
+                :loading="store.mutating"
+                @click="forceRefreshHistory"
+              >强制更新消息</el-button>
+              <el-button
                 v-if="(store.detail?.message_count ?? 0) === 0"
                 type="primary"
                 size="small"
@@ -891,7 +1014,7 @@ onBeforeUnmount(() => {
                 @click="refreshHistory"
               >获取消息</el-button>
               <el-button
-                v-else-if="session.message_update_required"
+                v-else-if="session.message_update_required" 
                 type="primary"
                 size="small"
                 :loading="store.mutating"
@@ -939,10 +1062,13 @@ onBeforeUnmount(() => {
               v-for="message in store.detail?.messages"
               :key="message.id"
               class="message-bubble"
-              :class="`message-bubble--${message.direction}`"
+              :class="message.display_kind === 'action' ? 'message-bubble--action' : `message-bubble--${message.direction}`"
             >
-              <small class="message-bubble__meta">{{ message.direction === "inbound" ? session.peer_name || "HR" : "我" }} · {{ formatDateTime(message.sent_at) }}</small>
-              <p>{{ message.content || `[${message.message_type}]` }}</p>
+              <small class="message-bubble__meta">{{ message.display_kind === "action" ? "会话动作" : message.direction === "inbound" ? session.peer_name || "HR" : "我" }} · {{ formatDateTime(message.sent_at) }}</small>
+              <p>
+                <span v-if="message.display_kind !== 'action' && latestMessageStatusLabel(message.status)" class="message-bubble__status">{{ latestMessageStatusLabel(message.status) }}</span>
+                {{ message.content || `[${message.message_type}]` }}
+              </p>
             </article>
           </div>
           <div v-if="session.history_has_more" class="message-more-actions">
@@ -1086,6 +1212,67 @@ onBeforeUnmount(() => {
         </details>
       </aside>
     </section>
+
+    <el-dialog v-model="messageTransformDialogVisible" class="message-transform-dialog" title="消息转义规则" width="min(900px, 94vw)">
+      <el-alert
+        type="info"
+        :closable="false"
+        title="默认规则用于后续全部会话的同步消息；中立动作不会被当作 HR 发言或触发自动回复。"
+      />
+      <div class="message-transform-rules">
+        <section v-for="(rule, index) in messageTransformRules" :key="rule.id" class="message-transform-rule">
+          <div class="message-transform-rule__heading">
+            <el-switch v-model="rule.enabled" active-text="启用" inactive-text="停用" />
+            <el-input v-model="rule.label" placeholder="规则名称" />
+            <el-button link type="danger" :icon="Delete" aria-label="删除规则" @click="removeMessageTransformRule(index)">删除</el-button>
+          </div>
+          <div class="message-transform-rule__fields">
+            <el-select v-model="rule.direction" aria-label="消息方向">
+              <el-option label="HR 侧" value="inbound" />
+              <el-option label="我方" value="outbound" />
+            </el-select>
+            <el-select v-model="rule.match_mode" aria-label="匹配方式">
+              <el-option label="精确匹配" value="exact" />
+              <el-option label="包含文字" value="contains" />
+              <el-option label="正则表达式" value="regex" />
+            </el-select>
+            <el-input v-model="rule.pattern" placeholder="匹配内容" />
+            <el-select v-model="rule.output_kind" aria-label="处理方式">
+              <el-option label="转为中立动作" value="action" />
+              <el-option label="过滤消息" value="discard" />
+            </el-select>
+            <el-input v-model="rule.display_content" :disabled="rule.output_kind === 'discard'" placeholder="页面展示文案；正则可使用 \1、\2" />
+          </div>
+          <div class="message-transform-rule__condition">
+            <el-select v-model="rule.condition_branch" aria-label="条件分支">
+              <el-option label="无条件" value="always" />
+              <el-option label="条件线之后" value="if" />
+              <el-option label="条件线之前" value="else" />
+            </el-select>
+            <el-select
+              v-model="rule.condition_rule_id"
+              :disabled="rule.condition_branch === 'always'"
+              placeholder="选择条件线"
+              aria-label="条件线"
+            >
+              <el-option
+                v-for="conditionRule in conditionLineRules(rule.id)"
+                :key="conditionRule.id"
+                :label="conditionRule.label"
+                :value="conditionRule.id"
+              />
+            </el-select>
+          </div>
+          <el-checkbox v-model="rule.requires_resume_sent" :disabled="rule.output_kind === 'discard'">仅在此前已发送附件简历时匹配</el-checkbox>
+        </section>
+      </div>
+      <template #footer>
+        <el-button :icon="Plus" :disabled="messageTransformSaving" @click="addMessageTransformRule">新增规则</el-button>
+        <el-button :disabled="messageTransformSaving" @click="resetMessageTransformSettings">恢复默认配置</el-button>
+        <el-button :disabled="messageTransformSaving" @click="messageTransformDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="messageTransformSaving" @click="saveMessageTransformSettings">保存全局配置</el-button>
+      </template>
+    </el-dialog>
   </section>
 </template>
 
@@ -1095,7 +1282,8 @@ onBeforeUnmount(() => {
 .runtime-summary,
 .runtime-actions,
 .session-card__meta,
-.identity-tags {
+.identity-tags,
+.session-heading-actions {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1308,6 +1496,10 @@ onBeforeUnmount(() => {
   color: var(--el-color-primary);
 }
 
+.session-card__preview--action {
+  color: var(--el-text-color-secondary);
+}
+
 .session-card__message-tag {
   display: inline;
   margin-right: 6px;
@@ -1425,6 +1617,14 @@ onBeforeUnmount(() => {
   background: var(--el-color-primary-light-9);
 }
 
+.message-bubble--action {
+  align-self: center;
+  max-width: 92%;
+  padding: 7px 12px;
+  background: var(--el-fill-color-lighter);
+  border: 1px dashed var(--el-border-color);
+}
+
 .message-bubble p {
   margin: 5px 0 0;
   font-size: 13px;
@@ -1438,12 +1638,79 @@ onBeforeUnmount(() => {
   font-size: 11px;
 }
 
+.message-bubble__status {
+  margin-right: 6px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .message-bubble--inbound p {
   color: var(--el-color-danger);
 }
 
 .message-bubble--outbound p {
   color: var(--el-color-primary);
+}
+
+.message-bubble--action p {
+  color: var(--el-text-color-secondary);
+}
+
+.message-transform-rules {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.message-transform-rule {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+}
+
+.message-transform-rule__heading {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.message-transform-rule__fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  min-width: 0;
+  gap: 8px;
+}
+
+.message-transform-rule__condition {
+  display: grid;
+  grid-template-columns: minmax(160px, 220px) minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+}
+
+:deep(.message-transform-dialog) {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  margin: 16px auto;
+  max-height: calc(100vh - 32px);
+}
+
+:deep(.message-transform-dialog .el-dialog__body) {
+  min-width: 0;
+  max-height: calc(100vh - 190px);
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.message-transform-rule :deep(.el-input),
+.message-transform-rule :deep(.el-select) {
+  min-width: 0;
 }
 
 .reply-panel {
@@ -1558,5 +1825,8 @@ onBeforeUnmount(() => {
   .conversation-panel,
   .reply-panel { border-left: 0; border-top: 1px solid var(--el-border-color-lighter); }
   .session-list { max-height: 420px; overflow: auto; }
+  .message-transform-rule__heading,
+  .message-transform-rule__fields,
+  .message-transform-rule__condition { grid-template-columns: 1fr; }
 }
 </style>

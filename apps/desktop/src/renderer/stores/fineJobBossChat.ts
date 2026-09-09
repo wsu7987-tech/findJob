@@ -7,6 +7,8 @@ import type {
   FineJobChatBatchSummary,
   FineJobChatBatchTask,
   FineJobChatRuntime,
+  FineJobChatMessageTransformConfig,
+  FineJobChatMessageTransformRule,
   FineJobChatSession,
   FineJobChatSessionDetail,
   FineJobBossResumeAttachment
@@ -15,6 +17,7 @@ import type {
 
 export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
   const runtime = ref<FineJobChatRuntime | null>(null);
+  const messageTransformConfig = ref<FineJobChatMessageTransformConfig | null>(null);
   const sessions = ref<FineJobChatSession[]>([]);
   const selectedSessionId = ref<string | null>(null);
   const searchQuery = ref("");
@@ -46,13 +49,15 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     loading.value = true;
     error.value = null;
     try {
-      const [runtimeResult, sessionResult, summaryResult, resumeResult] = await Promise.all([
+      const [runtimeResult, sessionResult, summaryResult, resumeResult, transformResult] = await Promise.all([
         api.getFineJobChatRuntime(),
         api.listFineJobChatSessions(listParams()),
         api.getFineJobChatBatchSummary(),
-        api.getFineJobChatResumeAttachments()
+        api.getFineJobChatResumeAttachments(),
+        api.getFineJobChatMessageTransformConfig()
       ]);
       runtime.value = runtimeResult.runtime;
+      messageTransformConfig.value = transformResult;
       sessions.value = sessionResult.sessions;
       nextOffset.value = sessionResult.next_offset ?? null;
       batchSummary.value = summaryResult;
@@ -122,6 +127,26 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
       runtime.value = (await api.updateFineJobChatRuntime(changes)).runtime;
       return runtime.value;
     });
+
+  const loadMessageTransformConfig = async () => {
+    try {
+      messageTransformConfig.value = await api.getFineJobChatMessageTransformConfig();
+      return messageTransformConfig.value;
+    } catch (value) {
+      error.value = mapError(value);
+      throw value;
+    }
+  };
+
+  const saveMessageTransformConfig = async (rules: FineJobChatMessageTransformRule[]) => mutate(async () => {
+    messageTransformConfig.value = await api.saveFineJobChatMessageTransformConfig(rules);
+    return messageTransformConfig.value;
+  });
+
+  const resetMessageTransformConfig = async () => mutate(async () => {
+    messageTransformConfig.value = await api.resetFineJobChatMessageTransformConfig();
+    return messageTransformConfig.value;
+  });
 
   const checkNow = async () => mutate(async () => {
     const result = await api.checkFineJobChatNow();
@@ -196,6 +221,20 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
       };
     }
     const result = await api.refreshFineJobChatHistory(selectedSessionId.value);
+    await refreshSelected();
+    return result;
+  });
+
+  const retransformMessages = async () => mutate(async () => {
+    if (!selectedSessionId.value) throw new Error("请先选择聊天会话");
+    const result = await api.retransformFineJobChatMessages(selectedSessionId.value);
+    await refreshSelected();
+    return result;
+  });
+
+  const forceRefreshHistory = async () => mutate(async () => {
+    if (!selectedSessionId.value) throw new Error("请先选择聊天会话");
+    const result = await api.forceRefreshFineJobChatHistory(selectedSessionId.value);
     await refreshSelected();
     return result;
   });
@@ -355,6 +394,7 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
 
   return {
     runtime,
+    messageTransformConfig,
     sessions,
     selectedSessionId,
     searchQuery,
@@ -380,12 +420,17 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     loadList,
     loadMore,
     updateRuntime,
+    loadMessageTransformConfig,
+    saveMessageTransformConfig,
+    resetMessageTransformConfig,
     checkNow,
     refreshFriendList,
     refreshBatchSummary,
     startBatchUpdate,
     stopBatchPolling,
     refreshHistory,
+    retransformMessages,
+    forceRefreshHistory,
     loadMoreHistory,
     updateJob,
     rejectJob,

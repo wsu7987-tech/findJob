@@ -1351,6 +1351,30 @@ export interface FineJobChatRuntime {
   updated_at: string;
 }
 
+export type FineJobChatMessageDisplayKind = "chat" | "action";
+export type FineJobChatMessageTransformMatchMode = "exact" | "contains" | "regex";
+export type FineJobChatMessageTransformOutputKind = "action" | "discard";
+
+export interface FineJobChatMessageTransformRule {
+  id: string;
+  label: string;
+  enabled: boolean;
+  direction: "inbound" | "outbound";
+  match_mode: FineJobChatMessageTransformMatchMode;
+  pattern: string;
+  output_kind: FineJobChatMessageTransformOutputKind;
+  display_content: string;
+  action_type: string;
+  requires_resume_sent: boolean;
+  condition_rule_id: string;
+  condition_branch: "always" | "if" | "else";
+}
+
+export interface FineJobChatMessageTransformConfig {
+  rules: FineJobChatMessageTransformRule[];
+  updated_at: string;
+}
+
 export interface FineJobChatSession {
   id: string;
   platform: "boss";
@@ -1373,6 +1397,7 @@ export interface FineJobChatSession {
   last_message_at?: string | null;
   latest_message_content?: string;
   latest_message_direction?: "inbound" | "outbound";
+  latest_message_display_kind?: FineJobChatMessageDisplayKind;
   latest_platform_msg_id?: string;
   platform_latest_message_status?: 0 | 1 | 2 | null;
   platform_relation_type?: 1 | 2 | 3 | 5 | null;
@@ -1404,6 +1429,9 @@ export interface FineJobChatMessage {
   platform_message_id: string;
   direction: "inbound" | "outbound";
   message_type: "text" | "image" | "system" | "unknown";
+  display_kind: FineJobChatMessageDisplayKind;
+  action_type: string;
+  status: 0 | 1 | 2 | null;
   content: string;
   source: "websocket" | "manual" | "assistant";
   sent_at: string;
@@ -1519,6 +1547,23 @@ export interface FineJobChatSessionDetail {
   latest_conversation_insight?: FineJobConversationInsight | null;
   messages_truncated?: boolean;
   message_count?: number;
+}
+
+export interface FineJobChatMessageRetransformResponse {
+  session_id: string;
+  updated_count: number;
+  discarded_count: number;
+}
+
+export interface FineJobChatForceRefreshResponse {
+  session_id: string;
+  fetched_count: number;
+  inserted_count: number;
+  message_update_required: boolean;
+  has_more: boolean;
+  retransformed_count: number;
+  discarded_count: number;
+  reconciled_count: number;
 }
 
 export interface FineJobChatRuntimeEnvelope { runtime: FineJobChatRuntime }
