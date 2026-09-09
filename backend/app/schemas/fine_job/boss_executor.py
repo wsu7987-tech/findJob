@@ -52,7 +52,7 @@ class BossTaskMatchRequest(BaseModel):
 
 class BossTaskCompleteRequest(BaseModel):
     execution_epoch: int = Field(ge=0)
-    outcome: Literal["accepted", "succeeded", "failed", "unknown"]
+    outcome: Literal["accepted", "succeeded", "failed", "blocked", "unknown"]
     contacted: bool | None = None
     status_code: str = Field(default="", max_length=100)
     message: str = Field(default="", max_length=500)

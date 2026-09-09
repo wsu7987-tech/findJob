@@ -757,7 +757,7 @@ export interface FineJobActionLogListEnvelope {
 }
 
 export type FineJobReviewStatus = "pending" | "approved" | "rejected" | "dismissed";
-export type FineJobReviewTab = FineJobReviewStatus | "running" | "executed";
+export type FineJobReviewTab = FineJobReviewStatus | "executed";
 export type FineJobAutomationActionStatus =
   | "queued"
   | "running"
@@ -1346,6 +1346,7 @@ export interface FineJobChatRuntime {
   listen_enabled: boolean;
   generation_enabled: boolean;
   send_enabled: boolean;
+  direct_execution_enabled: boolean;
   trigger_mode: "immediate" | "interval" | "manual";
   interval_minutes: 0 | 5 | 10 | 30 | 60;
   last_scheduled_at?: string | null;
@@ -1451,6 +1452,7 @@ export interface FineJobChatReplyTask {
   trigger_source: "realtime" | "interval" | "manual";
   action_kind?: "reply" | "followup" | "ask_rejection_reason";
   insight_id?: string | null;
+  is_draft?: boolean;
   status: FineJobChatReplyStatus;
   based_on_message_id: string;
   based_on_session_version: number;
@@ -1500,7 +1502,8 @@ export interface FineJobChatReviewTask {
   id: string;
   source: "chat_reply" | "chat_resume";
   session_id: string;
-  task_type: "发送消息" | "发送简历";
+  job_id?: string;
+  task_type: "代聊" | "发送简历";
   task_detail: string;
   peer_name: string;
   company_name: string;
@@ -1508,10 +1511,22 @@ export interface FineJobChatReviewTask {
   created_at: string;
   based_on_message_id?: string;
   based_on_session_version?: number;
+  has_new_message?: boolean;
+  latest_message?: string;
+  resume_already_sent?: boolean;
+  execution_state?: "accepted" | "failed" | "unknown";
+  execution_error?: string;
 }
 
 export interface FineJobChatReviewTaskListEnvelope {
   items: FineJobChatReviewTask[];
+}
+
+export interface FineJobChatReviewTaskContext {
+  status: "up_to_date" | "new_message" | "resume_not_sent" | "resume_already_sent";
+  has_new_message: boolean;
+  latest_message: string;
+  cancelled: boolean;
 }
 
 export interface FineJobBossResumeAttachment {
@@ -1547,6 +1562,7 @@ export interface FineJobConversationInsight {
 export interface FineJobChatSessionDetail {
   session: FineJobChatSession;
   messages: FineJobChatMessage[];
+  draft?: FineJobChatReplyTask | null;
   reply_tasks: FineJobChatReplyTask[];
   send_actions: FineJobChatSendAction[];
   resume_attachments?: FineJobBossResumeAttachment[];
@@ -1612,6 +1628,7 @@ export interface FineJobChatBatchSummary {
 }
 export interface FineJobChatBatchTask {
   id: string;
+  mode: "chat_and_job" | "job_only";
   status: "queued" | "running" | "completed" | "failed";
   total: number;
   current: number;

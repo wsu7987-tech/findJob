@@ -195,6 +195,22 @@ def list_review_items(
     page: int = 1,
     page_size: int = 50,
 ) -> dict[str, object]:
+    now = utc_now()
+    with db.connect() as connection:
+        # 早期已阻断动作统一退回待确认，后续可由用户再次批准重新入队。
+        connection.execute(
+            """
+            UPDATE fj_review_items
+            SET status = 'pending', resolved_at = NULL,
+                resolution_note = '执行被阻断，等待重新确认', updated_at = ?
+            WHERE status = 'approved'
+              AND id IN (
+                SELECT review_item_id FROM fj_automation_actions
+                WHERE execution_state = 'blocked'
+              )
+            """,
+            (now,),
+        )
     # 测试岗位仅服务于运行状态页的任务验证，不进入人工待确认流程。
     conditions: list[str] = ["j.is_test = 0"]
     values: list[object] = []
@@ -207,7 +223,7 @@ def list_review_items(
         if execution_view == "running":
             conditions.append("a.execution_state IN ('queued', 'running')")
         else:
-            conditions.append("a.execution_state IN ('succeeded', 'failed', 'blocked', 'unknown', 'cancelled')")
+            conditions.append("a.execution_state IN ('succeeded', 'failed', 'unknown', 'cancelled')")
     if decision:
         conditions.append("r.ai_decision = ?")
         values.append(decision)
@@ -412,6 +428,26 @@ def archive_review_item(
         detail={"job_id": row["job_id"], "review_item_id": review_item_id},
     )
     return _serialize_review(_get_review_row(db, review_item_id))
+
+
+def delete_review_item(db: Database, review_item_id: str) -> dict[str, object]:
+    """永久删除用户已拒绝或已归档的待确认记录。"""
+    row = _get_review_row(db, review_item_id)
+    if row["status"] not in {"rejected", "dismissed"}:
+        raise AppError(
+            status_code=409,
+            error_category="INVALID_STATE",
+            error_message="只有已拒绝或已归档事项可以删除。",
+        )
+    with db.connect() as connection:
+        connection.execute("DELETE FROM fj_review_items WHERE id = ?", (review_item_id,))
+    _log(
+        db,
+        "review_deleted",
+        f"已删除岗位“{row['job_title']}”的待确认记录。",
+        detail={"job_id": row["job_id"], "review_item_id": review_item_id},
+    )
+    return {"deleted": True, "id": review_item_id}
 
 
 def _link_review_item_chat(
@@ -708,7 +744,7 @@ def _enqueue_action(
                     """,
                     (evaluation_id, review_item_id, _json(payload), now, action_id),
                 )
-            elif existing["status"] == "cancelled":
+            elif existing["status"] in {"cancelled", "blocked"}:
                 # 当前事项再次获得批准后，统一恢复对应任务状态。
                 # 重新批准只恢复任务状态，不会在本事务内发起任何 BOSS 请求。
                 connection.execute(

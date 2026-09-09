@@ -1302,6 +1302,7 @@ CREATE TABLE IF NOT EXISTS fj_chat_runtime (
   listen_enabled INTEGER NOT NULL DEFAULT 0,
   generation_enabled INTEGER NOT NULL DEFAULT 0,
   send_enabled INTEGER NOT NULL DEFAULT 0,
+  direct_execution_enabled INTEGER NOT NULL DEFAULT 0,
   trigger_mode TEXT NOT NULL DEFAULT 'interval',
   interval_minutes INTEGER NOT NULL DEFAULT 30,
   last_scheduled_at TEXT,
@@ -1314,6 +1315,7 @@ CREATE TABLE IF NOT EXISTS fj_chat_runtime (
   CHECK (listen_enabled IN (0, 1)),
   CHECK (generation_enabled IN (0, 1)),
   CHECK (send_enabled IN (0, 1)),
+  CHECK (direct_execution_enabled IN (0, 1)),
   CHECK (trigger_mode IN ('immediate', 'interval', 'manual')),
   CHECK (interval_minutes IN (0, 5, 10, 30, 60))
 );
@@ -1417,6 +1419,7 @@ CREATE TABLE IF NOT EXISTS fj_chat_reply_tasks (
   job_action_key TEXT,
   action_kind TEXT NOT NULL DEFAULT 'reply',
   insight_id TEXT,
+  is_draft INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'pending_generation',
   based_on_message_id TEXT NOT NULL,
   based_on_session_version INTEGER NOT NULL,
@@ -1449,7 +1452,7 @@ CREATE INDEX IF NOT EXISTS idx_fj_chat_reply_tasks_status_created_at
   ON fj_chat_reply_tasks(status, created_at ASC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_chat_reply_tasks_one_active
   ON fj_chat_reply_tasks(session_id)
-  WHERE status IN ('pending_generation', 'generating', 'awaiting_review', 'confirmed');
+  WHERE is_draft = 1 AND status IN ('pending_generation', 'generating', 'awaiting_review');
 CREATE TABLE IF NOT EXISTS fj_chat_send_actions (
   id TEXT PRIMARY KEY,
   reply_task_id TEXT NOT NULL UNIQUE,
@@ -3135,6 +3138,10 @@ class Database:
                 "warnings_json": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN warnings_json TEXT NOT NULL DEFAULT '[]'",
                 "requires_user_input": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN requires_user_input INTEGER NOT NULL DEFAULT 0",
                 "decision_reason": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN decision_reason TEXT NOT NULL DEFAULT ''",
+                "is_draft": "ALTER TABLE fj_chat_reply_tasks ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0",
+            },
+            "fj_chat_runtime": {
+                "direct_execution_enabled": "ALTER TABLE fj_chat_runtime ADD COLUMN direct_execution_enabled INTEGER NOT NULL DEFAULT 0",
             },
             "fj_chat_send_actions": {
                 "operation_kind": "ALTER TABLE fj_chat_send_actions ADD COLUMN operation_kind TEXT NOT NULL DEFAULT 'text'",
@@ -3163,10 +3170,18 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_fj_chat_reply_tasks_due "
             "ON fj_chat_reply_tasks(status, generation_due_at, created_at)"
         )
+        # 每个会话只保留一条可编辑草稿，待确认任务不参与草稿唯一约束。
+        connection.execute("DROP INDEX IF EXISTS idx_fj_chat_reply_tasks_one_active")
         connection.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_chat_reply_tasks_active_action_key "
+            "CREATE UNIQUE INDEX idx_fj_chat_reply_tasks_one_active "
+            "ON fj_chat_reply_tasks(session_id) "
+            "WHERE is_draft = 1 AND status IN ('pending_generation', 'generating', 'awaiting_review')"
+        )
+        connection.execute("DROP INDEX IF EXISTS idx_fj_chat_reply_tasks_active_action_key")
+        connection.execute(
+            "CREATE UNIQUE INDEX idx_fj_chat_reply_tasks_active_action_key "
             "ON fj_chat_reply_tasks(job_action_key) "
-            "WHERE job_action_key IS NOT NULL "
+            "WHERE is_draft = 0 AND job_action_key IS NOT NULL "
             "AND status IN ('pending_generation', 'generating', 'awaiting_review', 'confirmed')"
         )
         connection.execute(

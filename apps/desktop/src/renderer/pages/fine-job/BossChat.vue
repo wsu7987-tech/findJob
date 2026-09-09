@@ -21,11 +21,11 @@ const route = useRoute();
 const instruction = ref("");
 const finalText = ref("");
 const selectedResumeId = ref("");
+const batchScopeDate = ref<Date | null>(new Date(Date.now() - 24 * 60 * 60 * 1_000));
 const resumeListRefreshing = ref(false);
 const messageTransformDialogVisible = ref(false);
 const messageTransformSaving = ref(false);
 const messageTransformRules = ref<FineJobChatMessageTransformRule[]>([]);
-const preferredReplyTaskId = ref<string | null>(null);
 const expandedMessages = ref<Record<string, boolean>>({});
 const messagePreviewNeedsExpand = ref<Record<string, boolean>>({});
 const messagePreviewElements = new Map<string, HTMLElement>();
@@ -40,14 +40,7 @@ const editorDrafts = ref<Record<string, {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   Boolean(value && typeof value === "object" && !Array.isArray(value));
 const session = computed(() => store.detail?.session ?? null);
-const task = computed(() => {
-  const preferred = store.detail?.reply_tasks.find((item) =>
-    item.id === preferredReplyTaskId.value
-    && item.session_id === session.value?.id
-    && item.status === "awaiting_review"
-  );
-  return preferred ?? store.currentTask;
-});
+const task = computed(() => store.currentTask);
 const progress = computed(() => session.value?.progress ?? null);
 const primaryAction = computed(() => progress.value?.primary_action ?? null);
 const displayProgressStage = computed(() => (
@@ -100,6 +93,16 @@ const defaultMessageActionKind = computed<"reply" | "followup" | "ask_rejection_
   return "reply";
 });
 const latestAction = computed(() => store.detail?.send_actions[0] ?? null);
+const hasOtherSendingMessage = computed(() => {
+  const hasPendingReview = store.detail?.reply_tasks.some((item) => item.status === "awaiting_review");
+  const hasQueuedAction = store.detail?.send_actions.some((action) => (
+    action.operation_kind === "text" && ["queued", "leased", "dispatching"].includes(action.status)
+  ));
+  return Boolean(hasPendingReview || hasQueuedAction);
+});
+const batchScope = computed(() => store.batchScope);
+const batchScopePendingChats = computed(() => batchScope.value?.counts.sessions_to_sync ?? 0);
+const batchScopePendingJobs = computed(() => batchScope.value?.counts.extra_jobs ?? 0);
 const resumeAttachments = computed(() => store.resumeAttachments);
 const latestResumeSendAction = computed(() => store.detail?.send_actions.find((item) => item.operation_kind === "resume") ?? null);
 const resumeListLoading = computed(() => resumeListRefreshing.value);
@@ -289,6 +292,50 @@ const selectSession = async (item: FineJobChatSession) => {
   }
 };
 
+const invalidateBatchScope = () => {
+  store.batchScope = null;
+};
+
+const discoverBatchScope = async () => {
+  if (!batchScopeDate.value) {
+    ElMessage.warning("请选择统计开始时间");
+    return;
+  }
+  try {
+    const since = new Date(batchScopeDate.value);
+    since.setMilliseconds(0);
+    await store.discoverBatchScope(since.toISOString().replace(".000Z", "Z"));
+    ElMessage.success("已统计待同步聊天和待补采岗位");
+  } catch {
+    ElMessage.error(store.error ?? "更新范围统计失败");
+  }
+};
+
+const startScopedChatBatch = async () => {
+  const scope = batchScope.value;
+  if (!scope) return;
+  try {
+    await store.startBatchUpdate(scope.session_ids_to_sync, store.batchSize);
+    ElMessage.success(`已启动聊天批量更新，本批最多 ${store.batchSize} 条`);
+  } catch {
+    ElMessage.error(store.error ?? "聊天批量更新启动失败");
+  }
+};
+
+const startScopedJobBatch = async () => {
+  const scope = batchScope.value;
+  if (!scope) return;
+  try {
+    await store.startBatchJobCollection(
+      scope.jobs_to_collect.map((item) => item.session_id),
+      store.batchSize
+    );
+    ElMessage.success(`已启动岗位批量采集，本批最多 ${store.batchSize} 条`);
+  } catch {
+    ElMessage.error(store.error ?? "岗位批量采集启动失败");
+  }
+};
+
 const applySessionFilters = async () => {
   try {
     await store.loadList();
@@ -298,7 +345,7 @@ const applySessionFilters = async () => {
 };
 
 const updateFlag = async (
-  field: "listen_enabled" | "generation_enabled" | "send_enabled",
+  field: "listen_enabled" | "generation_enabled" | "send_enabled" | "direct_execution_enabled",
   value: string | number | boolean
 ) => {
   try {
@@ -310,6 +357,7 @@ const updateFlag = async (
 const updateListen = (value: string | number | boolean) => updateFlag("listen_enabled", value);
 const updateGeneration = (value: string | number | boolean) => updateFlag("generation_enabled", value);
 const updateSend = (value: string | number | boolean) => updateFlag("send_enabled", value);
+const updateDirectExecution = (value: string | number | boolean) => updateFlag("direct_execution_enabled", value);
 
 const updateTrigger = async () => {
   if (!store.runtime) return;
@@ -626,19 +674,21 @@ const useAnalysisReplyDraft = () => {
 };
 
 const confirm = async () => {
-  try {
-    await ElMessageBox.confirm(
-      "确认后插件会向 BOSS 提交这条消息。“已提交发送”表示 MQTT 已确认提交，不等同于招聘方已经阅读。",
-      "确认发送",
-      { type: "warning", confirmButtonText: "确认提交" }
-    );
-  } catch {
-    return;
+  if (store.runtime?.direct_execution_enabled && hasOtherSendingMessage.value) {
+    try {
+      await ElMessageBox.confirm(
+        "当前有一条消息正在发送，仍要发送本条消息吗？",
+        "确认发送",
+        { type: "warning", confirmButtonText: "继续发送", cancelButtonText: "暂不发送" }
+      );
+    } catch {
+      return;
+    }
   }
   try {
-    await store.confirm(finalText.value.trim());
+    const result = await store.confirm(finalText.value.trim());
     if (store.selectedSessionId) delete editorDrafts.value[store.selectedSessionId];
-    ElMessage.success("回复已进入发送队列");
+    ElMessage.success(result.destination === "queue" ? "回复已进入发送队列" : "回复已进入待确认");
   } catch {
     ElMessage.error(store.error ?? "确认发送失败；若有新消息，请重新生成");
   }
@@ -674,7 +724,9 @@ const confirmResume = async () => {
   }
   try {
     await store.confirmResume(selected.resumeId, selected.showName);
-    ElMessage.success("简历发送任务已进入待确认列表");
+    ElMessage.success(
+      store.runtime?.direct_execution_enabled ? "简历已进入发送队列" : "简历发送任务已进入待确认列表"
+    );
   } catch {
     ElMessage.error(store.error ?? "确认发送简历失败");
   }
@@ -708,9 +760,6 @@ const emergencyStop = async () => {
 };
 
 onMounted(() => {
-  preferredReplyTaskId.value = typeof route.query.reply_task_id === "string"
-    ? route.query.reply_task_id
-    : null;
   const attention = typeof route.query.attention === "string" ? route.query.attention : "";
   if (attention) store.attentionFilter = attention;
   const waitingOn = typeof route.query.waiting_on === "string" ? route.query.waiting_on : "";
@@ -748,23 +797,63 @@ onBeforeUnmount(() => {
 
     <el-alert v-if="store.error" type="error" show-icon title="自动代聊操作失败" :description="store.error" />
 
-    <section v-if="store.batchSummary" class="page-panel batch-summary-panel">
-      <div class="batch-summary-panel__main-row">
-        <div class="batch-summary-panel__pending">
-          <span>待更新聊天：{{ store.batchSummary.pending_chat_count }} 条</span>
-        </div>
+    <section class="page-panel batch-scope-panel">
+      <div class="batch-scope-panel__header">
+        <h2>按时间批量更新</h2>
         <span>
           本次批量：
           <el-input-number
             v-model="store.batchSize"
             :min="1"
-            :max="Math.min(store.batchSummary.pending_chat_count, store.batchSummary.batch_limit)"
-            :disabled="!store.batchSummary.pending_chat_count || Boolean(store.batchProgress) || store.mutating"
+            :max="20"
+            :disabled="(!batchScopePendingChats && !batchScopePendingJobs) || Boolean(store.batchProgress) || store.mutating"
             controls-position="right"
             size="small"
           />
           条
         </span>
+        <div class="batch-scope-panel__controls">
+          <el-date-picker
+            v-model="batchScopeDate"
+            type="datetime"
+            placeholder="选择统计开始时间"
+            format="YYYY-MM-DD HH:mm"
+            :clearable="false"
+            @change="invalidateBatchScope"
+          />
+          <el-button type="primary" plain :loading="store.batchScopeDiscovering" @click="discoverBatchScope">统计</el-button>
+        </div>
+      </div>
+      <template v-if="batchScope">
+        <div class="batch-scope-panel__counts">
+          <span>待同步聊天：<b>{{ batchScopePendingChats }}</b> 条</span>
+          <span>待补采岗位：<b>{{ batchScopePendingJobs }}</b> 条</span>
+          <span class="secondary-text">统计范围：{{ formatDateTime(batchScope.selected_since_time) }} 起</span>
+        </div>
+        <div class="batch-scope-panel__actions">
+          <el-button
+            type="primary"
+            :disabled="!batchScopePendingChats || Boolean(store.batchProgress) || store.mutating"
+            :loading="store.mutating"
+            @click="startScopedChatBatch"
+          >批量更新聊天</el-button>
+          <el-button
+            type="primary"
+            plain
+            :disabled="!batchScopePendingJobs || Boolean(store.batchProgress) || store.mutating"
+            :loading="store.mutating"
+            @click="startScopedJobBatch"
+          >批量采集岗位</el-button>
+        </div>
+      </template>
+      <p v-else class="secondary-text">选择时间后点击统计，再按需启动聊天或岗位批量任务。</p>
+    </section>
+
+    <section v-if="store.batchSummary" class="page-panel batch-summary-panel">
+      <div class="batch-summary-panel__main-row">
+        <div class="batch-summary-panel__pending">
+          <span>待更新聊天：{{ store.batchSummary.pending_chat_count }} 条</span>
+        </div>
         <span>待采集岗位：{{ store.batchSummary.pending_job_count }} 条</span>
         <el-button
           class="batch-summary-panel__action"
@@ -811,7 +900,7 @@ onBeforeUnmount(() => {
       <div class="panel-title-row">
         <div>
           <p class="panel-eyebrow">Batch Update</p>
-          <h2>批量更新进度</h2>
+          <h2>{{ store.batchProgress.mode === "job_only" ? "批量岗位采集进度" : "批量更新进度" }}</h2>
         </div>
       </div>
       <el-progress :percentage="batchProgressPercentage" />
@@ -848,6 +937,13 @@ onBeforeUnmount(() => {
         <el-switch
           :model-value="store.runtime?.send_enabled ?? false"
           @change="updateSend"
+        />
+      </div>
+      <div class="runtime-item">
+        <span>确认后直接执行</span>
+        <el-switch
+          :model-value="store.runtime?.direct_execution_enabled ?? false"
+          @change="updateDirectExecution"
         />
       </div>
       <div class="runtime-item runtime-item--wide">
@@ -1674,6 +1770,39 @@ onBeforeUnmount(() => {
 .batch-summary-panel {
   display: grid;
   gap: 14px;
+}
+
+.batch-scope-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.batch-scope-panel h2 {
+  margin: 0;
+}
+
+.batch-scope-panel__header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.batch-scope-panel__controls {
+  margin-left: auto;
+}
+
+.batch-scope-panel__controls,
+.batch-scope-panel__counts,
+.batch-scope-panel__actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.batch-scope-panel__counts b {
+  color: var(--el-color-primary);
 }
 
 .batch-summary-panel__main-row {

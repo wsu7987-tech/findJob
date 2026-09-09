@@ -94,6 +94,22 @@ def start_batch(
     ))
 
 
+@router.post("/batch/jobs", response_model=BossChatBatchTaskResponse, status_code=status.HTTP_202_ACCEPTED)
+def start_job_batch(
+    payload: BossChatBatchStartRequest,
+    config: AppConfig = Depends(get_config),
+    db: Database = Depends(get_database),
+) -> BossChatBatchTaskResponse:
+    """按用户已统计的范围补采岗位详情，不读取聊天消息。"""
+    return BossChatBatchTaskResponse(**boss_chat.boss_chat_batch_manager.start(
+        db,
+        config,
+        batch_size=payload.batch_size,
+        session_ids=payload.session_ids,
+        mode="job_only",
+    ))
+
+
 @router.get("/batch/{task_id}", response_model=BossChatBatchTaskResponse)
 def batch_status(task_id: str) -> BossChatBatchTaskResponse:
     return BossChatBatchTaskResponse(**boss_chat.boss_chat_batch_manager.get(task_id))
@@ -307,13 +323,16 @@ def refresh_resume_attachments(
 
 
 @router.post("/sessions/{session_id}/resume-actions")
-def create_resume_action(
+async def create_resume_action(
     session_id: str,
     payload: BossChatResumeSendRequest,
     db: Database = Depends(get_database),
 ):
     """在用户选择附件并确认后创建同一聊天动作队列中的简历发送动作。"""
-    return {"action": boss_chat.create_resume_send_action(db, session_id, payload.encrypt_resume_id, payload.filename)}
+    action = boss_chat.create_resume_send_action(db, session_id, payload.encrypt_resume_id, payload.filename)
+    if action["confirmation_status"] == "confirmed":
+        await boss_executor_service.notify_queue_changed(db)
+    return {"action": action}
 
 
 @router.get("/review-tasks")
@@ -322,6 +341,24 @@ def list_review_tasks(
 ):
     """返回待确认页面展示的自动代聊任务。"""
     return boss_chat.list_review_tasks(db)
+
+
+@router.get("/executed-tasks")
+def list_executed_review_tasks(
+    db: Database = Depends(get_database),
+):
+    """返回待确认页展示的已执行自动代聊任务。"""
+    return boss_chat.list_executed_review_tasks(db)
+
+
+@router.post("/review-tasks/{task_id}/link-chat")
+def link_review_task_context(
+    task_id: str,
+    source: str,
+    db: Database = Depends(get_database),
+):
+    """检查关联聊天信息，并处理已发送简历的重复任务。"""
+    return boss_chat.link_review_task_context(db, task_id, source)
 
 
 @router.post("/send-actions/{action_id}/confirm")
@@ -343,11 +380,15 @@ def cancel_resume_action(
 
 
 @router.post("/send-actions/{action_id}/return-to-review")
-def return_send_action_to_review(
+async def return_send_action_to_review(
     action_id: str,
+    draft_resolution: str | None = Query(default=None, pattern="^(overwrite|discard)$"),
     db: Database = Depends(get_database),
 ):
-    return {"action": boss_chat.return_send_action_to_review(db, action_id)}
+    action = boss_chat.return_send_action_to_review(db, action_id, draft_resolution=draft_resolution)
+    # 取消后复用完整队列推送，已连接插件会立即移除这条任务。
+    await boss_executor_service.notify_queue_changed(db)
+    return {"action": action}
 
 
 @router.post("/sessions/{session_id}/history/refresh", response_model=BossChatHistoryRefreshResponse)
@@ -589,7 +630,7 @@ async def confirm_reply(
 @router.post("/reply-tasks/{task_id}/cancel")
 def cancel_reply(
     task_id: str,
-    _: BossChatReasonRequest,
+    draft_resolution: str | None = Query(default=None, pattern="^(overwrite|discard)$"),
     db: Database = Depends(get_database),
 ):
-    return {"reply_task": boss_chat.cancel_reply(db, task_id)}
+    return {"reply_task": boss_chat.cancel_reply(db, task_id, draft_resolution=draft_resolution)}

@@ -15,6 +15,7 @@ export const useFineJobWorkflowStore = defineStore("fineJobWorkflow", () => {
   const items = ref<FineJobReviewItem[]>([]);
   const queuedActions = ref<FineJobAutomationAction[]>([]);
   const chatReviewTasks = ref<FineJobChatReviewTask[]>([]);
+  const chatExecutedTasks = ref<FineJobChatReviewTask[]>([]);
   const selectedStatus = ref<FineJobReviewTab>("pending");
   const loading = ref(false);
   const processingId = ref<string | null>(null);
@@ -32,11 +33,12 @@ export const useFineJobWorkflowStore = defineStore("fineJobWorkflow", () => {
     error.value = null;
     selectedStatus.value = status;
     try {
-      const executionView = ["running", "executed"].includes(status)
-        ? status as "running" | "executed"
-        : "";
+      const executionView = status === "executed" ? "executed" : "";
       const reviewStatus = executionView ? "approved" : status as FineJobReviewStatus;
-      const [reviewResponse, actionResponse, chatReviewResponse] = await Promise.all([
+      const chatTaskRequest = status === "executed"
+        ? api.listFineJobChatExecutedTasks()
+        : api.listFineJobChatReviewTasks();
+      const [reviewResponse, actionResponse, chatTaskResponse] = await Promise.all([
         api.listFineJobReviewItems({
           status: reviewStatus,
           execution_view: executionView,
@@ -49,12 +51,13 @@ export const useFineJobWorkflowStore = defineStore("fineJobWorkflow", () => {
           page_size: pageSize.value
         }),
         api.listFineJobAutomationActions("queued"),
-        api.listFineJobChatReviewTasks()
+        chatTaskRequest
       ]);
       items.value = reviewResponse.items;
       total.value = reviewResponse.total;
       queuedActions.value = actionResponse.actions;
-      chatReviewTasks.value = status === "pending" ? chatReviewResponse.items : [];
+      chatReviewTasks.value = status === "pending" ? chatTaskResponse.items : [];
+      chatExecutedTasks.value = status === "executed" ? chatTaskResponse.items : [];
       return reviewResponse;
     } catch (errorValue) {
       error.value = mapError(errorValue);
@@ -92,18 +95,32 @@ export const useFineJobWorkflowStore = defineStore("fineJobWorkflow", () => {
     }
   };
 
+  const deleteItem = async (item: FineJobReviewItem) => {
+    processingId.value = item.id;
+    error.value = null;
+    try {
+      await api.deleteFineJobReviewItem(item.id);
+      await load(selectedStatus.value);
+    } catch (errorValue) {
+      error.value = mapError(errorValue);
+      throw errorValue;
+    } finally {
+      processingId.value = null;
+    }
+  };
+
   const linkChatBatch = async () => {
     const status = selectedStatus.value;
-    if (status !== "pending" && status !== "rejected" && status !== "running") {
-      throw new Error("仅待确认、已拒绝和正在执行列表支持关联聊天信息。");
+    if (status !== "pending" && status !== "rejected") {
+      throw new Error("仅待确认和已拒绝列表支持关联聊天信息。");
     }
-    const reviewStatus = status === "running" ? "approved" : status;
+    const reviewStatus = status;
     loading.value = true;
     error.value = null;
     try {
       const result = await api.linkFineJobReviewItemsChat({
         status: reviewStatus,
-        execution_view: status === "running" ? "running" : undefined,
+        execution_view: undefined,
         decision: decision.value || undefined,
         query: query.value || undefined,
         execution_state: executionState.value || undefined,
@@ -179,6 +196,7 @@ export const useFineJobWorkflowStore = defineStore("fineJobWorkflow", () => {
     items,
     queuedActions,
     chatReviewTasks,
+    chatExecutedTasks,
     selectedStatus,
     loading,
     processingId,
@@ -195,6 +213,7 @@ export const useFineJobWorkflowStore = defineStore("fineJobWorkflow", () => {
     reject,
     archive,
     restore,
+    deleteItem,
     linkChatBatch,
     batch
   };

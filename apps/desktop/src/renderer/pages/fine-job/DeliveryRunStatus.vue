@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { ElMessage, ElMessageBox } from "element-plus";
+import { computed, h, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { ElButton, ElMessage, ElMessageBox } from "element-plus";
 import { CopyDocument } from "@element-plus/icons-vue";
 
 import { formatDateTime } from "@/services/format";
@@ -189,20 +189,68 @@ const openActionJob = async (action: FineJobBossExecutorQueueAction) => {
   }
 };
 
+const copyChatMessage = async (message: string) => {
+  try {
+    await navigator.clipboard.writeText(message);
+    ElMessage.success("本轮信息已复制");
+  } catch {
+    ElMessage.error("复制信息失败");
+  }
+};
+
+const chooseChatDraftResolution = async (action: FineJobBossExecutorQueueAction) => {
+  if (action.task_type !== "BOSS_CHAT_MESSAGE" || !action.session_id) return undefined;
+  const detail = await api.getFineJobChatSession(action.session_id);
+  const existingDraftText = (detail.draft?.final_text || detail.draft?.draft_text || "").trim();
+  if (!existingDraftText) return undefined;
+  try {
+    await ElMessageBox.confirm(
+      h("div", { class: "draft-conflict-dialog" }, [
+        h("p", "当前会话已有草稿。请选择如何处理本轮已取消的发送消息："),
+        h("p", { class: "draft-conflict-dialog__label" }, "本轮发送消息"),
+        h("pre", { class: "draft-conflict-dialog__message" }, action.task_detail),
+        h(ElButton, { link: true, type: "primary", onClick: () => void copyChatMessage(action.task_detail) }, () => "复制信息")
+      ]),
+      "取消发送确认",
+      {
+        type: "warning",
+        confirmButtonText: "覆盖草稿",
+        cancelButtonText: "丢弃本轮信息",
+        distinguishCancelAndClose: true,
+        closeOnClickModal: false
+      }
+    );
+    return "overwrite" as const;
+  } catch (reason) {
+    if (reason === "cancel") return "discard" as const;
+    return null;
+  }
+};
+
 const returnToReview = async (action: FineJobBossExecutorQueueAction) => {
   try {
-    if (action.task_source === "chat") await api.returnFineJobChatSendActionToReview(action.id);
+    let draftResolution: "overwrite" | "discard" | undefined;
+    if (action.task_source === "chat") {
+      const selectedResolution = await chooseChatDraftResolution(action);
+      if (selectedResolution === null) return;
+      draftResolution = selectedResolution;
+      await api.returnFineJobChatSendActionToReview(action.id, draftResolution);
+    }
     else await executorStore.returnToReview(action.id);
     await load();
-    ElMessage.success("已退回待确认");
-  } catch {
-    ElMessage.error(executorStore.error ?? "退回待确认失败");
+    ElMessage.success(
+      action.task_type === "BOSS_CHAT_MESSAGE"
+        ? draftResolution === "discard" ? "已取消发送，已丢弃本轮信息" : "已取消发送，消息已恢复草稿"
+        : "已取消发送"
+    );
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : "取消发送失败");
   }
 };
 
 const canReturn = (action: FineJobBossExecutorQueueAction) =>
   action.task_source === "chat"
-    ? action.execution_state === "queued"
+    ? ["queued", "leased"].includes(action.status)
     : !["running", "succeeded"].includes(action.execution_state);
 
 const openCreateTestTask = () => {

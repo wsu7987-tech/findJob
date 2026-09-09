@@ -252,7 +252,7 @@ def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     result = dict(row)
-    for key in ("listen_enabled", "generation_enabled", "send_enabled"):
+    for key in ("listen_enabled", "generation_enabled", "send_enabled", "direct_execution_enabled", "is_draft"):
         if key in result:
             result[key] = bool(result[key])
     for key in ("message_update_required", "history_has_more", "has_local_messages"):
@@ -611,9 +611,9 @@ def _ensure_runtime(connection: sqlite3.Connection) -> sqlite3.Row:
     connection.execute(
         """
         INSERT INTO fj_chat_runtime (
-          id, listen_enabled, generation_enabled, send_enabled,
+          id, listen_enabled, generation_enabled, send_enabled, direct_execution_enabled,
           trigger_mode, interval_minutes, leader_epoch, created_at, updated_at
-        ) VALUES (?, 0, 0, 0, 'interval', 30, 0, ?, ?)
+        ) VALUES (?, 0, 0, 0, 0, 'interval', 30, 0, ?, ?)
         """,
         (RUNTIME_ID, now, now),
     )
@@ -639,13 +639,14 @@ def update_runtime(db: Database, changes: dict[str, Any]) -> dict[str, Any]:
         "listen_enabled",
         "generation_enabled",
         "send_enabled",
+        "direct_execution_enabled",
         "trigger_mode",
         "interval_minutes",
     }
     updates = {key: value for key, value in changes.items() if key in allowed and value is not None}
     if not updates:
         return get_runtime(db)
-    for key in ("listen_enabled", "generation_enabled", "send_enabled"):
+    for key in ("listen_enabled", "generation_enabled", "send_enabled", "direct_execution_enabled"):
         if key in updates:
             updates[key] = int(bool(updates[key]))
     updates["updated_at"] = _now()
@@ -1625,22 +1626,10 @@ def _queue_reply_task(
             (now, session["id"]),
         )
         return None
-    # 还没有开始真实发送的旧动作可以安全取消，禁止新消息到达后发送旧草稿。
-    connection.execute(
-        """
-        UPDATE fj_chat_send_actions SET status = 'cancelled', updated_at = ?, completed_at = ?,
-          canonical_status = 'cancelled', canonical_updated_at = ?,
-          canonical_reason = '新 inbound 消息使未发送草稿失效'
-        WHERE reply_task_id IN (
-          SELECT id FROM fj_chat_reply_tasks WHERE session_id = ?
-        ) AND status IN ('queued', 'leased')
-        """,
-        (now, now, now, session["id"]),
-    )
     pending = connection.execute(
         """
         SELECT * FROM fj_chat_reply_tasks
-        WHERE session_id = ? AND status = 'pending_generation'
+        WHERE session_id = ? AND is_draft = 1 AND status = 'pending_generation'
         ORDER BY created_at DESC LIMIT 1
         """,
         (session["id"],),
@@ -1651,6 +1640,7 @@ def _queue_reply_task(
         UPDATE fj_chat_reply_tasks
         SET status = 'stale', cancelled_at = ?, updated_at = ?
         WHERE session_id = ?
+          AND is_draft = 1
           AND status IN ('generating', 'awaiting_review', 'confirmed')
         """,
         (now, now, session["id"]),
@@ -1682,10 +1672,10 @@ def _queue_reply_task(
     connection.execute(
         """
         INSERT INTO fj_chat_reply_tasks (
-          id, session_id, trigger_source, status, based_on_message_id,
+          id, session_id, trigger_source, is_draft, status, based_on_message_id,
           based_on_session_version, generation_due_at, input_message_ids_json,
           created_at, updated_at
-        ) VALUES (?, ?, ?, 'pending_generation', ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, 1, 'pending_generation', ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id,
@@ -2206,6 +2196,7 @@ def list_sessions(
                 SELECT COUNT(*) FROM fj_chat_reply_tasks pending
                 WHERE pending.session_id = s.id
                   AND pending.status IN ('pending_generation', 'generating', 'awaiting_review')
+                  AND (pending.is_draft = 0 OR TRIM(COALESCE(pending.final_text, pending.draft_text, '')) <> '')
               ) AS unhandled_count
             FROM fj_chat_sessions s
             LEFT JOIN fj_chat_messages m ON m.id = s.latest_message_id
@@ -2238,8 +2229,12 @@ def get_session(db: Database, session_id: str) -> dict[str, Any]:
             """,
             (session_id,),
         ).fetchall()
+        draft = connection.execute(
+            "SELECT * FROM fj_chat_reply_tasks WHERE session_id = ? AND is_draft = 1 ORDER BY updated_at DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
         tasks = connection.execute(
-            "SELECT * FROM fj_chat_reply_tasks WHERE session_id = ? ORDER BY created_at DESC",
+            "SELECT * FROM fj_chat_reply_tasks WHERE session_id = ? AND is_draft = 0 ORDER BY created_at DESC",
             (session_id,),
         ).fetchall()
         actions = connection.execute(
@@ -2276,6 +2271,7 @@ def get_session(db: Database, session_id: str) -> dict[str, Any]:
         return {
             "session": _session_payload(session, connection),
             "messages": [_row(item) for item in messages],
+            "draft": _row(draft),
             "reply_tasks": [_row(item) for item in tasks],
             "send_actions": [_row(item) for item in actions],
             "resume_attachments": resume_attachments,
@@ -2398,6 +2394,7 @@ def retransform_session_messages(db: Database, session_id: str) -> dict[str, Any
                 UPDATE fj_chat_reply_tasks
                 SET status = 'stale', cancelled_at = ?, updated_at = ?
                 WHERE based_on_message_id IN ({placeholders})
+                  AND is_draft = 1
                   AND status IN ('pending_generation', 'generating', 'awaiting_review')
                 """,
                 (_now(), _now(), *reclassified_message_ids),
@@ -2822,6 +2819,7 @@ def _generate_reply(
         current = connection.execute(
             """
             SELECT * FROM fj_chat_reply_tasks WHERE session_id = ?
+              AND is_draft = 1
               AND status IN ('pending_generation', 'generating', 'awaiting_review', 'confirmed')
             ORDER BY created_at DESC LIMIT 1
             """,
@@ -2891,10 +2889,10 @@ def _generate_reply(
                 connection.execute(
                     """
                     INSERT INTO fj_chat_reply_tasks (
-                      id, session_id, trigger_source, job_action_key, action_kind,
+                      id, session_id, trigger_source, job_action_key, action_kind, is_draft,
                       status, based_on_message_id, based_on_session_version,
                       generation_due_at, input_message_ids_json, created_at, updated_at
-                    ) VALUES (?, ?, 'manual', ?, ?, 'generating', ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, 'manual', ?, ?, 1, 'generating', ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2914,6 +2912,7 @@ def _generate_reply(
                     """
                     SELECT * FROM fj_chat_reply_tasks
                     WHERE session_id = ?
+                      AND is_draft = 1
                       AND status IN ('pending_generation', 'generating', 'awaiting_review', 'confirmed')
                     ORDER BY updated_at DESC, created_at DESC LIMIT 1
                     """,
@@ -3064,7 +3063,7 @@ def generate_reply_for_action(
 def edit_reply(db: Database, task_id: str, final_text: str) -> dict[str, Any]:
     with db.connect() as connection:
         task = _task_or_404(connection, task_id)
-        if task["status"] != "awaiting_review":
+        if not task["is_draft"] or task["status"] != "awaiting_review":
             raise AppError(status_code=409, error_category="CHAT_REPLY_NOT_EDITABLE", error_message="当前回复任务不可编辑。")
         classification = classify_outbound_content(final_text, base_operation="send_chat_reply")
         warnings = [item for item in classification.categories if item != "send_chat_reply"]
@@ -3089,56 +3088,71 @@ def edit_reply(db: Database, task_id: str, final_text: str) -> dict[str, Any]:
 
 
 def create_manual_reply(db: Database, session_id: str, final_text: str) -> dict[str, Any]:
-    """将编辑框正文直接创建为可确认发送的回复任务。"""
+    """将唯一草稿复制为独立的待确认代聊任务。"""
     text = final_text.strip()
     if not text:
         raise AppError(status_code=422, error_category="CHAT_REPLY_EMPTY", error_message="回复正文不能为空。")
     with db.connect() as connection:
         session = _session_or_404(connection, session_id)
-        based_on_message_id = str(session["latest_inbound_message_id"] or "")
+        draft = connection.execute(
+            "SELECT * FROM fj_chat_reply_tasks WHERE session_id = ? AND is_draft = 1 ORDER BY updated_at DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        based_on_message_id = str(
+            (draft["based_on_message_id"] if draft is not None else session["latest_inbound_message_id"]) or ""
+        )
         if not based_on_message_id:
             raise AppError(status_code=409, error_category="NO_CHAT_MESSAGE", error_message="会话没有可作为回复依据的消息。")
         now = _now()
         classification = classify_outbound_content(text, base_operation="send_chat_reply")
         warnings = [item for item in classification.categories if item != "send_chat_reply"]
-        # 手动确认以当前编辑内容为准，替换尚未确认的旧草稿。
-        connection.execute(
-            """
-            UPDATE fj_chat_reply_tasks
-            SET status = 'stale', cancelled_at = ?, updated_at = ?
-            WHERE session_id = ? AND status IN ('pending_generation', 'generating', 'awaiting_review')
-            """,
-            (now, now, session_id),
-        )
         task_id = _id("chat_reply")
         connection.execute(
             """
             INSERT INTO fj_chat_reply_tasks (
-              id, session_id, trigger_source, action_kind, status,
+              id, session_id, trigger_source, job_action_key, action_kind, insight_id, is_draft, status,
               based_on_message_id, based_on_session_version, input_message_ids_json,
               draft_text, final_text, generation_model, generated_at,
               decision, warnings_json, requires_user_input,
-              content_categories_json, classification_version,
+              decision_reason, context_json, facts_used_json, content_categories_json, classification_version,
               created_at, updated_at
-            ) VALUES (?, ?, 'manual', 'reply', 'awaiting_review', ?, ?, ?, ?, ?, 'manual', ?,
-                      'reply', ?, 0, ?, ?, ?, ?)
+            ) VALUES (?, ?, 'manual', ?, ?, ?, 0, 'awaiting_review', ?, ?, ?, ?, ?, ?, ?,
+                      'reply', ?, 0, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
                 session_id,
+                draft["job_action_key"] if draft is not None else None,
+                draft["action_kind"] if draft is not None else "reply",
+                draft["insight_id"] if draft is not None else None,
                 based_on_message_id,
-                int(session["session_version"]),
-                json.dumps([based_on_message_id], ensure_ascii=False),
+                int(draft["based_on_session_version"] if draft is not None else session["session_version"]),
+                draft["input_message_ids_json"] if draft is not None else json.dumps([based_on_message_id], ensure_ascii=False),
                 text,
                 text,
-                now,
+                draft["generation_model"] if draft is not None else "manual",
+                draft["generated_at"] if draft is not None else now,
                 json.dumps(warnings, ensure_ascii=False),
+                draft["decision_reason"] if draft is not None else "手动创建待确认任务",
+                draft["context_json"] if draft is not None else "{}",
+                draft["facts_used_json"] if draft is not None else "[]",
                 json.dumps(classification.categories, ensure_ascii=False),
                 classification.classification_version,
                 now,
                 now,
             ),
         )
+        if draft is not None:
+            # 任务入待确认后清空唯一草稿，后续可继续编辑新的消息。
+            connection.execute(
+                """
+                UPDATE fj_chat_reply_tasks
+                SET status = 'awaiting_review', draft_text = '', final_text = '', generation_error = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, draft["id"]),
+            )
         return _row(connection.execute(
             "SELECT * FROM fj_chat_reply_tasks WHERE id = ?", (task_id,)
         ).fetchone()) or {}
@@ -3175,11 +3189,91 @@ def set_session_status(db: Database, session_id: str, status: str) -> dict[str, 
         return _row(connection.execute("SELECT * FROM fj_chat_sessions WHERE id = ?", (session_id,)).fetchone()) or {}
 
 
-def cancel_reply(db: Database, task_id: str) -> dict[str, Any]:
+def _restore_task_to_draft(
+    connection: sqlite3.Connection,
+    task: sqlite3.Row,
+    *,
+    draft_resolution: str | None,
+) -> None:
+    """把取消的待确认任务回填到会话唯一草稿。"""
+    draft = connection.execute(
+        "SELECT * FROM fj_chat_reply_tasks WHERE session_id = ? AND is_draft = 1 ORDER BY updated_at DESC LIMIT 1",
+        (task["session_id"],),
+    ).fetchone()
+    draft_text = str((draft["final_text"] or draft["draft_text"] or "") if draft is not None else "").strip()
+    if draft_text and draft_resolution not in {"overwrite", "discard"}:
+        raise AppError(
+            status_code=409,
+            error_category="CHAT_REPLY_DRAFT_EXISTS",
+            error_message="当前会话草稿已有内容，请选择覆盖草稿或丢弃本轮信息。",
+        )
+    if draft_resolution not in {None, "overwrite", "discard"}:
+        raise AppError(status_code=422, error_category="CHAT_REPLY_DRAFT_RESOLUTION_INVALID", error_message="草稿处理方式无效。")
+    if draft_resolution == "discard":
+        return
+    now = _now()
+    if draft is not None:
+        connection.execute(
+            """
+            UPDATE fj_chat_reply_tasks
+            SET trigger_source = 'manual', job_action_key = ?, action_kind = ?, insight_id = ?,
+                status = 'awaiting_review', based_on_message_id = ?, based_on_session_version = ?,
+                input_message_ids_json = ?, decision = 'reply', facts_used_json = ?, warnings_json = ?,
+                requires_user_input = 0, decision_reason = ?, context_json = ?, draft_text = ?, final_text = ?,
+                generation_model = ?, generated_at = ?, generation_error = NULL, cancelled_at = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                task["job_action_key"], task["action_kind"], task["insight_id"],
+                task["based_on_message_id"], task["based_on_session_version"], task["input_message_ids_json"],
+                task["facts_used_json"], task["warnings_json"], task["decision_reason"], task["context_json"],
+                task["draft_text"], task["final_text"], task["generation_model"], task["generated_at"], now,
+                draft["id"],
+            ),
+        )
+        return
+    draft_id = _id("chat_draft")
+    connection.execute(
+        """
+        INSERT INTO fj_chat_reply_tasks (
+          id, session_id, trigger_source, job_action_key, action_kind, insight_id, is_draft, status,
+          based_on_message_id, based_on_session_version, input_message_ids_json, decision,
+          facts_used_json, warnings_json, requires_user_input, decision_reason, context_json,
+          draft_text, final_text, generation_model, generated_at, created_at, updated_at
+        ) VALUES (?, ?, 'manual', ?, ?, ?, 1, 'awaiting_review', ?, ?, ?, 'reply', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            draft_id, task["session_id"], task["job_action_key"], task["action_kind"], task["insight_id"],
+            task["based_on_message_id"], task["based_on_session_version"], task["input_message_ids_json"],
+            task["facts_used_json"], task["warnings_json"], task["decision_reason"], task["context_json"],
+            task["draft_text"], task["final_text"], task["generation_model"], task["generated_at"], now, now,
+        ),
+    )
+
+
+def cancel_reply(
+    db: Database,
+    task_id: str,
+    *,
+    draft_resolution: str | None = None,
+) -> dict[str, Any]:
     with db.connect() as connection:
         task = _task_or_404(connection, task_id)
+        if task["is_draft"]:
+            now = _now()
+            connection.execute(
+                """
+                UPDATE fj_chat_reply_tasks
+                SET status = 'awaiting_review', draft_text = '', final_text = '', generation_error = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, task_id),
+            )
+            return _row(connection.execute("SELECT * FROM fj_chat_reply_tasks WHERE id = ?", (task_id,)).fetchone()) or {}
         if task["status"] in {"confirmed", "cancelled", "stale"}:
             return _row(task) or {}
+        _restore_task_to_draft(connection, task, draft_resolution=draft_resolution)
         now = _now()
         connection.execute(
             "UPDATE fj_chat_reply_tasks SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE id = ?",
@@ -3195,7 +3289,7 @@ def confirm_reply(db: Database, task_id: str, payload: dict[str, Any]) -> dict[s
             raise AppError(status_code=409, error_category="CHAT_SEND_DISABLED", error_message="请先在自动代聊设置中启用发送。")
         task = _task_or_404(connection, task_id)
         session = _session_or_404(connection, str(task["session_id"]))
-        if task["status"] != "awaiting_review":
+        if task["is_draft"] or task["status"] != "awaiting_review":
             raise AppError(status_code=409, error_category="CHAT_REPLY_NOT_CONFIRMABLE", error_message="当前回复任务不可确认发送。")
         if session["status"] == "unsupported":
             raise AppError(
@@ -3350,13 +3444,15 @@ def _create_resume_action(
         session = _session_or_404(connection, session_id)
         if not all(session[key] for key in ("account_uid", "peer_uid", "encrypt_peer_uid", "security_id", "encrypt_job_id")):
             raise AppError(status_code=409, error_category="CHAT_IDENTITY_INCOMPLETE", error_message="聊天对象身份不完整，请先在 BOSS 打开对应会话后重试。")
-        if operation_kind == "resume" and not runtime["send_enabled"]:
+        direct_execution = operation_kind == "resume" and bool(runtime["direct_execution_enabled"])
+        if direct_execution and not runtime["send_enabled"]:
             raise AppError(status_code=409, error_category="CHAT_SEND_DISABLED", error_message="请先在自动代聊设置中启用发送。")
         task_id = _create_resume_support_task(connection, session)
         now = _now()
         action_id = _id("chat_resume")
-        confirmation_status = "pending" if operation_kind == "resume" else "confirmed"
-        canonical_reason = "等待人工确认" if operation_kind == "resume" else "等待执行"
+        # 简历任务沿用统一开关决定进入待确认或执行队列。
+        confirmation_status = "confirmed" if direct_execution or operation_kind != "resume" else "pending"
+        canonical_reason = "等待执行" if confirmation_status == "confirmed" else "等待人工确认"
         connection.execute(
             """
             INSERT INTO fj_chat_send_actions (
@@ -3386,16 +3482,25 @@ def list_review_tasks(db: Database) -> dict[str, list[dict[str, Any]]]:
     with db.connect() as connection:
         reply_rows = connection.execute(
             """
-            SELECT t.*, s.peer_name, s.company_name, s.job_title
+            SELECT t.*, s.job_id, s.encrypt_job_id, s.peer_name, s.company_name, s.job_title,
+                   s.latest_inbound_message_id, s.session_version,
+                   COALESCE(latest_inbound.content, '') AS latest_message
             FROM fj_chat_reply_tasks t
             JOIN fj_chat_sessions s ON s.id = t.session_id
-            WHERE t.status = 'awaiting_review'
+            LEFT JOIN fj_chat_messages latest_inbound ON latest_inbound.id = s.latest_inbound_message_id
+            WHERE t.is_draft = 0 AND t.status = 'awaiting_review'
             ORDER BY t.created_at DESC, t.id DESC
             """
         ).fetchall()
         resume_rows = connection.execute(
             """
-            SELECT a.*, s.peer_name, s.company_name, s.job_title
+            SELECT a.*, s.job_id, s.encrypt_job_id, s.peer_name, s.company_name, s.job_title,
+                   EXISTS(
+                     SELECT 1 FROM fj_chat_send_actions sent
+                     WHERE sent.session_id = a.session_id
+                       AND sent.operation_kind = 'resume'
+                       AND sent.status = 'accepted'
+                   ) AS resume_already_sent
             FROM fj_chat_send_actions a
             JOIN fj_chat_sessions s ON s.id = a.session_id
             WHERE a.operation_kind = 'resume'
@@ -3404,12 +3509,34 @@ def list_review_tasks(db: Database) -> dict[str, list[dict[str, Any]]]:
             ORDER BY a.created_at DESC, a.id DESC
             """
         ).fetchall()
+        # 会话尚未写入本地岗位 ID 时，使用加密岗位标识补齐历史岗位关联。
+        reply_job_ids = {
+            str(row["id"]): _resolve_job_id(
+                connection,
+                {
+                    "job_id": str(row["job_id"] or ""),
+                    "encrypt_job_id": str(row["encrypt_job_id"] or ""),
+                },
+            ) or ""
+            for row in reply_rows
+        }
+        resume_job_ids = {
+            str(row["id"]): _resolve_job_id(
+                connection,
+                {
+                    "job_id": str(row["job_id"] or ""),
+                    "encrypt_job_id": str(row["encrypt_job_id"] or ""),
+                },
+            ) or ""
+            for row in resume_rows
+        }
     items = [
         {
             "id": str(row["id"]),
             "source": "chat_reply",
             "session_id": str(row["session_id"]),
-            "task_type": "发送消息",
+            "job_id": reply_job_ids[str(row["id"])],
+            "task_type": "代聊",
             # 待确认列表展示用户将要发送的完整消息。
             "task_detail": str(row["final_text"] or row["draft_text"] or ""),
             "peer_name": str(row["peer_name"] or ""),
@@ -3418,6 +3545,11 @@ def list_review_tasks(db: Database) -> dict[str, list[dict[str, Any]]]:
             "created_at": str(row["created_at"]),
             "based_on_message_id": str(row["based_on_message_id"]),
             "based_on_session_version": int(row["based_on_session_version"]),
+            "has_new_message": (
+                str(row["based_on_message_id"]) != str(row["latest_inbound_message_id"] or "")
+                or int(row["based_on_session_version"]) != int(row["session_version"])
+            ),
+            "latest_message": str(row["latest_message"] or ""),
         }
         for row in reply_rows
     ]
@@ -3426,17 +3558,129 @@ def list_review_tasks(db: Database) -> dict[str, list[dict[str, Any]]]:
             "id": str(row["id"]),
             "source": "chat_resume",
             "session_id": str(row["session_id"]),
+            "job_id": resume_job_ids[str(row["id"])],
             "task_type": "发送简历",
             "task_detail": str(row["resume_filename"] or "未命名简历"),
             "peer_name": str(row["peer_name"] or ""),
             "company_name": str(row["company_name"] or ""),
             "job_title": str(row["job_title"] or ""),
             "created_at": str(row["created_at"]),
+            "resume_already_sent": bool(row["resume_already_sent"]),
         }
         for row in resume_rows
     )
     items.sort(key=lambda item: (str(item["created_at"]), str(item["id"])), reverse=True)
     return {"items": items}
+
+
+def list_executed_review_tasks(db: Database) -> dict[str, list[dict[str, Any]]]:
+    """返回已完成执行的代聊和简历发送任务，供待确认页复用同一列表展示。"""
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT a.*, s.job_id, s.encrypt_job_id, s.peer_name, s.company_name, s.job_title
+            FROM fj_chat_send_actions a
+            JOIN fj_chat_sessions s ON s.id = a.session_id
+            WHERE a.operation_kind IN ('text', 'resume')
+              AND a.status IN ('accepted', 'failed', 'unknown')
+            ORDER BY COALESCE(a.completed_at, a.created_at) DESC, a.id DESC
+            """
+        ).fetchall()
+        job_ids = {
+            str(row["id"]): _resolve_job_id(
+                connection,
+                {
+                    "job_id": str(row["job_id"] or ""),
+                    "encrypt_job_id": str(row["encrypt_job_id"] or ""),
+                },
+            ) or ""
+            for row in rows
+        }
+    items = [
+        {
+            "id": str(row["id"]),
+            "source": "chat_reply" if row["operation_kind"] == "text" else "chat_resume",
+            "session_id": str(row["session_id"]),
+            "job_id": job_ids[str(row["id"])],
+            "task_type": "代聊" if row["operation_kind"] == "text" else "发送简历",
+            "task_detail": str(row["text"] or "") if row["operation_kind"] == "text" else str(row["resume_filename"] or "未命名简历"),
+            "peer_name": str(row["peer_name"] or ""),
+            "company_name": str(row["company_name"] or ""),
+            "job_title": str(row["job_title"] or ""),
+            "created_at": str(row["completed_at"] or row["created_at"]),
+            "execution_state": str(row["status"]),
+            "execution_error": str(row["error_message"] or ""),
+        }
+        for row in rows
+    ]
+    return {"items": items}
+
+
+def link_review_task_context(db: Database, task_id: str, source: str) -> dict[str, Any]:
+    """检查待确认任务关联会话的最新状态，并取消重复简历任务。"""
+    with db.connect() as connection:
+        if source == "chat_reply":
+            row = connection.execute(
+                """
+                SELECT t.based_on_message_id, t.based_on_session_version,
+                       s.latest_inbound_message_id, s.session_version,
+                       COALESCE(m.content, '') AS latest_message
+                FROM fj_chat_reply_tasks t
+                JOIN fj_chat_sessions s ON s.id = t.session_id
+                LEFT JOIN fj_chat_messages m ON m.id = s.latest_inbound_message_id
+                WHERE t.id = ? AND t.is_draft = 0 AND t.status = 'awaiting_review'
+                """,
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise AppError(status_code=409, error_category="CHAT_REPLY_NOT_CONFIRMABLE", error_message="当前回复任务不可确认发送。")
+            has_new_message = (
+                str(row["based_on_message_id"]) != str(row["latest_inbound_message_id"] or "")
+                or int(row["based_on_session_version"]) != int(row["session_version"])
+            )
+            return {
+                "status": "new_message" if has_new_message else "up_to_date",
+                "has_new_message": has_new_message,
+                "latest_message": str(row["latest_message"] or ""),
+                "cancelled": False,
+            }
+
+        if source == "chat_resume":
+            action = _action_payload(connection, task_id)
+            if action["operation_kind"] != "resume" or action["confirmation_status"] != "pending":
+                raise AppError(status_code=409, error_category="CHAT_RESUME_NOT_CONFIRMABLE", error_message="当前简历动作不可确认。")
+            sent = connection.execute(
+                """
+                SELECT 1 FROM fj_chat_send_actions
+                WHERE session_id = ? AND operation_kind = 'resume' AND status = 'accepted'
+                LIMIT 1
+                """,
+                (action["session_id"],),
+            ).fetchone()
+            if sent is not None:
+                now = _now()
+                connection.execute(
+                    """
+                    UPDATE fj_chat_send_actions
+                    SET status = 'cancelled', confirmation_status = 'confirmed', completed_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, task_id),
+                )
+                return {
+                    "status": "resume_already_sent",
+                    "has_new_message": False,
+                    "latest_message": "",
+                    "cancelled": True,
+                }
+            return {
+                "status": "resume_not_sent",
+                "has_new_message": False,
+                "latest_message": "",
+                "cancelled": False,
+            }
+
+    raise AppError(status_code=422, error_category="CHAT_REVIEW_SOURCE_INVALID", error_message="待确认任务类型无效。")
 
 
 def confirm_resume_action(db: Database, action_id: str) -> dict[str, Any]:
@@ -3473,12 +3717,21 @@ def cancel_resume_action(db: Database, action_id: str) -> dict[str, Any]:
         return _action_payload(connection, action_id)
 
 
-def return_send_action_to_review(db: Database, action_id: str) -> dict[str, Any]:
-    """将尚未执行的聊天发送动作退回到待确认状态。"""
+def return_send_action_to_review(
+    db: Database,
+    action_id: str,
+    *,
+    draft_resolution: str | None = None,
+) -> dict[str, Any]:
+    """取消尚未开始发送的聊天动作，并将代聊消息恢复为草稿。"""
     with db.connect() as connection:
         action = _action_payload(connection, action_id)
-        if action["status"] != "queued":
-            raise AppError(status_code=409, error_category="CHAT_ACTION_NOT_RETURNABLE", error_message="只有未执行的发送任务可以退回待确认。")
+        if action["status"] not in {"queued", "leased"}:
+            raise AppError(
+                status_code=409,
+                error_category="CHAT_ACTION_NOT_RETURNABLE",
+                error_message="任务已经开始发送，请到聊天信息确认发送结果。",
+            )
         now = _now()
         if action["operation_kind"] == "resume":
             if action["confirmation_status"] != "confirmed":
@@ -3487,6 +3740,7 @@ def return_send_action_to_review(db: Database, action_id: str) -> dict[str, Any]
                 """
                 UPDATE fj_chat_send_actions
                 SET confirmation_status = 'pending', canonical_status = 'pending',
+                    lease_owner = NULL, lease_expires_at = NULL, dispatch_deadline_at = NULL,
                     canonical_updated_at = ?, canonical_reason = '已退回待确认', updated_at = ?
                 WHERE id = ?
                 """,
@@ -3496,13 +3750,16 @@ def return_send_action_to_review(db: Database, action_id: str) -> dict[str, Any]
         if action["operation_kind"] != "text":
             raise AppError(status_code=409, error_category="CHAT_ACTION_NOT_RETURNABLE", error_message="当前任务不支持退回待确认。")
         task = _task_or_404(connection, str(action["reply_task_id"]))
-        if task["status"] != "confirmed":
-            raise AppError(status_code=409, error_category="CHAT_REPLY_NOT_RETURNABLE", error_message="当前消息草稿不能退回待确认。")
-        # 已确认的旧草稿保留为已取消记录，新建一份可编辑草稿供用户再次确认。
+        if task["is_draft"] or task["status"] != "confirmed":
+            raise AppError(status_code=409, error_category="CHAT_REPLY_NOT_RETURNABLE", error_message="当前代聊任务不能取消发送。")
+        _restore_task_to_draft(connection, task, draft_resolution=draft_resolution)
+        # 取消执行动作后，保留任务记录并将内容回填到唯一草稿。
         connection.execute(
             """
             UPDATE fj_chat_send_actions
             SET status = 'cancelled', outcome = NULL, status_code = '', error_message = '',
+                lease_owner = NULL, lease_expires_at = NULL, dispatch_deadline_at = NULL,
+                execution_epoch = execution_epoch + 1,
                 canonical_status = 'cancelled', canonical_updated_at = ?, canonical_reason = '已退回待确认',
                 completed_at = ?, updated_at = ?
             WHERE id = ?
@@ -3512,24 +3769,6 @@ def return_send_action_to_review(db: Database, action_id: str) -> dict[str, Any]
         connection.execute(
             "UPDATE fj_chat_reply_tasks SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE id = ?",
             (now, now, task["id"]),
-        )
-        returned_task_id = _id("chat_reply")
-        connection.execute(
-            """
-            INSERT INTO fj_chat_reply_tasks (
-              id, session_id, trigger_source, job_action_key, action_kind, insight_id,
-              status, based_on_message_id, based_on_session_version, input_message_ids_json,
-              decision, facts_used_json, warnings_json, requires_user_input, decision_reason,
-              context_json, draft_text, final_text, generation_model, generated_at, created_at, updated_at
-            ) VALUES (?, ?, 'manual', ?, ?, ?, 'awaiting_review', ?, ?, ?,
-                      'reply', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                returned_task_id, task["session_id"], task["job_action_key"], task["action_kind"], task["insight_id"],
-                task["based_on_message_id"], task["based_on_session_version"], task["input_message_ids_json"],
-                task["facts_used_json"], task["warnings_json"], task["decision_reason"], task["context_json"],
-                task["draft_text"], task["final_text"], task["generation_model"], task["generated_at"], now, now,
-            ),
         )
         return _action_payload(connection, action_id)
 
@@ -3973,7 +4212,7 @@ def process_due_tasks(
             f"""
             SELECT t.id, t.session_id FROM fj_chat_reply_tasks t
             JOIN fj_chat_sessions s ON s.id = t.session_id
-            WHERE t.status = 'pending_generation' AND s.status = 'active'
+            WHERE t.is_draft = 1 AND t.status = 'pending_generation' AND s.status = 'active'
               {due_clause}
             ORDER BY t.created_at ASC LIMIT ?
             """,
@@ -4030,7 +4269,7 @@ def schedule_pending_generation(db: Database, config: AppConfig) -> None:
             SELECT t.id, t.generation_due_at
             FROM fj_chat_reply_tasks t
             JOIN fj_chat_sessions s ON s.id = t.session_id
-            WHERE t.status = 'pending_generation' AND s.status = 'active'
+            WHERE t.is_draft = 1 AND t.status = 'pending_generation' AND s.status = 'active'
             """
         ).fetchall()
 
@@ -4119,6 +4358,48 @@ def get_batch_summary(db: Database) -> dict[str, int]:
     }
 
 
+def get_job_batch_candidates(
+    db: Database,
+    *,
+    session_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """返回已关联岗位且仍缺少详情的会话，供仅岗位批量采集使用。"""
+    session_filter = ""
+    parameters: tuple[Any, ...] = ()
+    if session_ids is not None:
+        normalized_ids = [str(value).strip() for value in session_ids if str(value).strip()]
+        if not normalized_ids:
+            return []
+        placeholders = ",".join("?" for _ in normalized_ids)
+        session_filter = f"AND s.id IN ({placeholders})"
+        parameters = tuple(normalized_ids)
+    with db.connect() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT s.id, s.peer_name, s.company_name, s.job_title,
+                   s.job_id, s.encrypt_job_id,
+                   COALESCE(
+                     (SELECT j.detail_status FROM fj_boss_jobs j WHERE j.id = s.job_id LIMIT 1),
+                     (SELECT j.detail_status FROM fj_boss_jobs j
+                      WHERE s.encrypt_job_id <> '' AND j.encrypt_job_id = s.encrypt_job_id LIMIT 1),
+                     'not_collected'
+                   ) AS job_detail_status
+            FROM fj_chat_sessions s
+            WHERE (COALESCE(s.job_id, '') <> '' OR s.encrypt_job_id <> '')
+              AND COALESCE(
+                (SELECT j.detail_status FROM fj_boss_jobs j WHERE j.id = s.job_id LIMIT 1),
+                (SELECT j.detail_status FROM fj_boss_jobs j
+                 WHERE s.encrypt_job_id <> '' AND j.encrypt_job_id = s.encrypt_job_id LIMIT 1),
+                'not_collected'
+              ) <> 'completed'
+            {session_filter}
+            ORDER BY s.platform_synced_at DESC, s.platform_list_index ASC, s.id ASC
+            """,
+            parameters,
+        ).fetchall()
+    return [_row(row) or {} for row in rows]
+
+
 class BossChatBatchManager:
     """按会话顺序同步最新聊天，并按需补齐岗位详情。"""
 
@@ -4133,7 +4414,10 @@ class BossChatBatchManager:
         *,
         batch_size: int = CHAT_BATCH_LIMIT,
         session_ids: list[str] | None = None,
+        mode: str = "chat_and_job",
     ) -> dict[str, Any]:
+        if mode not in {"chat_and_job", "job_only"}:
+            raise AppError(422, "CHAT_BATCH_MODE_INVALID", "批量更新模式无效。")
         scoped_ids = (
             [str(value).strip() for value in session_ids if str(value).strip()]
             if session_ids is not None
@@ -4142,22 +4426,27 @@ class BossChatBatchManager:
         if self._active_task_id:
             active = self._tasks.get(self._active_task_id)
             if active and active["status"] in {"queued", "running"}:
-                if scoped_ids is not None and active.get("scope_session_ids") != scoped_ids:
+                if active.get("mode") != mode or (
+                    scoped_ids is not None and active.get("scope_session_ids") != scoped_ids
+                ):
                     raise AppError(
                         409,
                         "CHAT_BATCH_ACTIVE",
                         "已有批量更新任务正在执行，请等待完成后重试。",
                     )
                 return self.get(self._active_task_id)
-        candidates = get_batch_candidates(db, session_ids=scoped_ids)[
+        candidate_source = get_batch_candidates if mode == "chat_and_job" else get_job_batch_candidates
+        candidates = candidate_source(db, session_ids=scoped_ids)[
             :max(1, min(batch_size, CHAT_BATCH_LIMIT))
         ]
         if not candidates:
-            raise AppError(409, "CHAT_BATCH_EMPTY", "当前没有需要更新的聊天记录。")
+            message = "当前没有需要更新的聊天记录。" if mode == "chat_and_job" else "当前没有需要补采的岗位。"
+            raise AppError(409, "CHAT_BATCH_EMPTY", message)
         now = _now()
         task_id = _id("chat_batch")
         self._tasks[task_id] = {
             "id": task_id,
+            "mode": mode,
             "status": "queued",
             "total": len(candidates),
             "current": 0,
@@ -4168,7 +4457,7 @@ class BossChatBatchManager:
             "current_session_name": "",
             "current_job_title": "",
             "stage": "queued",
-            "message": "批量更新任务已创建。",
+            "message": "批量更新任务已创建。" if mode == "chat_and_job" else "批量岗位采集任务已创建。",
             "created_at": now,
             "finished_at": None,
             "candidates": candidates,
@@ -4190,19 +4479,26 @@ class BossChatBatchManager:
 
     def _run(self, task_id: str, db: Database, config: AppConfig) -> None:
         task = self._tasks[task_id]
-        task.update(status="running", stage="syncing_chat", message="开始同步聊天记录。")
+        is_job_only = task["mode"] == "job_only"
+        task.update(
+            status="running",
+            stage="collecting_job" if is_job_only else "syncing_chat",
+            message="开始采集岗位详情。" if is_job_only else "开始同步聊天记录。",
+        )
         try:
             for index, candidate in enumerate(task["candidates"], start=1):
                 task.update(
                     current=index - 1,
                     current_session_name=str(candidate.get("peer_name") or candidate.get("company_name") or "当前会话"),
                     current_job_title=str(candidate.get("job_title") or ""),
-                    stage="syncing_chat",
-                    message="正在获取最新 20 条聊天消息。",
+                    stage="collecting_job" if is_job_only else "syncing_chat",
+                    message="正在采集岗位详情。" if is_job_only else "正在获取最新 20 条聊天消息。",
                 )
                 try:
-                    refresh_session_history(db, str(candidate["id"]))
-                    task["chat_completed"] += 1
+                    # 仅岗位模式复用会话关联信息，不触发聊天消息同步。
+                    if not is_job_only:
+                        refresh_session_history(db, str(candidate["id"]))
+                        task["chat_completed"] += 1
                     job_action = prepare_chat_job(
                         db,
                         str(candidate["id"]),
@@ -4231,9 +4527,17 @@ class BossChatBatchManager:
                     task["message"] = f"当前会话处理失败：{str(exc)[:120]}"
                 task["current"] = index
                 if index < task["total"]:
-                    task.update(stage="waiting_next", message="等待后处理下一条聊天记录。")
+                    task.update(
+                        stage="waiting_next",
+                        message="等待后处理下一条岗位记录。" if is_job_only else "等待后处理下一条聊天记录。",
+                    )
                     time.sleep(random.randint(2, 5))
-            task.update(status="completed", stage="completed", message="批量更新已完成。", finished_at=_now())
+            task.update(
+                status="completed",
+                stage="completed",
+                message="批量岗位采集已完成。" if is_job_only else "批量更新已完成。",
+                finished_at=_now(),
+            )
         except Exception as exc:
             task.update(status="failed", stage="failed", message=str(exc)[:300], finished_at=_now())
         finally:

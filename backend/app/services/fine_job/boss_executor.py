@@ -834,7 +834,7 @@ def complete_task(
         raise AppError(409, "STALE_EXECUTION_EPOCH", "该任务执行轮次已经失效。")
     outcome = str(payload.get("outcome") or "unknown")
     status = "succeeded" if outcome in {"accepted", "succeeded"} else outcome
-    if status not in {"succeeded", "failed", "unknown"}:
+    if status not in {"succeeded", "failed", "blocked", "unknown"}:
         status = "unknown"
     if task["status"] not in {"queued", "running", "leased"}:
         if task["status"] == status:
@@ -871,6 +871,17 @@ def complete_task(
                 task_id,
             ),
         )
+        if status == "blocked":
+            # 执行器阻断后保留原任务记录，并交回待确认供用户重新决定。
+            connection.execute(
+                """
+                UPDATE fj_review_items
+                SET status = 'pending', resolved_at = NULL,
+                    resolution_note = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (message or "执行被阻断，等待重新确认", now, task["review_item_id"]),
+            )
         if task["action_type"] == "BOSS_DEFAULT_GREETING":
             if status == "succeeded" and bool(payload.get("contacted")):
                 evidence, _, _ = record_execution_evidence_with_connection(

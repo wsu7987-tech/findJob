@@ -26,6 +26,7 @@ from backend.app.services.fine_job.workflow import (
     approve_review_item,
     archive_review_item,
     batch_review_items,
+    delete_review_item,
     link_review_items_chat,
     list_automation_actions,
     list_review_items,
@@ -109,6 +110,14 @@ def archive_fine_job_review_item(
     return FineJobReviewItemResponse(
         **archive_review_item(db, review_item_id, note=payload.note)
     )
+
+
+@router.delete("/review-items/{review_item_id}")
+def delete_fine_job_review_item(
+    review_item_id: str,
+    db: Database = Depends(get_database),
+):
+    return delete_review_item(db, review_item_id)
 
 
 @router.post(

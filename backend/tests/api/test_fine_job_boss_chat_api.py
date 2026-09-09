@@ -445,7 +445,7 @@ def test_chat_observe_generate_confirm_and_send(configured_client) -> None:
     review_task = review_tasks.json()["items"][0]
     assert review_task["id"] == task["id"]
     assert review_task["source"] == "chat_reply"
-    assert review_task["task_type"] == "发送消息"
+    assert review_task["task_type"] == "代聊"
     assert review_task["task_detail"] == task["final_text"]
 
     edited_text = "您好，可以沟通一下办公地点、面试时间和薪资范围吗？"

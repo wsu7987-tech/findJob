@@ -9,6 +9,7 @@ class BossChatRuntimeUpdateRequest(BaseModel):
     listen_enabled: bool | None = None
     generation_enabled: bool | None = None
     send_enabled: bool | None = None
+    direct_execution_enabled: bool | None = None
     trigger_mode: Literal["immediate", "interval", "manual"] | None = None
     interval_minutes: Literal[0, 5, 10, 30, 60] | None = None
 
@@ -75,6 +76,7 @@ class BossChatBatchStartRequest(BaseModel):
 
 class BossChatBatchTaskResponse(BaseModel):
     id: str
+    mode: Literal["chat_and_job", "job_only"]
     status: Literal["queued", "running", "completed", "failed"]
     total: int
     current: int

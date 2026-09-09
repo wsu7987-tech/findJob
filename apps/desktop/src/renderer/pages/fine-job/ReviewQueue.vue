@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import { ElMessage, ElMessageBox } from "element-plus";
+import { computed, h, onBeforeUnmount, onMounted, ref } from "vue";
+import { ElButton, ElMessage, ElMessageBox } from "element-plus";
 import { useRouter } from "vue-router";
 
 import { formatDateTime } from "@/services/format";
@@ -18,10 +18,13 @@ const detailDrawerOpen = ref(false);
 const navigationErrors = ref<Record<string, string>>({});
 let executorPollTimer: number | null = null;
 
+type ReviewQueueRow =
+  | { id: string; kind: "greeting"; reviewItem: FineJobReviewItem }
+  | { id: string; kind: "chat"; chatTask: FineJobChatReviewTask };
+
 const reviewTabs: Array<{ label: string; name: FineJobReviewTab }> = [
   { label: "待确认", name: "pending" },
   { label: "不建议/已拒绝", name: "rejected" },
-  { label: "待执行", name: "running" },
   { label: "已执行", name: "executed" },
   { label: "已归档", name: "dismissed" }
 ];
@@ -30,12 +33,33 @@ const reviewPageDescriptions: Record<FineJobReviewTab, string> = {
   pending: "集中审核推荐岗位和需要判断的岗位，批准后创建默认招呼执行任务。",
   approved: "查看已经批准的岗位和执行任务。",
   rejected: "查看 AI 不建议或用户拒绝的岗位，可明确覆盖结论。",
-  running: "查看已经批准、等待执行或正在推进的岗位。",
-  executed: "查看已经完成沟通、发送后失败或结果未知的岗位。",
+  executed: "查看已经执行完成的打招呼、代聊和简历发送任务。",
   dismissed: "保存用户主动归档和被新评估替代的历史事项。"
 };
 
 const pageDescription = computed(() => reviewPageDescriptions[workflowStore.selectedStatus]);
+const reviewRows = computed<ReviewQueueRow[]>(() => {
+  const greetingRows = workflowStore.items.map((reviewItem) => ({
+    id: reviewItem.id,
+    kind: "greeting" as const,
+    reviewItem
+  }));
+  const chatTasks = workflowStore.selectedStatus === "pending"
+    ? workflowStore.chatReviewTasks
+    : workflowStore.selectedStatus === "executed"
+      ? workflowStore.chatExecutedTasks
+      : [];
+  if (!chatTasks.length) return greetingRows;
+  // 自动代聊任务与岗位打招呼任务复用主列表，按当前页签展示对应状态。
+  return [
+    ...chatTasks.map((chatTask) => ({
+      id: chatTask.id,
+      kind: "chat" as const,
+      chatTask
+    })),
+    ...greetingRows
+  ];
+});
 
 const executorLabel = computed(() => {
   const executor = executorStore.dashboard?.executor;
@@ -109,6 +133,15 @@ const archive = async (item: FineJobReviewItem) => {
     ElMessage.success("已归档该事项");
   } catch {
     ElMessage.error(workflowStore.error ?? "归档失败");
+  }
+};
+
+const deleteGreeting = async (item: FineJobReviewItem) => {
+  try {
+    await workflowStore.archive(item, "用户删除待确认打招呼任务");
+    ElMessage.success("已删除待确认打招呼任务");
+  } catch {
+    ElMessage.error(workflowStore.error ?? "删除失败");
   }
 };
 
@@ -194,13 +227,149 @@ const canReturnToReview = (item: FineJobReviewItem) => Boolean(
   item.action_id && !["running", "succeeded"].includes(item.execution_state ?? "")
 );
 
+const handleSelectionChange = (rows: ReviewQueueRow[]) => {
+  const greetings: FineJobReviewItem[] = [];
+  rows.forEach((row) => {
+    if (row.kind === "greeting") greetings.push(row.reviewItem);
+  });
+  selectedRows.value = greetings;
+};
+
 const showDetail = (item: FineJobReviewItem) => {
   detailItem.value = item;
   detailDrawerOpen.value = true;
 };
 
-const approveChatReviewTask = async (task: FineJobChatReviewTask) => {
+const openHistoryDetail = (item: FineJobReviewItem) => router.push({
+  name: "fine-job-capture-history",
+  query: { history_id: item.job_id }
+});
+
+const openChatJobDetail = (task: FineJobChatReviewTask) => {
+  if (!task.job_id) {
+    ElMessage.warning("当前代聊任务没有关联岗位详情");
+    return;
+  }
+  router.push({ name: "fine-job-capture-history", query: { history_id: task.job_id } });
+};
+
+const deleteReviewItem = async (item: FineJobReviewItem) => {
   try {
+    await workflowStore.deleteItem(item);
+    ElMessage.success("已删除待确认记录");
+  } catch {
+    ElMessage.error(workflowStore.error ?? "删除失败");
+  }
+};
+
+const linkChatReviewTask = async (task: FineJobChatReviewTask) => {
+  try {
+    const context = await api.linkFineJobChatReviewTask(task.id, task.source);
+    if (context.status === "resume_already_sent") {
+      await loadStatus("pending");
+      ElMessage.success("检测到该会话已发送简历，已取消重复任务");
+      return context;
+    }
+    if (context.status === "new_message") {
+      ElMessage.warning(`有新消息：${context.latest_message || "暂无消息内容"}`);
+      return context;
+    }
+    ElMessage.success(task.source === "chat_reply" ? "当前没有新消息" : "当前会话尚未发送简历");
+    return context;
+  } catch (errorValue) {
+    ElMessage.error(errorValue instanceof Error ? errorValue.message : "关联聊天信息失败");
+    return null;
+  }
+};
+
+const hasOtherSendingMessage = async (task: FineJobChatReviewTask) => {
+  const detail = await api.getFineJobChatSession(task.session_id);
+  const hasPendingReview = detail.reply_tasks.some((item) => (
+    item.id !== task.id && item.status === "awaiting_review"
+  ));
+  const hasQueuedAction = detail.send_actions.some((action) => (
+    action.operation_kind === "text" && ["queued", "leased", "dispatching"].includes(action.status)
+  ));
+  return hasPendingReview || hasQueuedAction;
+};
+
+const copyChatMessage = async (message: string) => {
+  try {
+    await navigator.clipboard.writeText(message);
+    ElMessage.success("本轮信息已复制");
+  } catch {
+    ElMessage.error("复制信息失败");
+  }
+};
+
+const linkAllChatInformation = async () => {
+  try {
+    const greetingResult = await workflowStore.linkChatBatch();
+    let newMessageCount = 0;
+    let resumeCancelledCount = 0;
+    let upToDateCount = 0;
+    for (const task of workflowStore.chatReviewTasks) {
+      const context = await api.linkFineJobChatReviewTask(task.id, task.source);
+      if (context.status === "new_message") newMessageCount += 1;
+      else if (context.status === "resume_already_sent") resumeCancelledCount += 1;
+      else upToDateCount += 1;
+    }
+    await loadStatus("pending");
+    const greetingSummary = greetingResult.matched
+      ? `岗位聊天已关联 ${greetingResult.matched} 项`
+      : "没有匹配到岗位聊天";
+    ElMessage.success(
+      `${greetingSummary}；代聊有新消息 ${newMessageCount} 条，已取消重复简历 ${resumeCancelledCount} 条，当前无更新 ${upToDateCount} 条`
+    );
+  } catch (errorValue) {
+    ElMessage.error(errorValue instanceof Error ? errorValue.message : "关联聊天信息失败");
+  }
+};
+
+const chooseChatDraftResolution = async (task: FineJobChatReviewTask) => {
+  if (task.source !== "chat_reply") return undefined;
+  const detail = await api.getFineJobChatSession(task.session_id);
+  const existingDraftText = (detail.draft?.final_text || detail.draft?.draft_text || "").trim();
+  if (!existingDraftText) return undefined;
+  try {
+    await ElMessageBox.confirm(
+      h("div", { class: "draft-conflict-dialog" }, [
+        h("p", "当前会话草稿已有内容。请选择如何处理本轮待确认消息："),
+        h("p", { class: "draft-conflict-dialog__label" }, "本轮信息"),
+        h("pre", { class: "draft-conflict-dialog__message" }, task.task_detail),
+        h(ElButton, { link: true, type: "primary", onClick: () => void copyChatMessage(task.task_detail) }, () => "复制信息")
+      ]),
+      "取消待确认任务",
+      {
+        type: "warning",
+        confirmButtonText: "覆盖草稿",
+        cancelButtonText: "丢弃本轮信息",
+        distinguishCancelAndClose: true,
+        closeOnClickModal: false
+      }
+    );
+    return "overwrite" as const;
+  } catch (reason) {
+    if (reason === "cancel") return "discard" as const;
+    return null;
+  }
+};
+
+const approveChatReviewTask = async (task: FineJobChatReviewTask) => {
+  const context = await linkChatReviewTask(task);
+  if (!context || context.cancelled) return;
+  if (context.has_new_message) {
+    ElMessage.warning("当前会话有新消息，请进入聊天信息页查看后重新生成回复");
+    return;
+  }
+  try {
+    if (task.source === "chat_reply" && await hasOtherSendingMessage(task)) {
+      await ElMessageBox.confirm(
+        "当前有一条消息处于待确认或发送中，仍要发送本条消息吗？",
+        "确认发送",
+        { type: "warning", confirmButtonText: "继续发送", cancelButtonText: "暂不发送" }
+      );
+    }
     if (task.source === "chat_reply") {
       await api.confirmFineJobChatReply(task.id, {
         final_text: task.task_detail,
@@ -214,16 +383,27 @@ const approveChatReviewTask = async (task: FineJobChatReviewTask) => {
     await executorStore.load();
     ElMessage.success("任务已进入执行队列");
   } catch (errorValue) {
+    if (errorValue === "cancel" || errorValue === "close") return;
     ElMessage.error(errorValue instanceof Error ? errorValue.message : "确认任务失败");
   }
 };
 
 const rejectChatReviewTask = async (task: FineJobChatReviewTask) => {
   try {
-    if (task.source === "chat_reply") await api.cancelFineJobChatReply(task.id);
+    let draftResolution: "overwrite" | "discard" | undefined;
+    if (task.source === "chat_reply") {
+      const selectedResolution = await chooseChatDraftResolution(task);
+      if (selectedResolution === null) return;
+      draftResolution = selectedResolution;
+      await api.cancelFineJobChatReply(task.id, draftResolution);
+    }
     else await api.cancelFineJobChatResumeAction(task.id);
     await loadStatus("pending");
-    ElMessage.success("已取消待确认任务");
+    ElMessage.success(
+      task.source === "chat_reply"
+        ? draftResolution === "discard" ? "已取消待确认任务，已丢弃本轮信息" : "已取消待确认任务，消息已恢复草稿"
+        : "已取消待确认任务"
+    );
   } catch (errorValue) {
     ElMessage.error(errorValue instanceof Error ? errorValue.message : "取消任务失败");
   }
@@ -239,6 +419,11 @@ const executionLabel = (item: FineJobReviewItem) => {
     queued: "待处理", running: "执行中", succeeded: "已完成",
     cancelled: "已取消", blocked: "已阻断", failed: "执行失败", unknown: "结果未知"
   } as Record<string, string>)[item.execution_state ?? ""] ?? item.execution_state ?? "未知";
+};
+const chatExecutionLabel = (task: FineJobChatReviewTask) => {
+  if (workflowStore.selectedStatus !== "executed") return "待确认";
+  return ({ accepted: "已发送", failed: "发送失败", unknown: "结果未知" } as Record<string, string>)[task.execution_state ?? ""]
+    ?? "已执行";
 };
 const evaluationReasons = (evaluation: FineJobReviewItem["evaluation"]) =>
   Array.isArray(evaluation?.reasons) ? evaluation.reasons : [];
@@ -378,103 +563,115 @@ onBeforeUnmount(() => {
         <el-button v-if="workflowStore.selectedStatus === 'pending'" type="danger" plain @click="runBatch('reject')">批量拒绝</el-button>
         <el-button @click="runBatch('archive')">批量归档</el-button>
       </div>
-      <div v-if="['pending', 'rejected', 'running'].includes(workflowStore.selectedStatus)" class="batch-toolbar">
-        <el-button type="success" :loading="workflowStore.loading" @click="linkChatBatch">关联聊天信息</el-button>
+      <div v-if="['pending', 'rejected'].includes(workflowStore.selectedStatus)" class="batch-toolbar">
+        <el-button
+          type="success"
+          :loading="workflowStore.loading"
+          @click="workflowStore.selectedStatus === 'pending' ? linkAllChatInformation() : linkChatBatch()"
+        >关联聊天信息</el-button>
         <span class="secondary-text">
-          {{ workflowStore.selectedStatus === 'running'
-            ? '按当前筛选条件关联全部分页记录，匹配到同岗位聊天会话后确认已执行。'
+          {{ workflowStore.selectedStatus === 'pending'
+            ? '统一检查岗位关联、代聊是否有新消息，并自动取消已发送的重复简历任务。'
             : '按当前筛选条件关联全部分页记录，匹配到同岗位聊天会话后归档。' }}
         </span>
       </div>
 
       <el-table
         v-loading="workflowStore.loading"
-        :data="workflowStore.items"
+        :data="reviewRows"
         row-key="id"
         empty-text="当前筛选条件下暂无事项"
-        @selection-change="(rows: FineJobReviewItem[]) => selectedRows = rows"
+        @selection-change="handleSelectionChange"
       >
         <el-table-column v-if="['pending', 'rejected'].includes(workflowStore.selectedStatus)" type="selection" width="46" />
+        <el-table-column label="任务类型" width="125">
+          <template #default="{ row }">
+            <span v-if="row.kind === 'greeting'">打招呼</span>
+            <el-button v-else link type="primary" @click="openChat(row.chatTask.session_id)">{{ row.chatTask.task_type }}</el-button>
+          </template>
+        </el-table-column>
         <el-table-column label="岗位" min-width="210">
           <template #default="{ row }">
-            <el-button link type="primary" :loading="executorStore.openingJobId === row.id" @click="openInDedicatedBrowser(row)">
-              {{ row.job_title }}
+            <el-button v-if="row.kind === 'greeting'" link type="primary" @click="showDetail(row.reviewItem)">
+              {{ row.reviewItem.job_title }}
             </el-button>
-            <p v-if="navigationErrors[row.id]" class="row-error">{{ navigationErrors[row.id] }}</p>
+            <el-button v-else link type="primary" @click="openChatJobDetail(row.chatTask)">
+              {{ row.chatTask.job_title || "-" }}
+            </el-button>
           </template>
         </el-table-column>
         <el-table-column label="公司" min-width="220">
           <template #default="{ row }">
-            <div class="company-cell">
-              <span>{{ row.company_name }}</span>
-              <el-tag v-if="row.company_type === 'outsourcing'" type="warning" size="small">外包公司</el-tag>
+            <div v-if="row.kind === 'greeting'" class="company-cell">
+              <span>{{ row.reviewItem.company_name }}</span>
+              <el-tag v-if="row.reviewItem.company_type === 'outsourcing'" type="warning" size="small">外包公司</el-tag>
               <el-tag
-                v-if="row.company_chat_session_id"
+                v-if="row.reviewItem.company_chat_session_id"
                 class="company-chat-tag"
                 type="success"
                 size="small"
-                @click="openChat(row.company_chat_session_id)"
+                @click="openChat(row.reviewItem.company_chat_session_id)"
               >有过沟通</el-tag>
             </div>
+            <span v-else>{{ row.chatTask.company_name || row.chatTask.peer_name || "-" }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="任务类型" width="115"><template #default>打招呼</template></el-table-column>
+
         <el-table-column label="任务详情" min-width="260" show-overflow-tooltip>
-          <template #default="{ row }">{{ row.final_message || row.draft_message || "待生成招呼语" }}</template>
+          <template #default="{ row }">
+            {{ row.kind === 'greeting'
+              ? row.reviewItem.final_message || row.reviewItem.draft_message || "待生成招呼语"
+              : row.chatTask.task_detail }}
+          </template>
         </el-table-column>
         <el-table-column label="AI 结论" width="115">
-          <template #default="{ row }"><el-tag :type="decisionType(row.ai_decision)">{{ decisionLabel(row.ai_decision) }}</el-tag></template>
+          <template #default="{ row }">
+            <el-tag v-if="row.kind === 'greeting'" :type="decisionType(row.reviewItem.ai_decision)">{{ decisionLabel(row.reviewItem.ai_decision) }}</el-tag>
+            <span v-else>-</span>
+          </template>
         </el-table-column>
         <el-table-column label="置信度" width="90">
-          <template #default="{ row }">{{ confidencePercent(row.evaluation) }}%</template>
+          <template #default="{ row }">{{ row.kind === 'greeting' ? `${confidencePercent(row.reviewItem.evaluation)}%` : "-" }}</template>
         </el-table-column>
         <el-table-column label="关键判断" min-width="240" show-overflow-tooltip>
-          <template #default="{ row }">{{ evaluationSummary(row.evaluation) }}</template>
+          <template #default="{ row }">{{ row.kind === 'greeting' ? evaluationSummary(row.reviewItem.evaluation) : row.chatTask.peer_name || "待确认发送" }}</template>
         </el-table-column>
         <el-table-column label="执行状态" width="140">
-          <template #default="{ row }">{{ executionLabel(row) }}</template>
+          <template #default="{ row }">
+            <el-tag v-if="row.kind === 'chat' && row.chatTask.has_new_message" type="warning">有新消息</el-tag>
+            <el-tag v-else-if="row.kind === 'chat' && row.chatTask.resume_already_sent" type="success">已发送简历</el-tag>
+            <span v-else>{{ row.kind === 'greeting' ? executionLabel(row.reviewItem) : chatExecutionLabel(row.chatTask) }}</span>
+          </template>
         </el-table-column>
         <el-table-column label="创建时间" width="175">
-          <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
+          <template #default="{ row }">{{ formatDateTime(row.kind === 'greeting' ? row.reviewItem.created_at : row.chatTask.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="230" fixed="right">
+        <el-table-column label="操作" width="180" fixed="right">
           <template #default="{ row }">
-            <el-button link @click="showDetail(row)">详情</el-button>
-            <template v-if="row.status === 'pending'">
-              <el-button link type="primary" @click="approve(row)">批准</el-button>
-              <el-button link type="danger" @click="reject(row)">拒绝</el-button>
-              <el-button link @click="archive(row)">归档</el-button>
+            <template v-if="row.kind === 'chat'">
+              <template v-if="workflowStore.selectedStatus === 'pending'">
+                <el-button link type="primary" @click="approveChatReviewTask(row.chatTask)">批准</el-button>
+                <el-button link type="danger" @click="rejectChatReviewTask(row.chatTask)">取消</el-button>
+              </template>
             </template>
-            <template v-else-if="row.status === 'rejected'">
-              <el-button link type="warning" @click="approve(row)">仍要沟通</el-button>
-              <el-button link @click="archive(row)">归档</el-button>
+            <template v-else-if="row.reviewItem.status === 'pending'">
+              <el-button link type="primary" @click="approve(row.reviewItem)">批准</el-button>
+              <el-button link type="danger" @click="reject(row.reviewItem)">拒绝</el-button>
+              <el-button link type="danger" @click="deleteGreeting(row.reviewItem)">删除</el-button>
             </template>
-            <el-button v-else-if="canRestore(row)" link type="primary" @click="restore(row)">恢复</el-button>
-            <el-button v-else-if="canReturnToReview(row)" link type="danger" @click="returnToReview(row)">退回</el-button>
+            <template v-else-if="row.reviewItem.status === 'rejected'">
+              <el-button link type="warning" @click="approve(row.reviewItem)">仍要沟通</el-button>
+              <el-button link @click="archive(row.reviewItem)">归档</el-button>
+              <el-button link type="danger" @click="deleteReviewItem(row.reviewItem)">删除</el-button>
+            </template>
+            <template v-else-if="row.reviewItem.status === 'dismissed'">
+              <el-button v-if="canRestore(row.reviewItem)" link type="primary" @click="restore(row.reviewItem)">恢复</el-button>
+              <el-button link type="danger" @click="deleteReviewItem(row.reviewItem)">删除</el-button>
+            </template>
+            <el-button v-else-if="canReturnToReview(row.reviewItem)" link type="danger" @click="returnToReview(row.reviewItem)">退回</el-button>
           </template>
         </el-table-column>
       </el-table>
-
-      <section v-if="workflowStore.selectedStatus === 'pending'" class="chat-review-section">
-        <div class="panel-title-row">
-          <div><p class="panel-eyebrow">Chat Actions</p><h2>自动代聊待确认</h2></div>
-          <el-tag type="warning">{{ workflowStore.chatReviewTasks.length }} 项</el-tag>
-        </div>
-        <el-table :data="workflowStore.chatReviewTasks" empty-text="当前没有待确认的自动代聊任务">
-          <el-table-column label="任务类型" width="120"><template #default="{ row }">{{ row.task_type }}</template></el-table-column>
-          <el-table-column label="任务详情" min-width="280" show-overflow-tooltip><template #default="{ row }">{{ row.task_detail }}</template></el-table-column>
-          <el-table-column label="招聘方" min-width="140"><template #default="{ row }">{{ row.peer_name || "-" }}</template></el-table-column>
-          <el-table-column label="公司 / 岗位" min-width="180"><template #default="{ row }">{{ row.company_name || "-" }} · {{ row.job_title || "-" }}</template></el-table-column>
-          <el-table-column label="创建时间" width="175"><template #default="{ row }">{{ formatDateTime(row.created_at) }}</template></el-table-column>
-          <el-table-column label="操作" width="230" fixed="right">
-            <template #default="{ row }">
-              <el-button link @click="openChat(row.session_id)">查看会话</el-button>
-              <el-button link type="primary" @click="approveChatReviewTask(row)">批准</el-button>
-              <el-button link type="danger" @click="rejectChatReviewTask(row)">取消</el-button>
-            </template>
-          </el-table-column>
-        </el-table>
-      </section>
 
       <div class="review-pagination">
         <el-pagination
@@ -515,6 +712,7 @@ onBeforeUnmount(() => {
           </div>
           <h3>招呼语草稿</h3>
           <p>{{ detailItem.draft_message || "暂无招呼语草稿" }}</p>
+          <el-button type="primary" plain @click="openHistoryDetail(detailItem)">查看更多详细信息</el-button>
           <el-link v-if="detailItem.job_link" :href="detailItem.job_link" target="_blank" type="info">打开 BOSS 原始链接</el-link>
         </div>
       </template>

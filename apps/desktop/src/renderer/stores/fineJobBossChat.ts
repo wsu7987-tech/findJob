@@ -11,7 +11,8 @@ import type {
   FineJobChatMessageTransformRule,
   FineJobChatSession,
   FineJobChatSessionDetail,
-  FineJobBossResumeAttachment
+  FineJobBossResumeAttachment,
+  FineJobJobHuntRefreshScope
 } from "@/types";
 
 
@@ -31,6 +32,8 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
   const batchSummary = ref<FineJobChatBatchSummary | null>(null);
   const batchProgress = ref<FineJobChatBatchTask | null>(null);
   const batchSize = ref(20);
+  const batchScope = ref<FineJobJobHuntRefreshScope | null>(null);
+  const batchScopeDiscovering = ref(false);
   const resumeAttachments = ref<FineJobBossResumeAttachment[]>([]);
   const resumeListLoaded = ref(false);
   const resumeListError = ref<string | null>(null);
@@ -39,11 +42,7 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
   const error = ref<string | null>(null);
   let batchPollTimer: number | null = null;
 
-  const currentTask = computed<FineJobChatReplyTask | null>(() =>
-    detail.value?.reply_tasks.find((task) => [
-      "pending_generation", "generating", "awaiting_review", "failed"
-    ].includes(task.status)) ?? null
-  );
+  const currentTask = computed<FineJobChatReplyTask | null>(() => detail.value?.draft ?? null);
 
   const load = async () => {
     loading.value = true;
@@ -171,6 +170,25 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     return batchSummary.value;
   };
 
+  const discoverBatchScope = async (selectedSinceTime: string) => {
+    batchScopeDiscovering.value = true;
+    error.value = null;
+    try {
+      // 与求职数据更新页面共用 Scope，保证时间范围和计数口径一致。
+      batchScope.value = await api.discoverFineJobJobHuntRefreshScope(selectedSinceTime, "auto");
+      const hasPendingItems = batchScope.value.counts.sessions_to_sync > 0
+        || batchScope.value.counts.extra_jobs > 0;
+      // 按时间范围统计后，批量计步器恢复为默认上限，用户可自行调小。
+      batchSize.value = hasPendingItems ? 20 : 0;
+      return batchScope.value;
+    } catch (value) {
+      error.value = mapError(value);
+      throw value;
+    } finally {
+      batchScopeDiscovering.value = false;
+    }
+  };
+
   const stopBatchPolling = () => {
     if (batchPollTimer !== null) window.clearInterval(batchPollTimer);
     batchPollTimer = null;
@@ -186,6 +204,7 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     batchProgress.value = null;
     await refreshSelected();
     await refreshBatchSummary();
+    if (batchScope.value) await discoverBatchScope(batchScope.value.selected_since_time);
     return progress;
   };
 
@@ -199,8 +218,15 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     }, 1000);
   };
 
-  const startBatchUpdate = async () => mutate(async () => {
-    const task = await api.startFineJobChatBatch(batchSize.value);
+  const startBatchUpdate = async (sessionIds?: string[], size = batchSize.value) => mutate(async () => {
+    const task = await api.startFineJobChatBatch(size, sessionIds);
+    batchProgress.value = task;
+    startBatchPolling(task.id);
+    return task;
+  });
+
+  const startBatchJobCollection = async (sessionIds: string[], size = batchSize.value) => mutate(async () => {
+    const task = await api.startFineJobChatJobBatch(size, sessionIds);
     batchProgress.value = task;
     startBatchPolling(task.id);
     return task;
@@ -296,11 +322,12 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
 
   const confirm = async (finalText: string) => mutate(async () => {
     if (!selectedSessionId.value) throw new Error("请先选择聊天会话");
-    let task = currentTask.value;
-    if (task?.status === "awaiting_review") {
-      await api.editFineJobChatReply(task.id, finalText);
-    } else {
-      task = (await api.createFineJobChatManualReply(selectedSessionId.value, finalText)).reply_task;
+    const draft = currentTask.value;
+    if (draft?.status === "awaiting_review") await api.editFineJobChatReply(draft.id, finalText);
+    const task = (await api.createFineJobChatManualReply(selectedSessionId.value, finalText)).reply_task;
+    if (!runtime.value?.direct_execution_enabled) {
+      await refreshSelected();
+      return { destination: "review" as const };
     }
     const result = await api.confirmFineJobChatReply(task.id, {
       final_text: finalText,
@@ -308,7 +335,7 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
       based_on_session_version: task.based_on_session_version
     });
     await refreshSelected();
-    return result.action;
+    return { destination: "queue" as const, action: result.action };
   });
 
   const refreshResumeAttachments = async () => mutate(async () => {
@@ -412,6 +439,8 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     batchSummary,
     batchProgress,
     batchSize,
+    batchScope,
+    batchScopeDiscovering,
     resumeAttachments,
     resumeListLoaded,
     resumeListError,
@@ -430,7 +459,9 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     checkNow,
     refreshFriendList,
     refreshBatchSummary,
+    discoverBatchScope,
     startBatchUpdate,
+    startBatchJobCollection,
     stopBatchPolling,
     refreshHistory,
     retransformMessages,
