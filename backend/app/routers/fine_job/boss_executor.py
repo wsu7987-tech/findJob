@@ -42,7 +42,7 @@ def create_pairing_code(db: Database = Depends(get_database)):
 @router.post("/boss-executor/pair", response_model=BossExecutorPairResponse)
 async def pair(payload: BossExecutorPairRequest, db: Database = Depends(get_database)):
     result = boss_executor.pair_executor(db, **payload.model_dump())
-    await boss_executor.broadcast_executor_state(db)
+    await boss_executor.broadcast_executor_state(db, str(result["executor_id"]))
     return result
 
 
@@ -54,7 +54,7 @@ async def heartbeat(
 ):
     executor = _executor(db, authorization)
     result = boss_executor.heartbeat(db, str(executor["id"]), payload.model_dump())
-    await boss_executor.broadcast_executor_state(db)
+    await boss_executor.broadcast_executor_state(db, str(executor["id"]))
     return result
 
 

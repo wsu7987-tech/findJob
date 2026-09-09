@@ -29,6 +29,8 @@ const PAGE_MATCH_TIMEOUT_MS = 5_000;
 const PAGE_MATCH_PROBE_INTERVAL_MS = 1_000;
 const PAGE_OPEN_TIMEOUT_MS = 5_000;
 const TASK_EXECUTION_TIMEOUT_MS = 40_000;
+const HEARTBEAT_ATTEMPTS = 3;
+const HEARTBEAT_RETRY_DELAYS_MS = [600, 1_500];
 
 type Credentials = { executorId: string; token: string };
 
@@ -142,30 +144,22 @@ export class FineJobExecutorClient {
     if (this.heartbeatPromise) return this.heartbeatPromise;
     this.heartbeatPromise = (async () => {
       try {
-        const heartbeat = await this.request<{
-          executor: ExecutorRuntimeState["executor"];
-          queue: { actions: FineJobQueueAction[] };
-        }>("/heartbeat", {
-          method: "POST",
-          body: JSON.stringify({
-            protocol_version: PROTOCOL_VERSION,
-            plugin_version: packageJson.version,
-            capabilities: CAPABILITIES,
-            browser_connected: true,
-            risk_state: "none"
-          })
-        });
-        this.state.connected = true;
-        this.state.paired = true;
-        this.state.executor = heartbeat.executor;
-        this.state.queue = heartbeat.queue.actions;
-        if (!this.shouldKeepDetailAfterHeartbeat()) {
-          this.state.detail = "FineJob通信正常";
+        let lastError: Error | null = null;
+        for (let attempt = 0; attempt < HEARTBEAT_ATTEMPTS; attempt += 1) {
+          try {
+            await this.sendHeartbeat();
+            return;
+          } catch (error) {
+            lastError = error as Error;
+            if (attempt === HEARTBEAT_ATTEMPTS - 1) break;
+            // 未收到本次心跳回执时短暂等待后重发，后端按执行器状态幂等更新。
+            await this.waitForHeartbeatRetry(HEARTBEAT_RETRY_DELAYS_MS[attempt] ?? 1_500);
+          }
         }
-        await this.flushPendingResults();
+        throw lastError ?? new Error("FineJob未确认本次心跳");
       } catch (error) {
         this.state.connected = false;
-        this.state.detail = (error as Error).message || "FineJob连接失败";
+        this.state.detail = `FineJob未确认连接：${(error as Error).message || "请稍后重试"}`;
         throw error;
       }
     })();
@@ -174,6 +168,43 @@ export class FineJobExecutorClient {
     } finally {
       this.heartbeatPromise = null;
     }
+  }
+
+  private async sendHeartbeat(): Promise<void> {
+    const requestId = crypto.randomUUID();
+    const heartbeat = await this.request<{
+      accepted: boolean;
+      request_id: string;
+      executor: ExecutorRuntimeState["executor"];
+      queue: { actions: FineJobQueueAction[] };
+    }>("/heartbeat", {
+      method: "POST",
+      body: JSON.stringify({
+        request_id: requestId,
+        protocol_version: PROTOCOL_VERSION,
+        plugin_version: packageJson.version,
+        capabilities: CAPABILITIES,
+        browser_connected: true,
+        risk_state: "none"
+      })
+    });
+    if (heartbeat.accepted !== true || heartbeat.request_id !== requestId) {
+      throw new Error("FineJob未确认本次心跳");
+    }
+    this.state.connected = true;
+    this.state.paired = true;
+    this.state.executor = heartbeat.executor;
+    this.state.queue = heartbeat.queue.actions;
+    if (!this.shouldKeepDetailAfterHeartbeat()) {
+      this.state.detail = "FineJob通信正常";
+    }
+    await this.flushPendingResults();
+  }
+
+  private async waitForHeartbeatRetry(delayMs: number): Promise<void> {
+    await new Promise<void>((resolve) => {
+      globalThis.setTimeout(resolve, delayMs);
+    });
   }
 
   private connectControlChannel(): void {

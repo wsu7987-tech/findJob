@@ -25,6 +25,7 @@ class BossExecutorPairResponse(BaseModel):
 
 
 class BossExecutorHeartbeatRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=80)
     protocol_version: str = Field(max_length=20)
     plugin_version: str = Field(max_length=40)
     capabilities: list[str] = Field(default_factory=list, max_length=20)

@@ -148,7 +148,7 @@ async def register_executor_channel(db: Database, executor_id: str, websocket: A
     _finish_active_tasks_as_unknown(db, "插件重新连接后清理遗留执行中任务，已结束为结果未知。", "EXECUTOR_RECONNECTED_RESET")
     _record_channel_heartbeat(db, executor_id)
     await _send_queue(db, executor_id)
-    await _broadcast_executor_state(db)
+    await _broadcast_executor_state(db, executor_id)
 
 
 async def unregister_executor_channel(db: Database, executor_id: str, websocket: Any) -> None:
@@ -415,7 +415,11 @@ def heartbeat(db: Database, executor_id: str, payload: dict[str, object]) -> dic
                 "UPDATE fj_boss_executor_instances SET queue_state = 'risk_paused' WHERE id = ?",
                 (executor_id,),
             )
-    return executor_status(db, executor_id)
+    return {
+        "accepted": True,
+        "request_id": str(payload["request_id"]),
+        **executor_status(db, executor_id),
+    }
 
 
 def update_executor_settings(db: Database, payload: dict[str, object]) -> dict[str, object]:
@@ -509,7 +513,10 @@ def executor_status(db: Database, executor_id: str | None = None) -> dict[str, o
         executor = (
             connection.execute("SELECT * FROM fj_boss_executor_instances WHERE id = ?", (executor_id,)).fetchone()
             if executor_id
-            else connection.execute("SELECT * FROM fj_boss_executor_instances ORDER BY updated_at DESC LIMIT 1").fetchone()
+            # 时间精度为秒级时，以最新插入的执行器稳定打破并列，避免桌面端读取旧连接状态。
+            else connection.execute(
+                "SELECT * FROM fj_boss_executor_instances ORDER BY updated_at DESC, rowid DESC LIMIT 1"
+            ).fetchone()
         )
     return {
         "executor": _serialize_executor(executor) if executor else None,
@@ -1323,22 +1330,22 @@ async def notify_queue_changed(db: Database) -> None:
     await _broadcast_executor_state(db)
 
 
-async def _send_desktop_state(db: Database, websocket: Any) -> bool:
+async def _send_desktop_state(db: Database, websocket: Any, executor_id: str | None = None) -> bool:
     try:
-        await websocket.send_json({"type": "executor_state", "runtime": executor_status(db)})
+        await websocket.send_json({"type": "executor_state", "runtime": executor_status(db, executor_id)})
     except Exception:
         return False
     return True
 
 
-async def _broadcast_executor_state(db: Database) -> None:
+async def _broadcast_executor_state(db: Database, executor_id: str | None = None) -> None:
     for websocket in list(_desktop_channels):
-        if not await _send_desktop_state(db, websocket):
+        if not await _send_desktop_state(db, websocket, executor_id):
             _desktop_channels.discard(websocket)
 
 
-async def broadcast_executor_state(db: Database) -> None:
-    await _broadcast_executor_state(db)
+async def broadcast_executor_state(db: Database, executor_id: str | None = None) -> None:
+    await _broadcast_executor_state(db, executor_id)
 
 
 async def _open_and_notify_task_page(db: Database, executor_id: str) -> None:
