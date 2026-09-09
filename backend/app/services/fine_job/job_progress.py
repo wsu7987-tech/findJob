@@ -72,9 +72,10 @@ def build_job_progress_with_connection(
     waiting_on = str(snapshot["waiting_on"] or "unknown")
     reason_source = str(snapshot["rejection_reason_source"] or "unknown")
     reason_category = str(snapshot["rejection_reason_category"] or "unknown")
+    rejection_party = _rejection_party(connection, snapshot["stage_event_id"])
     decision = str(attention["decision"] or "wait") if attention else "wait"
     primary_action = _primary_action(
-        stage, waiting_on, reason_source, reason_category, decision
+        stage, waiting_on, reason_source, reason_category, decision, rejection_party
     )
     draft_text = ""
     if draft:
@@ -103,7 +104,9 @@ def build_job_progress_with_connection(
             "rejection_reason_source": reason_source,
             "rejection_reason_category": str(snapshot["rejection_reason_category"] or "unknown"),
             "rejection_reason_summary": str(snapshot["rejection_reason_summary"] or ""),
+            "rejection_party": rejection_party,
         },
+        "resume_delivery": _resume_delivery(connection, selected_session_id),
         "primary_action": primary_action,
         "analysis_updated_at": analysis_updated_at,
     }
@@ -136,13 +139,84 @@ def _activity_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return payload
 
 
+def _rejection_party(connection: sqlite3.Connection, stage_event_id: str) -> str | None:
+    row = connection.execute(
+        "SELECT payload_json FROM fj_job_activity_events WHERE id = ?", (stage_event_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        party = json.loads(str(row["payload_json"] or "{}")).get("rejection_party")
+    except json.JSONDecodeError:
+        return None
+    return party if party in {"candidate", "recruiter"} else None
+
+
+def _resume_delivery(
+    connection: sqlite3.Connection, session_id: str | None
+) -> dict[str, Any]:
+    """会话简历状态以平台动作优先，发送队列只表达尚未被平台观察到的过程。"""
+    if not session_id:
+        return {"status": "not_started", "source": "none", "occurred_at": None}
+    action_message = connection.execute(
+        """
+        SELECT action_type, sent_at FROM fj_chat_messages
+        WHERE session_id = ? AND display_kind = 'action'
+          AND action_type IN (
+            'resume_sent', 'resume_sent_confirmed', 'resume_received',
+            'resume_viewed', 'resume_withdrawn', 'resume_withdrawn_by_hr'
+          )
+        ORDER BY sent_at DESC, rowid DESC LIMIT 1
+        """,
+        (session_id,),
+    ).fetchone()
+    if action_message is not None:
+        status = {
+            "resume_sent": "sent",
+            "resume_sent_confirmed": "sent",
+            "resume_received": "received",
+            "resume_viewed": "viewed",
+            "resume_withdrawn": "withdrawn",
+            "resume_withdrawn_by_hr": "withdrawn",
+        }[str(action_message["action_type"])]
+        return {"status": status, "source": "chat_action", "occurred_at": action_message["sent_at"]}
+
+    action = connection.execute(
+        """
+        SELECT confirmation_status, status, outcome, created_at, updated_at
+        FROM fj_chat_send_actions
+        WHERE session_id = ? AND operation_kind = 'resume'
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (session_id,),
+    ).fetchone()
+    if action is None:
+        return {"status": "not_started", "source": "none", "occurred_at": None}
+    if str(action["confirmation_status"] or "") == "pending":
+        status = "pending_confirmation"
+    elif str(action["status"] or "") in {"leased", "dispatching"}:
+        status = "sending"
+    elif str(action["outcome"] or "") == "failed":
+        status = "failed"
+    elif str(action["outcome"] or "") == "unknown":
+        status = "unknown"
+    elif str(action["outcome"] or "") == "accepted":
+        status = "awaiting_observation"
+    else:
+        status = "queued"
+    return {"status": status, "source": "send_action", "occurred_at": action["updated_at"] or action["created_at"]}
+
+
 def _primary_action(
     stage: str,
     waiting_on: str,
     rejection_reason_source: str,
     rejection_reason_category: str,
     decision: str,
+    rejection_party: str | None,
 ) -> dict[str, Any] | None:
+    if stage == "rejected" and rejection_party == "candidate":
+        return None
     if stage == "rejected" and (
         rejection_reason_source == "unknown"
         or rejection_reason_category in {"unknown", "fit"}

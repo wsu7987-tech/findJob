@@ -1182,6 +1182,21 @@ export const api = {
       method: "POST"
     });
   },
+  async analyzeFineJobChatRules(sessionId: string) {
+    return request<{ progress: FineJobJobProgress | null }>(
+      `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/analyze-rules`,
+      { method: "POST" }
+    );
+  },
+  async markFineJobChatManualProgress(
+    sessionId: string,
+    action: "interview_scheduled" | "candidate_rejected" | "recruiter_rejected"
+  ) {
+    return request<{ progress: FineJobJobProgress | null }>(
+      `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/progress/manual`,
+      { method: "POST", body: JSON.stringify({ action }) }
+    );
+  },
   async linkFineJobReviewItemsChat(payload: {
     status: "pending" | "rejected" | "approved";
     execution_view?: "running";

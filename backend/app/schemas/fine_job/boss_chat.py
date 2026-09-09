@@ -171,6 +171,10 @@ class BossChatReasonRequest(BaseModel):
     reason: str = Field(default="用户操作", max_length=300)
 
 
+class BossChatManualProgressRequest(BaseModel):
+    action: Literal["interview_scheduled", "candidate_rejected", "recruiter_rejected"]
+
+
 class BossChatClaimActionRequest(BaseModel):
     account_uid: str = Field(min_length=1, max_length=80)
     tab_id: str = Field(min_length=1, max_length=120)

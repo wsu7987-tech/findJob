@@ -955,6 +955,12 @@ export interface FineJobJobProgress {
     rejection_reason_source: "recruiter_explicit" | "ai_inferred" | "unknown";
     rejection_reason_category: string;
     rejection_reason_summary: string;
+    rejection_party?: "candidate" | "recruiter" | null;
+  };
+  resume_delivery: {
+    status: "not_started" | "pending_confirmation" | "queued" | "sending" | "awaiting_observation" | "sent" | "received" | "viewed" | "withdrawn" | "failed" | "unknown";
+    source: "none" | "send_action" | "chat_action";
+    occurred_at?: string | null;
   };
   primary_action?: {
     type: "reply" | "followup" | "ask_rejection_reason";

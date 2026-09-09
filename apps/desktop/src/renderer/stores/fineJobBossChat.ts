@@ -253,14 +253,18 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     return result;
   });
 
-  const rejectJob = async () => mutate(async () => {
-    const jobId = detail.value?.session.job_id;
-    if (!jobId) throw new Error("当前聊天尚未关联历史岗位");
-    const result = await api.setFineJobJobApplicationStatus(
-      jobId,
-      "rejected",
-      "自动代聊页面人工标记为已被拒绝"
-    );
+  const markManualProgress = async (
+    action: "interview_scheduled" | "candidate_rejected" | "recruiter_rejected"
+  ) => mutate(async () => {
+    if (!selectedSessionId.value) throw new Error("请先选择聊天会话");
+    const result = await api.markFineJobChatManualProgress(selectedSessionId.value, action);
+    await refreshSelected();
+    return result;
+  });
+
+  const analyzeRules = async () => mutate(async () => {
+    if (!selectedSessionId.value) throw new Error("请先选择聊天会话");
+    const result = await api.analyzeFineJobChatRules(selectedSessionId.value);
     await refreshSelected();
     return result;
   });
@@ -433,7 +437,8 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     forceRefreshHistory,
     loadMoreHistory,
     updateJob,
-    rejectJob,
+    markManualProgress,
+    analyzeRules,
     analyzeProgress,
     generate,
     confirm,

@@ -20,6 +20,7 @@ from backend.app.schemas.fine_job.boss_chat import (
     BossChatHistoryRefreshResponse,
     BossChatJobUpdateResponse,
     BossChatMessageTransformConfigRequest,
+    BossChatManualProgressRequest,
     BossChatGenerateRequest,
     BossChatHeartbeatRequest,
     BossChatReasonRequest,
@@ -507,6 +508,21 @@ def analyze_progress(
     config: AppConfig = Depends(get_config),
 ):
     return job_hunt_analysis.analyze_single_session(db, config, session_id)
+
+
+@router.post("/sessions/{session_id}/analyze-rules")
+def analyze_rules(session_id: str, db: Database = Depends(get_database)):
+    """仅按已同步的聊天消息重算当前进展。"""
+    return boss_chat.analyze_rule_progress(db, session_id)
+
+
+@router.post("/sessions/{session_id}/progress/manual")
+def mark_manual_progress(
+    session_id: str,
+    payload: BossChatManualProgressRequest,
+    db: Database = Depends(get_database),
+):
+    return boss_chat.mark_manual_progress(db, session_id, payload.action)
 
 
 @router.post("/sessions/{session_id}/regenerate")

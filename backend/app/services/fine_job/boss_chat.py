@@ -1055,6 +1055,10 @@ def _record_message_activity(
     direction: str,
     occurred_at: str,
     platform_message_id: str,
+    message_type: str = "text",
+    content: str = "",
+    display_kind: str = "chat",
+    action_type: str = "",
 ) -> None:
     session = connection.execute(
         "SELECT job_id, company_name FROM fj_chat_sessions WHERE id = ?",
@@ -1062,20 +1066,87 @@ def _record_message_activity(
     ).fetchone()
     if session is None or not session["job_id"]:
         return
-    event_type = "recruiter_replied" if direction == "inbound" else "candidate_replied"
-    append_job_activity_with_connection(
-        connection,
-        job_id=str(session["job_id"]),
-        chat_session_id=session_id,
-        event_type=event_type,
-        occurred_at=occurred_at,
-        source="chat",
-        source_ref_type="chat_message",
-        source_ref_id=message_id,
-        evidence_level="direct",
-        payload={"direction": direction, "platform_message_id": platform_message_id},
-        dedupe_key=f"chat_message:{message_id}:{event_type}",
-    )
+    job_id = str(session["job_id"])
+    if display_kind == "chat":
+        event_type = "recruiter_replied" if direction == "inbound" else "candidate_replied"
+        append_job_activity_with_connection(
+            connection, job_id=job_id, chat_session_id=session_id, event_type=event_type,
+            occurred_at=occurred_at, source="chat", source_ref_type="chat_message",
+            source_ref_id=message_id, evidence_level="direct",
+            payload={"direction": direction, "platform_message_id": platform_message_id},
+            dedupe_key=f"chat_message:{message_id}:{event_type}",
+        )
+
+    # 聊天动作和 HR 的明确文案直接形成事实，不依赖 AI 推断。
+    rule_event = {
+        "resume_sent": "resume_submitted",
+        "resume_sent_confirmed": "resume_submitted",
+        "resume_received": "resume_accepted",
+        "resume_viewed": "resume_viewed",
+    }.get(action_type)
+    compact = "".join(content.split())
+    if not rule_event and direction == "inbound" and display_kind == "chat":
+        if any(phrase in compact for phrase in ("请发简历", "发下简历", "发一份简历", "简历发一下", "投递简历", "附件简历")):
+            rule_event = "resume_requested"
+        elif any(phrase in compact for phrase in ("发给业务部门看看", "发给用人部门看看", "用人部门评估", "内部再评估")):
+            rule_event = "under_review"
+        elif any(phrase in compact for phrase in ("约面", "安排面试", "面试时间", "面试安排")):
+            rule_event = "interview_invited"
+    if rule_event:
+        append_job_activity_with_connection(
+            connection, job_id=job_id, chat_session_id=session_id, event_type=rule_event,
+            occurred_at=occurred_at, source="rule", source_ref_type="chat_message",
+            source_ref_id=message_id, evidence_level="direct",
+            payload={"derived_by": "chat_rule", "action_type": action_type, "message_type": message_type},
+            dedupe_key=f"chat_message:{message_id}:{rule_event}:chat-rule-v2",
+        )
+
+
+def analyze_rule_progress(db: Database, session_id: str) -> dict[str, Any]:
+    """按当前本地聊天记录重放固定规则，不调用 AI 或外部页面。"""
+    with db.connect() as connection:
+        session = _session_or_404(connection, session_id)
+        if not session["job_id"]:
+            raise AppError(409, "CHAT_JOB_UNLINKED", "请先关联本地岗位，再分析聊天规则。")
+        messages = connection.execute(
+            """
+            SELECT id, direction, message_type, content, display_kind, action_type, sent_at, platform_message_id
+            FROM fj_chat_messages WHERE session_id = ? AND display_kind <> 'discard'
+            ORDER BY sent_at, rowid
+            """,
+            (session_id,),
+        ).fetchall()
+        for message in messages:
+            _record_message_activity(
+                connection, session_id=session_id, message_id=str(message["id"]),
+                direction=str(message["direction"]), occurred_at=str(message["sent_at"]),
+                platform_message_id=str(message["platform_message_id"]),
+                message_type=str(message["message_type"]), content=str(message["content"]),
+                display_kind=str(message["display_kind"]), action_type=str(message["action_type"]),
+            )
+        return {"progress": build_job_progress_with_connection(connection, str(session["job_id"]), session_id=session_id)}
+
+
+def mark_manual_progress(db: Database, session_id: str, action: str) -> dict[str, Any]:
+    """记录用户在会话页确认的约面或拒绝结果。"""
+    with db.connect() as connection:
+        session = _session_or_404(connection, session_id)
+        if not session["job_id"]:
+            raise AppError(409, "CHAT_JOB_UNLINKED", "请先关联本地岗位，再更新求职进展。")
+        event_type = "interview_scheduled" if action == "interview_scheduled" else "rejected"
+        party = "candidate" if action == "candidate_rejected" else "recruiter"
+        append_job_activity_with_connection(
+            connection, job_id=str(session["job_id"]), chat_session_id=session_id,
+            event_type=event_type, occurred_at=_now(), source="manual",
+            source_ref_type="chat_session", source_ref_id=session_id,
+            evidence_level="direct",
+            payload={
+                "waiting_on": "none",
+                **({"rejection_party": party, "rejection_reason_source": "unknown", "rejection_reason_category": "unknown"} if event_type == "rejected" else {}),
+            },
+            dedupe_key=f"chat_session:{session_id}:manual:{action}",
+        )
+        return {"progress": build_job_progress_with_connection(connection, str(session["job_id"]), session_id=session_id)}
 
 
 def refresh_session_history(db: Database, session_id: str) -> dict[str, Any]:
@@ -1341,15 +1412,12 @@ def sync_history_messages(
             )
             inserted_count += int(cursor.rowcount > 0)
             if cursor.rowcount > 0:
-                if transformed["display_kind"] == "chat":
-                    _record_message_activity(
-                        connection,
-                        session_id=session_id,
-                        message_id=local_message_id,
-                        direction=direction,
-                        occurred_at=sent_at,
-                        platform_message_id=message_id,
-                    )
+                _record_message_activity(
+                    connection, session_id=session_id, message_id=local_message_id,
+                    direction=direction, occurred_at=sent_at, platform_message_id=message_id,
+                    message_type=transformed["message_type"], content=transformed["content"],
+                    display_kind=transformed["display_kind"], action_type=transformed["action_type"],
+                )
                 if direction == "outbound" and transformed["display_kind"] == "chat":
                     observe_outbound_chat_message(connection, message_id=local_message_id)
 
@@ -1885,15 +1953,15 @@ def ingest_events(
             except sqlite3.IntegrityError:
                 duplicates += 1
                 continue
-            if message.get("display_kind") == "chat":
-                _record_message_activity(
-                    connection,
-                    session_id=str(session["id"]),
-                    message_id=message_id,
-                    direction=str(message["direction"]),
-                    occurred_at=str(message["sent_at"]),
-                    platform_message_id=str(message["platform_message_id"]),
-                )
+            _record_message_activity(
+                connection, session_id=str(session["id"]), message_id=message_id,
+                direction=str(message["direction"]), occurred_at=str(message["sent_at"]),
+                platform_message_id=str(message["platform_message_id"]),
+                message_type=str(message.get("message_type") or "text"),
+                content=str(message.get("content") or ""),
+                display_kind=str(message.get("display_kind") or "chat"),
+                action_type=str(message.get("action_type") or ""),
+            )
             if message["direction"] == "outbound" and message.get("display_kind") == "chat":
                 observe_outbound_chat_message(
                     connection,
@@ -2004,6 +2072,12 @@ def _session_payload(
                 str(payload["job_id"]),
                 session_id=str(payload.get("id") or ""),
             )
+            attention_status, attention_label = _effective_attention_from_progress(
+                payload["progress"], str(payload.get("attention_status") or "")
+            )
+            if attention_status:
+                payload["attention_status"] = attention_status
+                payload["attention_label"] = attention_label
     payload["identity_state"] = (
         "ready"
         if payload.get("encrypt_peer_uid") and payload.get("security_id") and payload.get("encrypt_job_id")
@@ -2011,6 +2085,40 @@ def _session_payload(
     )
     payload["job_context_state"] = "linked" if payload.get("job_id") else "unlinked"
     return payload
+
+
+def _effective_attention_from_progress(
+    progress: dict[str, Any] | None, fallback_status: str
+) -> tuple[str, str]:
+    """聊天事实优先于旧分析待办，避免简历状态与左侧提示冲突。"""
+    if not progress:
+        return fallback_status, ""
+    stage = str(progress.get("stage") or "")
+    outcome = progress.get("outcome") or {}
+    if stage == "rejected":
+        party = str(outcome.get("rejection_party") or "")
+        if party == "candidate":
+            return "no_action", "无需处理"
+        reason_source = str(outcome.get("rejection_reason_source") or "unknown")
+        reason_category = str(outcome.get("rejection_reason_category") or "unknown")
+        if reason_source == "unknown" or reason_category in {"unknown", "fit"}:
+            return "needs_rejection_reason", "建议询问"
+        return "no_action", "无需处理"
+    delivery = str((progress.get("resume_delivery") or {}).get("status") or "not_started")
+    if stage == "resume_requested" and delivery in {"not_started", "pending_confirmation", "queued"}:
+        return "needs_resume", "待发简历"
+    if delivery == "sending":
+        return "waiting", "简历发送中"
+    if delivery in {"awaiting_observation", "sent", "received", "viewed"}:
+        return "waiting", "等待 HR"
+    if delivery == "withdrawn":
+        waiting_on = str(progress.get("waiting_on") or "unknown")
+        if waiting_on == "candidate":
+            return "needs_reply", "待回复"
+        if waiting_on == "recruiter":
+            return "waiting", "等待 HR"
+        return "no_action", "无需处理"
+    return fallback_status, ""
 
 
 def list_sessions(

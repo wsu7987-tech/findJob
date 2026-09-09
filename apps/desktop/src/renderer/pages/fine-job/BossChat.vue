@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { Delete, Plus, Setting } from "@element-plus/icons-vue";
+import { Delete, InfoFilled, Plus, Setting } from "@element-plus/icons-vue";
 import { useRoute, useRouter } from "vue-router";
 
 import { formatDateTime } from "@/services/format";
@@ -50,16 +50,37 @@ const task = computed(() => {
 });
 const progress = computed(() => session.value?.progress ?? null);
 const primaryAction = computed(() => progress.value?.primary_action ?? null);
+const displayProgressStage = computed(() => (
+  progress.value?.resume_delivery.status === "withdrawn"
+    ? "resume_withdrawn"
+    : progress.value?.stage ?? ""
+));
+const showResumeDelivery = computed(() => ![
+  "resume_requested", "resume_submitted", "resume_viewed", "resume_withdrawn"
+].includes(displayProgressStage.value));
+const showResumePanel = computed(() => (
+  progress.value?.stage === "resume_requested"
+  && progress.value.waiting_on === "candidate"
+));
 const canMarkRejected = computed(() => Boolean(
   session.value?.job_context_state === "linked"
   && !["offer", "rejected", "closed"].includes(progress.value?.stage ?? "")
 ));
+const canMarkInterview = computed(() => Boolean(
+  session.value?.job_context_state === "linked"
+  && !["offer", "rejected", "closed", "interviewing"].includes(progress.value?.stage ?? "")
+));
 const rejectionReasonNeedsDetail = computed(() => Boolean(
   progress.value?.stage === "rejected"
+  && progress.value.outcome.rejection_party !== "candidate"
   && (
     progress.value.outcome.rejection_reason_source === "unknown"
     || ["unknown", "fit"].includes(progress.value.outcome.rejection_reason_category)
   )
+));
+const isCandidateRejected = computed(() => (
+  progress.value?.stage === "rejected"
+  && progress.value.outcome.rejection_party === "candidate"
 ));
 const analysisButtonLabel = computed(() => (
   rejectionReasonNeedsDetail.value
@@ -217,8 +238,8 @@ const attentionType = (item?: FineJobChatSession | null) => ({
 }[item?.attention_status ?? ""] ?? "info") as "success" | "warning" | "danger" | "primary" | "info";
 const stageLabel = (value?: string | null) => ({
   discovered: "已发现岗位", shortlisted: "已进入候选", greeted: "已打招呼",
-  communicating: "沟通中", resume_requested: "HR 请求简历",
-  resume_submitted: "已发送简历", resume_viewed: "简历已查看",
+  communicating: "沟通中", resume_requested: "待发送简历",
+  resume_submitted: "已发送简历", resume_viewed: "简历已查看", resume_withdrawn: "简历已撤回",
   under_review: "用人部门评估中", interview_scheduling: "面试时间沟通中",
   interviewing: "面试阶段", offer: "已获得 Offer", rejected: "已被拒绝", closed: "岗位关闭"
 }[value ?? ""] ?? "进展待分析");
@@ -239,6 +260,18 @@ const rejectionCategoryLabel = (value?: string | null) => ({
   availability: "到岗时间", position_filled: "已招到人",
   headcount_closed: "岗位已关闭", fit: "综合匹配度", other: "其他", unknown: "未知"
 }[value ?? ""] ?? "未知");
+const resumeDeliveryLabel = (value?: string | null) => ({
+  not_started: "未发送", pending_confirmation: "待确认发送", queued: "等待发送",
+  sending: "发送中", awaiting_observation: "等待平台回显", sent: "已发送",
+  received: "HR 已接收", viewed: "HR 已查看", withdrawn: "已撤回",
+  failed: "发送失败", unknown: "发送结果待确认"
+}[value ?? ""] ?? "未发送");
+const showResumeHelp = () => {
+  ElMessage.info("读取当前 BOSS 账号可发送的附件；提交后在待确认列表批准，再进入执行队列。");
+};
+const rejectionPartyLabel = (value?: string | null) => ({
+  candidate: "我拒绝", recruiter: "招聘方拒绝"
+}[value ?? ""] ?? "拒绝");
 const waitingDuration = computed(() => {
   const since = progress.value?.waiting_since_at;
   if (!since || progress.value?.waiting_on === "none") return "";
@@ -438,12 +471,32 @@ const viewJob = async () => {
   });
 };
 
+const markManualProgress = async (
+  action: "interview_scheduled" | "candidate_rejected" | "recruiter_rejected"
+) => {
+  try {
+    await store.markManualProgress(action);
+    ElMessage.success(action === "interview_scheduled" ? "已更新为面试阶段" : "已记录拒绝结果");
+  } catch {
+    ElMessage.error(store.error ?? "当前进展更新失败");
+  }
+};
+
 const rejectJob = async () => {
   try {
-    await store.rejectJob();
-    ElMessage.success("投递状态已更新为已被拒绝");
-  } catch {
-    ElMessage.error(store.error ?? "投递状态更新失败");
+    await ElMessageBox.confirm(
+      "请选择拒绝方，系统会结束当前岗位流程并保留拒绝方记录。",
+      "拒绝",
+      {
+        type: "warning",
+        confirmButtonText: "招聘方拒绝",
+        cancelButtonText: "我拒绝",
+        distinguishCancelAndClose: true
+      }
+    );
+    await markManualProgress("recruiter_rejected");
+  } catch (error) {
+    if (error === "cancel") await markManualProgress("candidate_rejected");
   }
 };
 
@@ -554,6 +607,15 @@ const analyzeProgress = async () => {
     else ElMessage.success("当前求职进展已更新");
   } catch {
     ElMessage.error(store.error ?? "分析进展失败");
+  }
+};
+
+const analyzeRules = async () => {
+  try {
+    await store.analyzeRules();
+    ElMessage.success("已按本地聊天消息重算当前进展");
+  } catch {
+    ElMessage.error(store.error ?? "规则分析失败");
   }
 };
 
@@ -944,14 +1006,16 @@ onBeforeUnmount(() => {
 
       <main class="conversation-panel">
         <template v-if="session">
-          <div class="section-heading conversation-heading">
-            <div>
+          <div class="conversation-heading">
+            <div class="conversation-identity">
               <div class="conversation-contact">
                 <h2>{{ session.company_name || "未知公司" }}</h2>
                 <span class="conversation-contact__hr">{{ session.peer_name || session.peer_uid }}</span>
               </div>
-              <p v-if="session.job_title">{{ session.job_title }}</p>
-              <div class="identity-tags">
+              <div class="conversation-job">
+                <p v-if="session.job_title">{{ session.job_title }}</p>
+                <el-tag v-else size="small" type="info" effect="plain">岗位未返回</el-tag>
+                <el-tag v-if="session.job_context_state !== 'linked'" size="small" type="info">本地岗位未关联</el-tag>
                 <el-tag v-if="session.message_update_required" size="small" type="warning">消息需更新</el-tag>
                 <el-tag
                   v-if="attentionLabel(session)"
@@ -960,66 +1024,6 @@ onBeforeUnmount(() => {
                   effect="plain"
                 >{{ attentionLabel(session) }}</el-tag>
               </div>
-              <div class="identity-tags">
-                <el-tag size="small" :type="session.job_context_state === 'linked' ? 'success' : 'info'">
-                  {{ session.job_context_state === 'linked' ? '已关联本地岗位' : '本地岗位未关联' }}
-                </el-tag>
-              </div>
-            </div>
-            <div class="heading-actions">
-              <el-button
-                v-if="session.job_context_state === 'linked'"
-                size="small"
-                type="primary"
-                @click="viewJob"
-              >查看岗位</el-button>
-              <el-button
-                v-else
-                size="small"
-                :loading="store.mutating"
-                @click="refreshJob"
-              >更新岗位</el-button>
-              <el-button
-                v-if="canMarkRejected"
-                size="small"
-                type="danger"
-                plain
-                :loading="store.mutating"
-                @click="rejectJob"
-              >已被拒绝</el-button>
-              <el-button
-                size="small"
-                plain
-                :loading="store.mutating"
-                @click="analyzeProgress"
-              >{{ analysisButtonLabel }}</el-button>
-              <el-button
-                size="small"
-                plain
-                :loading="store.mutating"
-                @click="retransformMessages"
-              >重新转义消息</el-button>
-              <el-button
-                size="small"
-                type="primary"
-                plain
-                :loading="store.mutating"
-                @click="forceRefreshHistory"
-              >强制更新消息</el-button>
-              <el-button
-                v-if="(store.detail?.message_count ?? 0) === 0"
-                type="primary"
-                size="small"
-                :loading="store.mutating"
-                @click="refreshHistory"
-              >获取消息</el-button>
-              <el-button
-                v-else-if="session.message_update_required" 
-                type="primary"
-                size="small"
-                :loading="store.mutating"
-                @click="refreshHistory"
-              >更新</el-button>
             </div>
           </div>
           <el-alert
@@ -1034,58 +1038,142 @@ onBeforeUnmount(() => {
             :closable="false"
             :title="`当前显示最近 ${store.detail.messages.length} 条，本地共 ${store.detail.message_count} 条消息`"
           />
-          <section v-if="progress" class="progress-card">
-            <div class="progress-card__heading">
-              <div>
-                <small>当前进展</small>
-                <h3>{{ stageLabel(progress.stage) }}</h3>
-              </div>
-              <el-tag :type="primaryAction ? 'warning' : 'info'">
-                {{ primaryAction?.label || (progress.waiting_on === "recruiter" ? "等待中，可主动生成消息" : "当前无需行动") }}
-              </el-tag>
+          <div class="conversation-messages">
+            <div class="message-timeline">
+              <article
+                v-for="message in store.detail?.messages"
+                :key="message.id"
+                class="message-bubble"
+                :class="message.display_kind === 'action' ? 'message-bubble--action' : `message-bubble--${message.direction}`"
+              >
+                <small class="message-bubble__meta">{{ message.display_kind === "action" ? "会话动作" : message.direction === "inbound" ? session.peer_name || "HR" : "我" }} · {{ formatDateTime(message.sent_at) }}</small>
+                <p>
+                  <span v-if="message.display_kind !== 'action' && latestMessageStatusLabel(message.status)" class="message-bubble__status">{{ latestMessageStatusLabel(message.status) }}</span>
+                  {{ message.content || `[${message.message_type}]` }}
+                </p>
+              </article>
             </div>
-            <div class="progress-card__facts">
-              <span>{{ waitingLabel(progress.waiting_on) }}</span>
-              <span v-if="waitingDuration">{{ waitingDuration }}</span>
-              <span>{{ contactOriginLabel(progress.contact_origin) }}</span>
+            <div v-if="session.history_has_more" class="message-more-actions">
+              <el-button
+                plain
+                :loading="store.mutating"
+                @click="loadMoreHistory"
+              >获取更多</el-button>
             </div>
-            <p v-if="progress.followup.reason_summary">
-              行动建议：{{ progress.followup.reason_summary }}
-            </p>
-            <p v-if="progress.stage === 'rejected' || progress.stage === 'closed'">
-              拒绝原因：{{ progress.outcome.rejection_reason_summary || rejectionCategoryLabel(progress.outcome.rejection_reason_category) }}
-              · 来源：{{ rejectionSourceLabel(progress.outcome.rejection_reason_source) }}
-            </p>
-          </section>
-          <div class="message-timeline">
-            <article
-              v-for="message in store.detail?.messages"
-              :key="message.id"
-              class="message-bubble"
-              :class="message.display_kind === 'action' ? 'message-bubble--action' : `message-bubble--${message.direction}`"
-            >
-              <small class="message-bubble__meta">{{ message.display_kind === "action" ? "会话动作" : message.direction === "inbound" ? session.peer_name || "HR" : "我" }} · {{ formatDateTime(message.sent_at) }}</small>
-              <p>
-                <span v-if="message.display_kind !== 'action' && latestMessageStatusLabel(message.status)" class="message-bubble__status">{{ latestMessageStatusLabel(message.status) }}</span>
-                {{ message.content || `[${message.message_type}]` }}
-              </p>
-            </article>
-          </div>
-          <div v-if="session.history_has_more" class="message-more-actions">
-            <el-button
-              plain
-              :loading="store.mutating"
-              @click="loadMoreHistory"
-            >获取更多</el-button>
           </div>
         </template>
         <el-empty v-else description="选择一个会话查看本地消息" />
       </main>
 
       <aside class="reply-panel">
-        <section class="resume-send-panel">
-          <h2>附件简历</h2>
-          <p class="secondary-text">读取当前 BOSS 账号可发送的附件；提交后在待确认列表批准，再进入执行队列。</p>
+        <template v-if="session">
+          <div class="heading-actions">
+          <el-button
+            v-if="session?.job_context_state === 'linked'"
+            size="small"
+            type="primary"
+            @click="viewJob"
+          >查看岗位</el-button>
+          <el-button
+            v-else
+            size="small"
+            :loading="store.mutating"
+            @click="refreshJob"
+          >更新岗位</el-button>
+          <el-button
+            v-if="canMarkRejected"
+            size="small"
+            type="danger"
+            plain
+            :loading="store.mutating"
+            @click="rejectJob"
+          >拒绝</el-button>
+          <el-button
+            v-if="canMarkInterview"
+            size="small"
+            type="primary"
+            plain
+            :loading="store.mutating"
+            @click="markManualProgress('interview_scheduled')"
+          >已约面试</el-button>
+          <el-button
+            size="small"
+            plain
+            :loading="store.mutating"
+            @click="analyzeRules"
+          >规则分析</el-button>
+          <el-button
+            v-if="!isCandidateRejected"
+            size="small"
+            plain
+            :loading="store.mutating"
+            @click="analyzeProgress"
+          >{{ analysisButtonLabel }}</el-button>
+          <el-button
+            size="small"
+            plain
+            :loading="store.mutating"
+            @click="retransformMessages"
+          >重新转义消息</el-button>
+          <el-button
+            size="small"
+            type="primary"
+            plain
+            :loading="store.mutating"
+            @click="forceRefreshHistory"
+          >强制更新消息</el-button>
+          <el-button
+            v-if="(store.detail?.message_count ?? 0) === 0"
+            type="primary"
+            size="small"
+            :loading="store.mutating"
+            @click="refreshHistory"
+          >获取消息</el-button>
+          <el-button
+            v-else-if="session?.message_update_required"
+            type="primary"
+            size="small"
+            :loading="store.mutating"
+            @click="refreshHistory"
+          >更新</el-button>
+          </div>
+          <section v-if="progress" class="progress-card">
+          <div class="progress-card__heading">
+            <div style="display:flex">
+              <small>当前进展</small>
+              <h3 style="margin-left:15px">{{ stageLabel(displayProgressStage) }}</h3>
+            </div>
+            <el-tag :type="primaryAction ? 'warning' : 'info'">
+              {{ primaryAction?.label || (progress.waiting_on === "recruiter" ? "等待中，可主动生成消息" : "当前无需行动") }}
+            </el-tag>
+          </div>
+          <div class="progress-card__facts">
+            <span>{{ waitingLabel(progress.waiting_on) }}</span>
+            <span v-if="waitingDuration">{{ waitingDuration }}</span>
+            <span>{{ contactOriginLabel(progress.contact_origin) }}</span>
+            <span v-if="showResumeDelivery">简历：{{ resumeDeliveryLabel(progress.resume_delivery.status) }}</span>
+          </div>
+          <p v-if="progress.followup.reason_summary">
+            行动建议：{{ progress.followup.reason_summary }}
+          </p>
+          <p v-if="progress.stage === 'rejected' || progress.stage === 'closed'">
+            {{ rejectionPartyLabel(progress.outcome.rejection_party) }}：{{ progress.outcome.rejection_reason_summary || rejectionCategoryLabel(progress.outcome.rejection_reason_category) }}
+            · 来源：{{ rejectionSourceLabel(progress.outcome.rejection_reason_source) }}
+          </p>
+          </section>
+        </template>
+        <section v-if="showResumePanel" class="resume-send-panel">
+          <h2>
+            附件简历
+            <el-tooltip
+              content="读取当前 BOSS 账号可发送的附件；提交后在待确认列表批准，再进入执行队列。"
+              placement="top"
+            >
+              <button class="resume-help" type="button" aria-label="查看附件简历说明" @click="showResumeHelp">
+                <el-icon><InfoFilled /></el-icon>
+              </button>
+            </el-tooltip>
+          </h2>
           <p v-if="resumeListLoading" class="secondary-text">正在读取附件简历…</p>
           <el-alert v-else-if="resumeListFailed" type="error" :closable="false" show-icon>
             {{ store.resumeListError || "附件简历读取失败，请刷新后重试。" }}
@@ -1099,13 +1187,16 @@ onBeforeUnmount(() => {
               {{ item.showName }}<template v-if="item.resumeSizeDesc"> · {{ item.resumeSizeDesc }}</template>
             </el-radio>
           </el-radio-group>
+          <span v-else-if="selectedResume" class="resume-selected-name">
+            已选择：{{ selectedResume.showName }}<template v-if="selectedResume.resumeSizeDesc"> · {{ selectedResume.resumeSizeDesc }}</template>
+          </span>
           <el-button
             v-if="resumeAttachments.length"
             type="warning"
             :disabled="!canConfirmResume"
             @click="confirmResume"
           >发送简历</el-button>
-          <p v-if="selectedResumeId" class="secondary-text">encryptResumeId：{{ selectedResumeId }}</p>
+          <!-- <p v-if="selectedResumeId" class="secondary-text">encryptResumeId：{{ selectedResumeId }}</p> -->
           <p v-if="latestResumeSendAction?.status === 'queued' || latestResumeSendAction?.status === 'leased' || latestResumeSendAction?.status === 'dispatching'" class="secondary-text">简历发送进行中…</p>
           <el-alert v-else-if="latestResumeSendAction?.outcome === 'accepted'" type="success" :closable="false" show-icon>
             简历已提交传输，等待 BOSS 平台后续状态。
@@ -1177,8 +1268,12 @@ onBeforeUnmount(() => {
           @input="markEditorDirty"
         />
         <div class="reply-actions">
-          <!-- :disabled="!canConfirm" -->
-          <el-button type="primary"  :loading="store.mutating" @click="confirm">确认发送</el-button>
+          <el-button
+            type="primary"
+            :disabled="!finalText.trim()"
+            :loading="store.mutating"
+            @click="confirm"
+          >确认发送</el-button>
           <el-button :disabled="!task" @click="cancel">取消草稿</el-button>
         </div>
         <p v-if="confirmBlocker" class="confirm-blocker">{{ confirmBlocker }}</p>
@@ -1337,7 +1432,6 @@ onBeforeUnmount(() => {
 }
 
 .session-list,
-.conversation-panel,
 .reply-panel {
   min-width: 0;
   padding: 20px;
@@ -1350,8 +1444,16 @@ onBeforeUnmount(() => {
   border-left: 1px solid var(--el-border-color-lighter);
 }
 
-.section-heading,
-.conversation-heading {
+.conversation-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  padding: 20px;
+  overflow: hidden;
+}
+
+.section-heading {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
@@ -1362,6 +1464,23 @@ onBeforeUnmount(() => {
 .reply-panel h2,
 .conversation-heading p {
   margin: 0;
+}
+
+.conversation-heading {
+  display: grid;
+  gap: 10px;
+}
+
+.conversation-identity {
+  display: grid;
+  gap: 6px;
+}
+
+.conversation-job {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .conversation-contact {
@@ -1536,9 +1655,13 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.conversation-messages {
+  flex: 1;
+  min-height: 0;
   margin-top: 18px;
-  max-height: 510px;
-  overflow: auto;
+  overflow-y: auto;
 }
 
 .batch-progress-metrics {
@@ -1723,6 +1846,22 @@ onBeforeUnmount(() => {
 .resume-attachment-list {
   display: grid;
   gap: 10px;
+}
+
+.resume-help {
+  display: inline-flex;
+  margin-left: 4px;
+  padding: 0;
+  border: 0;
+  color: var(--el-color-info);
+  background: transparent;
+  cursor: pointer;
+  vertical-align: middle;
+}
+
+.resume-selected-name {
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
 }
 
 .resume-attachment-list .el-radio {
