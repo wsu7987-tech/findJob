@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { resolveFineJobResumeSelection } from "./fineJobResumeSelection";
 
 const attachment = (id: string) => ({
-  encryptResumeId: id,
+  resumeId: id,
   showName: `${id}.pdf`,
   resumeSizeDesc: "",
   suffixName: "pdf"
@@ -18,8 +18,8 @@ describe("FineJob 附件简历选择", () => {
     expect(resolveFineJobResumeSelection([attachment("only")], "")).toBe("only");
   });
 
-  it("多份附件不默认选择第一份", () => {
-    expect(resolveFineJobResumeSelection([attachment("first"), attachment("second")], "")).toBe("");
+  it("多份附件默认选择第一份", () => {
+    expect(resolveFineJobResumeSelection([attachment("first"), attachment("second")], "")).toBe("first");
   });
 
   it("多份附件保留用户明确选择", () => {

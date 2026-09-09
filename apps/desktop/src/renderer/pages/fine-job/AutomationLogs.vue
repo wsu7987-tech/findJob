@@ -89,6 +89,9 @@ const outcomeType = (value?: string) => value === "failed" ? "danger" : value ==
 const actionLabel = (value: string) => ({
   review_approved: "批准岗位", review_rejected: "拒绝岗位", review_archived: "归档事项",
   review_restored: "恢复事项", boss_page_opened: "打开岗位页面",
+  boss_page_open_requested: "请求打开任务页面",
+  boss_page_open_failed: "打开任务页面失败",
+  boss_page_match_failed: "任务页面匹配失败",
   boss_task_matched: "匹配执行任务", boss_task_completed: "任务完成",
   boss_return_to_review: "退回待确认", executor_control: "执行器控制", boss_executor_risk: "执行器风险",
   run_created: "创建旧任务", boss_search_started: "开始采集", boss_search_finished: "完成采集",

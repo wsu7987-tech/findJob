@@ -29,6 +29,10 @@ export default defineContentScript({
     });
     const background = injectBackgroundService(new InjectBackgroundAdapter());
     const contentService = new ContentService(background, status);
+    const refreshLiveZpToken = async () => {
+      const response = await browser.runtime.sendMessage({ type: "finejob:boss-chat:get-zp-token:v1" });
+      await contentService.setLiveZpToken(response?.zpToken);
+    };
     const controller = {
       pair: async (code: string) => { await background.pair(code); },
       testHeartbeat: async () => { await background.testHeartbeat(); },
@@ -45,10 +49,17 @@ export default defineContentScript({
     });
 
     await contentService.refreshBackground();
+    await refreshLiveZpToken().catch(() => undefined);
 
-    const runtimeHandler = (message?: { type?: string; command?: MainWorldCommand }) => {
+    const runtimeHandler = (message?: { type?: string; command?: MainWorldCommand; zpToken?: string }) => {
+      if (message?.type === "finejob:boss-chat:zp-token:v1") {
+        return contentService.setLiveZpToken(message.zpToken);
+      }
       if (message?.type === "finejob:boss-executor:probe:v1") {
         return contentService.enqueueMainCommand({ type: "BOSS_PAGE_PROBE" });
+      }
+      if (message?.type === "finejob:boss-chat:probe:v1") {
+        return contentService.enqueueMainCommand({ type: "BOSS_CHAT_PAGE_PROBE" });
       }
       if (![
         "finejob:boss-executor:execute:v1",

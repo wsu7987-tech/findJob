@@ -92,6 +92,8 @@
   FineJobJobHuntRefreshWorkflowOptions,
   FineJobChatReplyEnvelope,
   FineJobChatSendActionEnvelope,
+  FineJobChatReviewTaskListEnvelope,
+  FineJobResumeAttachmentsRefreshResponse,
   FineJobCodexPendingWork,
   FineJobCodexPermissions,
   FineJobCompanyEnvelope,
@@ -992,6 +994,7 @@ export const api = {
   },
   async createFineJobBossExecutorTestTask(payload: {
     job_id: string;
+    test_task_type: "greeting" | "resume" | "chat";
     close_page_after_completion: boolean;
     delay_seconds: number;
   }) {
@@ -1334,7 +1337,7 @@ export const api = {
   },
   async setFineJobChatSessionStatus(
     sessionId: string,
-    operation: "take-over" | "resume" | "pause",
+    operation: "resume" | "pause",
     reason: string
   ) {
     return request<{ session: FineJobChatSessionDetail["session"] }>(
@@ -1348,6 +1351,12 @@ export const api = {
       { method: "PATCH", body: JSON.stringify({ final_text: finalText }) }
     );
   },
+  async createFineJobChatManualReply(sessionId: string, finalText: string) {
+    return request<FineJobChatReplyEnvelope>(
+      `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/manual-reply`,
+      { method: "POST", body: JSON.stringify({ final_text: finalText }) }
+    );
+  },
   async confirmFineJobChatReply(
     taskId: string,
     payload: { final_text: string; based_on_message_id: string; based_on_session_version: number }
@@ -1357,16 +1366,42 @@ export const api = {
       { method: "POST", body: JSON.stringify(payload) }
     );
   },
-  async refreshFineJobChatResumeAttachments(sessionId: string) {
-    return request<FineJobChatSendActionEnvelope>(
-      `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/resume-attachments/refresh`,
+  async refreshFineJobChatResumeAttachments() {
+    return request<FineJobResumeAttachmentsRefreshResponse>(
+      "/api/fine-job/boss-chat/resume-attachments/refresh",
       { method: "POST" }
     );
   },
-  async createFineJobChatResumeAction(sessionId: string, encryptResumeId: string, filename: string) {
+  async listFineJobChatReviewTasks() {
+    return request<FineJobChatReviewTaskListEnvelope>("/api/fine-job/boss-chat/review-tasks");
+  },
+  async confirmFineJobChatResumeAction(actionId: string) {
+    return request<FineJobChatSendActionEnvelope>(
+      `/api/fine-job/boss-chat/send-actions/${encodeURIComponent(actionId)}/confirm`,
+      { method: "POST" }
+    );
+  },
+  async cancelFineJobChatResumeAction(actionId: string) {
+    return request<FineJobChatSendActionEnvelope>(
+      `/api/fine-job/boss-chat/send-actions/${encodeURIComponent(actionId)}/cancel`,
+      { method: "POST" }
+    );
+  },
+  async returnFineJobChatSendActionToReview(actionId: string) {
+    return request<FineJobChatSendActionEnvelope>(
+      `/api/fine-job/boss-chat/send-actions/${encodeURIComponent(actionId)}/return-to-review`,
+      { method: "POST" }
+    );
+  },
+  async getFineJobChatResumeAttachments() {
+    return request<FineJobResumeAttachmentsRefreshResponse>(
+      "/api/fine-job/boss-chat/resume-attachments"
+    );
+  },
+  async createFineJobChatResumeAction(sessionId: string, resumeId: string, filename: string) {
     return request<FineJobChatSendActionEnvelope>(
       `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/resume-actions`,
-      { method: "POST", body: JSON.stringify({ encrypt_resume_id: encryptResumeId, filename }) }
+      { method: "POST", body: JSON.stringify({ encrypt_resume_id: resumeId, filename }) }
     );
   },
   async cancelFineJobChatReply(taskId: string, reason = "用户取消回复") {

@@ -19,7 +19,10 @@ const mocks = vi.hoisted(() => ({
     loading: false,
     mutating: false,
     nextOffset: null,
-    runtime: null,
+    runtime: null as { send_enabled: boolean; leaders: unknown[] } | null,
+    resumeAttachments: [] as Array<{ resumeId: string; showName: string }>,
+    resumeListError: null,
+    resumeListLoaded: false,
     searchQuery: "",
     selectedSessionId: "session-1",
     sessions: [],
@@ -27,6 +30,7 @@ const mocks = vi.hoisted(() => ({
     cancel: vi.fn(),
     checkNow: vi.fn(),
     confirm: vi.fn(),
+    confirmResume: vi.fn(),
     generate: vi.fn(),
     load: vi.fn().mockResolvedValue(undefined),
     loadDetail: vi.fn(),
@@ -34,6 +38,7 @@ const mocks = vi.hoisted(() => ({
     loadMore: vi.fn(),
     loadMoreHistory: vi.fn(),
     refreshFriendList: vi.fn(),
+    refreshResumeAttachments: vi.fn(),
     refreshHistory: vi.fn(),
     rejectJob: vi.fn(),
     startBatchUpdate: vi.fn(),
@@ -63,6 +68,10 @@ describe("BossChat 进展操作", () => {
     mocks.routeQuery = {};
     mocks.store.attentionFilter = "";
     mocks.store.waitingOnFilter = "";
+    mocks.store.resumeAttachments = [];
+    mocks.store.resumeListError = null;
+    mocks.store.resumeListLoaded = false;
+    mocks.store.runtime = null;
     mocks.store.detail = {
       session: {
         id: "session-1",
@@ -174,5 +183,20 @@ describe("BossChat 进展操作", () => {
       "reply",
       "reply:session-1:message-1"
     );
+  });
+
+  it("已选择会话和附件时，即使发送开关关闭也允许发起发送简历", async () => {
+    mocks.store.resumeAttachments = [{
+      resumeId: "resume-1",
+      showName: "测试简历.pdf"
+    }];
+    mocks.store.runtime = { send_enabled: false, leaders: [] };
+
+    const wrapper = shallowMount(BossChat);
+    await flushPromises();
+
+    const button = wrapper.findAll("el-button").find((item) => item.text() === "发送简历");
+    expect(button).toBeDefined();
+    expect(button?.attributes("disabled")).toBeUndefined();
   });
 });

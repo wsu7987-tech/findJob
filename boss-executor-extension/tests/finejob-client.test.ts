@@ -20,6 +20,7 @@ const { storageData, browser } = vi.hoisted(() => {
 
 import { FineJobExecutorClient } from "../src/finejob/client";
 import type { FineJobQueueAction, MainWorldExecutionResult } from "../src/finejob/types";
+import type { BossPageIdentity } from "../src/platform/boss/types";
 
 const response = (body: unknown) => ({
   ok: true,
@@ -77,6 +78,8 @@ describe("FineJob执行结果可靠回写", () => {
         sockets.push(this);
       }
     });
+    browser.tabs.query.mockResolvedValue([]);
+    browser.tabs.sendMessage.mockResolvedValue(undefined);
     for (const key of Object.keys(storageData)) delete storageData[key];
     storageData.finejobBossExecutorCredentialsV1 = { executorId: "executor-1", token: "token-1" };
   });
@@ -350,12 +353,64 @@ describe("FineJob执行结果可靠回写", () => {
     socket.sent.length = 0;
 
     socket.message({ type: "task_queue", tasks: [task] });
-    await Promise.resolve();
-    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(5_000);
 
     expect(socket.sent.map((item) => JSON.parse(item))).toContainEqual(
       expect.objectContaining({ type: "open_task_page" })
     );
+  });
+
+  it("FineJob五秒未回传页面已打开时累计失败，第三次断开连接", async () => {
+    const task: FineJobQueueAction = {
+      id: "task-open-timeout-1",
+      job_id: "job-1",
+      review_item_id: "review-1",
+      action_type: "start_conversation",
+      task_type: "TEST_DELAY",
+      status: "queued",
+      execution_state: "queued",
+      execution_epoch: 0,
+      job_title: "开页超时测试岗位",
+      company_name: "测试公司",
+      encrypt_job_id: "encrypt-1",
+      close_page_after_completion: false,
+      delay_seconds: 5
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response({
+      executor: {
+        id: "executor-1", plugin_version: "0.1.0", protocol_version: "1.1",
+        permission_state: "paused", queue_state: "running", risk_state: "none",
+        browser_connected: true, task_cooldown_max_seconds: 4, page_load_wait_max_seconds: 3,
+        runtime_phase: "idle"
+      },
+      queue: { actions: [] }
+    }));
+    browser.tabs.query.mockResolvedValue([]);
+    const client = new FineJobExecutorClient();
+    await client.start();
+    const socket = sockets[0];
+    if (!socket) throw new Error("测试 WebSocket 未建立");
+    socket.readyState = TestWebSocket.OPEN;
+    socket.sent.length = 0;
+
+    socket.message({ type: "task_queue", tasks: [task] });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await Promise.resolve();
+    expect(socket.sent.map((item) => JSON.parse(item)).filter((item) => item.type === "open_task_page")).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await Promise.resolve();
+    expect(socket.sent.map((item) => JSON.parse(item)).filter((item) => item.type === "open_task_page")).toHaveLength(2);
+    expect(socket.readyState).toBe(TestWebSocket.OPEN);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await Promise.resolve();
+    expect(socket.sent.map((item) => JSON.parse(item))).toContainEqual(expect.objectContaining({
+      type: "execution_error",
+      failure_kind: "page_open_timeout",
+      disconnect: true
+    }));
+    expect(socket.readyState).toBe(3);
   });
 
   it("任务回写确认后先进入任务间隔冷却再请求下一页", async () => {
@@ -431,6 +486,7 @@ describe("FineJob执行结果可靠回写", () => {
       job_title: "测试岗位",
       company_name: "测试公司",
       encrypt_job_id: "encrypt-1",
+      page_type: "job",
       close_page_after_completion: true,
       delay_seconds: 7
     };
@@ -451,6 +507,27 @@ describe("FineJob执行结果可靠回写", () => {
     socket.sent.length = 0;
 
     socket.message({ type: "page_opened", task_id: task.id, success: true, page: {} });
+    const identity: BossPageIdentity = {
+      component: "boss-page-identity",
+      pathname: "/web/geek/job",
+      pageKind: "detail",
+      state: "ready",
+      loggedIn: true,
+      job: {
+        encryptJobId: task.encrypt_job_id,
+        securityId: "security-1",
+        encryptBossId: "boss-1",
+        jobName: task.job_title,
+        bossName: "招聘者",
+        bossTitle: "招聘经理",
+        lid: "lid-1",
+        contacted: false,
+        identitySource: "standalone-job-info",
+        bossIdentifierVerified: true
+      },
+      reason: "测试页面已匹配"
+    };
+    await client.reportBossPageIdentity("1", identity);
     await Promise.resolve();
     expect(socket.sent.map((item) => JSON.parse(item))).toContainEqual(
       expect.objectContaining({ type: "match_task", task_id: task.id })

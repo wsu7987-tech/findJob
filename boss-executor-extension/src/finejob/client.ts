@@ -27,7 +27,7 @@ const CAPABILITIES = [
 ];
 const PAGE_MATCH_TIMEOUT_MS = 5_000;
 const PAGE_MATCH_PROBE_INTERVAL_MS = 1_000;
-const PAGE_OPEN_TIMEOUT_MS = 10_000;
+const PAGE_OPEN_TIMEOUT_MS = 5_000;
 const TASK_EXECUTION_TIMEOUT_MS = 40_000;
 
 type Credentials = { executorId: string; token: string };
@@ -89,6 +89,31 @@ export class FineJobExecutorClient {
 
   getState(): ExecutorRuntimeState {
     return structuredClone(this.state);
+  }
+
+  markChatResumeSendSucceeded(): void {
+    this.state.detail = "简历发送成功";
+  }
+
+  markChatResumeSendFailed(reason: string): void {
+    this.state.detail = `简历发送失败：${reason}`;
+  }
+
+  markChatResumeParametersReceived(): void {
+    this.state.detail = "已收到简历发送参数";
+  }
+
+  getChatPagePaths(): string[] {
+    const paths = new Set<string>(["/web/geek/chat"]);
+    for (const task of this.state.queue) {
+      if (task.page_type !== "chat" || !task.chat_page_url) continue;
+      try {
+        paths.add(new URL(task.chat_page_url).pathname);
+      } catch {
+        continue;
+      }
+    }
+    return [...paths];
   }
 
   async pair(code: string): Promise<void> {
@@ -228,7 +253,7 @@ export class FineJobExecutorClient {
         return;
       }
       this.state.detail = this.state.queue.length > 0 ? "正在匹配任务页面" : "当前没有待执行任务";
-      this.requestTaskPage(false);
+      this.startPageChecks("all");
       return;
     }
     if (message.type === "executor_control" && socket.readyState === WebSocket.OPEN) {
@@ -239,7 +264,7 @@ export class FineJobExecutorClient {
         request_id: String(message.request_id || ""),
         queue_state: this.state.executor?.queue_state
       }));
-      if (command === "start") this.requestTaskPage(false);
+      if (command === "start") this.startPageChecks("all");
       return;
     }
     if (message.type === "page_opened") {
@@ -249,7 +274,6 @@ export class FineJobExecutorClient {
       this.waitingForPageOpen = false;
       if (!opened) {
         this.stopPageChecks();
-        this.currentPageTaskId = "";
         if (message.queue_empty === true) this.state.queue = [];
         this.state.detail = message.queue_empty === true
           ? "当前没有待执行任务"
@@ -261,17 +285,24 @@ export class FineJobExecutorClient {
           && this.hasQueuedTask()
           && !this.isTaskBusy(false)
         ) {
-          this.requestTaskPage(false);
+          this.handlePageOpenFailure(
+            `FineJob 打开页面失败：${String(message.message || "未知错误")}`,
+            taskId || this.currentPageTaskId
+          );
         }
+        this.currentPageTaskId = "";
         return;
       }
       this.currentPageTaskId = taskId;
       const task = this.state.queue.find((item) => item.id === taskId);
       if (task?.task_type === "TEST_DELAY") {
-        this.dispatchTestDelay(task);
+        // 测试任务只验证指定页面能被打开，开页成功后直接按配置时长回传成功。
+        this.stopPageChecks();
+        this.consecutivePageMatchFailures = 0;
+        void this.dispatchTestDelay(task);
         return;
       }
-      this.startPageChecks();
+      this.startPageChecks(task?.page_type ?? "all");
       return;
     }
     if (message.type === "task_match_synced") {
@@ -347,7 +378,7 @@ export class FineJobExecutorClient {
       body: JSON.stringify({ command })
     });
     if (response.executor) this.state.executor = response.executor;
-    if (command === "start") this.requestTaskPage(false);
+    if (command === "start") this.startPageChecks("all");
   }
 
   private applyQueueState(queueState: "running" | "paused"): void {
@@ -486,11 +517,16 @@ export class FineJobExecutorClient {
     return response.action;
   }
 
-  async markChatDispatchStarted(action: FineJobChatSendAction): Promise<void> {
-    await this.chatRequest(`/executor/actions/${encodeURIComponent(action.id)}/dispatch-started`, {
+  async markChatDispatchStarted(
+    action: FineJobChatSendAction,
+    tabId: string,
+    leaderEpoch: number
+  ): Promise<FineJobChatSendAction> {
+    const response = await this.chatRequest<{ action: FineJobChatSendAction }>(`/executor/actions/${encodeURIComponent(action.id)}/dispatch-started`, {
       method: "POST",
-      body: JSON.stringify({ execution_epoch: action.execution_epoch })
+      body: JSON.stringify({ execution_epoch: action.execution_epoch, tab_id: tabId, leader_epoch: leaderEpoch })
     });
+    return response.action;
   }
 
   async completeChatSend(result: ChatSendExecutionResult): Promise<void> {
@@ -512,8 +548,8 @@ export class FineJobExecutorClient {
     const matched = identity.state === "ready" && identity.job
       ? this.state.queue.find((task) =>
           task.status === "queued"
+          && task.page_type === "job"
           && task.encrypt_job_id === identity.job?.encryptJobId
-          && (!this.currentPageTaskId || task.id === this.currentPageTaskId)
         )
       : undefined;
     if (matched && identity.job && !this.isTaskBusy()) {
@@ -521,21 +557,31 @@ export class FineJobExecutorClient {
       this.waitingForPageOpen = false;
       this.currentPageTaskId = matched.id;
       this.consecutivePageMatchFailures = 0;
-      await this.dispatchDefaultGreeting(tabId, matched);
-      return;
-    }
-    if (
-      this.pageCheckTimer === null
-      && !this.waitingForPageOpen
-      && !this.isTaskBusy()
-      && this.state.queue.length > 0
-      && this.state.executor?.queue_state === "running"
-    ) {
-      this.requestTaskPage(false);
+      if (matched.task_type === "TEST_DELAY") await this.dispatchTestDelay(matched);
+      else await this.dispatchDefaultGreeting(tabId, matched);
     }
   }
 
-  private startPageChecks(): void {
+  async reportChatPageIdentity(identity: ChatTabHeartbeat): Promise<void> {
+    if (this.pageCheckTimer === null || this.isTaskBusy()) return;
+    const matched = this.state.queue.find((task) =>
+      task.status === "queued"
+      && task.page_type === "chat"
+      && this.matchesChatPage(task, identity)
+    );
+    if (!matched) return;
+    this.stopPageChecks();
+    this.waitingForPageOpen = false;
+    this.currentPageTaskId = matched.id;
+    this.consecutivePageMatchFailures = 0;
+    if (matched.task_type === "TEST_DELAY") {
+      await this.dispatchTestDelay(matched);
+      return;
+    }
+    this.state.detail = `聊天页面已匹配：${matched.job_title}`;
+  }
+
+  private startPageChecks(pageType: "job" | "chat" | "all"): void {
     if (
       this.state.queue.length === 0
       || this.waitingForPageOpen
@@ -545,7 +591,7 @@ export class FineJobExecutorClient {
     this.stopPageChecks();
     // 每轮最多匹配5秒，超时后交给FineJob打开目标页面。
     this.pageCheckCount = 0;
-    this.state.detail = "正在匹配任务页面";
+    this.state.detail = pageType === "chat" ? "正在匹配聊天任务页面" : "正在匹配任务页面";
     this.requestCurrentPageProbe();
     // 5秒窗口内持续触发轻量页面身份读取，避免页面刚加载时错过匹配。
     this.pageCheckTimer = globalThis.setInterval(() => {
@@ -567,17 +613,12 @@ export class FineJobExecutorClient {
 
   private startPageOpenTimer(): void {
     this.stopPageOpenTimer();
-    // FineJob打开页面没有返回结果时退出等待态，避免插件长期卡在打开页面。
+    // 等待5秒仍未收到页面已打开回执，视为一次开页失败并进入下一次开页请求。
     this.pageOpenTimer = globalThis.setTimeout(() => {
       this.pageOpenTimer = null;
       if (!this.waitingForPageOpen) return;
       this.waitingForPageOpen = false;
-      this.sendControlMessage({
-        type: "execution_error",
-        error_message: "FineJob 打开页面后未返回页面打开结果",
-        occurred_at: new Date().toISOString()
-      });
-      this.closeControlChannelForIssue("FineJob 打开页面超时，已断开连接");
+      this.handlePageOpenFailure("FineJob 在5秒内未返回页面已打开结果", this.currentPageTaskId);
     }, PAGE_OPEN_TIMEOUT_MS) as unknown as number;
   }
 
@@ -592,19 +633,41 @@ export class FineJobExecutorClient {
     this.stopPageChecks();
     if (this.state.queue.length === 0 || this.isTaskBusy(false)) return;
     this.consecutivePageMatchFailures += 1;
-    this.sendControlMessage({
-      type: "execution_error",
-      task_id: this.currentPageTaskId,
-      failure_kind: "page_match_failed",
-      disconnect: this.consecutivePageMatchFailures >= 3,
-      error_message: "任务页面打开后5秒内未匹配执行任务",
-      occurred_at: new Date().toISOString()
-    });
+    const currentTask = this.state.queue.find((task) => task.id === this.currentPageTaskId);
+    if (currentTask?.task_source !== "chat") {
+      this.sendControlMessage({
+        type: "execution_error",
+        task_id: this.currentPageTaskId,
+        failure_kind: "page_match_failed",
+        disconnect: this.consecutivePageMatchFailures >= 3,
+        error_message: "任务页面打开后5秒内未匹配执行任务",
+        occurred_at: new Date().toISOString()
+      });
+    }
     if (this.consecutivePageMatchFailures >= 3) {
       this.closeControlChannelForIssue("连续匹配页面失败3次，已断开连接");
       return;
     }
     this.state.detail = "匹配任务页面失败，正在请求重新打开";
+    this.requestTaskPage(true);
+  }
+
+  private handlePageOpenFailure(message: string, taskId: string): void {
+    this.consecutivePageMatchFailures += 1;
+    const disconnect = this.consecutivePageMatchFailures >= 3;
+    this.sendControlMessage({
+      type: "execution_error",
+      task_id: taskId,
+      failure_kind: "page_open_timeout",
+      disconnect,
+      error_message: message,
+      occurred_at: new Date().toISOString()
+    });
+    if (disconnect) {
+      this.closeControlChannelForIssue("连续打开或匹配任务页面失败3次，已断开连接");
+      return;
+    }
+    this.state.detail = `${message}，正在请求重新打开`;
     this.requestTaskPage(true);
   }
 
@@ -614,7 +677,9 @@ export class FineJobExecutorClient {
     this.waitingForPageOpen = true;
     this.startPageOpenTimer();
     if (!retry) this.currentPageTaskId = "";
-    this.state.detail = "正在等 FineJob 打开页面";
+    this.state.detail = retry
+      ? "匹配页面失败，正在请求 FineJob 打开页面"
+      : "正在请求 FineJob 打开页面";
   }
 
   private requestCurrentPageProbe(): void {
@@ -623,8 +688,22 @@ export class FineJobExecutorClient {
       const tab = tabs.find((item) => item.active) ?? tabs[0];
       if (tab?.id !== undefined) {
         void browser.tabs.sendMessage(tab.id, { type: "finejob:boss-executor:probe:v1" }).catch(() => undefined);
+        void browser.tabs.sendMessage(tab.id, { type: "finejob:boss-chat:probe:v1" }).catch(() => undefined);
       }
     }).catch(() => undefined);
+  }
+
+  private matchesChatPage(task: FineJobQueueAction, identity: ChatTabHeartbeat): boolean {
+    const configured = task.chat_page_url || "https://www.zhipin.com/web/geek/chat";
+    let expectedPath = "/web/geek/chat";
+    try {
+      expectedPath = new URL(configured).pathname;
+    } catch {
+      return false;
+    }
+    return identity.loggedIn
+      && identity.pathname === expectedPath
+      && (!task.account_uid || task.account_uid === identity.accountUid);
   }
 
   private closeControlChannelForIssue(detail: string): void {
@@ -837,6 +916,8 @@ export class FineJobExecutorClient {
       || this.state.detail.includes("同步失败")
       || this.state.detail.includes("冷却等待")
       || this.state.detail.includes("页面加载等待")
+      || this.state.detail.includes("已收到简历发送参数")
+      || this.state.detail.includes("正在发送简历")
       || this.state.detail.includes("结果回写等待确认")
       || this.state.detail.includes("回写等待重试");
   }

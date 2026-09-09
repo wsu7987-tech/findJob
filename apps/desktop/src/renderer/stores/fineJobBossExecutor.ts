@@ -207,6 +207,7 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
 
   const createTestTask = async (payload: {
     job_id: string;
+    test_task_type: "greeting" | "resume" | "chat";
     close_page_after_completion: boolean;
     delay_seconds: number;
   }) => {

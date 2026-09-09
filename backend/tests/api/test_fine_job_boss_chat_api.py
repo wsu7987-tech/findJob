@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from backend.app.services.fine_job import boss_chat
+from backend.app.services.fine_job.boss_scraper.service import boss_scraper_service
 
 
 def _pair(client) -> tuple[str, str]:
@@ -438,6 +439,15 @@ def test_chat_observe_generate_confirm_and_send(configured_client) -> None:
     assert task["decision"] == "reply"
     assert task["facts_used"] == []
 
+    review_tasks = configured_client.get("/api/fine-job/boss-chat/review-tasks")
+    assert review_tasks.status_code == 200
+    assert len(review_tasks.json()["items"]) == 1
+    review_task = review_tasks.json()["items"][0]
+    assert review_task["id"] == task["id"]
+    assert review_task["source"] == "chat_reply"
+    assert review_task["task_type"] == "发送消息"
+    assert review_task["task_detail"] == task["final_text"]
+
     edited_text = "您好，可以沟通一下办公地点、面试时间和薪资范围吗？"
     edited = configured_client.patch(
         f"/api/fine-job/boss-chat/reply-tasks/{task['id']}",
@@ -460,6 +470,25 @@ def test_chat_observe_generate_confirm_and_send(configured_client) -> None:
         "send_commitment_reply",
         "send_interview_decision",
     ]
+
+    returned = configured_client.post(
+        f"/api/fine-job/boss-chat/send-actions/{confirmed.json()['action']['id']}/return-to-review"
+    )
+    assert returned.status_code == 200
+    assert returned.json()["action"]["status"] == "cancelled"
+    returned_tasks = configured_client.get("/api/fine-job/boss-chat/review-tasks").json()["items"]
+    assert len(returned_tasks) == 1
+    assert returned_tasks[0]["source"] == "chat_reply"
+    assert returned_tasks[0]["task_detail"] == edited_text
+    reconfirmed = configured_client.post(
+        f"/api/fine-job/boss-chat/reply-tasks/{returned_tasks[0]['id']}/confirm",
+        json={
+            "final_text": edited_text,
+            "based_on_message_id": returned_tasks[0]["based_on_message_id"],
+            "based_on_session_version": returned_tasks[0]["based_on_session_version"],
+        },
+    )
+    assert reconfirmed.status_code == 200
 
     claimed = configured_client.post(
         "/api/fine-job/boss-chat/executor/actions/claim",
@@ -933,7 +962,7 @@ def test_incomplete_session_is_reconciled_when_job_identity_arrives(configured_c
     assert sessions[0]["status"] == "active"
 
 
-def test_resume_action_requires_cached_selection_and_keeps_selected_filename(configured_client) -> None:
+def test_resume_action_requires_cached_selection_and_keeps_selected_filename(configured_client, monkeypatch) -> None:
     _, token = _pair(configured_client)
     headers = {"Authorization": f"Bearer {token}"}
     configured_client.patch(
@@ -953,39 +982,27 @@ def test_resume_action_requires_cached_selection_and_keeps_selected_filename(con
     session_id = configured_client.get("/api/fine-job/boss-chat/sessions").json()["sessions"][0]["id"]
     _resume_session(configured_client, session_id)
 
+    monkeypatch.setattr(
+        boss_scraper_service,
+        "capture_resume_attachments",
+        lambda: {
+            "account_uid": "geek-100",
+            "url": "https://www.zhipin.com/wapi/zpgeek/resume/attachment/checkbox.json?from=2",
+            "attachments": [
+                {"resumeId": "resume-a", "showName": "简历 A.pdf"},
+                {"resumeId": "resume-b", "showName": "简历 B.pdf"},
+            ],
+        },
+    )
     refresh = configured_client.post(
         f"/api/fine-job/boss-chat/sessions/{session_id}/resume-attachments/refresh"
     )
     assert refresh.status_code == 200
-    list_action = configured_client.post(
-        "/api/fine-job/boss-chat/executor/actions/claim",
-        headers=headers,
-        json={"account_uid": "geek-100", "tab_id": "tab-resume", "leader_epoch": 1},
-    ).json()["action"]
-    started = configured_client.post(
-        f"/api/fine-job/boss-chat/executor/actions/{list_action['id']}/dispatch-started",
-        headers=headers,
-        json={"execution_epoch": list_action["execution_epoch"]},
-    )
-    assert started.status_code == 200
-    completed = configured_client.post(
-        f"/api/fine-job/boss-chat/executor/actions/{list_action['id']}/complete",
-        headers=headers,
-        json={
-            "execution_epoch": list_action["execution_epoch"],
-            "outcome": "accepted",
-            "client_mid": list_action["client_mid"],
-            "status_code": "resume_list_loaded",
-            "evidence": {"attachments": [
-                {"encryptResumeId": "resume-a", "showName": "简历 A.pdf"},
-                {"encryptResumeId": "resume-b", "showName": "简历 B.pdf"},
-            ]},
-        },
-    )
-    assert completed.status_code == 200
+    assert refresh.json()["action"]["status"] == "accepted"
+    assert refresh.json()["action"]["outcome"] == "accepted"
     assert configured_client.get(f"/api/fine-job/boss-chat/sessions/{session_id}").json()["resume_attachments"] == [
-        {"encryptResumeId": "resume-a", "showName": "简历 A.pdf"},
-        {"encryptResumeId": "resume-b", "showName": "简历 B.pdf"},
+        {"resumeId": "resume-a", "showName": "简历 A.pdf"},
+        {"resumeId": "resume-b", "showName": "简历 B.pdf"},
     ]
 
     missing_choice = configured_client.post(
@@ -1000,3 +1017,48 @@ def test_resume_action_requires_cached_selection_and_keeps_selected_filename(con
     assert selected.status_code == 200
     assert selected.json()["action"]["encrypt_resume_id"] == "resume-b"
     assert selected.json()["action"]["resume_filename"] == "简历 B.pdf"
+    assert selected.json()["action"]["confirmation_status"] == "pending"
+
+    review_tasks = configured_client.get("/api/fine-job/boss-chat/review-tasks")
+    assert review_tasks.status_code == 200
+    assert len(review_tasks.json()["items"]) == 1
+    review_task = review_tasks.json()["items"][0]
+    assert review_task["id"] == selected.json()["action"]["id"]
+    assert review_task["source"] == "chat_resume"
+    assert review_task["session_id"] == session_id
+    assert review_task["task_type"] == "发送简历"
+    assert review_task["task_detail"] == "简历 B.pdf"
+
+    confirmed = configured_client.post(
+        f"/api/fine-job/boss-chat/send-actions/{selected.json()['action']['id']}/confirm"
+    )
+    assert confirmed.status_code == 200
+    assert confirmed.json()["action"]["confirmation_status"] == "confirmed"
+
+    returned = configured_client.post(
+        f"/api/fine-job/boss-chat/send-actions/{selected.json()['action']['id']}/return-to-review"
+    )
+    assert returned.status_code == 200
+    assert returned.json()["action"]["confirmation_status"] == "pending"
+    assert configured_client.get("/api/fine-job/boss-chat/review-tasks").json()["items"][0]["id"] == selected.json()["action"]["id"]
+
+    reconfirmed = configured_client.post(
+        f"/api/fine-job/boss-chat/send-actions/{selected.json()['action']['id']}/confirm"
+    )
+    assert reconfirmed.status_code == 200
+    claimed = configured_client.post(
+        "/api/fine-job/boss-chat/executor/actions/claim",
+        headers=headers,
+        json={"account_uid": "geek-100", "tab_id": "tab-resume", "leader_epoch": 1},
+    )
+    assert claimed.status_code == 200
+    assert claimed.json()["action"]["status"] == "leased"
+
+    disconnected = configured_client.post("/api/fine-job/boss-executor/desktop-disconnect")
+    assert disconnected.status_code == 200
+    detail_after_disconnect = configured_client.get(f"/api/fine-job/boss-chat/sessions/{session_id}").json()
+    resumed_action = next(item for item in detail_after_disconnect["send_actions"] if item["id"] == selected.json()["action"]["id"])
+    assert resumed_action["status"] == "queued"
+    queue_after_disconnect = configured_client.get("/api/fine-job/boss-executor/status").json()["queue"]["actions"]
+    queue_action = next(item for item in queue_after_disconnect if item["id"] == selected.json()["action"]["id"])
+    assert queue_action["execution_state"] == "queued"

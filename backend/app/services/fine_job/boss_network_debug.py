@@ -95,13 +95,7 @@ class BossNetworkDebugRun:
             raise RuntimeError("没有找到 BOSS 页面，请先在专用 Chrome 中打开 BOSS 页面。")
 
         for target in self.targets:
-            target_id = str(target.get("targetId") or "")
-            try:
-                session_id = engine.attach_page_session(self.cdp, target_id)
-                self.cdp.send("Network.enable", {}, session_id)
-                self.sessions[session_id] = target_id
-            except Exception:
-                continue
+            self._attach_boss_target(target)
 
         if not self.sessions:
             self.cdp.close()
@@ -109,6 +103,15 @@ class BossNetworkDebugRun:
             raise RuntimeError("无法连接到 BOSS 页面，请重新打开专用 Chrome 后再试。")
 
         self.trace = NetworkTraceCapture(self.sessions)
+        # 新页面先暂停，完成 Network 绑定后再继续，避免遗漏页面首个请求。
+        self.cdp.send(
+            "Target.setAutoAttach",
+            {
+                "autoAttach": True,
+                "waitForDebuggerOnStart": True,
+                "flatten": True,
+            },
+        )
         self.started_at = _now()
         self.thread = threading.Thread(target=self._listen, name="boss-network-debug", daemon=True)
         self.thread.start()
@@ -200,6 +203,9 @@ class BossNetworkDebugRun:
                 # 同一连接仅由 CDPSession 的读取入口接收并分流消息。
                 self.cdp.drain_events(0.5)
                 self._process_buffered_events()
+                # 聊天页可能在监听启动后才打开，此处补充绑定新页面。
+                self._sync_boss_targets()
+                self._process_buffered_events()
         except Exception as exc:
             self.error_message = str(exc)
         finally:
@@ -210,6 +216,7 @@ class BossNetworkDebugRun:
         buffered, self.event_cursor = self.cdp.events_since(
             self.event_cursor,
             methods={
+                "Target.attachedToTarget",
                 "Network.requestWillBeSent",
                 "Network.responseReceived",
                 "Network.loadingFinished",
@@ -223,8 +230,65 @@ class BossNetworkDebugRun:
             },
         )
         for event in buffered:
+            if event.get("method") == "Target.attachedToTarget":
+                self._process_attached_target(event)
+                continue
             self._process_event(event)
         return self.event_cursor != previous_cursor
+
+    def _process_attached_target(self, event: dict[str, Any]) -> None:
+        """为自动接管的新页面启用 Network 后，立即恢复页面执行。"""
+        params = event.get("params") or {}
+        session_id = str(params.get("sessionId") or "")
+        target = params.get("targetInfo") or {}
+        try:
+            if session_id and _is_boss_target(target):
+                target_id = str(target.get("targetId") or "")
+                self.cdp.send("Network.enable", {}, session_id)
+                self.sessions[session_id] = target_id
+                self._update_target(target)
+        finally:
+            if session_id and params.get("waitingForDebugger"):
+                self.cdp.send("Runtime.runIfWaitingForDebugger", {}, session_id)
+
+    def _sync_boss_targets(self) -> None:
+        """发现监听启动后打开或跳转到 BOSS 的页面，并开启网络监听。"""
+        target_response = self.cdp.send("Target.getTargets")
+        all_targets = target_response.get("result", {}).get("targetInfos", [])
+        known_target_ids = set(self.sessions.values())
+        for target in all_targets:
+            if not _is_boss_target(target):
+                continue
+            target_id = str(target.get("targetId") or "")
+            if not target_id:
+                continue
+            if target_id not in known_target_ids:
+                self._attach_boss_target(target)
+                known_target_ids.add(target_id)
+                continue
+            self._update_target(target)
+
+    def _attach_boss_target(self, target: dict[str, Any]) -> None:
+        """为一个 BOSS 页面创建 CDP session，并启用 Network 域。"""
+        target_id = str(target.get("targetId") or "")
+        if not target_id or target_id in self.sessions.values():
+            return
+        try:
+            session_id = engine.attach_page_session(self.cdp, target_id)
+            self.cdp.send("Network.enable", {}, session_id)
+        except Exception:
+            return
+        self.sessions[session_id] = target_id
+        self._update_target(target)
+
+    def _update_target(self, target: dict[str, Any]) -> None:
+        """保存当前页面信息，供抓包状态和导出文件展示。"""
+        target_id = str(target.get("targetId") or "")
+        self.targets = [
+            item for item in self.targets
+            if str(item.get("targetId") or "") != target_id
+        ]
+        self.targets.append(target)
 
     def _add_evidence_gap(self, reason: str) -> None:
         if reason not in self.evidence_gap_reasons:
@@ -329,6 +393,18 @@ class BossNetworkDebugRun:
         cdp_diagnostics = self._current_cdp_diagnostics()
         self.cdp_diagnostics = cdp_diagnostics
         if self.cdp is not None:
+            try:
+                self.cdp.send(
+                    "Target.setAutoAttach",
+                    {
+                        "autoAttach": False,
+                        "waitForDebuggerOnStart": False,
+                        "flatten": True,
+                    },
+                    timeout=3,
+                )
+            except Exception:
+                pass
             for session_id in self.sessions:
                 try:
                     self.cdp.send("Network.disable", {}, session_id, timeout=3)

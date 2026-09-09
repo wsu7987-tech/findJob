@@ -4,9 +4,10 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { useRouter } from "vue-router";
 
 import { formatDateTime } from "@/services/format";
+import { api } from "@/services/api";
 import { useFineJobBossExecutorStore } from "@/stores/fineJobBossExecutor";
 import { useFineJobWorkflowStore } from "@/stores/fineJobWorkflow";
-import type { FineJobReviewItem, FineJobReviewTab } from "@/types";
+import type { FineJobChatReviewTask, FineJobReviewItem, FineJobReviewTab } from "@/types";
 
 const router = useRouter();
 const workflowStore = useFineJobWorkflowStore();
@@ -198,6 +199,36 @@ const showDetail = (item: FineJobReviewItem) => {
   detailDrawerOpen.value = true;
 };
 
+const approveChatReviewTask = async (task: FineJobChatReviewTask) => {
+  try {
+    if (task.source === "chat_reply") {
+      await api.confirmFineJobChatReply(task.id, {
+        final_text: task.task_detail,
+        based_on_message_id: task.based_on_message_id ?? "",
+        based_on_session_version: task.based_on_session_version ?? 0
+      });
+    } else {
+      await api.confirmFineJobChatResumeAction(task.id);
+    }
+    await loadStatus("pending");
+    await executorStore.load();
+    ElMessage.success("任务已进入执行队列");
+  } catch (errorValue) {
+    ElMessage.error(errorValue instanceof Error ? errorValue.message : "确认任务失败");
+  }
+};
+
+const rejectChatReviewTask = async (task: FineJobChatReviewTask) => {
+  try {
+    if (task.source === "chat_reply") await api.cancelFineJobChatReply(task.id);
+    else await api.cancelFineJobChatResumeAction(task.id);
+    await loadStatus("pending");
+    ElMessage.success("已取消待确认任务");
+  } catch (errorValue) {
+    ElMessage.error(errorValue instanceof Error ? errorValue.message : "取消任务失败");
+  }
+};
+
 const decisionLabel = (decision: FineJobReviewItem["ai_decision"]) =>
   ({ recommend: "建议投递", review: "待判断", reject: "不建议" })[decision];
 const decisionType = (decision: FineJobReviewItem["ai_decision"]) =>
@@ -387,6 +418,10 @@ onBeforeUnmount(() => {
             </div>
           </template>
         </el-table-column>
+        <el-table-column label="任务类型" width="115"><template #default>打招呼</template></el-table-column>
+        <el-table-column label="任务详情" min-width="260" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.final_message || row.draft_message || "待生成招呼语" }}</template>
+        </el-table-column>
         <el-table-column label="AI 结论" width="115">
           <template #default="{ row }"><el-tag :type="decisionType(row.ai_decision)">{{ decisionLabel(row.ai_decision) }}</el-tag></template>
         </el-table-column>
@@ -419,6 +454,27 @@ onBeforeUnmount(() => {
           </template>
         </el-table-column>
       </el-table>
+
+      <section v-if="workflowStore.selectedStatus === 'pending'" class="chat-review-section">
+        <div class="panel-title-row">
+          <div><p class="panel-eyebrow">Chat Actions</p><h2>自动代聊待确认</h2></div>
+          <el-tag type="warning">{{ workflowStore.chatReviewTasks.length }} 项</el-tag>
+        </div>
+        <el-table :data="workflowStore.chatReviewTasks" empty-text="当前没有待确认的自动代聊任务">
+          <el-table-column label="任务类型" width="120"><template #default="{ row }">{{ row.task_type }}</template></el-table-column>
+          <el-table-column label="任务详情" min-width="280" show-overflow-tooltip><template #default="{ row }">{{ row.task_detail }}</template></el-table-column>
+          <el-table-column label="招聘方" min-width="140"><template #default="{ row }">{{ row.peer_name || "-" }}</template></el-table-column>
+          <el-table-column label="公司 / 岗位" min-width="180"><template #default="{ row }">{{ row.company_name || "-" }} · {{ row.job_title || "-" }}</template></el-table-column>
+          <el-table-column label="创建时间" width="175"><template #default="{ row }">{{ formatDateTime(row.created_at) }}</template></el-table-column>
+          <el-table-column label="操作" width="230" fixed="right">
+            <template #default="{ row }">
+              <el-button link @click="openChat(row.session_id)">查看会话</el-button>
+              <el-button link type="primary" @click="approveChatReviewTask(row)">批准</el-button>
+              <el-button link type="danger" @click="rejectChatReviewTask(row)">取消</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </section>
 
       <div class="review-pagination">
         <el-pagination

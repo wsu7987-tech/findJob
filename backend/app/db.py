@@ -1318,6 +1318,17 @@ CREATE TABLE IF NOT EXISTS fj_chat_runtime (
   CHECK (interval_minutes IN (0, 5, 10, 30, 60))
 );
 
+-- 当前 BOSS 账号最近一次成功读取的附件简历，用于桌面端重启后恢复展示。
+CREATE TABLE IF NOT EXISTS fj_boss_resume_attachment_snapshots (
+  account_uid TEXT PRIMARY KEY,
+  attachments_json TEXT NOT NULL DEFAULT '[]',
+  source_url TEXT NOT NULL DEFAULT '',
+  captured_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_boss_resume_attachment_snapshots_captured_at
+  ON fj_boss_resume_attachment_snapshots(captured_at DESC);
+
 CREATE TABLE IF NOT EXISTS fj_chat_sessions (
   id TEXT PRIMARY KEY,
   platform TEXT NOT NULL DEFAULT 'boss',
@@ -1344,7 +1355,7 @@ CREATE TABLE IF NOT EXISTS fj_chat_sessions (
   message_update_required INTEGER NOT NULL DEFAULT 0,
   history_has_more INTEGER NOT NULL DEFAULT 0,
   history_next_cursor TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'human_takeover',
+  status TEXT NOT NULL DEFAULT 'active',
   session_version INTEGER NOT NULL DEFAULT 0,
   latest_message_id TEXT,
   latest_inbound_message_id TEXT,
@@ -1442,6 +1453,7 @@ CREATE TABLE IF NOT EXISTS fj_chat_send_actions (
   operation_kind TEXT NOT NULL DEFAULT 'text',
   encrypt_resume_id TEXT NOT NULL DEFAULT '',
   resume_filename TEXT NOT NULL DEFAULT '',
+  confirmation_status TEXT NOT NULL DEFAULT 'confirmed',
   status TEXT NOT NULL DEFAULT 'queued',
   text TEXT NOT NULL,
   execution_epoch INTEGER NOT NULL DEFAULT 0,
@@ -3089,6 +3101,7 @@ class Database:
                 "operation_kind": "ALTER TABLE fj_chat_send_actions ADD COLUMN operation_kind TEXT NOT NULL DEFAULT 'text'",
                 "encrypt_resume_id": "ALTER TABLE fj_chat_send_actions ADD COLUMN encrypt_resume_id TEXT NOT NULL DEFAULT ''",
                 "resume_filename": "ALTER TABLE fj_chat_send_actions ADD COLUMN resume_filename TEXT NOT NULL DEFAULT ''",
+                "confirmation_status": "ALTER TABLE fj_chat_send_actions ADD COLUMN confirmation_status TEXT NOT NULL DEFAULT 'confirmed'",
                 "authorization_mode": "ALTER TABLE fj_chat_send_actions ADD COLUMN authorization_mode TEXT NOT NULL DEFAULT 'manual_confirmation'",
                 "authorization_source": "ALTER TABLE fj_chat_send_actions ADD COLUMN authorization_source TEXT NOT NULL DEFAULT 'confirmation'",
                 "content_categories_json": "ALTER TABLE fj_chat_send_actions ADD COLUMN content_categories_json TEXT NOT NULL DEFAULT '[]'",

@@ -1241,7 +1241,7 @@ export interface FineJobBossExecutorInstance {
   last_heartbeat_at?: string | null;
   task_cooldown_max_seconds: number;
   page_load_wait_max_seconds: number;
-  runtime_phase?: "idle" | "task_cooldown";
+  runtime_phase?: "idle" | "task_cooldown" | "page_opening" | "page_matching";
   runtime_detail?: string;
   runtime_until_at?: string | null;
   updated_at: string;
@@ -1249,20 +1249,24 @@ export interface FineJobBossExecutorInstance {
 
 export interface FineJobBossExecutorQueueAction {
   id: string;
-  job_id: string;
-  review_item_id: string;
+  job_id?: string;
+  review_item_id?: string;
   action_type: string;
-  task_type: "BOSS_DEFAULT_GREETING" | "TEST_DELAY";
-  status: FineJobAutomationActionStatus;
+  task_type: string;
+  task_detail: string;
+  task_source: "greeting" | "chat" | "test";
+  session_id?: string;
+  status: string;
   execution_state: FineJobBossExecutionState;
   execution_epoch: number;
   job_title: string;
   company_name: string;
-  encrypt_job_id: string;
+  encrypt_job_id?: string;
   last_status_code?: string | null;
   last_error?: string | null;
   close_page_after_completion: boolean;
   delay_seconds: number;
+  test_task_type?: "greeting" | "resume" | "chat" | "";
 }
 
 export interface FineJobBossExecutorTestJob {
@@ -1312,7 +1316,7 @@ export interface FineJobBossNavigationTask {
   opened_at?: string | null;
 }
 
-export type FineJobChatSessionStatus = "active" | "human_takeover" | "paused" | "unsupported";
+export type FineJobChatSessionStatus = "active" | "paused" | "unsupported";
 export type FineJobChatReplyStatus =
   | "pending_generation"
   | "generating"
@@ -1455,13 +1459,41 @@ export interface FineJobChatSendAction {
   operation_kind?: "text" | "resume_list" | "resume";
   encrypt_resume_id?: string;
   resume_filename?: string;
+  confirmation_status?: "pending" | "confirmed";
+}
+
+export interface FineJobChatReviewTask {
+  id: string;
+  source: "chat_reply" | "chat_resume";
+  session_id: string;
+  task_type: "发送消息" | "发送简历";
+  task_detail: string;
+  peer_name: string;
+  company_name: string;
+  job_title: string;
+  created_at: string;
+  based_on_message_id?: string;
+  based_on_session_version?: number;
+}
+
+export interface FineJobChatReviewTaskListEnvelope {
+  items: FineJobChatReviewTask[];
 }
 
 export interface FineJobBossResumeAttachment {
-  encryptResumeId: string;
+  resumeId: string;
   showName: string;
   resumeSizeDesc: string;
   suffixName: string;
+}
+
+export interface FineJobResumeAttachmentsRefreshResponse {
+  account_uid: string;
+  attachments: FineJobBossResumeAttachment[];
+  url: string;
+  target_id: string;
+  captured_at: string | null;
+  saved: boolean;
 }
 
 export interface FineJobConversationInsight {

@@ -5,6 +5,7 @@ import { ApiError, NetworkError, api } from "@/services/api";
 import type {
   FineJobAutomationAction,
   FineJobBossExecutionState,
+  FineJobChatReviewTask,
   FineJobReviewItem,
   FineJobReviewStatus,
   FineJobReviewTab
@@ -13,6 +14,7 @@ import type {
 export const useFineJobWorkflowStore = defineStore("fineJobWorkflow", () => {
   const items = ref<FineJobReviewItem[]>([]);
   const queuedActions = ref<FineJobAutomationAction[]>([]);
+  const chatReviewTasks = ref<FineJobChatReviewTask[]>([]);
   const selectedStatus = ref<FineJobReviewTab>("pending");
   const loading = ref(false);
   const processingId = ref<string | null>(null);
@@ -34,7 +36,7 @@ export const useFineJobWorkflowStore = defineStore("fineJobWorkflow", () => {
         ? status as "running" | "executed"
         : "";
       const reviewStatus = executionView ? "approved" : status as FineJobReviewStatus;
-      const [reviewResponse, actionResponse] = await Promise.all([
+      const [reviewResponse, actionResponse, chatReviewResponse] = await Promise.all([
         api.listFineJobReviewItems({
           status: reviewStatus,
           execution_view: executionView,
@@ -46,11 +48,13 @@ export const useFineJobWorkflowStore = defineStore("fineJobWorkflow", () => {
           page: page.value,
           page_size: pageSize.value
         }),
-        api.listFineJobAutomationActions("queued")
+        api.listFineJobAutomationActions("queued"),
+        api.listFineJobChatReviewTasks()
       ]);
       items.value = reviewResponse.items;
       total.value = reviewResponse.total;
       queuedActions.value = actionResponse.actions;
+      chatReviewTasks.value = status === "pending" ? chatReviewResponse.items : [];
       return reviewResponse;
     } catch (errorValue) {
       error.value = mapError(errorValue);
@@ -174,6 +178,7 @@ export const useFineJobWorkflowStore = defineStore("fineJobWorkflow", () => {
   return {
     items,
     queuedActions,
+    chatReviewTasks,
     selectedStatus,
     loading,
     processingId,

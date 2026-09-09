@@ -73,11 +73,11 @@ describe("BOSS 聊天 sender 离线边界", () => {
 
   it("附件列表动作只读取列表，不连接 MQTT 或 publish", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-      json: async () => ({ code: 0, zpData: { resumeList: [{ encryptResumeId: "resume-1", showName: "候选人.pdf" }] } })
+      json: async () => ({ code: 0, zpData: { resumeList: [{ resumeId: "resume-1", showName: "候选人.pdf" }] } })
     }));
     const result = await new BossChatSender().send(action({ operation_kind: "resume_list" }));
     expect(result).toMatchObject({ outcome: "accepted", statusCode: "resume_list_loaded" });
-    expect(result.evidence).toMatchObject({ attachments: [{ encryptResumeId: "resume-1", showName: "候选人.pdf" }] });
+    expect(result.evidence).toMatchObject({ attachments: [{ resumeId: "resume-1", showName: "候选人.pdf" }] });
     expect(mqttMock.connect).not.toHaveBeenCalled();
     expect(mqttMock.client.publish).not.toHaveBeenCalled();
   });

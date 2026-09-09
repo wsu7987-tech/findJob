@@ -400,6 +400,109 @@ class BossScraperService:
                     pass
                 cdp.close()
 
+    def capture_resume_attachments(
+        self,
+        *,
+        cdp_port: int = engine.DEFAULT_CDP_PORT,
+        timeout: int = 30,
+    ) -> dict[str, object]:
+        """使用当前 BOSS 聊天页登录态读取当前账号的附件简历列表。"""
+        if not engine.is_cdp_ready(cdp_port):
+            raise RuntimeError("FineJob 专用 Chrome 未启动，请先打开浏览器。")
+
+        with _CAPTURE_LOCK:
+            cdp = engine.CDPSession(cdp_port)
+            session_id = ""
+            try:
+                targets = cdp.send("Target.getTargets").get("result", {}).get("targetInfos", [])
+                target = next(
+                    (
+                        item for item in targets
+                        if item.get("type") == "page"
+                        and str(item.get("targetId") or "") == self._chat_target_id
+                    ),
+                    None,
+                )
+                if target is None:
+                    target = next(
+                        (
+                            item for item in targets
+                            if item.get("type") == "page"
+                            and urlparse(str(item.get("url") or "")).path.rstrip("/") == "/web/geek/chat"
+                        ),
+                        None,
+                    )
+                if target is None:
+                    raise RuntimeError("BOSS 聊天页尚未准备，请先点击“更新聊天列表”。")
+
+                target_id = str(target["targetId"])
+                session_id = engine.attach_page_session(cdp, target_id)
+                account_uid = str(cdp.eval_js(
+                    "String((window._PAGE && (window._PAGE.uid || window._PAGE.userId)) || '')",
+                    session_id,
+                ) or "").strip()
+                if not account_uid:
+                    raise RuntimeError("未能从聊天页读取当前 BOSS 账号，请确认登录状态。")
+
+                url = "https://www.zhipin.com/wapi/zpgeek/resume/attachment/checkbox.json"
+                # 在当前 BOSS 页面上下文发起请求，复用浏览器登录态和页面 Cookie。
+                expression = (
+                    "(async () => {"
+                    f"const response = await fetch({json.dumps(url)}, {{credentials: 'include'}});"
+                    "return {status: response.status, text: await response.text()};"
+                    "})()"
+                )
+                result = cdp.send(
+                    "Runtime.evaluate",
+                    {
+                        "expression": expression,
+                        "awaitPromise": True,
+                        "returnByValue": True,
+                    },
+                    session_id,
+                    timeout=timeout,
+                )
+                value = result.get("result", {}).get("result", {}).get("value") or {}
+                if int(value.get("status") or 0) != 200:
+                    raise RuntimeError(f"BOSS 附件简历接口请求失败，HTTP 状态码 {value.get('status')}。")
+                try:
+                    payload = json.loads(str(value.get("text") or ""))
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("BOSS 附件简历接口响应不是有效 JSON。") from exc
+                if payload.get("code") not in (None, 0):
+                    raise RuntimeError(str(payload.get("message") or "BOSS 附件简历接口返回失败。"))
+
+                zp_data = payload.get("zpData") or {}
+                resume_list = zp_data.get("resumeList") if isinstance(zp_data, dict) else None
+                attachments = []
+                for item in resume_list if isinstance(resume_list, list) else []:
+                    if not isinstance(item, dict):
+                        continue
+                    resume_id = str(item.get("resumeId") or "")
+                    if not resume_id:
+                        continue
+                    attachments.append({
+                        "resumeId": resume_id,
+                        "showName": str(item.get("showName") or "未命名附件"),
+                        "resumeSizeDesc": str(item.get("resumeSizeDesc") or ""),
+                        "suffixName": str(item.get("suffixName") or ""),
+                    })
+                self._chat_target_id = target_id
+                self._interactive_target_id = target_id
+                return {
+                    "url": url,
+                    "account_uid": account_uid,
+                    "attachments": attachments,
+                    "target_id": target_id,
+                }
+            finally:
+                try:
+                    if session_id:
+                        cdp.send("Runtime.disable", {}, session_id, timeout=3)
+                except Exception:
+                    pass
+                cdp.close()
+
     def get_browser_status(
         self,
         *,

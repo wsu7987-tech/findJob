@@ -182,10 +182,11 @@ export class BossChatCoordinator {
   }
 
   private async elect(accountUid: string): Promise<LeaderLease | null> {
+    const chatPagePaths = this.client.getChatPagePaths();
     const candidates = [...this.candidates.values()]
       .filter((item) =>
         item.accountUid === accountUid
-        && item.pathname.includes("/web/geek/chat")
+        && chatPagePaths.includes(item.pathname)
         && item.receivedAt >= Date.now() - TAB_STALE_MS
       )
       .sort((left, right) => Number(right.visible) - Number(left.visible) || left.tabId.localeCompare(right.tabId));
@@ -308,9 +309,12 @@ export class BossChatCoordinator {
 
   private async claimAndDispatch(accountUid: string, leader: LeaderLease): Promise<void> {
     if (this.activeActions.has(accountUid)) return;
-    const action = await this.client.claimChatSendAction(accountUid, leader.tabId, leader.epoch);
-    if (!action) return;
-    await this.client.markChatDispatchStarted(action);
+    // 自动代聊与自动打招呼共用“开始”按钮：未开始时保留已确认任务，不领取也不派发。
+    if (this.client.getState().executor?.queue_state !== "running") return;
+    const claimedAction = await this.client.claimChatSendAction(accountUid, leader.tabId, leader.epoch);
+    if (!claimedAction) return;
+    this.client.markChatResumeParametersReceived();
+    const action = await this.client.markChatDispatchStarted(claimedAction, leader.tabId, leader.epoch);
     this.activeActions.set(accountUid, { action, deadlineAt: Date.now() + 30_000 });
     const command: ChatSendCommand = {
       type: "BOSS_CHAT_SEND",

@@ -1,13 +1,13 @@
 import mqtt, { type MqttClient } from "mqtt";
 
 import type { ChatSendExecutionResult, ChatSendOptions, FineJobChatSendAction } from "../../../finejob/types";
-import { markAssistantClientMid, waitForResumeCard } from "./observer";
+import { markAssistantClientMid } from "./observer";
 import { bossChatProtocol } from "./protocol";
 
 
 type PageIdentity = { uid: string; token: string };
 type ResumeAttachment = {
-  encryptResumeId: string;
+  resumeId: string;
   showName: string;
   resumeSizeDesc: string;
   suffixName: string;
@@ -91,7 +91,7 @@ export class BossChatSender {
   }
 
   private async listResumeAttachments(): Promise<ResumeAttachment[]> {
-    const response = await fetch("https://www.zhipin.com/wapi/zpgeek/resume/attachment/checkbox.json?from=2", {
+    const response = await fetch("https://www.zhipin.com/wapi/zpgeek/resume/attachment/checkbox.json", {
       credentials: "include"
     });
     const body = await response.json() as {
@@ -101,10 +101,10 @@ export class BossChatSender {
     };
     if (body.code !== 0) throw new Error(`获取 BOSS 附件简历失败：${body.message ?? "未知错误"}`);
     return (body.zpData?.resumeList ?? []).flatMap((item) => {
-      const encryptResumeId = String(item.encryptResumeId ?? "");
-      if (!encryptResumeId) return [];
+      const resumeId = String(item.resumeId ?? "");
+      if (!resumeId) return [];
       return [{
-        encryptResumeId,
+        resumeId,
         showName: String(item.showName ?? "未命名附件"),
         resumeSizeDesc: String(item.resumeSizeDesc ?? ""),
         suffixName: String(item.suffixName ?? "")
@@ -116,12 +116,8 @@ export class BossChatSender {
     const clientMid = action.client_mid || (options.dryRun ? createProcessClientMid() : "");
     const operationKind = action.operation_kind ?? "text";
     let publishStarted = false;
-    let resumeExchangeAccepted = false;
+    let resumeExchangeEvidence: Record<string, unknown> = {};
     try {
-      const identity = readPageIdentity();
-      if (identity.uid !== action.account_uid) {
-        throw new Error("当前 BOSS 账号与待发送动作不一致");
-      }
       if (!action.session_id || !action.peer_uid || !action.encrypt_peer_uid || !action.security_id || !action.encrypt_job_id) {
         throw new Error("聊天对象身份不完整，已阻止发送");
       }
@@ -146,14 +142,9 @@ export class BossChatSender {
       }
       if (operationKind === "text" && !action.text) throw new Error("发送内容为空，已阻止发送");
       const normalized = operationKind === "resume" ? {
-        transport: "mqtt", topic: "chat", qos: 1, retain: true, dup: false,
-        techwolf: {
-          protocolType: 6,
-          field1Source: "resume_card.from.uid",
-          field2Source: "resume_card.mid",
-          field3Source: "page_time_like_dynamic",
-          field5Value: 0
-        }
+        transport: "http",
+        method: "POST",
+        endpoint: "/wapi/zpchat/exchange/request"
       } : {
         transport: "mqtt",
         topic: "chat",
@@ -182,39 +173,84 @@ export class BossChatSender {
       if (!await isSendEnabled()) throw new Error("自动代聊发送开关已关闭，已阻止发送");
       let payload: Uint8Array;
       if (operationKind === "resume") {
-        // 先注册监听，避免 exchange 成功后简历卡片到达过快而丢失关联依据。
-        const abortController = new AbortController();
-        const resumeCardPromise = waitForResumeCard(action.peer_uid, 10_000, abortController.signal);
-        void resumeCardPromise.catch(() => undefined);
+        const resumeId = action.encrypt_resume_id ?? "";
+        const liveZpToken = await options.getLiveZpToken?.() ?? "";
+        if (!liveZpToken) throw new Error("未取得当前聊天页 BOSS 请求凭证");
         const request = new URLSearchParams({
           securityId: action.security_id,
           type: "3",
-          encryptResumeId: action.encrypt_resume_id ?? "",
+          encryptResumeId: resumeId,
           mid: ""
         });
         let body: { code?: number; message?: string; zpData?: { status?: number } };
         try {
+          const traceId = `F-${crypto.randomUUID().replaceAll("-", "")}`;
+          // 使用聊天页当前登录态发起 BOSS 简历交换请求。
+          resumeExchangeEvidence = {
+            endpoint: "/wapi/zpchat/exchange/request",
+            method: "POST",
+            request_started: true,
+            trace_id: traceId,
+            request_headers: ["Content-Type", "zp_token", "X-Requested-With", "Accept", "traceid"],
+            request_parameters: {
+              securityId: action.security_id,
+              type: "3",
+              encryptResumeId: resumeId,
+              mid: ""
+            }
+          };
           const response = await fetch("https://www.zhipin.com/wapi/zpchat/exchange/request", {
             method: "POST", credentials: "include",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: request
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+              "zp_token": liveZpToken,
+              "X-Requested-With": "XMLHttpRequest",
+              "Accept": "application/json, text/plain, */*",
+              "traceid": traceId
+            },
+            body: request
           });
-          body = await response.json() as { code?: number; message?: string; zpData?: { status?: number } };
-        } catch (error) {
-          abortController.abort();
-          throw error;
-        }
+          const contentType = response.headers.get("content-type") ?? "";
+          const responseText = await response.text();
+          resumeExchangeEvidence = {
+            ...resumeExchangeEvidence,
+            http_status: response.status,
+            response_content_type: contentType
+          };
+          try {
+            body = JSON.parse(responseText) as { code?: number; message?: string; zpData?: { status?: number } };
+          } catch {
+            const responseKind = responseText.trimStart().startsWith("<") ? "HTML" : "非 JSON 内容";
+            resumeExchangeEvidence = { ...resumeExchangeEvidence, response_kind: responseKind };
+            throw new Error(`BOSS 简历交换请求返回${responseKind}（HTTP ${response.status}，${contentType || "未提供 Content-Type"}）`);
+          }
+          resumeExchangeEvidence = {
+            ...resumeExchangeEvidence,
+            boss_code: body.code ?? null,
+            boss_status: body.zpData?.status ?? null
+          };
+        } catch (error) { throw error; }
         if (body.code !== 0 || body.zpData?.status !== 0) {
-          abortController.abort();
           throw new Error(`请求发送 BOSS 附件简历失败：${body.message ?? "未知错误"}`);
         }
-        resumeExchangeAccepted = true;
-        const resumeCard = await resumeCardPromise;
-        payload = bossChatProtocol.encodeResume({
-          field1Value: resumeCard.fromUid,
-          field2Value: resumeCard.mid,
-          field3Value: String(Date.now())
-        });
+        // BOSS 已在 exchange 成功后自行完成简历卡片与聊天 MQTT 流程。
+        void options.onResumeSendSucceeded?.().catch(() => undefined);
+        return {
+          actionId: action.id,
+          executionEpoch: action.execution_epoch,
+          outcome: "accepted",
+          platformMessageId: "",
+          clientMid,
+          statusCode: "resume_exchange_accepted",
+          message: "BOSS 已确认附件简历发送",
+          evidence: {
+            transport_state: "platform_confirmed",
+            platform_confirmed: true,
+            exchange: resumeExchangeEvidence
+          }
+        };
       } else {
+        const identity = readPageIdentity();
         payload = bossChatProtocol.encodeText({
           fromUid: identity.uid, toUid: action.peer_uid, encryptToUid: action.encrypt_peer_uid,
           friendSource: 0, clientMid, text: action.text
@@ -245,7 +281,7 @@ export class BossChatSender {
         platformMessageId: "",
         clientMid,
         statusCode: "transport_accepted",
-        message: operationKind === "resume" ? "简历 MQTT QoS 1 已接受传输，等待平台确认" : "MQTT QoS 1 已接受传输，等待平台确认",
+        message: "MQTT QoS 1 已接受传输，等待平台确认",
         evidence: {
           transport_state: "transport_accepted_but_unconfirmed",
           platform_confirmed: false,
@@ -253,17 +289,21 @@ export class BossChatSender {
         }
       };
     } catch (error) {
+      const message = (error as Error).message || "BOSS 聊天发送失败";
+      if (operationKind === "resume") {
+        void options.onResumeSendFailed?.(message).catch(() => undefined);
+      }
       return {
         actionId: action.id,
         executionEpoch: action.execution_epoch,
-        outcome: publishStarted || resumeExchangeAccepted ? "unknown" : "failed",
+        outcome: publishStarted ? "unknown" : "failed",
         platformMessageId: "",
         clientMid,
-        statusCode: publishStarted || resumeExchangeAccepted
-          ? operationKind === "resume" ? "resume_send_result_unknown" : "chat_send_result_unknown"
+        statusCode: publishStarted
+          ? "chat_send_result_unknown"
           : "chat_send_failed",
-        message: (error as Error).message || "BOSS 聊天发送失败",
-        evidence: {}
+        message,
+        evidence: operationKind === "resume" ? { exchange: resumeExchangeEvidence } : {}
       };
     }
   }

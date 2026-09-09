@@ -126,11 +126,12 @@ def test_test_jobs_can_be_edited_and_create_delay_task(configured_client, monkey
 
     created = configured_client.post(
         "/api/fine-job/boss-executor/test-tasks",
-        json={"job_id": job["id"], "close_page_after_completion": True, "delay_seconds": 7},
+        json={"job_id": job["id"], "test_task_type": "greeting", "close_page_after_completion": True, "delay_seconds": 7},
     )
     assert created.status_code == 200
     task = created.json()["task"]
     assert task["task_type"] == "TEST_DELAY"
+    assert task["test_task_type"] == "greeting"
     assert task["delay_seconds"] == 7
     assert task["close_page_after_completion"] is True
 
@@ -179,7 +180,7 @@ def test_test_jobs_can_be_edited_and_create_delay_task(configured_client, monkey
 
     second = configured_client.post(
         "/api/fine-job/boss-executor/test-tasks",
-        json={"job_id": job["id"], "close_page_after_completion": False},
+        json={"job_id": job["id"], "test_task_type": "greeting", "close_page_after_completion": False},
     ).json()["task"]
     configured_client.post("/api/fine-job/boss-executor/tasks/open-page", headers=headers)
     asyncio.run(boss_executor.handle_executor_channel_message(
@@ -188,6 +189,18 @@ def test_test_jobs_can_be_edited_and_create_delay_task(configured_client, monkey
         {"type": "task_succeeded", "task_id": second["id"], "execution_result": "测试完成"},
     ))
     assert closed_targets == ["target-test"]
+
+    chat_test = configured_client.post(
+        "/api/fine-job/boss-executor/test-tasks",
+        json={"job_id": job["id"], "test_task_type": "resume", "close_page_after_completion": True},
+    )
+    assert chat_test.status_code == 200
+    assert chat_test.json()["task"]["page_type"] == "chat"
+    assert chat_test.json()["task"]["close_page_after_completion"] is False
+    opened_chat = configured_client.post("/api/fine-job/boss-executor/tasks/open-page", headers=headers)
+    assert opened_chat.status_code == 200
+    assert opened_chat.json()["task"]["id"] == chat_test.json()["task"]["id"]
+    assert opened_chat.json()["navigation"]["target_url"] == "https://www.zhipin.com/web/geek/chat"
 
 
 def test_created_test_task_pushes_queue_to_connected_plugin(configured_client) -> None:
@@ -294,6 +307,62 @@ def test_executor_settings_and_runtime_cooldown_state(configured_client) -> None
         await boss_executor.unregister_desktop_channel(desktop_socket)
 
     asyncio.run(verify_runtime_state())
+
+
+def test_open_page_broadcasts_opening_and_matching_state(configured_client, monkeypatch) -> None:
+    code = configured_client.post("/api/fine-job/boss-executor/pairing-code").json()["code"]
+    paired = configured_client.post(
+        "/api/fine-job/boss-executor/pair",
+        json={"code": code, "plugin_version": "0.1.0", "protocol_version": "1.1", "capabilities": []},
+    ).json()
+    headers = {"Authorization": f"Bearer {paired['token']}"}
+    configured_client.post("/api/fine-job/boss-executor/control", headers=headers, json={"command": "start"})
+
+    class DesktopSocket:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, object]] = []
+
+        async def send_json(self, message: dict[str, object]) -> None:
+            self.messages.append(message)
+
+    class PluginSocket:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, object]] = []
+
+        async def send_json(self, message: dict[str, object]) -> None:
+            self.messages.append(message)
+
+        async def close(self, **_kwargs) -> None:
+            return None
+
+    task = {"id": "task-open-state-1", "job_title": "测试岗位", "company_name": "测试公司"}
+    monkeypatch.setattr(
+        boss_executor,
+        "open_task_page",
+        lambda *_args, **_kwargs: {"task": task, "navigation": {"id": "navigation-1"}},
+    )
+
+    async def verify_page_open_state() -> None:
+        db = configured_client.app.state.db
+        desktop_socket = DesktopSocket()
+        plugin_socket = PluginSocket()
+        await boss_executor.register_desktop_channel(db, desktop_socket)
+        await boss_executor.register_executor_channel(db, paired["executor_id"], plugin_socket)
+        await boss_executor._open_and_notify_task_page(db, paired["executor_id"])
+        phases = [
+            message.get("runtime", {}).get("executor", {}).get("runtime_phase")
+            for message in desktop_socket.messages
+        ]
+        assert "page_opening" in phases
+        assert "page_matching" in phases
+        assert any(
+            message.get("type") == "page_opened" and message.get("success") is True
+            for message in plugin_socket.messages
+        )
+        await boss_executor.unregister_executor_channel(db, paired["executor_id"], plugin_socket)
+        await boss_executor.unregister_desktop_channel(desktop_socket)
+
+    asyncio.run(verify_page_open_state())
 
 
 def test_executor_channel_reports_message_error_without_closing(configured_client) -> None:

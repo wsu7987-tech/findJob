@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import secrets
 from typing import Any, Callable
@@ -22,6 +23,10 @@ PROTOCOL_VERSION = "1.1"
 PAIRING_CODE_TTL_SECONDS = 300
 TEST_JOB_COUNT = 5
 TEST_JOB_LINK_DEFAULT = "https://www.zhipin.com/"
+DEFAULT_CHAT_PAGE_URL = os.environ.get(
+    "FINEJOB_BOSS_CHAT_PAGE_URL",
+    "https://www.zhipin.com/web/geek/chat",
+).strip()
 
 # 控制通道只保存当前进程中的连接和一次性心跳请求。
 _executor_channels: dict[str, Any] = {}
@@ -243,6 +248,12 @@ async def _handle_executor_channel_message(db: Database, executor_id: str, messa
         await notify_queue_changed(db)
         return
     if message_type == "open_task_page":
+        _audit(
+            db,
+            "boss_page_open_requested",
+            "插件请求打开任务页面。",
+            {"executor_id": executor_id},
+        )
         await _open_and_notify_task_page(db, executor_id)
         return
     if message_type == "match_task":
@@ -286,9 +297,17 @@ async def _handle_executor_channel_message(db: Database, executor_id: str, messa
     if message_type == "execution_error":
         task_id = str(message.get("task_id") or "")
         failure_kind = str(message.get("failure_kind") or "")
-        if task_id and failure_kind == "page_match_failed":
-            _record_task_match_failure(db, task_id, str(message.get("error_message") or "页面匹配失败"))
-            await notify_queue_changed(db)
+        if failure_kind == "page_open_timeout":
+            if bool(message.get("disconnect")):
+                await close_executor_channel(executor_id)
+                mark_executor_disconnected(db, executor_id)
+                await _broadcast_executor_state(db)
+            return
+        if failure_kind == "page_match_failed":
+            # 首次匹配只使用完整任务数组，此时尚未打开任务页，task_id 可以为空。
+            if task_id:
+                _record_task_match_failure(db, task_id, str(message.get("error_message") or "页面匹配失败"))
+                await notify_queue_changed(db)
             if bool(message.get("disconnect")):
                 await close_executor_channel(executor_id)
                 mark_executor_disconnected(db, executor_id)
@@ -329,6 +348,9 @@ async def request_heartbeat_test(db: Database, executor_id: str) -> dict[str, ob
 
 def mark_executor_disconnected(db: Database, executor_id: str) -> None:
     _finish_active_tasks_as_unknown(db, "插件连接已断开，执行中任务已结束为结果未知。", "EXECUTOR_DISCONNECTED")
+    from backend.app.services.fine_job import boss_chat
+
+    boss_chat.handle_executor_disconnected(db, executor_id)
     with db.connect() as connection:
         connection.execute(
             """
@@ -343,6 +365,9 @@ def mark_executor_disconnected(db: Database, executor_id: str) -> None:
 
 async def disconnect_executor(db: Database, executor_id: str) -> dict[str, object]:
     _finish_active_tasks_as_unknown(db, "执行器断开连接，执行中任务已结束为结果未知。", "EXECUTOR_DISCONNECTED")
+    from backend.app.services.fine_job import boss_chat
+
+    boss_chat.handle_executor_disconnected(db, executor_id)
     with db.connect() as connection:
         connection.execute(
             """
@@ -489,7 +514,7 @@ def executor_status(db: Database, executor_id: str | None = None) -> dict[str, o
     return {
         "executor": _serialize_executor(executor) if executor else None,
         "current_task": _current_task(db),
-        "queue": list_queue(db),
+        "queue": list_display_queue(db),
         "protocol_version": PROTOCOL_VERSION,
     }
 
@@ -508,8 +533,46 @@ def list_queue(db: Database) -> dict[str, object]:
             ORDER BY a.created_at ASC, a.id ASC
             """
         ).fetchall()
+        chat_rows = connection.execute(
+            """
+            SELECT a.*, s.job_id, s.account_uid, s.job_title, s.company_name
+            FROM fj_chat_send_actions a
+            JOIN fj_chat_sessions s ON s.id = a.session_id
+            WHERE a.confirmation_status = 'confirmed'
+              AND a.status IN ('queued', 'leased', 'dispatching')
+              AND a.operation_kind IN ('text', 'resume')
+            ORDER BY a.created_at ASC, a.id ASC
+            """
+        ).fetchall()
     actions = [_serialize_action(row, include_payload=False) for row in rows]
+    actions.extend(_serialize_chat_queue_action(row) for row in chat_rows)
+    actions.sort(key=lambda action: (str(action["created_at"]), str(action["id"])))
     return {"actions": actions, "total": len(actions)}
+
+
+def list_display_queue(db: Database) -> dict[str, object]:
+    """汇总岗位招呼和自动代聊的已确认执行任务，供桌面端展示。"""
+    greeting_queue = list_queue(db)["actions"]
+    display_actions: list[dict[str, object]] = []
+    for action in greeting_queue:
+        if action.get("task_source") == "chat":
+            display_actions.append(action)
+            continue
+        detail = ""
+        with db.connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM fj_automation_actions WHERE id = ?",
+                (action["id"],),
+            ).fetchone()
+        if row is not None:
+            detail = str(json.loads(row["payload_json"] or "{}").get("message") or "")
+        display_actions.append({
+            **action,
+            "task_source": "test" if action["task_type"] == "TEST_DELAY" else "greeting",
+            "task_detail": detail or ("延时测试任务" if action["task_type"] == "TEST_DELAY" else "待发送招呼语"),
+        })
+    display_actions.sort(key=lambda action: (str(action["created_at"]), str(action["id"])))
+    return {"actions": display_actions, "total": len(display_actions)}
 
 
 def open_navigation(
@@ -596,7 +659,19 @@ def open_task_page(
             "queue": list_queue(db),
         }
     if queued_total <= 0:
-        return {"task": None, "navigation": None, "queue": list_queue(db)}
+        chat_task = next((item for item in list_queue(db)["actions"] if item["status"] == "queued"), None)
+        if chat_task is None:
+            return {"task": None, "navigation": None, "queue": list_queue(db)}
+        try:
+            navigation = _open_chat_task_page(db, chat_task, open_page=open_page)
+        except AppError as exc:
+            return {
+                "task": chat_task,
+                "navigation": None,
+                "error": {"code": exc.error_category, "message": exc.error_message},
+                "queue": list_queue(db),
+            }
+        return {"task": chat_task, "navigation": navigation, "queue": list_queue(db)}
     last_error: dict[str, str] | None = None
     queue_changed = False
     for _index in range(max(queued_total, 0)):
@@ -614,7 +689,12 @@ def open_task_page(
         task_id = str(row["id"])
         try:
             if row["task_type"] == "TEST_DELAY":
-                navigation = _open_test_task_page(db, task_id, open_page=open_page)
+                task = _serialize_action(_require_action(db, task_id), include_payload=False)
+                navigation = (
+                    _open_chat_task_page(db, task, open_page=open_page)
+                    if task["page_type"] == "chat"
+                    else _open_test_task_page(db, task_id, open_page=open_page)
+                )
             else:
                 navigation = open_navigation(
                     db,
@@ -932,11 +1012,14 @@ def create_test_task(
     db: Database,
     *,
     job_id: str,
+    test_task_type: str = "greeting",
     close_page_after_completion: bool,
     delay_seconds: int = 3,
 ) -> dict[str, object]:
     _ensure_test_jobs(db)
     delay_seconds = min(600, max(1, int(delay_seconds)))
+    if test_task_type not in {"greeting", "resume", "chat"}:
+        raise AppError(422, "TEST_TASK_TYPE_INVALID", "测试任务类型无效。")
     now = utc_now()
     with db.connect() as connection:
         job = connection.execute(
@@ -956,8 +1039,9 @@ def create_test_task(
         task_id = new_id()
         payload = {
             "task_type": "TEST_DELAY",
+            "test_task_type": test_task_type,
             "delay_seconds": delay_seconds,
-            "close_page_after_completion": close_page_after_completion,
+            "close_page_after_completion": close_page_after_completion if test_task_type == "greeting" else False,
             "job_link": job["job_link"],
         }
         connection.execute(
@@ -1040,6 +1124,47 @@ def _validate_test_job_link(job_link: str) -> None:
     parsed = urlparse(job_link.strip())
     if parsed.scheme != "https" or not parsed.netloc:
         raise AppError(422, "INVALID_TEST_JOB_LINK", "测试岗位链接必须是 HTTPS 页面地址。")
+
+
+def _open_chat_task_page(
+    db: Database,
+    task: dict[str, object],
+    *,
+    open_page: Callable[[str], str] | None = None,
+) -> dict[str, object]:
+    """打开聊天类任务配置的页面，页面保留给后续代聊或简历发送使用。"""
+    target_url = str(task.get("chat_page_url") or DEFAULT_CHAT_PAGE_URL).strip()
+    parsed = urlparse(target_url)
+    if parsed.scheme != "https" or parsed.hostname not in {"www.zhipin.com", "zhipin.com"}:
+        raise AppError(422, "CHAT_PAGE_URL_INVALID", "聊天任务页面必须是 BOSS HTTPS 地址。")
+    navigation_id = new_id()
+    now = utc_now()
+    job_id = str(task.get("job_id") or "")
+    with db.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO fj_boss_navigation_tasks (
+              id, action_id, job_id, source_context, target_url, target_encrypt_job_id,
+              status, created_at, updated_at
+            ) VALUES (?, ?, ?, 'queue', ?, '', 'queued', ?, ?)
+            """,
+            (navigation_id, str(task["id"]), job_id, target_url, now, now),
+        )
+    try:
+        target_id = (open_page or boss_scraper_service.open_test_page)(target_url)
+    except (ValueError, RuntimeError, TimeoutError, OSError) as exc:
+        with db.connect() as connection:
+            connection.execute(
+                "UPDATE fj_boss_navigation_tasks SET status = 'failed', error_code = 'PAGE_OPEN_FAILED', error_message = ?, updated_at = ? WHERE id = ?",
+                (str(exc), utc_now(), navigation_id),
+            )
+        raise AppError(409, "PAGE_OPEN_FAILED", str(exc)) from exc
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_boss_navigation_tasks SET status = 'opened', browser_target_id = ?, opened_at = ?, updated_at = ? WHERE id = ?",
+            (target_id, utc_now(), utc_now(), navigation_id),
+        )
+    return get_navigation(db, navigation_id)
 
 
 def _open_test_task_page(
@@ -1183,12 +1308,16 @@ async def broadcast_executor_state(db: Database) -> None:
 
 
 async def _open_and_notify_task_page(db: Database, executor_id: str) -> None:
-    opened = open_task_page(db, executor_id)
+    # 收到插件开页请求后立即向桌面端广播，页面打开完成再通知插件开始匹配。
+    _update_runtime_state(db, executor_id, "page_opening", detail="正在打开任务页面")
     await _broadcast_executor_state(db)
+    opened = open_task_page(db, executor_id)
     if opened.get("queue_changed") is True:
         await _send_queue(db, executor_id)
     if opened.get("busy") is True:
         task = opened.get("task")
+        _update_runtime_state(db, executor_id, "idle", detail="已有任务正在执行")
+        await _broadcast_executor_state(db)
         await _send_executor_message(executor_id, {
             "type": "page_opened",
             "task_id": task.get("id") if isinstance(task, dict) else "",
@@ -1200,6 +1329,9 @@ async def _open_and_notify_task_page(db: Database, executor_id: str) -> None:
     task = opened.get("task")
     error = opened.get("error")
     if not isinstance(task, dict):
+        detail = error.get("message") if isinstance(error, dict) else "当前没有待执行任务"
+        _update_runtime_state(db, executor_id, "idle", detail=str(detail))
+        await _broadcast_executor_state(db)
         await _send_executor_message(executor_id, {
             "type": "page_opened",
             "task_id": "",
@@ -1210,6 +1342,8 @@ async def _open_and_notify_task_page(db: Database, executor_id: str) -> None:
         return
     navigation = opened.get("navigation")
     if isinstance(navigation, dict):
+        _update_runtime_state(db, executor_id, "page_matching", detail="任务页面已打开，正在等待插件匹配")
+        await _broadcast_executor_state(db)
         await _send_executor_message(executor_id, {
             "type": "page_opened",
             "task_id": task["id"],
@@ -1217,6 +1351,16 @@ async def _open_and_notify_task_page(db: Database, executor_id: str) -> None:
             "page": navigation,
         })
         return
+    error_message = error.get("message") if isinstance(error, dict) else "任务页面打开失败"
+    _audit(
+        db,
+        "boss_page_open_failed",
+        f"打开任务页面失败：{error_message}",
+        {"task_id": str(task["id"]), "status_code": error.get("code") if isinstance(error, dict) else "PAGE_OPEN_FAILED"},
+        level="warning",
+    )
+    _update_runtime_state(db, executor_id, "idle", detail=f"打开任务页面失败：{error_message}")
+    await _broadcast_executor_state(db)
     await _send_executor_message(executor_id, {
         "type": "page_opened",
         "task_id": task["id"],
@@ -1310,6 +1454,13 @@ def _close_task_page(db: Database, task_id: str) -> None:
 
 
 def _record_task_open_failure(db: Database, task_id: str, message: str) -> None:
+    _audit(
+        db,
+        "boss_page_open_failed",
+        f"打开任务页面失败：{message}",
+        {"task_id": task_id, "status_code": "PAGE_OPEN_FAILED"},
+        level="warning",
+    )
     _record_retriable_task_failure(
         db,
         task_id,
@@ -1322,6 +1473,13 @@ def _record_task_open_failure(db: Database, task_id: str, message: str) -> None:
 
 
 def _record_task_match_failure(db: Database, task_id: str, message: str) -> None:
+    _audit(
+        db,
+        "boss_page_match_failed",
+        f"任务页面匹配失败：{message}",
+        {"task_id": task_id, "status_code": "PAGE_MATCH_FAILED"},
+        level="warning",
+    )
     _record_retriable_task_failure(
         db,
         task_id,
@@ -1633,6 +1791,8 @@ def _require_action(db: Database, action_id: str):
 def _serialize_action(row, *, include_payload: bool = True) -> dict[str, object]:
     payload = json.loads(row["payload_json"] or "{}")
     delay_seconds = int(payload.get("delay_seconds") or (3 if row["task_type"] == "TEST_DELAY" else 0))
+    test_task_type = str(payload.get("test_task_type") or "greeting")
+    page_type = "chat" if row["task_type"] == "TEST_DELAY" and test_task_type in {"resume", "chat"} else "job"
     data = {
         "id": row["id"],
         "job_id": row["job_id"],
@@ -1654,11 +1814,48 @@ def _serialize_action(row, *, include_payload: bool = True) -> dict[str, object]
         "completed_at": row["completed_at"],
         "close_page_after_completion": bool(payload.get("close_page_after_completion", row["task_type"] != "TEST_DELAY")),
         "delay_seconds": delay_seconds,
+        "test_task_type": test_task_type if row["task_type"] == "TEST_DELAY" else "",
+        "page_type": page_type,
+        "chat_page_url": DEFAULT_CHAT_PAGE_URL if page_type == "chat" else "",
     }
     if include_payload:
         payload.pop("message", None)
         data["payload"] = payload
     return data
+
+
+def _serialize_chat_queue_action(row) -> dict[str, object]:
+    operation_kind = str(row["operation_kind"])
+    raw_status = str(row["status"])
+    is_resume = operation_kind == "resume"
+    return {
+        "id": str(row["id"]),
+        "job_id": str(row["job_id"] or ""),
+        "review_item_id": "",
+        "action_type": "send_resume" if is_resume else "send_chat_reply",
+        "task_type": "BOSS_CHAT_RESUME" if is_resume else "BOSS_CHAT_MESSAGE",
+        "task_detail": str((row["resume_filename"] if is_resume else row["text"]) or "未命名简历"),
+        "task_source": "chat",
+        "session_id": str(row["session_id"]),
+        "status": raw_status,
+        "execution_state": "queued" if raw_status == "queued" else "running",
+        "execution_epoch": int(row["execution_epoch"]),
+        "last_error": str(row["error_message"] or ""),
+        "last_status_code": str(row["status_code"] or ""),
+        "job_title": str(row["job_title"] or ""),
+        "company_name": str(row["company_name"] or ""),
+        "encrypt_job_id": "",
+        "job_link": "",
+        "account_uid": str(row["account_uid"] or ""),
+        "page_type": "chat",
+        "chat_page_url": DEFAULT_CHAT_PAGE_URL,
+        "created_at": str(row["created_at"]),
+        "updated_at": str(row["updated_at"]),
+        "completed_at": None,
+        "close_page_after_completion": False,
+        "delay_seconds": 0,
+        "test_task_type": "",
+    }
 
 
 def _serialize_executor(row) -> dict[str, object]:

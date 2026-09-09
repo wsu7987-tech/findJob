@@ -8,7 +8,8 @@ import type {
   FineJobChatBatchTask,
   FineJobChatRuntime,
   FineJobChatSession,
-  FineJobChatSessionDetail
+  FineJobChatSessionDetail,
+  FineJobBossResumeAttachment
 } from "@/types";
 
 
@@ -27,6 +28,9 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
   const batchSummary = ref<FineJobChatBatchSummary | null>(null);
   const batchProgress = ref<FineJobChatBatchTask | null>(null);
   const batchSize = ref(20);
+  const resumeAttachments = ref<FineJobBossResumeAttachment[]>([]);
+  const resumeListLoaded = ref(false);
+  const resumeListError = ref<string | null>(null);
   const loading = ref(false);
   const mutating = ref(false);
   const error = ref<string | null>(null);
@@ -42,10 +46,11 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     loading.value = true;
     error.value = null;
     try {
-      const [runtimeResult, sessionResult, summaryResult] = await Promise.all([
+      const [runtimeResult, sessionResult, summaryResult, resumeResult] = await Promise.all([
         api.getFineJobChatRuntime(),
         api.listFineJobChatSessions(listParams()),
-        api.getFineJobChatBatchSummary()
+        api.getFineJobChatBatchSummary(),
+        api.getFineJobChatResumeAttachments()
       ]);
       runtime.value = runtimeResult.runtime;
       sessions.value = sessionResult.sessions;
@@ -53,6 +58,10 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
       batchSummary.value = summaryResult;
       const available = Math.min(summaryResult.pending_chat_count, summaryResult.batch_limit);
       batchSize.value = available ? Math.min(Math.max(batchSize.value, 1), available) : 0;
+      // 仅恢复上次已保存的结果，页面打开时不触发 BOSS 浏览器请求。
+      resumeAttachments.value = resumeResult.attachments;
+      resumeListLoaded.value = resumeResult.saved;
+      resumeListError.value = null;
       // 页面打开时保持空白，只有用户点击左侧会话后才读取本地详情。
       selectedSessionId.value = null;
       detail.value = null;
@@ -243,9 +252,13 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
   });
 
   const confirm = async (finalText: string) => mutate(async () => {
-    const task = currentTask.value;
-    if (!task) throw new Error("没有可确认的回复草稿");
-    await api.editFineJobChatReply(task.id, finalText);
+    if (!selectedSessionId.value) throw new Error("请先选择聊天会话");
+    let task = currentTask.value;
+    if (task?.status === "awaiting_review") {
+      await api.editFineJobChatReply(task.id, finalText);
+    } else {
+      task = (await api.createFineJobChatManualReply(selectedSessionId.value, finalText)).reply_task;
+    }
     const result = await api.confirmFineJobChatReply(task.id, {
       final_text: finalText,
       based_on_message_id: task.based_on_message_id,
@@ -256,15 +269,21 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
   });
 
   const refreshResumeAttachments = async () => mutate(async () => {
-    if (!selectedSessionId.value) throw new Error("请先选择聊天会话");
-    const result = await api.refreshFineJobChatResumeAttachments(selectedSessionId.value);
-    await refreshSelected();
-    return result.action;
+    resumeListError.value = null;
+    try {
+      const result = await api.refreshFineJobChatResumeAttachments();
+      resumeAttachments.value = result.attachments;
+      resumeListLoaded.value = true;
+      return result;
+    } catch (value) {
+      resumeListError.value = mapError(value);
+      throw value;
+    }
   });
 
-  const confirmResume = async (encryptResumeId: string, filename: string) => mutate(async () => {
+  const confirmResume = async (resumeId: string, filename: string) => mutate(async () => {
     if (!selectedSessionId.value) throw new Error("请先选择聊天会话");
-    const result = await api.createFineJobChatResumeAction(selectedSessionId.value, encryptResumeId, filename);
+    const result = await api.createFineJobChatResumeAction(selectedSessionId.value, resumeId, filename);
     await refreshSelected();
     return result.action;
   });
@@ -291,7 +310,7 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
   });
 
   const setSessionStatus = async (
-    operation: "take-over" | "resume" | "pause",
+    operation: "resume" | "pause",
     reason: string
   ) => mutate(async () => {
     if (!selectedSessionId.value) throw new Error("请先选择聊天会话");
@@ -349,6 +368,9 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     batchSummary,
     batchProgress,
     batchSize,
+    resumeAttachments,
+    resumeListLoaded,
+    resumeListError,
     currentTask,
     loading,
     mutating,

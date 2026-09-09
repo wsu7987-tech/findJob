@@ -28,6 +28,7 @@ from backend.app.schemas.fine_job.boss_chat import (
     BossChatRuntimeUpdateRequest,
 )
 from backend.app.services.fine_job import boss_chat
+from backend.app.services.fine_job import boss_executor as boss_executor_service
 from backend.app.services.fine_job import job_hunt_analysis
 from backend.app.services.fine_job.boss_scraper.service import boss_scraper_service
 
@@ -111,6 +112,34 @@ def refresh_friend_list(
     return BossChatFriendListRefreshResponse(**result)
 
 
+@router.get("/resume-attachments")
+def get_latest_resume_attachments(db: Database = Depends(get_database)):
+    """读取已保存的最近一次附件简历快照，不访问 BOSS 页面。"""
+    return boss_chat.get_latest_resume_attachment_snapshot(db)
+
+
+@router.post("/resume-attachments/refresh")
+def refresh_resume_attachments_for_account(db: Database = Depends(get_database)):
+    """读取当前 BOSS 登录账号的附件简历并保存为页面快照。"""
+    try:
+        return boss_chat.save_resume_attachment_snapshot(
+            db,
+            boss_scraper_service.capture_resume_attachments(),
+        )
+    except ValueError as exc:
+        raise AppError(
+            status_code=400,
+            error_category="BOSS_RESUME_LIST_INVALID",
+            error_message=str(exc),
+        ) from exc
+    except RuntimeError as exc:
+        raise AppError(
+            status_code=409,
+            error_category="BOSS_RESUME_LIST_CAPTURE_FAILED",
+            error_message=str(exc),
+        ) from exc
+
+
 @router.post("/executor/heartbeat")
 def executor_heartbeat(
     payload: BossChatHeartbeatRequest,
@@ -166,7 +195,12 @@ def dispatch_started(
 ):
     executor = _executor(db, authorization)
     return {"action": boss_chat.mark_dispatch_started(
-        db, str(executor["id"]), action_id, payload.execution_epoch
+        db,
+        str(executor["id"]),
+        action_id,
+        payload.execution_epoch,
+        tab_id=payload.tab_id,
+        leader_epoch=payload.leader_epoch,
     )}
 
 
@@ -223,8 +257,22 @@ def refresh_resume_attachments(
     session_id: str,
     db: Database = Depends(get_database),
 ):
-    """通过当前 BOSS 领导标签页读取可发送的附件简历。"""
-    return {"action": boss_chat.create_resume_list_action(db, session_id)}
+    """通过当前 BOSS 聊天页登录态直接读取当前账号的附件简历。"""
+    try:
+        action = boss_chat.refresh_resume_attachments(db, session_id)
+    except ValueError as exc:
+        raise AppError(
+            status_code=400,
+            error_category="BOSS_RESUME_LIST_INVALID",
+            error_message=str(exc),
+        ) from exc
+    except RuntimeError as exc:
+        raise AppError(
+            status_code=409,
+            error_category="BOSS_RESUME_LIST_CAPTURE_FAILED",
+            error_message=str(exc),
+        ) from exc
+    return {"action": action}
 
 
 @router.post("/sessions/{session_id}/resume-actions")
@@ -235,6 +283,40 @@ def create_resume_action(
 ):
     """在用户选择附件并确认后创建同一聊天动作队列中的简历发送动作。"""
     return {"action": boss_chat.create_resume_send_action(db, session_id, payload.encrypt_resume_id, payload.filename)}
+
+
+@router.get("/review-tasks")
+def list_review_tasks(
+    db: Database = Depends(get_database),
+):
+    """返回待确认页面展示的自动代聊任务。"""
+    return boss_chat.list_review_tasks(db)
+
+
+@router.post("/send-actions/{action_id}/confirm")
+async def confirm_resume_action(
+    action_id: str,
+    db: Database = Depends(get_database),
+):
+    action = boss_chat.confirm_resume_action(db, action_id)
+    await boss_executor_service.notify_queue_changed(db)
+    return {"action": action}
+
+
+@router.post("/send-actions/{action_id}/cancel")
+def cancel_resume_action(
+    action_id: str,
+    db: Database = Depends(get_database),
+):
+    return {"action": boss_chat.cancel_resume_action(db, action_id)}
+
+
+@router.post("/send-actions/{action_id}/return-to-review")
+def return_send_action_to_review(
+    action_id: str,
+    db: Database = Depends(get_database),
+):
+    return {"action": boss_chat.return_send_action_to_review(db, action_id)}
 
 
 @router.post("/sessions/{session_id}/history/refresh", response_model=BossChatHistoryRefreshResponse)
@@ -389,15 +471,6 @@ def regenerate(
     )}
 
 
-@router.post("/sessions/{session_id}/take-over")
-def take_over(
-    session_id: str,
-    _: BossChatReasonRequest,
-    db: Database = Depends(get_database),
-):
-    return {"session": boss_chat.set_session_status(db, session_id, "human_takeover")}
-
-
 @router.post("/sessions/{session_id}/resume")
 def resume_session(
     session_id: str,
@@ -425,13 +498,24 @@ def edit_reply(
     return {"reply_task": boss_chat.edit_reply(db, task_id, payload.final_text)}
 
 
+@router.post("/sessions/{session_id}/manual-reply")
+def create_manual_reply(
+    session_id: str,
+    payload: BossChatReplyEditRequest,
+    db: Database = Depends(get_database),
+):
+    return {"reply_task": boss_chat.create_manual_reply(db, session_id, payload.final_text)}
+
+
 @router.post("/reply-tasks/{task_id}/confirm")
-def confirm_reply(
+async def confirm_reply(
     task_id: str,
     payload: BossChatReplyConfirmRequest,
     db: Database = Depends(get_database),
 ):
-    return {"action": boss_chat.confirm_reply(db, task_id, payload.model_dump())}
+    action = boss_chat.confirm_reply(db, task_id, payload.model_dump())
+    await boss_executor_service.notify_queue_changed(db)
+    return {"action": action}
 
 
 @router.post("/reply-tasks/{task_id}/cancel")

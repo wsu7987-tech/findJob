@@ -20,6 +20,7 @@ const route = useRoute();
 const instruction = ref("");
 const finalText = ref("");
 const selectedResumeId = ref("");
+const resumeListRefreshing = ref(false);
 const preferredReplyTaskId = ref<string | null>(null);
 const expandedMessages = ref<Record<string, boolean>>({});
 const messagePreviewNeedsExpand = ref<Record<string, boolean>>({});
@@ -74,19 +75,15 @@ const defaultMessageActionKind = computed<"reply" | "followup" | "ask_rejection_
   return "reply";
 });
 const latestAction = computed(() => store.detail?.send_actions[0] ?? null);
-const resumeAttachments = computed(() => store.detail?.resume_attachments ?? []);
-const latestResumeListAction = computed(() => store.detail?.send_actions.find((item) => item.operation_kind === "resume_list") ?? null);
+const resumeAttachments = computed(() => store.resumeAttachments);
 const latestResumeSendAction = computed(() => store.detail?.send_actions.find((item) => item.operation_kind === "resume") ?? null);
-const resumeListLoading = computed(() => ["queued", "leased", "dispatching"].includes(latestResumeListAction.value?.status ?? ""));
-const resumeListFailed = computed(() => latestResumeListAction.value?.outcome === "failed");
-const resumeListLoaded = computed(() => latestResumeListAction.value?.outcome === "accepted");
-const selectedResume = computed(() => resumeAttachments.value.find((item) => item.encryptResumeId === selectedResumeId.value) ?? null);
+const resumeListLoading = computed(() => resumeListRefreshing.value);
+const resumeListFailed = computed(() => Boolean(store.resumeListError));
+const resumeListLoaded = computed(() => store.resumeListLoaded);
+const selectedResume = computed(() => resumeAttachments.value.find((item) => item.resumeId === selectedResumeId.value) ?? null);
 const canConfirmResume = computed(() => Boolean(
   session.value
-  && store.runtime?.send_enabled
-  && leaderAvailable.value
   && selectedResume.value
-  && !resumeListLoading.value
 ));
 const latestInsight = computed(() => store.detail?.latest_conversation_insight?.insight ?? null);
 const analysisReplyDraft = computed(() => {
@@ -481,38 +478,36 @@ const confirm = async () => {
 };
 
 const refreshResumeAttachments = async () => {
+  // 读取动作由后端同步完成，按钮只在本次 CDP 请求期间显示 loading。
+  resumeListRefreshing.value = true;
   try {
-    const action = await store.refreshResumeAttachments();
-    void store.pollResumeAction(action.id).catch((value) => {
-      ElMessage.error((value as Error).message || "附件简历状态刷新失败");
-    });
-    ElMessage.success("附件简历读取动作已进入既有执行队列。");
+    await store.refreshResumeAttachments();
+    ElMessage.success("附件简历读取完成。");
   } catch {
     ElMessage.error(store.error ?? "读取附件简历失败");
+  } finally {
+    resumeListRefreshing.value = false;
   }
 };
 
 const confirmResume = async () => {
-  const selected = resumeAttachments.value.find((item) => item.encryptResumeId === selectedResumeId.value);
+  const selected = resumeAttachments.value.find((item) => item.resumeId === selectedResumeId.value);
   if (!selected) {
     ElMessage.warning("请先选择一份附件简历");
     return;
   }
   try {
     await ElMessageBox.confirm(
-      `确认向当前招聘方发送附件简历“${selected.showName}”？提交后将进入既有发送队列。`,
-      "确认发送简历",
-      { type: "warning", confirmButtonText: "确认提交" }
+      `确认向当前招聘方发送附件简历“${selected.showName}”？发送任务将进入待确认列表，批准后进入执行队列。`,
+      "发送简历",
+      { type: "warning", confirmButtonText: "发送简历" }
     );
   } catch {
     return;
   }
   try {
-    const action = await store.confirmResume(selected.encryptResumeId, selected.showName);
-    void store.pollResumeAction(action.id).catch((value) => {
-      ElMessage.error((value as Error).message || "简历发送状态刷新失败");
-    });
-    ElMessage.success("简历已进入发送队列");
+    await store.confirmResume(selected.resumeId, selected.showName);
+    ElMessage.success("简历发送任务已进入待确认列表");
   } catch {
     ElMessage.error(store.error ?? "确认发送简历失败");
   }
@@ -533,15 +528,6 @@ const pauseAll = async () => {
     ElMessage.success("已暂停自动生成，消息监听和人工确认发送开关保持原值");
   } catch {
     ElMessage.error(store.error ?? "暂停失败");
-  }
-};
-
-const resumeAutomation = async () => {
-  try {
-    await store.setSessionStatus("resume", "用户恢复自动代聊");
-    ElMessage.success("已恢复自动代聊，请重新生成草稿");
-  } catch {
-    ElMessage.error(store.error ?? "恢复自动代聊失败");
   }
 };
 
@@ -596,30 +582,63 @@ onBeforeUnmount(() => {
     <el-alert v-if="store.error" type="error" show-icon title="自动代聊操作失败" :description="store.error" />
 
     <section v-if="store.batchSummary" class="page-panel batch-summary-panel">
-      <span>待更新聊天：{{ store.batchSummary.pending_chat_count }} 条</span>
-      <span>
-        本次批量：
-        <el-input-number
-          v-model="store.batchSize"
-          :min="1"
-          :max="Math.min(store.batchSummary.pending_chat_count, store.batchSummary.batch_limit)"
-          :disabled="!store.batchSummary.pending_chat_count || Boolean(store.batchProgress) || store.mutating"
-          controls-position="right"
+      <div class="batch-summary-panel__main-row">
+        <div class="batch-summary-panel__pending">
+          <span>待更新聊天：{{ store.batchSummary.pending_chat_count }} 条</span>
+        </div>
+        <span>
+          本次批量：
+          <el-input-number
+            v-model="store.batchSize"
+            :min="1"
+            :max="Math.min(store.batchSummary.pending_chat_count, store.batchSummary.batch_limit)"
+            :disabled="!store.batchSummary.pending_chat_count || Boolean(store.batchProgress) || store.mutating"
+            controls-position="right"
+            size="small"
+          />
+          条
+        </span>
+        <span>待采集岗位：{{ store.batchSummary.pending_job_count }} 条</span>
+        <el-button
+          class="batch-summary-panel__action"
+          type="primary"
+          plain
           size="small"
-        />
-        条
-      </span>
-      <span>待采集岗位：{{ store.batchSummary.pending_job_count }} 条</span>
+          :disabled="!store.batchSummary.queued_chat_count || Boolean(store.batchProgress) || store.mutating"
+          :loading="store.mutating"
+          @click="startBatchUpdate"
+        >批量更新聊天记录</el-button>
+      </div>
+    </section>
+
+    <div v-if="store.batchSummary" class="page-panel batch-summary-panel__resume-row">
       <el-button
-        class="batch-summary-panel__action"
         type="primary"
         plain
         size="small"
-        :disabled="!store.batchSummary.queued_chat_count || Boolean(store.batchProgress) || store.mutating"
-        :loading="store.mutating"
-        @click="startBatchUpdate"
-      >批量更新聊天记录</el-button>
-    </section>
+        :disabled="resumeListLoading"
+        :loading="resumeListLoading"
+        @click="refreshResumeAttachments"
+      >{{ resumeListLoaded ? "刷新附件简历" : "读取附件简历" }}</el-button>
+      <span class="batch-summary-panel__resume-label">默认投递简历：</span>
+      <!-- 顶部默认简历与右侧附件简历选择共用同一状态，保持选择联动。 -->
+      <el-select
+        v-if="resumeAttachments.length"
+        v-model="selectedResumeId"
+        size="small"
+        :disabled="resumeListLoading"
+        placeholder="请选择附件简历"
+        class="batch-summary-panel__resume-select"
+      >
+        <el-option
+          v-for="item in resumeAttachments"
+          :key="item.resumeId"
+          :label="item.showName"
+          :value="item.resumeId"
+        />
+      </el-select>
+      <span v-else class="secondary-text">请先读取附件简历</span>
+    </div>
 
     <section v-if="store.batchProgress" class="page-panel batch-progress-panel">
       <div class="panel-title-row">
@@ -887,23 +906,6 @@ onBeforeUnmount(() => {
             title="聊天对象身份尚未补全；允许生成和编辑草稿，发送保持关闭。"
           />
           <el-alert
-            v-if="session.status === 'human_takeover'"
-            type="warning"
-            :closable="false"
-          >
-            <template #title>当前会话已由人工接管。</template>
-            <div class="takeover-alert-content">
-              <span>恢复后需要重新生成草稿。</span>
-              <el-button
-                size="small"
-                type="warning"
-                plain
-                :loading="store.mutating"
-                @click="resumeAutomation"
-              >恢复自动代聊</el-button>
-            </div>
-          </el-alert>
-          <el-alert
             v-if="store.detail?.messages_truncated"
             type="info"
             :closable="false"
@@ -957,34 +959,27 @@ onBeforeUnmount(() => {
       <aside class="reply-panel">
         <section class="resume-send-panel">
           <h2>附件简历</h2>
-          <p class="secondary-text">读取当前 BOSS 账号可发送的附件；创建发送动作前始终需要人工确认。</p>
-          <el-button :loading="resumeListLoading" :disabled="!session" @click="refreshResumeAttachments">
-            {{ resumeListLoaded ? "刷新附件列表" : "读取附件简历" }}
-          </el-button>
+          <p class="secondary-text">读取当前 BOSS 账号可发送的附件；提交后在待确认列表批准，再进入执行队列。</p>
           <p v-if="resumeListLoading" class="secondary-text">正在读取附件简历…</p>
           <el-alert v-else-if="resumeListFailed" type="error" :closable="false" show-icon>
-            {{ latestResumeListAction?.error_message || "附件简历读取失败，请刷新后重试。" }}
+            {{ store.resumeListError || "附件简历读取失败，请刷新后重试。" }}
           </el-alert>
           <el-alert v-else-if="resumeListLoaded && !resumeAttachments.length" type="warning" :closable="false" show-icon>
             无可用附件简历
           </el-alert>
           <p v-else-if="!resumeListLoaded" class="secondary-text">尚未读取附件简历。</p>
           <el-radio-group v-if="resumeAttachments.length > 1" v-model="selectedResumeId" class="resume-attachment-list">
-            <el-radio v-for="item in resumeAttachments" :key="item.encryptResumeId" :value="item.encryptResumeId">
+            <el-radio v-for="item in resumeAttachments" :key="item.resumeId" :value="item.resumeId">
               {{ item.showName }}<template v-if="item.resumeSizeDesc"> · {{ item.resumeSizeDesc }}</template>
             </el-radio>
           </el-radio-group>
-          <p v-else-if="resumeAttachments.length === 1" class="secondary-text">
-            已自动选中：{{ resumeAttachments[0].showName }}
-          </p>
-          <p v-if="selectedResume" class="secondary-text">当前选择：{{ selectedResume.showName }}</p>
-          <p v-else-if="resumeAttachments.length > 1" class="secondary-text">请选择一份附件简历后再发送。</p>
           <el-button
+            v-if="resumeAttachments.length"
             type="warning"
             :disabled="!canConfirmResume"
-            :loading="latestResumeSendAction?.status === 'queued' || latestResumeSendAction?.status === 'leased' || latestResumeSendAction?.status === 'dispatching'"
             @click="confirmResume"
-          >确认发送所选简历</el-button>
+          >发送简历</el-button>
+          <p v-if="selectedResumeId" class="secondary-text">encryptResumeId：{{ selectedResumeId }}</p>
           <p v-if="latestResumeSendAction?.status === 'queued' || latestResumeSendAction?.status === 'leased' || latestResumeSendAction?.status === 'dispatching'" class="secondary-text">简历发送进行中…</p>
           <el-alert v-else-if="latestResumeSendAction?.outcome === 'accepted'" type="success" :closable="false" show-icon>
             简历已提交传输，等待 BOSS 平台后续状态。
@@ -1354,12 +1349,49 @@ onBeforeUnmount(() => {
   overflow: auto;
 }
 
-.batch-summary-panel,
 .batch-progress-metrics {
   display: flex;
   align-items: center;
   gap: 14px;
   flex-wrap: wrap;
+}
+
+.batch-summary-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.batch-summary-panel__main-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.batch-summary-panel__pending {
+  display: grid;
+  gap: 8px;
+}
+
+.batch-summary-panel__resume-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: nowrap;
+  white-space: nowrap;
+  margin: 14px 0 0;
+}
+
+.batch-summary-panel__resume-label {
+  color: var(--el-text-color-regular);
+  white-space: nowrap;
+}
+
+.batch-summary-panel__resume-select {
+  width: 240px;
+  min-width: 240px;
+  flex: 0 0 240px;
 }
 
 .batch-summary-panel__action {

@@ -13,6 +13,7 @@ const radioGroupKey = Symbol("radio-group");
 const mocks = vi.hoisted(() => ({
   listFineJobReviewItems: vi.fn(),
   listFineJobAutomationActions: vi.fn(),
+  listFineJobChatReviewTasks: vi.fn(),
   getFineJobBossExecutorStatus: vi.fn(),
   routerPush: vi.fn(),
   messageError: vi.fn(),
@@ -25,6 +26,7 @@ vi.mock("@/services/api", () => ({
   api: {
     listFineJobReviewItems: mocks.listFineJobReviewItems,
     listFineJobAutomationActions: mocks.listFineJobAutomationActions,
+    listFineJobChatReviewTasks: mocks.listFineJobChatReviewTasks,
     getFineJobBossExecutorStatus: mocks.getFineJobBossExecutorStatus
   }
 }));
@@ -101,6 +103,7 @@ describe("ReviewQueue", () => {
     vi.clearAllMocks();
     mocks.listFineJobReviewItems.mockResolvedValue({ items: [], total: 0 });
     mocks.listFineJobAutomationActions.mockResolvedValue({ actions: [], total: 0 });
+    mocks.listFineJobChatReviewTasks.mockResolvedValue({ items: [] });
     mocks.getFineJobBossExecutorStatus.mockResolvedValue({
       executor: null,
       current_task: null,

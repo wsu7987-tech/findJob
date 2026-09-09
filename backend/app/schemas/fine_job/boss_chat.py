@@ -153,7 +153,9 @@ class BossChatClaimActionRequest(BaseModel):
 
 
 class BossChatDispatchStartedRequest(BaseModel):
-    execution_epoch: int = Field(ge=1)
+    execution_epoch: int = Field(ge=0)
+    tab_id: str = Field(min_length=1, max_length=120)
+    leader_epoch: int = Field(ge=1)
 
 
 class BossChatActionCompleteRequest(BaseModel):

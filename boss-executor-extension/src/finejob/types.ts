@@ -5,13 +5,18 @@ export type FineJobQueueAction = {
   job_id: string;
   review_item_id: string;
   action_type: string;
-  task_type: "BOSS_DEFAULT_GREETING" | "TEST_DELAY";
+  task_type: "BOSS_DEFAULT_GREETING" | "BOSS_CHAT_RESUME" | "BOSS_CHAT_MESSAGE" | "TEST_DELAY";
+  task_source?: "greeting" | "chat" | "test";
   status: string;
   execution_state: string;
   execution_epoch: number;
   job_title: string;
   company_name: string;
   encrypt_job_id: string;
+  account_uid?: string;
+  page_type?: "job" | "chat";
+  chat_page_url?: string;
+  test_task_type?: "greeting" | "resume" | "chat" | "";
   last_status_code?: string | null;
   last_error?: string | null;
   close_page_after_completion: boolean;
@@ -28,7 +33,7 @@ export type FineJobExecutorInstance = {
   last_heartbeat_at?: string | null;
   task_cooldown_max_seconds: number;
   page_load_wait_max_seconds: number;
-  runtime_phase?: "idle" | "task_cooldown";
+  runtime_phase?: "idle" | "task_cooldown" | "page_opening" | "page_matching";
   runtime_detail?: string;
   runtime_until_at?: string | null;
 };
@@ -64,6 +69,10 @@ export type DefaultGreetingCommand = {
 
 export type BossPageProbeCommand = {
   type: "BOSS_PAGE_PROBE";
+};
+
+export type BossChatPageProbeCommand = {
+  type: "BOSS_CHAT_PAGE_PROBE";
 };
 
 export type ChatObservedMessage = {
@@ -129,7 +138,7 @@ export type ChatSendCommand = {
   action: FineJobChatSendAction;
 };
 
-export type MainWorldCommand = DefaultGreetingCommand | ChatSendCommand | BossPageProbeCommand;
+export type MainWorldCommand = DefaultGreetingCommand | ChatSendCommand | BossPageProbeCommand | BossChatPageProbeCommand;
 
 export type ChatSendExecutionResult = {
   actionId: string;
@@ -146,6 +155,12 @@ export type ChatSendOptions = {
   dryRun?: boolean;
   /** MAIN World 在真正 publish 前读取当前后端运行时开关。 */
   isSendEnabled?: () => Promise<boolean>;
+  /** 同一聊天标签页中 BOSS 页面接口实际使用的 zp_token。 */
+  getLiveZpToken?: () => Promise<string>;
+  /** BOSS 已确认简历交换请求成功时同步插件状态栏。 */
+  onResumeSendSucceeded?: () => Promise<void>;
+  /** 简历发送任一步失败时同步插件状态栏。 */
+  onResumeSendFailed?: (reason: string) => Promise<void>;
 };
 
 export type MainWorldExecutionResult = {

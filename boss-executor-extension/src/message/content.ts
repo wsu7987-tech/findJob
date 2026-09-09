@@ -20,6 +20,7 @@ export class ContentService {
   private readonly mainWorldWaiters = new Set<() => void>();
   private readonly mainCommands: MainWorldCommand[] = [];
   private chatLeaderEpoch = 0;
+  private liveZpToken = "";
   private readonly tabId = typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
     : `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -68,8 +69,8 @@ export class ContentService {
   }
 
   async enqueueMainCommand(command: MainWorldCommand): Promise<{ accepted: boolean }> {
-    if (command.type === "BOSS_PAGE_PROBE") {
-      const alreadyQueued = this.mainCommands.some((item) => item.type === "BOSS_PAGE_PROBE");
+    if (command.type === "BOSS_PAGE_PROBE" || command.type === "BOSS_CHAT_PAGE_PROBE") {
+      const alreadyQueued = this.mainCommands.some((item) => item.type === command.type);
       if (!alreadyQueued) this.mainCommands.push(command);
       return { accepted: true };
     }
@@ -137,6 +138,15 @@ export class ContentService {
     return this.background.isChatSendingEnabled();
   }
 
+  async setLiveZpToken(token: unknown): Promise<{ accepted: true }> {
+    this.liveZpToken = typeof token === "string" ? token : "";
+    return { accepted: true };
+  }
+
+  async getLiveZpToken(): Promise<string> {
+    return this.liveZpToken;
+  }
+
   async reportChatMessage(message: ChatObservedMessage): Promise<{ accepted: boolean }> {
     if (!message.eventId || !message.accountUid || !message.platformMessageId) {
       throw new Error("聊天观察消息载荷无效");
@@ -149,6 +159,16 @@ export class ContentService {
 
   async reportChatSendResult(result: ChatSendExecutionResult): Promise<{ accepted: true }> {
     await this.background.reportChatSendResult(result);
+    return { accepted: true };
+  }
+
+  async reportChatResumeSendSucceeded(): Promise<{ accepted: true }> {
+    await this.background.reportChatResumeSendSucceeded();
+    return { accepted: true };
+  }
+
+  async reportChatResumeSendFailed(reason: string): Promise<{ accepted: true }> {
+    await this.background.reportChatResumeSendFailed(reason);
     return { accepted: true };
   }
 

@@ -48,13 +48,18 @@ export default defineUnlistedScript(async () => {
         if (!command) return;
         if (command.type === "BOSS_PAGE_PROBE") {
           await contentService.reportBossPageIdentity(readBossPageIdentity());
+        } else if (command.type === "BOSS_CHAT_PAGE_PROBE") {
+          await contentService.reportChatIdentity(readBossChatIdentity());
         } else if (command.type === "BOSS_DEFAULT_GREETING") {
           const result = await executeDefaultGreeting(command);
           await contentService.reportExecutionResult(result);
         } else {
           const result = await bossChatSender.send(command.action, {
             // 发送前每次都回到后端读取运行时开关，避免使用启动阶段缓存。
-            isSendEnabled: () => contentService.isChatSendingEnabled()
+            isSendEnabled: () => contentService.isChatSendingEnabled(),
+            getLiveZpToken: () => contentService.getLiveZpToken(),
+            onResumeSendSucceeded: () => contentService.reportChatResumeSendSucceeded(),
+            onResumeSendFailed: (reason) => contentService.reportChatResumeSendFailed(reason)
           });
           await contentService.reportChatSendResult(result);
         }

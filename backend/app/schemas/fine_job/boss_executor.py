@@ -61,6 +61,7 @@ class BossTaskCompleteRequest(BaseModel):
 
 class BossTestTaskCreateRequest(BaseModel):
     job_id: str = Field(min_length=1, max_length=160)
+    test_task_type: Literal["greeting", "resume", "chat"] = "greeting"
     close_page_after_completion: bool = False
     delay_seconds: int = Field(default=3, ge=1, le=600)
 

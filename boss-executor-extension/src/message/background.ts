@@ -70,6 +70,7 @@ export class BackgroundService {
   }
 
   async reportChatTabHeartbeat(heartbeat: ChatTabHeartbeat): Promise<{ isLeader: boolean; leaderEpoch: number }> {
+    await fineJobExecutorClient.reportChatPageIdentity(heartbeat);
     return bossChatCoordinator.reportTabHeartbeat(heartbeat);
   }
 
@@ -87,6 +88,16 @@ export class BackgroundService {
 
   async reportChatSendResult(result: ChatSendExecutionResult): Promise<{ accepted: true }> {
     await bossChatCoordinator.reportSendResult(result);
+    return { accepted: true };
+  }
+
+  async reportChatResumeSendSucceeded(): Promise<{ accepted: true }> {
+    fineJobExecutorClient.markChatResumeSendSucceeded();
+    return { accepted: true };
+  }
+
+  async reportChatResumeSendFailed(reason: string): Promise<{ accepted: true }> {
+    fineJobExecutorClient.markChatResumeSendFailed(reason);
     return { accepted: true };
   }
 }

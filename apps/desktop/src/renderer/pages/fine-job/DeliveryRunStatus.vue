@@ -4,6 +4,7 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { CopyDocument } from "@element-plus/icons-vue";
 
 import { formatDateTime } from "@/services/format";
+import { api } from "@/services/api";
 import { useFineJobBossExecutorStore } from "@/stores/fineJobBossExecutor";
 import { useFineJobDeliveryRunsStore } from "@/stores/fineJobDeliveryRuns";
 import type { FineJobBossExecutorQueueAction, FineJobDeliveryRun } from "@/types";
@@ -21,7 +22,7 @@ const testTaskSubmitting = ref(false);
 const testJobDialogOpen = ref(false);
 const testJobSaving = ref(false);
 const executorSettingsSaving = ref(false);
-const testTaskForm = reactive({ jobId: "", closePageAfterCompletion: false, delaySeconds: 3 });
+const testTaskForm = reactive({ jobId: "", taskType: "greeting" as "greeting" | "resume" | "chat", closePageAfterCompletion: false, delaySeconds: 3 });
 const testJobForm = reactive({ id: "", encryptJobId: "", jobLink: "" });
 const executorSettingsForm = reactive({ taskCooldownMaxSeconds: 4, pageLoadWaitMaxSeconds: 3 });
 
@@ -30,7 +31,7 @@ const executor = computed(() => dashboard.value?.executor ?? null);
 const currentTask = computed(() => dashboard.value?.current_task ?? null);
 const filteredQueue = computed(() => (dashboard.value?.queue.actions ?? []).filter((item) => {
   const keyword = queueQuery.value.trim().toLowerCase();
-  const matchesKeyword = !keyword || `${item.job_title} ${item.company_name}`.toLowerCase().includes(keyword);
+  const matchesKeyword = !keyword || `${item.task_type} ${item.task_detail} ${item.job_title} ${item.company_name}`.toLowerCase().includes(keyword);
   const matchesState = !queueState.value || item.execution_state === queueState.value;
   return matchesKeyword && matchesState;
 }));
@@ -68,6 +69,15 @@ const executorProgressText = computed(() => {
   if (executor.value?.runtime_phase === "task_cooldown") {
     return executor.value.runtime_detail || "任务间隔冷却等待";
   }
+  if (executor.value?.runtime_phase === "page_opening") {
+    return executor.value.runtime_detail || "正在打开任务页面";
+  }
+  if (executor.value?.runtime_phase === "page_matching") {
+    return executor.value.runtime_detail || "任务页面已打开，正在等待插件匹配";
+  }
+  if (executor.value?.runtime_detail?.startsWith("打开任务页面失败：")) {
+    return executor.value.runtime_detail;
+  }
   if (currentTask.value) return `正在执行：${currentTask.value.job_title} · ${currentTask.value.company_name}`;
   if ((dashboard.value?.queue.total ?? 0) === 0) return "当前没有待执行任务";
   return "正在等待插件匹配任务页面";
@@ -80,6 +90,12 @@ const executionLabel = (state: string) => ({
   queued: "待处理", running: "执行中", succeeded: "已完成", cancelled: "已取消",
   blocked: "已阻断", failed: "执行失败", unknown: "结果未知"
 } as Record<string, string>)[state] ?? state;
+const taskTypeLabel = (action: FineJobBossExecutorQueueAction) => ({
+  BOSS_DEFAULT_GREETING: "打招呼",
+  BOSS_CHAT_RESUME: "发送简历",
+  BOSS_CHAT_MESSAGE: "代聊",
+  TEST_DELAY: `测试任务（${({ greeting: "打招呼", resume: "发简历", chat: "代聊" } as Record<string, string>)[action.test_task_type ?? "greeting"] ?? "打招呼"}）`
+} as Record<string, string>)[action.task_type] ?? action.task_type;
 
 const control = async (command: "start" | "pause") => {
   try {
@@ -164,6 +180,7 @@ const disconnect = async () => {
 };
 
 const openActionJob = async (action: FineJobBossExecutorQueueAction) => {
+  if (!action.job_id) return;
   try {
     await executorStore.openJob(action.job_id, "history");
     ElMessage.success("已在专用浏览器打开岗位");
@@ -174,7 +191,8 @@ const openActionJob = async (action: FineJobBossExecutorQueueAction) => {
 
 const returnToReview = async (action: FineJobBossExecutorQueueAction) => {
   try {
-    await executorStore.returnToReview(action.id);
+    if (action.task_source === "chat") await api.returnFineJobChatSendActionToReview(action.id);
+    else await executorStore.returnToReview(action.id);
     await load();
     ElMessage.success("已退回待确认");
   } catch {
@@ -183,10 +201,13 @@ const returnToReview = async (action: FineJobBossExecutorQueueAction) => {
 };
 
 const canReturn = (action: FineJobBossExecutorQueueAction) =>
-  !["running", "succeeded"].includes(action.execution_state);
+  action.task_source === "chat"
+    ? action.execution_state === "queued"
+    : !["running", "succeeded"].includes(action.execution_state);
 
 const openCreateTestTask = () => {
   testTaskForm.jobId = executorStore.testJobs[0]?.id ?? "";
+  testTaskForm.taskType = "greeting";
   testTaskForm.closePageAfterCompletion = false;
   testTaskForm.delaySeconds = 3;
   testTaskDrawerOpen.value = true;
@@ -201,6 +222,7 @@ const createTestTask = async () => {
   try {
     await executorStore.createTestTask({
       job_id: testTaskForm.jobId,
+      test_task_type: testTaskForm.taskType,
       close_page_after_completion: testTaskForm.closePageAfterCompletion,
       delay_seconds: testTaskForm.delaySeconds
     });
@@ -410,14 +432,16 @@ onBeforeUnmount(() => {
         </el-select>
       </div>
       <el-table :data="filteredQueue" empty-text="当前筛选条件下暂无动作">
+        <el-table-column label="任务类型" min-width="120"><template #default="{ row }">{{ taskTypeLabel(row) }}</template></el-table-column>
+        <el-table-column label="任务详情" min-width="280" show-overflow-tooltip><template #default="{ row }">{{ row.task_detail }}</template></el-table-column>
         <el-table-column prop="job_title" label="岗位" min-width="200" />
         <el-table-column prop="company_name" label="公司" min-width="150" />
         <el-table-column label="执行状态" min-width="150"><template #default="{ row }">{{ executionLabel(row.execution_state) }}</template></el-table-column>
         <el-table-column prop="last_error" label="最近错误" min-width="220" show-overflow-tooltip />
         <el-table-column label="操作" width="190" fixed="right">
           <template #default="{ row }">
-            <el-button link type="primary" @click="openActionJob(row)">打开岗位</el-button>
-            <el-button v-if="canReturn(row)" link @click="returnToReview(row)">退回</el-button>
+            <el-button v-if="row.job_id" link type="primary" @click="openActionJob(row)">打开岗位</el-button>
+            <el-button v-if="canReturn(row)" link @click="returnToReview(row)">{{ row.task_source === "chat" ? "取消发送" : "退回待确认" }}</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -429,6 +453,13 @@ onBeforeUnmount(() => {
           <el-select v-model="testTaskForm.jobId" placeholder="选择测试岗位" class="form-full-width">
             <el-option v-for="job in executorStore.testJobs" :key="job.id" :label="`${job.title} · ${job.id}`" :value="job.id" />
           </el-select>
+        </el-form-item>
+        <el-form-item label="测试任务类型">
+          <el-radio-group v-model="testTaskForm.taskType">
+            <el-radio value="greeting">打招呼</el-radio>
+            <el-radio value="resume">发简历</el-radio>
+            <el-radio value="chat">代聊</el-radio>
+          </el-radio-group>
         </el-form-item>
         <el-form-item label="执行完成后关闭页面">
           <el-switch v-model="testTaskForm.closePageAfterCompletion" />

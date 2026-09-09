@@ -12,7 +12,7 @@ export default defineConfig({
     name: packageJson.displayName,
     description: "FineJob 的BOSS默认招呼任务执行器；真实动作受插件权限和任务状态共同控制。",
     version: packageJson.version,
-    permissions: ["storage", "tabs"],
+    permissions: ["storage", "tabs", "webRequest"],
     host_permissions: [...bossMatches, "http://127.0.0.1:8000/*"],
     web_accessible_resources: [
       {

@@ -498,6 +498,28 @@ def get_operations_dashboard(db: Database) -> dict[str, object]:
         action_counts = _group_counts(connection, "fj_automation_actions", "status")
         execution_counts = _group_counts(connection, "fj_automation_actions", "execution_state")
         capture_counts = _group_counts(connection, "fj_boss_capture_batches", "status")
+        chat_pending_reviews = int(connection.execute(
+            "SELECT COUNT(*) FROM fj_chat_reply_tasks WHERE status = 'awaiting_review'"
+        ).fetchone()[0]) + int(connection.execute(
+            """
+            SELECT COUNT(*) FROM fj_chat_send_actions
+            WHERE operation_kind = 'resume' AND status = 'queued' AND confirmation_status = 'pending'
+            """
+        ).fetchone()[0])
+        chat_queued_actions = int(connection.execute(
+            """
+            SELECT COUNT(*) FROM fj_chat_send_actions
+            WHERE confirmation_status = 'confirmed' AND status = 'queued'
+              AND operation_kind IN ('text', 'resume')
+            """
+        ).fetchone()[0])
+        chat_active_actions = int(connection.execute(
+            """
+            SELECT COUNT(*) FROM fj_chat_send_actions
+            WHERE confirmation_status = 'confirmed' AND status IN ('leased', 'dispatching')
+              AND operation_kind IN ('text', 'resume')
+            """
+        ).fetchone()[0])
         metrics = {
             "jobs": int(connection.execute("SELECT COUNT(*) FROM fj_boss_jobs").fetchone()[0]),
             "detailed_jobs": int(connection.execute(
@@ -506,12 +528,12 @@ def get_operations_dashboard(db: Database) -> dict[str, object]:
             "evaluated_jobs": int(connection.execute(
                 "SELECT COUNT(DISTINCT job_id) FROM fj_job_evaluations"
             ).fetchone()[0]),
-            "pending_reviews": review_counts.get("pending", 0),
-            "queued_actions": action_counts.get("queued", 0),
+            "pending_reviews": review_counts.get("pending", 0) + chat_pending_reviews,
+            "queued_actions": action_counts.get("queued", 0) + chat_queued_actions,
             "active_actions": sum(
                 execution_counts.get(state, 0)
                 for state in ("running",)
-            ),
+            ) + chat_active_actions,
             "successful_actions": action_counts.get("succeeded", 0),
             "issue_actions": sum(action_counts.get(state, 0) for state in ("failed", "blocked", "unknown")),
         }

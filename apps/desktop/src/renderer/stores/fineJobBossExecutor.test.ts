@@ -118,7 +118,7 @@ describe("fineJobBossExecutor store", () => {
     vi.spyOn(api, "createFineJobBossExecutorTestTask").mockResolvedValue({
       task: {
         id: "test-task-1", job_id: "system-test-job-1", review_item_id: "review-1",
-        action_type: "start_conversation", task_type: "TEST_DELAY", status: "queued",
+        action_type: "start_conversation", task_type: "TEST_DELAY", task_detail: "延时测试任务", task_source: "test", status: "queued",
         execution_state: "queued", execution_epoch: 0, job_title: "测试岗位 1",
         company_name: "FineJob 系统测试", encrypt_job_id: "test-id",
         close_page_after_completion: true, delay_seconds: 8
@@ -132,13 +132,14 @@ describe("fineJobBossExecutor store", () => {
     await store.loadTestJobs();
     await store.createTestTask({
       job_id: "system-test-job-1",
+      test_task_type: "greeting",
       close_page_after_completion: true,
       delay_seconds: 8
     });
 
     expect(store.testJobs).toHaveLength(1);
     expect(api.createFineJobBossExecutorTestTask).toHaveBeenCalledWith({
-      job_id: "system-test-job-1", close_page_after_completion: true, delay_seconds: 8
+      job_id: "system-test-job-1", test_task_type: "greeting", close_page_after_completion: true, delay_seconds: 8
     });
   });
 });
