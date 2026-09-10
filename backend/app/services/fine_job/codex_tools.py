@@ -55,7 +55,7 @@ from backend.app.services.fine_job.filter_exclusions import (
     record_job_event,
 )
 from backend.app.services.fine_job.job_applications import set_job_application
-from backend.app.services.fine_job import job_hunt_analysis, job_hunt_refresh
+from backend.app.services.fine_job import job_hunt_analysis, job_hunt_refresh, workflow_runs
 from backend.app.utils import new_id, utc_now
 
 
@@ -71,6 +71,7 @@ CORE_TOOLS = (
     "finejob.list_job_hunt_refresh_analysis_items",
     "finejob.save_job_hunt_refresh_analysis",
     "finejob.complete_job_hunt_refresh_run",
+    "finejob.get_workflow_context_snapshot",
     "finejob.search_jobs",
     "finejob.list_companies",
     "finejob.set_company_type",
@@ -170,6 +171,7 @@ class CodexToolService:
             "finejob.list_job_hunt_refresh_analysis_items": self.list_job_hunt_refresh_analysis_items,
             "finejob.save_job_hunt_refresh_analysis": self.save_job_hunt_refresh_analysis,
             "finejob.complete_job_hunt_refresh_run": self.complete_job_hunt_refresh_run,
+            "finejob.get_workflow_context_snapshot": self.get_workflow_context_snapshot,
             "finejob.list_job_strategies": self.list_job_strategies,
             "finejob.get_job_evaluation_context": self.get_job_evaluation_context,
             "finejob.start_job_capture": self.start_job_capture,
@@ -407,6 +409,19 @@ class CodexToolService:
             resource=_resource("job_hunt_refresh_run", run_id),
             data=run,
             terminal=True,
+        )
+
+    def get_workflow_context_snapshot(self, arguments: dict[str, Any]) -> dict[str, object]:
+        workflow_run_id = str(arguments.get("workflow_run_id") or "").strip()
+        channel = str(arguments.get("channel") or "deep_job_search").strip()
+        snapshot = workflow_runs.get_context_snapshot(self.db, workflow_run_id, channel)
+        return _result(
+            result_type="data",
+            status=str(snapshot["status"]),
+            resource=_resource("context_snapshot", str(snapshot["context_snapshot_id"])),
+            data=snapshot,
+            terminal=True,
+            message="Workflow Run 的真实上下文快照已读取。",
         )
 
     def list_companies(self, arguments: dict[str, Any]) -> dict[str, object]:

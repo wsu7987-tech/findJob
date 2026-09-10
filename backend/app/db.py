@@ -1827,6 +1827,98 @@ CREATE INDEX IF NOT EXISTS idx_fj_job_hunt_refresh_items_run_status
 CREATE INDEX IF NOT EXISTS idx_fj_codex_sessions_updated_at
   ON fj_codex_sessions(updated_at DESC);
 
+-- Workflow Run 只保存通用生命周期；具体采集、分析和写入继续复用既有 FineJob 服务。
+CREATE TABLE IF NOT EXISTS fj_workflow_runs (
+  id TEXT PRIMARY KEY,
+  workflow_type TEXT NOT NULL,
+  completion_contract_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'pending',
+  completed_count INTEGER NOT NULL DEFAULT 0,
+  remaining_count INTEGER NOT NULL DEFAULT 0,
+  current_step TEXT NOT NULL DEFAULT 'created',
+  next_action TEXT NOT NULL DEFAULT '',
+  next_action_reason TEXT NOT NULL DEFAULT '',
+  waiting_for_user INTEGER NOT NULL DEFAULT 0,
+  stop_reason TEXT NOT NULL DEFAULT '',
+  codex_session_ref TEXT,
+  codex_runtime_id TEXT,
+  telemetry_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  CHECK (workflow_type IN ('deep_job_search')),
+  CHECK (status IN ('pending', 'running', 'waiting_for_user', 'waiting_codex', 'completed', 'completed_with_errors', 'cancelled', 'failed')),
+  CHECK (waiting_for_user IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_workflow_runs_created_at
+  ON fj_workflow_runs(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS fj_workflow_tasks (
+  id TEXT PRIMARY KEY,
+  workflow_run_id TEXT NOT NULL,
+  task_type TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  result_json TEXT NOT NULL DEFAULT '{}',
+  operation_ref_type TEXT,
+  operation_ref_id TEXT,
+  retryable INTEGER NOT NULL DEFAULT 1,
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE CASCADE,
+  UNIQUE (workflow_run_id, task_type, id),
+  CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'skipped', 'waiting_for_user')),
+  CHECK (retryable IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_workflow_tasks_run_status
+  ON fj_workflow_tasks(workflow_run_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS fj_workflow_context_snapshots (
+  id TEXT PRIMARY KEY,
+  workflow_run_id TEXT NOT NULL,
+  channel TEXT NOT NULL,
+  snapshot_json TEXT NOT NULL DEFAULT '{}',
+  context_characters INTEGER NOT NULL DEFAULT 0,
+  estimated_tokens INTEGER NOT NULL DEFAULT 0,
+  soft_budget_characters INTEGER NOT NULL DEFAULT 0,
+  hard_budget_characters INTEGER NOT NULL DEFAULT 1000000,
+  status TEXT NOT NULL DEFAULT 'ready',
+  blocker_reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE CASCADE,
+  UNIQUE (workflow_run_id, channel),
+  CHECK (status IN ('ready', 'blocked'))
+);
+
+CREATE TABLE IF NOT EXISTS fj_workflow_job_discoveries (
+  id TEXT PRIMARY KEY,
+  workflow_run_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  search_keyword TEXT NOT NULL,
+  city TEXT NOT NULL,
+  search_combination_json TEXT NOT NULL DEFAULT '{}',
+  scroll_depth INTEGER NOT NULL DEFAULT 0,
+  discovered_at TEXT NOT NULL,
+  is_run_first_discovery INTEGER NOT NULL DEFAULT 0,
+  is_historical_duplicate INTEGER NOT NULL DEFAULT 0,
+  is_filter_candidate INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE CASCADE,
+  FOREIGN KEY (task_id) REFERENCES fj_workflow_tasks(id) ON DELETE CASCADE,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+  UNIQUE (workflow_run_id, task_id, job_id),
+  CHECK (is_run_first_discovery IN (0, 1)),
+  CHECK (is_historical_duplicate IN (0, 1)),
+  CHECK (is_filter_candidate IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_workflow_job_discoveries_job
+  ON fj_workflow_job_discoveries(job_id, discovered_at DESC);
+
 CREATE TABLE IF NOT EXISTS fj_fact_resume_links (
   fact_id TEXT NOT NULL,
   resume_version_id TEXT NOT NULL,
@@ -2074,6 +2166,7 @@ class Database:
             self._ensure_job_hunt_refresh_schema(connection)
             self._ensure_job_hunt_analysis_schema(connection)
             self._ensure_job_progress_schema(connection)
+            self._ensure_workflow_run_schema(connection)
             # 兼容升级只从可靠旧事实追加事件，并按完整事件流重放 shadow Pipeline。
             from backend.app.services.fine_job.job_activity import migrate_legacy_job_activity
             from backend.app.services.fine_job.execution_reconciliation import (
@@ -2082,6 +2175,23 @@ class Database:
 
             migrate_legacy_job_activity(connection)
             initialize_execution_observability(connection)
+
+    def _ensure_workflow_run_schema(self, connection: sqlite3.Connection) -> None:
+        """为已创建的 Workflow Run 表补齐可筛选候选标记。"""
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fj_workflow_job_discoveries'"
+        ).fetchone()
+        if table is None:
+            return
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(fj_workflow_job_discoveries)")
+        }
+        if "is_filter_candidate" not in columns:
+            connection.execute(
+                "ALTER TABLE fj_workflow_job_discoveries "
+                "ADD COLUMN is_filter_candidate INTEGER NOT NULL DEFAULT 0"
+            )
 
     def _ensure_job_hunt_refresh_schema(self, connection: sqlite3.Connection) -> None:
         """为已有数据库补齐 Refresh Scope 与 Run 关联字段。"""

@@ -2396,6 +2396,45 @@ export interface ApiErrorShape {
   detail?: string | Record<string, unknown> | null;
 }
 
+export interface FineJobWorkflowContextSection {
+  section_id: string;
+  section_type: string;
+  source: string;
+  source_version: number | null;
+  included: boolean;
+  exclusion_reason: string;
+  character_count: number;
+  estimated_tokens: number;
+  content?: unknown;
+}
+
+export interface FineJobWorkflowContextSnapshot {
+  context_snapshot_id: string;
+  channel: string;
+  sections: FineJobWorkflowContextSection[];
+  context_characters: number;
+  estimated_tokens: number;
+  soft_budget_characters: number;
+  hard_budget_characters: number;
+  status: "ready" | "blocked";
+  blocker_reason: string;
+  generated_at: string;
+}
+
+export interface FineJobWorkflowRun {
+  workflow_run_id: string;
+  workflow_type: "deep_job_search";
+  status: string;
+  completed_count: number;
+  remaining_count: number;
+  current_step: string;
+  next_action: string;
+  next_action_reason: string;
+  waiting_for_user: boolean;
+  stop_reason: string;
+  telemetry: Record<string, number>;
+}
+
 export interface PollFallbackInput {
   lastEventAt: number;
   now: number;

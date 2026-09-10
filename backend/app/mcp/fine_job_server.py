@@ -156,6 +156,15 @@ async def get_job_hunt_refresh_run(run_id: str) -> dict[str, Any]:
     return await _invoke("get_job_hunt_refresh_run", locals())
 
 
+@server.tool(name="finejob.get_workflow_context_snapshot", structured_output=True)
+async def get_workflow_context_snapshot(
+    workflow_run_id: str,
+    channel: str = "deep_job_search",
+) -> dict[str, Any]:
+    """读取 Workflow Run 当前任务通道实际允许使用的上下文快照。"""
+    return await _invoke("get_workflow_context_snapshot", locals())
+
+
 @server.tool(name="finejob.list_job_hunt_refresh_items", structured_output=True)
 async def list_job_hunt_refresh_items(run_id: str, item_type: str) -> dict[str, Any]:
     """读取指定步骤中未完成、中断遗留或可重试的 Run Item。"""

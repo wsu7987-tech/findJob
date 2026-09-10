@@ -97,6 +97,8 @@
   FineJobResumeAttachmentsRefreshResponse,
   FineJobCodexPendingWork,
   FineJobCodexPermissions,
+  FineJobWorkflowContextSnapshot,
+  FineJobWorkflowRun,
   FineJobCompanyEnvelope,
   FineJobCompanyListEnvelope,
   FineJobCompanyType,
@@ -1418,6 +1420,44 @@ export const api = {
   },
   async listFineJobChatReviewTasks() {
     return request<FineJobChatReviewTaskListEnvelope>("/api/fine-job/boss-chat/review-tasks");
+  },
+  async getFineJobWorkflowContextSnapshot(workflowRunId: string) {
+    return request<FineJobWorkflowContextSnapshot>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/context-snapshot`
+    );
+  },
+  async createFineJobDeepJobSearchRun(payload: {
+    filter_strategy_id: string;
+    target_count: number;
+    candidate_target_count?: number;
+    allowed_search_keywords: string[];
+    allowed_cities: string[];
+    min_depth?: number;
+    scroll_batch_size?: number;
+    max_depth?: number;
+    low_yield_streak_limit?: number;
+    context_soft_budget_characters?: number;
+  }) {
+    return request<FineJobWorkflowRun>("/api/fine-job/workflow-runs", {
+      method: "POST",
+      body: JSON.stringify({
+        task_type: "deep_job_search",
+        created_from: "task_cockpit",
+        deep_job_search: payload
+      })
+    });
+  },
+  async advanceFineJobWorkflowRun(workflowRunId: string) {
+    return request<FineJobWorkflowRun>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/advance`,
+      { method: "POST" }
+    );
+  },
+  async resumeFineJobWorkflowRun(workflowRunId: string) {
+    return request<FineJobWorkflowRun>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/resume`,
+      { method: "POST" }
+    );
   },
   async listFineJobChatExecutedTasks() {
     return request<FineJobChatReviewTaskListEnvelope>("/api/fine-job/boss-chat/executed-tasks");

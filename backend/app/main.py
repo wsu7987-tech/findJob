@@ -26,6 +26,7 @@ from backend.app.routers.fine_job.profiles_v3 import router as fine_job_profiles
 from backend.app.routers.fine_job.resumes import router as fine_job_resumes_router
 from backend.app.routers.fine_job.strategies import router as fine_job_strategies_router
 from backend.app.routers.fine_job.workflow import router as fine_job_workflow_router
+from backend.app.routers.fine_job.workflow_runs import router as fine_job_workflow_runs_router
 from backend.app.routers.health import router as health_router
 from backend.app.routers.internal_codex import router as internal_codex_router
 from backend.app.routers.parse_results import router as parse_results_router
@@ -108,6 +109,7 @@ def create_app() -> FastAPI:
     app.include_router(fine_job_resumes_router, prefix="/api")
     app.include_router(fine_job_strategies_router, prefix="/api")
     app.include_router(fine_job_workflow_router, prefix="/api")
+    app.include_router(fine_job_workflow_runs_router, prefix="/api")
     app.include_router(parse_results_router, prefix="/api")
     app.include_router(pdf_drafts_router, prefix="/api")
     app.include_router(web_drafts_router, prefix="/api")
