@@ -17,6 +17,7 @@ class DeepJobSearchConfig(BaseModel):
     scroll_batch_size: int = Field(default=3, ge=1, le=10)
     max_depth: int = Field(default=20, ge=1, le=200)
     low_yield_streak_limit: int = Field(default=3, ge=1, le=20)
+    jd_batch_size: int = Field(default=3, ge=1, le=5)
     context_soft_budget_characters: int = Field(default=12000, ge=1000, le=200000)
     applied_feedback_ids: list[str] = Field(default_factory=list, max_length=100)
     applied_preference_ids: list[str] = Field(default_factory=list, max_length=100)
@@ -31,3 +32,13 @@ class WorkflowRunCreateRequest(BaseModel):
 class WorkflowRunCodexSessionRequest(BaseModel):
     codex_session_ref: str = Field(min_length=1, max_length=200)
     codex_runtime_id: str | None = Field(default=None, max_length=200)
+
+
+class WorkflowAnalysisSaveRequest(BaseModel):
+    decision: Literal["recommend", "review", "reject"]
+    confidence: float = Field(default=0, ge=0, le=1)
+    summary: str = Field(default="", max_length=2000)
+    reasons: list[str] = Field(default_factory=list, max_length=30)
+    risks: list[str] = Field(default_factory=list, max_length=30)
+    strengths: list[str] = Field(default_factory=list, max_length=30)
+    gaps: list[str] = Field(default_factory=list, max_length=30)

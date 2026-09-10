@@ -165,6 +165,43 @@ async def get_workflow_context_snapshot(
     return await _invoke("get_workflow_context_snapshot", locals())
 
 
+@server.tool(name="finejob.get_workflow_run", structured_output=True)
+async def get_workflow_run(workflow_run_id: str) -> dict[str, Any]:
+    """读取 deep_job_search Workflow Run 的权威状态与完成计数。"""
+    return await _invoke("get_workflow_run", locals())
+
+
+@server.tool(name="finejob.list_workflow_analysis_items", structured_output=True)
+async def list_workflow_analysis_items(workflow_run_id: str) -> dict[str, Any]:
+    """读取当前批次待由 Codex 分析并正式保存的 Workflow Item。"""
+    return await _invoke("list_workflow_analysis_items", locals())
+
+
+@server.tool(name="finejob.get_workflow_analysis_item_context", structured_output=True)
+async def get_workflow_analysis_item_context(
+    workflow_run_id: str,
+    workflow_task_id: str,
+) -> dict[str, Any]:
+    """按需读取单个岗位的紧凑 JD 分析上下文。"""
+    return await _invoke("get_workflow_analysis_item_context", locals())
+
+
+@server.tool(name="finejob.save_workflow_analysis_item", structured_output=True)
+async def save_workflow_analysis_item(
+    workflow_run_id: str,
+    workflow_task_id: str,
+    decision: str,
+    confidence: float = 0,
+    summary: str = "",
+    reasons: list[str] | None = None,
+    risks: list[str] | None = None,
+    strengths: list[str] | None = None,
+    gaps: list[str] | None = None,
+) -> dict[str, Any]:
+    """保存单个岗位的正式评估，并由 Workflow 更新 recommend 完成计数。"""
+    return await _invoke("save_workflow_analysis_item", locals())
+
+
 @server.tool(name="finejob.list_job_hunt_refresh_items", structured_output=True)
 async def list_job_hunt_refresh_items(run_id: str, item_type: str) -> dict[str, Any]:
     """读取指定步骤中未完成、中断遗留或可重试的 Run Item。"""

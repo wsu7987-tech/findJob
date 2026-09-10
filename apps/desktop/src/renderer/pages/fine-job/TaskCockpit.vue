@@ -9,6 +9,8 @@ import type {
 } from "@/types";
 
 const workflowRunId = ref("");
+const contextChannel = ref("deep_job_search");
+const analysisTaskId = ref("");
 const snapshot = ref<FineJobWorkflowContextSnapshot | null>(null);
 const workflowRun = ref<FineJobWorkflowRun | null>(null);
 const strategies = ref<FineJobFilterStrategy[]>([]);
@@ -38,7 +40,19 @@ const loadSnapshot = async () => {
   loading.value = true;
   error.value = "";
   try {
-    snapshot.value = await api.getFineJobWorkflowContextSnapshot(identifier);
+    const channel = contextChannel.value === "analysis_item"
+      ? `analysis_item:${analysisTaskId.value.trim()}`
+      : contextChannel.value;
+    if (contextChannel.value === "analysis_item" && !analysisTaskId.value.trim()) {
+      error.value = "查看单个分析 Item Context 前，请输入 Workflow Task ID。";
+      return;
+    }
+    const [loadedSnapshot, loadedRun] = await Promise.all([
+      api.getFineJobWorkflowContextSnapshot(identifier, channel),
+      api.getFineJobWorkflowRun(identifier)
+    ]);
+    snapshot.value = loadedSnapshot;
+    workflowRun.value = loadedRun;
   } catch (value) {
     error.value = value instanceof Error ? value.message : String(value);
   } finally {
@@ -153,9 +167,15 @@ onMounted(async () => {
     </el-card>
     <div class="inspector-input">
       <el-input v-model="workflowRunId" placeholder="输入 Workflow Run ID 查看本轮上下文" clearable @keyup.enter="loadSnapshot" />
+      <el-select v-model="contextChannel" class="channel-select">
+        <el-option label="搜索 Context" value="deep_job_search" />
+        <el-option label="分析 Shared Base" value="candidate_analysis" />
+        <el-option label="分析 Item Context" value="analysis_item" />
+      </el-select>
+      <el-input v-if="contextChannel === 'analysis_item'" v-model="analysisTaskId" placeholder="Workflow Task ID" />
       <el-button type="primary" :loading="loading" @click="loadSnapshot">查看本轮上下文</el-button>
       <el-button :loading="advancing" :disabled="!workflowRunId" @click="advanceRun">推进 Run</el-button>
-      <el-button v-if="workflowRun?.status === 'waiting_for_user'" :loading="advancing" @click="resumeRun">确认恢复</el-button>
+      <el-button v-if="workflowRun?.status === 'waiting_for_user' && ['capture_interrupted', 'browser_not_running'].includes(workflowRun.stop_reason)" :loading="advancing" @click="resumeRun">确认恢复</el-button>
     </div>
     <el-alert v-if="error" :title="error" type="error" :closable="false" />
     <el-alert
@@ -166,6 +186,14 @@ onMounted(async () => {
       :closable="false"
       show-icon
     />
+    <el-descriptions v-if="workflowRun" :column="3" border>
+      <el-descriptions-item label="目标推荐数">{{ workflowRun.completion_contract?.target_count ?? targetCount }}</el-descriptions-item>
+      <el-descriptions-item label="正式 recommend">{{ workflowRun.completed_count }}</el-descriptions-item>
+      <el-descriptions-item label="剩余目标">{{ workflowRun.remaining_count }}</el-descriptions-item>
+      <el-descriptions-item label="fresh candidates">{{ workflowRun.telemetry.fresh_candidates ?? 0 }}</el-descriptions-item>
+      <el-descriptions-item label="当前状态">{{ workflowRun.status }} / {{ workflowRun.current_step }}</el-descriptions-item>
+      <el-descriptions-item label="下一步原因">{{ workflowRun.next_action_reason }}</el-descriptions-item>
+    </el-descriptions>
     <template v-if="snapshot">
       <el-alert
         :title="`任务通道：${snapshot.channel}；后端快照 ${snapshot.status === 'ready' ? '可用' : '被预算阻断'}`"
@@ -198,7 +226,8 @@ onMounted(async () => {
 
 <style scoped>
 .task-cockpit { display: grid; gap: 16px; }
-.inspector-input { display: flex; gap: 12px; max-width: 760px; }
+.inspector-input { display: flex; gap: 12px; max-width: 1100px; flex-wrap: wrap; }
+.channel-select { width: 180px; }
 .context-table { width: 100%; }
 .run-form { max-width: 760px; }
 .context-content pre { margin: 0; white-space: pre-wrap; word-break: break-word; }

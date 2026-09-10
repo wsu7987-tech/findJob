@@ -343,3 +343,175 @@ def test_interrupted_capture_waits_for_user_and_requires_explicit_resume(
     assert resumed.status_code == 200
     assert resumed.json()["status"] == "pending"
     assert resumed.json()["tasks"][0]["operation_ref_id"] is None
+
+
+def _prepare_analysis_batch(configured_client, test_db, *, candidate_count: int, target_count: int = 2):
+    run = _create_run(
+        configured_client,
+        target_count=target_count,
+        candidate_target_count=candidate_count,
+        jd_batch_size=min(2, candidate_count),
+    )
+    capture_id = new_id()
+    now = utc_now()
+    create_capture_batch(
+        test_db,
+        capture_id=capture_id,
+        keyword="AI Agent",
+        city="广州",
+        pages=5,
+        auto_details=False,
+        created_at=now,
+    )
+    jobs = record_capture_jobs(
+        test_db,
+        capture_id=capture_id,
+        search_keyword="AI Agent",
+        jobs=[
+            {
+                "job_id": f"analysis-source-{index}",
+                "encrypt_job_id": f"analysis-encrypt-{index}",
+                "title": f"AI Agent 工程师 {index}",
+                "company_name": f"候选公司 {index}",
+                "location": "广州",
+                "detail_status": "completed",
+                "detail": {"job_description": f"当前岗位 JD {index}"},
+            }
+            for index in range(candidate_count)
+        ],
+        collected_at=now,
+    )
+    search_task_id = run["tasks"][0]["workflow_task_id"]
+    with test_db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_workflow_tasks SET status = 'succeeded' WHERE workflow_run_id = ? AND task_type = 'deep_job_search'",
+            (run["workflow_run_id"],),
+        )
+        for job in jobs:
+            connection.execute(
+                """
+                INSERT INTO fj_workflow_job_discoveries (
+                  id, workflow_run_id, task_id, job_id, search_keyword, city,
+                  search_combination_json, scroll_depth, discovered_at,
+                  is_run_first_discovery, is_historical_duplicate, is_filter_candidate
+                ) VALUES (?, ?, ?, ?, 'AI Agent', '广州', '{}', 5, ?, 1, 0, 1)
+                """,
+                (new_id(), run["workflow_run_id"], search_task_id, job["history_record_id"], utc_now()),
+            )
+    workflow_runs._refresh_counts(test_db, run["workflow_run_id"])
+    assert workflow_runs._create_jd_tasks(test_db, run["workflow_run_id"], candidate_count) > 0
+    advanced = workflow_runs.advance_deep_job_search(
+        test_db, configured_client.app.state.config, run["workflow_run_id"]
+    )
+    return advanced, jobs
+
+
+def test_candidate_pool_to_jd_to_waiting_codex_uses_compact_shared_and_item_context(
+    configured_client, test_db
+) -> None:
+    run, jobs = _prepare_analysis_batch(configured_client, test_db, candidate_count=3)
+
+    assert run["status"] == "waiting_codex"
+    analysis_items = [item for item in run["tasks"] if item["task_type"] == "deep_job_search_analysis"]
+    assert len(analysis_items) == 2
+    shared = workflow_runs.get_context_snapshot(test_db, run["workflow_run_id"], "candidate_analysis")
+    assert not any(item["section_id"] == "candidate_jds" for item in shared["sections"])
+    assert any(item["section_id"] == "complete_resume" and not item["included"] for item in shared["sections"])
+
+    item_context = workflow_runs.get_workflow_analysis_item_context(
+        test_db, run["workflow_run_id"], analysis_items[0]["workflow_task_id"]
+    )
+    material = next(
+        item["content"]
+        for item in item_context["item_context_snapshot"]["sections"]
+        if item["section_id"] == "job_material"
+    )
+    selected = next(job for job in jobs if job["history_record_id"] == material["job_id"])
+    assert material["jd"]["job_description"] == f"当前岗位 JD {selected['job_id'].rsplit('-', 1)[1]}"
+    assert sum(job["history_record_id"] == material["job_id"] for job in jobs) == 1
+
+
+def test_mixed_analysis_results_refill_candidate_pool_and_complete_on_unique_recommends(
+    configured_client, test_db
+) -> None:
+    run, _jobs = _prepare_analysis_batch(configured_client, test_db, candidate_count=3, target_count=2)
+    tool_service = CodexToolService(test_db, configured_client.app.state.config)
+    first_batch = tool_service.call(
+        "finejob.list_workflow_analysis_items", {"workflow_run_id": run["workflow_run_id"]}
+    )["data"]["items"]
+
+    first = tool_service.call(
+        "finejob.save_workflow_analysis_item",
+        {
+            "workflow_run_id": run["workflow_run_id"],
+            "workflow_task_id": first_batch[0]["workflow_task_id"],
+            "decision": "recommend",
+            "confidence": 0.9,
+            "summary": "适合",
+            "reasons": ["技能匹配"],
+        },
+    )["data"]
+    second = tool_service.call(
+        "finejob.save_workflow_analysis_item",
+        {
+            "workflow_run_id": run["workflow_run_id"],
+            "workflow_task_id": first_batch[1]["workflow_task_id"],
+            "decision": "review",
+            "confidence": 0.5,
+            "summary": "需要确认",
+        },
+    )["data"]
+
+    assert first["completed_count"] == 1
+    assert first["remaining_count"] == 1
+    assert second["status"] == "waiting_codex"
+    next_batch = tool_service.call(
+        "finejob.list_workflow_analysis_items", {"workflow_run_id": run["workflow_run_id"]}
+    )["data"]["items"]
+    pending = [item for item in next_batch if item["status"] == "pending"]
+    assert len(pending) == 1
+    final = tool_service.call(
+        "finejob.save_workflow_analysis_item",
+        {
+            "workflow_run_id": run["workflow_run_id"],
+            "workflow_task_id": pending[0]["workflow_task_id"],
+            "decision": "recommend",
+            "confidence": 0.8,
+            "summary": "补足目标",
+        },
+    )["data"]
+
+    assert final["status"] == "completed"
+    assert final["completed_count"] == 2
+    assert final["remaining_count"] == 0
+
+
+def test_candidate_pool_exhausted_after_reject_waits_for_new_jobs(configured_client, test_db) -> None:
+    run, _jobs = _prepare_analysis_batch(configured_client, test_db, candidate_count=1, target_count=1)
+    item = workflow_runs.list_workflow_analysis_items(test_db, run["workflow_run_id"])["items"][0]
+    result = CodexToolService(test_db, configured_client.app.state.config).call(
+        "finejob.save_workflow_analysis_item",
+        {
+            "workflow_run_id": run["workflow_run_id"],
+            "workflow_task_id": item["workflow_task_id"],
+            "decision": "reject",
+            "summary": "不匹配",
+        },
+    )["data"]
+
+    assert result["status"] == "waiting_for_user"
+    assert result["stop_reason"] == "new_jobs_insufficient"
+
+
+def test_non_resumable_stop_reason_is_not_resumed(configured_client, test_db) -> None:
+    run = _create_run(configured_client)
+    workflow_runs._wait_for_user(
+        test_db, run["workflow_run_id"], "new_jobs_insufficient", "需要扩大搜索范围。"
+    )
+
+    response = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/resume"
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error_category"] == "WORKFLOW_NOT_RESUMABLE"

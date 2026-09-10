@@ -2433,6 +2433,7 @@ export interface FineJobWorkflowRun {
   waiting_for_user: boolean;
   stop_reason: string;
   telemetry: Record<string, number>;
+  completion_contract?: { target_count?: number };
 }
 
 export interface PollFallbackInput {

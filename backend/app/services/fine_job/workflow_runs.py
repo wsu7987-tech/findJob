@@ -7,7 +7,10 @@ from backend.app.config import AppConfig
 from backend.app.db import Database
 from backend.app.errors import AppError
 from backend.app.services.fine_job.boss_capture_tasks import boss_capture_task_manager
-from backend.app.services.fine_job.boss_capture_history import get_capture_history_job
+from backend.app.services.fine_job.boss_capture_history import (
+    get_capture_history_job,
+    update_capture_job_delivery_evaluation,
+)
 from backend.app.services.fine_job.boss_scraper.service import BossCaptureRequest, boss_scraper_service
 from backend.app.services.fine_job.filter_exclusions import apply_filter_exclusions
 from backend.app.services.fine_job.job_evaluation import evaluate_filter_strategy
@@ -64,6 +67,7 @@ def create_deep_job_search_run(
             "scroll_batch_size": int(payload.get("scroll_batch_size") or 3),
             "max_depth": max_depth,
             "low_yield_streak_limit": int(payload.get("low_yield_streak_limit") or 3),
+            "jd_batch_size": int(payload.get("jd_batch_size") or 3),
             "candidate_target_count": candidate_target,
         },
         "created_from": created_from,
@@ -117,7 +121,8 @@ def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: st
     capture_task_id = str(task["operation_ref_id"] or "")
     if not capture_task_id:
         if not boss_scraper_service.get_browser_status().running:
-            raise AppError(409, "BROWSER_NOT_RUNNING", "FineJob 专用 Chrome 未启动，无法开始 deep_job_search。")
+            _wait_for_user(db, workflow_run_id, "browser_not_running", "FineJob 专用 Chrome 未启动，暂不能继续 deep_job_search。")
+            return get_workflow_run(db, workflow_run_id)
         pages = min(int(contract["stop_policy"]["min_depth"]), 10)
         capture = boss_capture_task_manager.start_capture(
             BossCaptureRequest(
@@ -163,6 +168,120 @@ def get_context_snapshot(db: Database, workflow_run_id: str, channel: str = "dee
     if row is None:
         raise AppError(404, "CONTEXT_SNAPSHOT_NOT_FOUND", "本轮上下文快照不存在。")
     return _serialize_snapshot(row)
+
+
+def list_workflow_analysis_items(db: Database, workflow_run_id: str) -> dict[str, object]:
+    _require_run(db, workflow_run_id)
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM fj_workflow_tasks
+            WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis'
+            ORDER BY created_at
+            """,
+            (workflow_run_id,),
+        ).fetchall()
+    return {"workflow_run_id": workflow_run_id, "items": [_serialize_task(row) for row in rows]}
+
+
+def get_workflow_analysis_item_context(
+    db: Database, workflow_run_id: str, workflow_task_id: str
+) -> dict[str, object]:
+    run = _require_run(db, workflow_run_id)
+    with db.connect() as connection:
+        item = connection.execute(
+            """
+            SELECT * FROM fj_workflow_tasks
+            WHERE id = ? AND workflow_run_id = ? AND task_type = 'deep_job_search_analysis'
+            """,
+            (workflow_task_id, workflow_run_id),
+        ).fetchone()
+    if item is None:
+        raise AppError(404, "WORKFLOW_ANALYSIS_ITEM_NOT_FOUND", "Workflow 分析 Item 不存在。")
+    payload = _load(item["payload_json"], {})
+    job_id = str(payload.get("job_id") or "")
+    job = get_capture_history_job(db, job_id)
+    if str(job.get("detail_status") or "") != "completed":
+        raise AppError(409, "CAPTURE_NOT_READY", "当前 Item 缺少完整 JD，不能进入 Codex 分析。")
+    contract = _load(run["completion_contract_json"], {})
+    strategy = get_filter_strategy(db, str(contract["selected_strategy_ids"]["filter_strategy_id"]))
+    shared = get_context_snapshot(db, workflow_run_id, "candidate_analysis")
+    sections = [
+        _section("analysis_item", "analysis_item", {"workflow_task_id": workflow_task_id, "job_id": job_id}, "workflow_task", None, True, ""),
+        _section("job_material", "analysis_item", _compact_job_for_analysis(job), "boss_job", int(job.get("detail_version") or 0), True, "只包含当前岗位的 JD 与必要岗位事实。"),
+        _section("strategy_reference", "analysis_item", {"filter_strategy_id": strategy["id"], "strategy_version": strategy.get("strategy_version")}, "filter_strategy", int(strategy.get("strategy_version") or 1), True, ""),
+        _section("shared_base_reference", "analysis_item", {"context_snapshot_id": shared["context_snapshot_id"], "profile_versions": _shared_profile_versions(shared)}, "workflow_context_snapshot", None, True, "候选人事实与偏好请复用已读取的 Shared Base。"),
+        _section("applied_feedback", "analysis_item", {"applied_feedback_ids": contract.get("applied_feedback_ids") or [], "applied_preference_ids": contract.get("applied_preference_ids") or []}, "workflow_contract", 1, True, ""),
+        _section("complete_resume", "excluded", None, "resume", None, False, "单 Item 默认不注入完整简历。"),
+        _section("historical_payload", "excluded", None, "boss_job", None, False, "单 Item 默认不注入历史岗位 payload。"),
+        _section("unrelated_qa", "excluded", None, "profile_qa", None, False, "单 Item 默认不注入无关 QA。"),
+        _section("unrelated_chat", "excluded", None, "chat", None, False, "单 Item 默认不注入无关聊天。"),
+    ]
+    snapshot = _save_context_snapshot(
+        db,
+        workflow_run_id,
+        f"analysis_item:{workflow_task_id}",
+        sections,
+        int(shared["soft_budget_characters"]),
+    )
+    if snapshot["status"] == "blocked":
+        raise AppError(409, "CONTEXT_SNAPSHOT_BLOCKED", str(snapshot["blocker_reason"]))
+    return {
+        "workflow_run_id": workflow_run_id,
+        "workflow_task_id": workflow_task_id,
+        "job_id": job_id,
+        "shared_context_snapshot_id": shared["context_snapshot_id"],
+        "item_context_snapshot": snapshot,
+        "expected_output": {"decision": "recommend | review | reject", "confidence": "0 到 1", "summary": "简要结论", "reasons": ["依据"], "risks": ["风险"]},
+    }
+
+
+def record_workflow_analysis_result(
+    db: Database,
+    config: AppConfig,
+    workflow_run_id: str,
+    workflow_task_id: str,
+    *,
+    decision: str,
+    evaluation_id: str,
+    evaluation: dict[str, object],
+) -> dict[str, object]:
+    if decision not in {"recommend", "review", "reject"}:
+        raise AppError(422, "VALIDATION_FAILED", "Workflow 分析结论无效。")
+    run = _require_run(db, workflow_run_id)
+    with db.connect() as connection:
+        item = connection.execute(
+            "SELECT * FROM fj_workflow_tasks WHERE id = ? AND workflow_run_id = ? AND task_type = 'deep_job_search_analysis'",
+            (workflow_task_id, workflow_run_id),
+        ).fetchone()
+    if item is None:
+        raise AppError(404, "WORKFLOW_ANALYSIS_ITEM_NOT_FOUND", "Workflow 分析 Item 不存在。")
+    if item["status"] == "succeeded":
+        return get_workflow_run(db, workflow_run_id)
+    payload = _load(item["payload_json"], {})
+    job_id = str(payload.get("job_id") or "")
+    job = get_capture_history_job(db, job_id)
+    update_capture_job_delivery_evaluation(db, job=job, evaluation=evaluation)
+    _finish_task(
+        db,
+        workflow_task_id,
+        "succeeded",
+        payload,
+        {"job_id": job_id, "decision": decision, "evaluation_id": evaluation_id},
+    )
+    _refresh_counts(db, workflow_run_id)
+    refreshed = _require_run(db, workflow_run_id)
+    contract = _load(refreshed["completion_contract_json"], {})
+    if int(refreshed["completed_count"] or 0) >= int(contract["target_count"]):
+        _update_run(db, workflow_run_id, status="completed", current_step="completed", next_action="", next_action_reason="已达到本轮正式 recommend 目标。", completed_at=utc_now())
+        return get_workflow_run(db, workflow_run_id)
+    if _next_analysis_task(db, workflow_run_id) is not None:
+        _update_run(db, workflow_run_id, status="waiting_codex", current_step="waiting_codex", next_action="codex_analysis", next_action_reason="当前 JD 批次仍有待保存的岗位分析 Item。")
+        return get_workflow_run(db, workflow_run_id)
+    if _create_jd_tasks(db, workflow_run_id, int(contract["stop_policy"]["candidate_target_count"])):
+        return advance_deep_job_search(db, config, workflow_run_id)
+    _resume_search_or_wait(db, config, workflow_run_id)
+    return get_workflow_run(db, workflow_run_id)
 
 
 def attach_codex_session(db: Database, workflow_run_id: str, codex_session_ref: str, codex_runtime_id: str | None) -> dict[str, object]:
@@ -264,18 +383,12 @@ def _decide_next_step(db: Database, config: AppConfig, workflow_run_id: str, tas
     return advance_deep_job_search(db, config, workflow_run_id)
 
 
-def _create_jd_tasks(db: Database, workflow_run_id: str, candidate_target: int) -> None:
-    """从已形成的候选池中选择少量岗位补齐 JD，保持搜索与分析边界清晰。"""
+def _create_jd_tasks(db: Database, workflow_run_id: str, candidate_target: int) -> int:
+    """按稳定发现顺序选择尚未处理的候选，创建一个小批次 JD 任务。"""
     run = _require_run(db, workflow_run_id)
     contract = _load(run["completion_contract_json"], {})
-    jd_target = min(int(contract.get("target_count") or 0), candidate_target)
+    jd_target = min(int(contract["stop_policy"].get("jd_batch_size") or 3), candidate_target)
     with db.connect() as connection:
-        existing = int(connection.execute(
-            "SELECT COUNT(*) FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_jd'",
-            (workflow_run_id,),
-        ).fetchone()[0])
-        if existing:
-            return
         candidates = connection.execute(
             """
             SELECT d.job_id
@@ -284,12 +397,19 @@ def _create_jd_tasks(db: Database, workflow_run_id: str, candidate_target: int) 
               AND d.is_run_first_discovery = 1
               AND d.is_historical_duplicate = 0
               AND d.is_filter_candidate = 1
-            ORDER BY d.discovered_at ASC
+              AND NOT EXISTS (
+                SELECT 1 FROM fj_workflow_tasks t
+                WHERE t.workflow_run_id = d.workflow_run_id
+                  AND t.task_type IN ('deep_job_search_jd', 'deep_job_search_analysis')
+                  AND json_extract(t.payload_json, '$.job_id') = d.job_id
+              )
+            ORDER BY d.discovered_at ASC, d.job_id ASC
             LIMIT ?
             """,
             (workflow_run_id, jd_target),
         ).fetchall()
         now = utc_now()
+        batch_id = new_id()
         for candidate in candidates:
             job_id = str(candidate["job_id"])
             connection.execute(
@@ -298,16 +418,19 @@ def _create_jd_tasks(db: Database, workflow_run_id: str, candidate_target: int) 
                   id, workflow_run_id, task_type, payload_json, result_json, created_at, updated_at
                 ) VALUES (?, ?, 'deep_job_search_jd', ?, '{}', ?, ?)
                 """,
-                (new_id(), workflow_run_id, _dump({"job_id": job_id}), now, now),
+                (new_id(), workflow_run_id, _dump({"job_id": job_id, "jd_batch_id": batch_id}), now, now),
             )
+    if not candidates:
+        return 0
     _update_run(
         db,
         workflow_run_id,
         status="running",
         current_step="collecting_jd",
         next_action="collect_jd",
-        next_action_reason="新岗位候选池已达到目标，正在按优先级补齐少量岗位 JD。",
+        next_action_reason="新岗位候选池已达到目标，正在按发现顺序补齐一小批岗位 JD。",
     )
+    return len(candidates)
 
 
 def _advance_jd_collection(
@@ -327,7 +450,10 @@ def _advance_jd_collection(
         job = get_capture_history_job(db, job_id)
         if str(job.get("detail_status") or "") == "completed":
             _finish_task(db, task["id"], "succeeded", payload, {"job_id": job_id, "reused_detail": True})
-            return advance_deep_job_search(db, config, workflow_run_id)
+            if _next_jd_task(db, workflow_run_id) is not None:
+                return advance_deep_job_search(db, config, workflow_run_id)
+            _finish_jd_collection(db, config, workflow_run_id, contract)
+            return get_workflow_run(db, workflow_run_id)
         if not boss_scraper_service.get_browser_status().running:
             _wait_for_user(db, workflow_run_id, "browser_not_running", "候选池已形成，但浏览器未启动，暂不能采集岗位 JD。")
             return get_workflow_run(db, workflow_run_id)
@@ -357,38 +483,77 @@ def _advance_jd_collection(
             _finish_task(db, task["id"], "failed", payload, {"job_id": job_id, "error": "JD 采集没有返回完整详情。"})
     if _next_jd_task(db, workflow_run_id) is not None:
         return advance_deep_job_search(db, config, workflow_run_id)
-    _finish_jd_collection(db, workflow_run_id, contract)
+    _finish_jd_collection(db, config, workflow_run_id, contract)
     return get_workflow_run(db, workflow_run_id)
 
 
-def _finish_jd_collection(db: Database, workflow_run_id: str, contract: dict[str, Any]) -> None:
+def _finish_jd_collection(
+    db: Database, config: AppConfig, workflow_run_id: str, contract: dict[str, Any]
+) -> None:
     with db.connect() as connection:
         rows = connection.execute(
             "SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_jd' ORDER BY created_at",
             (workflow_run_id,),
         ).fetchall()
-    succeeded = [row for row in rows if row["status"] == "succeeded"]
-    target = min(int(contract.get("target_count") or 0), int(contract["stop_policy"]["candidate_target_count"]))
-    if len(succeeded) < target:
-        _wait_for_user(db, workflow_run_id, "jd_incomplete", "候选池已形成，但可用 JD 数量未达到分析目标。")
+    succeeded = [row for row in rows if row["status"] == "succeeded" and not _analysis_exists_for_job(db, workflow_run_id, str(_load(row["payload_json"], {}).get("job_id") or ""))]
+    if succeeded:
+        _create_analysis_tasks(db, workflow_run_id, succeeded, contract)
         return
-    snapshot = _create_candidate_analysis_snapshot(db, workflow_run_id, [str(_load(row["payload_json"], {}).get("job_id") or "") for row in succeeded], contract)
+    if _create_jd_tasks(db, workflow_run_id, int(contract["stop_policy"]["candidate_target_count"])):
+        advance_deep_job_search(db, config, workflow_run_id)
+        return
+    _resume_search_or_wait(db, config, workflow_run_id)
+
+
+def _create_analysis_tasks(
+    db: Database,
+    workflow_run_id: str,
+    jd_rows: list[Any],
+    contract: dict[str, Any],
+) -> None:
+    job_ids = [str(_load(row["payload_json"], {}).get("job_id") or "") for row in jd_rows]
+    snapshot = _create_candidate_analysis_snapshot(db, workflow_run_id, contract)
     if snapshot["status"] == "blocked":
         _wait_for_user(db, workflow_run_id, "context_budget_exceeded", str(snapshot["blocker_reason"]))
         return
-    _update_run(db, workflow_run_id, status="waiting_codex", current_step="waiting_codex", next_action="codex_analysis", next_action_reason="候选岗位 JD 与真实分析上下文均已准备完成。")
+    now = utc_now()
+    with db.connect() as connection:
+        for jd_row, job_id in zip(jd_rows, job_ids, strict=True):
+            if not job_id:
+                continue
+            connection.execute(
+                """
+                INSERT INTO fj_workflow_tasks (
+                  id, workflow_run_id, task_type, payload_json, result_json, created_at, updated_at
+                ) VALUES (?, ?, 'deep_job_search_analysis', ?, '{}', ?, ?)
+                """,
+                (new_id(), workflow_run_id, _dump({"job_id": job_id, "jd_task_id": jd_row["id"]}), now, now),
+            )
+    _update_run(
+        db,
+        workflow_run_id,
+        status="waiting_codex",
+        current_step="waiting_codex",
+        next_action="codex_analysis",
+        next_action_reason="本批岗位 JD 已准备完成，等待 Codex 逐岗位保存正式分析结果。",
+    )
 
 
 def _create_candidate_analysis_snapshot(
-    db: Database, workflow_run_id: str, job_ids: list[str], contract: dict[str, Any]
+    db: Database, workflow_run_id: str, contract: dict[str, Any]
 ) -> dict[str, object]:
     profile = ensure_default_profile(db)
-    profile_context = get_profile_context(db, str(profile["id"]), view="evaluation", persist_artifact=False)
-    jobs = [get_capture_history_job(db, job_id) for job_id in job_ids if job_id]
+    profile_context = get_profile_context(db, str(profile["id"]), view="search", persist_artifact=False)
+    strategy = get_filter_strategy(db, str(contract["selected_strategy_ids"]["filter_strategy_id"]))
     sections = [
-        _section("task_goal", "shared_base", {"target_count": contract["target_count"], "external_action_policy": contract["external_action_policy"]}, "workflow_run", 1, True, ""),
-        _section("candidate_profile", "task_channel", {"profile_id": profile_context["profile_id"], "versions": profile_context["versions"], "markdown": profile_context["markdown"]}, "candidate_profile", int(profile_context["artifact_version"]), True, ""),
-        _section("candidate_jds", "task_channel", jobs, "boss_job", None, True, ""),
+        _section("task_goal", "shared_base", {"target_count": contract["target_count"], "counting_rule": "saved_unique_recommend", "external_action_policy": contract["external_action_policy"]}, "workflow_run", 1, True, ""),
+        _section("candidate_facts", "shared_base", {"profile_id": profile_context["profile_id"], "versions": profile_context["versions"], "facts_markdown": profile_context["markdown"]}, "candidate_profile", int(profile_context["artifact_version"]), True, "已使用 search 视图，不包含完整简历或 normalized resume。"),
+        _section("filter_strategy_summary", "shared_base", _compact_filter_strategy(strategy), "filter_strategy", int(strategy.get("strategy_version") or 1), True, ""),
+        _section("applied_feedback", "shared_base", {"applied_feedback_ids": contract.get("applied_feedback_ids") or [], "applied_preference_ids": contract.get("applied_preference_ids") or []}, "workflow_contract", 1, True, "仅保存已应用引用，不注入无关反馈全文。"),
+        _section("complete_resume", "excluded", None, "resume", None, False, "岗位评估默认不注入完整简历。"),
+        _section("normalized_resume", "excluded", None, "resume", None, False, "岗位评估默认不注入 normalized resume 全文。"),
+        _section("historical_job_payload", "excluded", None, "boss_job", None, False, "岗位历史 payload 只在单 Item 中按需读取必要 JD 字段。"),
+        _section("unrelated_qa", "excluded", None, "profile_qa", None, False, "岗位评估默认不注入无关 QA。"),
         _section("unrelated_chat", "excluded", None, "chat", None, False, "岗位分析不读取无关聊天。"),
     ]
     characters = sum(int(item["character_count"]) for item in sections if item["included"])
@@ -444,6 +609,77 @@ def _section(section_id: str, section_type: str, content: object, source: str, v
     return {"section_id": section_id, "section_type": section_type, "source": source, "source_version": version, "included": included, "exclusion_reason": exclusion_reason, "character_count": len(rendered), "estimated_tokens": _estimate_tokens(len(rendered)), "content": content}
 
 
+def _compact_filter_strategy(strategy: dict[str, object]) -> dict[str, object]:
+    fields = (
+        "id", "strategy_version", "title_include_any", "title_include_all", "title_exclude",
+        "company_include", "company_exclude", "company_scales", "company_industries",
+        "company_stages", "degrees", "experiences", "job_types", "monthly_salary_min",
+        "monthly_salary_max_at_least", "daily_salary_min", "skill_include_any",
+        "skill_include_all", "skill_exclude", "unknown_value_policy",
+    )
+    return {field: strategy.get(field) for field in fields}
+
+
+def _compact_job_for_analysis(job: dict[str, object]) -> dict[str, object]:
+    detail = job.get("detail") if isinstance(job.get("detail"), dict) else {}
+    return {
+        "job_id": job.get("id"),
+        "source_job_id": job.get("job_id"),
+        "title": job.get("title"),
+        "company_name": job.get("boss_name") or job.get("company_name"),
+        "salary": job.get("salary"),
+        "location": job.get("location"),
+        "experience": job.get("experience"),
+        "degree": job.get("degree"),
+        "skills": job.get("skills"),
+        "job_detail_version": job.get("detail_version"),
+        "jd": detail,
+    }
+
+
+def _shared_profile_versions(snapshot: dict[str, object]) -> dict[str, object]:
+    for section in snapshot.get("sections", []):
+        if isinstance(section, dict) and section.get("section_id") == "candidate_facts":
+            content = section.get("content")
+            if isinstance(content, dict) and isinstance(content.get("versions"), dict):
+                return content["versions"]
+    return {}
+
+
+def _save_context_snapshot(
+    db: Database,
+    workflow_run_id: str,
+    channel: str,
+    sections: list[dict[str, object]],
+    soft_budget: int,
+) -> dict[str, object]:
+    characters = sum(int(item["character_count"]) for item in sections if item["included"])
+    status = "blocked" if characters > soft_budget else "ready"
+    blocker = "上下文超过本轮软预算，请先缩小本轮范围后继续。" if status == "blocked" else ""
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO fj_workflow_context_snapshots (
+              id, workflow_run_id, channel, snapshot_json, context_characters,
+              estimated_tokens, soft_budget_characters, hard_budget_characters,
+              status, blocker_reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(workflow_run_id, channel) DO UPDATE SET
+              snapshot_json = excluded.snapshot_json,
+              context_characters = excluded.context_characters,
+              estimated_tokens = excluded.estimated_tokens,
+              soft_budget_characters = excluded.soft_budget_characters,
+              hard_budget_characters = excluded.hard_budget_characters,
+              status = excluded.status,
+              blocker_reason = excluded.blocker_reason,
+              created_at = excluded.created_at
+            """,
+            (new_id(), workflow_run_id, channel, _dump({"sections": sections}), characters, _estimate_tokens(characters), soft_budget, HARD_CONTEXT_BUDGET, status, blocker, now),
+        )
+    return get_context_snapshot(db, workflow_run_id, channel)
+
+
 def _next_task(db: Database, workflow_run_id: str):
     with db.connect() as connection:
         return connection.execute("SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search' AND status IN ('pending', 'running') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, created_at LIMIT 1", (workflow_run_id,)).fetchone()
@@ -454,15 +690,38 @@ def _next_jd_task(db: Database, workflow_run_id: str):
         return connection.execute("SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_jd' AND status IN ('pending', 'running') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, created_at LIMIT 1", (workflow_run_id,)).fetchone()
 
 
+def _next_analysis_task(db: Database, workflow_run_id: str):
+    with db.connect() as connection:
+        return connection.execute("SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis' AND status IN ('pending', 'running') ORDER BY created_at LIMIT 1", (workflow_run_id,)).fetchone()
+
+
+def _analysis_exists_for_job(db: Database, workflow_run_id: str, job_id: str) -> bool:
+    if not job_id:
+        return True
+    with db.connect() as connection:
+        return connection.execute("SELECT 1 FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis' AND json_extract(payload_json, '$.job_id') = ? LIMIT 1", (workflow_run_id, job_id)).fetchone() is not None
+
+
+def _resume_search_or_wait(db: Database, config: AppConfig, workflow_run_id: str) -> None:
+    _update_run(db, workflow_run_id, status="pending", current_step="searching", next_action="continue_search", next_action_reason="当前候选池已处理完，继续寻找 fresh_only 候选。", waiting_for_user=0, stop_reason="")
+    if _next_task(db, workflow_run_id) is None:
+        _wait_for_user(db, workflow_run_id, "new_jobs_insufficient", "已批准搜索组合与候选池均已处理完，仍未达到正式 recommend 目标。")
+        return
+    advance_deep_job_search(db, config, workflow_run_id)
+
+
 def _refresh_counts(db: Database, workflow_run_id: str) -> None:
     with db.connect() as connection:
         fresh = int(connection.execute("SELECT COUNT(DISTINCT d.job_id) FROM fj_workflow_job_discoveries d WHERE d.workflow_run_id = ? AND d.is_run_first_discovery = 1 AND d.is_historical_duplicate = 0 AND d.is_filter_candidate = 1", (workflow_run_id,)).fetchone()[0])
         run = _require_run(db, workflow_run_id)
         target = int(_load(run["completion_contract_json"], {}).get("target_count") or 0)
+        completed = int(connection.execute("SELECT COUNT(DISTINCT json_extract(result_json, '$.job_id')) FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis' AND status = 'succeeded' AND json_extract(result_json, '$.decision') = 'recommend'", (workflow_run_id,)).fetchone()[0])
+        available = int(connection.execute("""SELECT COUNT(DISTINCT d.job_id) FROM fj_workflow_job_discoveries d WHERE d.workflow_run_id = ? AND d.is_run_first_discovery = 1 AND d.is_historical_duplicate = 0 AND d.is_filter_candidate = 1 AND NOT EXISTS (SELECT 1 FROM fj_workflow_tasks t WHERE t.workflow_run_id = d.workflow_run_id AND t.task_type IN ('deep_job_search_jd', 'deep_job_search_analysis') AND json_extract(t.payload_json, '$.job_id') = d.job_id)""", (workflow_run_id,)).fetchone()[0])
         telemetry = _load(run["telemetry_json"], {})
         telemetry["fresh_candidates"] = fresh
+        telemetry["available_fresh_candidates"] = available
         telemetry["search_batches"] = int(connection.execute("SELECT COUNT(*) FROM fj_workflow_tasks WHERE workflow_run_id = ?", (workflow_run_id,)).fetchone()[0])
-        connection.execute("UPDATE fj_workflow_runs SET completed_count = ?, remaining_count = ?, telemetry_json = ?, updated_at = ? WHERE id = ?", (0, target, _dump(telemetry), utc_now(), workflow_run_id))
+        connection.execute("UPDATE fj_workflow_runs SET completed_count = ?, remaining_count = ?, telemetry_json = ?, updated_at = ? WHERE id = ?", (completed, max(0, target - completed), _dump(telemetry), utc_now(), workflow_run_id))
 
 
 def _update_task_operation(db: Database, task_id: str, operation_id: str, status: str, payload: dict[str, Any]) -> None:

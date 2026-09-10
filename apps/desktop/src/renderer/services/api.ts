@@ -1421,9 +1421,14 @@ export const api = {
   async listFineJobChatReviewTasks() {
     return request<FineJobChatReviewTaskListEnvelope>("/api/fine-job/boss-chat/review-tasks");
   },
-  async getFineJobWorkflowContextSnapshot(workflowRunId: string) {
+  async getFineJobWorkflowContextSnapshot(workflowRunId: string, channel = "deep_job_search") {
     return request<FineJobWorkflowContextSnapshot>(
-      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/context-snapshot`
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/context-snapshot?channel=${encodeURIComponent(channel)}`
+    );
+  },
+  async getFineJobWorkflowRun(workflowRunId: string) {
+    return request<FineJobWorkflowRun>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}`
     );
   },
   async createFineJobDeepJobSearchRun(payload: {

@@ -62,6 +62,11 @@ from backend.app.utils import new_id, utc_now
 CORE_TOOLS = (
     "finejob.get_capabilities",
     "finejob.get_job_hunt_refresh_run",
+    "finejob.get_workflow_context_snapshot",
+    "finejob.get_workflow_run",
+    "finejob.list_workflow_analysis_items",
+    "finejob.get_workflow_analysis_item_context",
+    "finejob.save_workflow_analysis_item",
     "finejob.list_job_hunt_refresh_items",
     "finejob.refresh_job_hunt_chat_batch",
     "finejob.refresh_job_hunt_chat_messages",
@@ -71,7 +76,6 @@ CORE_TOOLS = (
     "finejob.list_job_hunt_refresh_analysis_items",
     "finejob.save_job_hunt_refresh_analysis",
     "finejob.complete_job_hunt_refresh_run",
-    "finejob.get_workflow_context_snapshot",
     "finejob.search_jobs",
     "finejob.list_companies",
     "finejob.set_company_type",
@@ -171,7 +175,11 @@ class CodexToolService:
             "finejob.list_job_hunt_refresh_analysis_items": self.list_job_hunt_refresh_analysis_items,
             "finejob.save_job_hunt_refresh_analysis": self.save_job_hunt_refresh_analysis,
             "finejob.complete_job_hunt_refresh_run": self.complete_job_hunt_refresh_run,
+            "finejob.get_workflow_run": self.get_workflow_run,
             "finejob.get_workflow_context_snapshot": self.get_workflow_context_snapshot,
+            "finejob.list_workflow_analysis_items": self.list_workflow_analysis_items,
+            "finejob.get_workflow_analysis_item_context": self.get_workflow_analysis_item_context,
+            "finejob.save_workflow_analysis_item": self.save_workflow_analysis_item,
             "finejob.list_job_strategies": self.list_job_strategies,
             "finejob.get_job_evaluation_context": self.get_job_evaluation_context,
             "finejob.start_job_capture": self.start_job_capture,
@@ -422,6 +430,122 @@ class CodexToolService:
             data=snapshot,
             terminal=True,
             message="Workflow Run 的真实上下文快照已读取。",
+        )
+
+    def get_workflow_run(self, arguments: dict[str, Any]) -> dict[str, object]:
+        workflow_run_id = str(arguments.get("workflow_run_id") or "").strip()
+        run = workflow_runs.get_workflow_run(self.db, workflow_run_id)
+        return _result(
+            result_type="data",
+            status=str(run["status"]),
+            resource=_resource("workflow_run", workflow_run_id),
+            data=run,
+            terminal=True,
+        )
+
+    def list_workflow_analysis_items(self, arguments: dict[str, Any]) -> dict[str, object]:
+        workflow_run_id = str(arguments.get("workflow_run_id") or "").strip()
+        data = workflow_runs.list_workflow_analysis_items(self.db, workflow_run_id)
+        return _result(
+            result_type="data",
+            status="succeeded",
+            resource=_resource("workflow_run", workflow_run_id),
+            data=data,
+            terminal=True,
+        )
+
+    def get_workflow_analysis_item_context(self, arguments: dict[str, Any]) -> dict[str, object]:
+        workflow_run_id = str(arguments.get("workflow_run_id") or "").strip()
+        workflow_task_id = str(arguments.get("workflow_task_id") or "").strip()
+        data = workflow_runs.get_workflow_analysis_item_context(
+            self.db, workflow_run_id, workflow_task_id
+        )
+        return _result(
+            result_type="data",
+            status="succeeded",
+            resource=_resource("workflow_analysis_item", workflow_task_id),
+            data=data,
+            terminal=True,
+        )
+
+    def save_workflow_analysis_item(self, arguments: dict[str, Any]) -> dict[str, object]:
+        workflow_run_id = str(arguments.get("workflow_run_id") or "").strip()
+        workflow_task_id = str(arguments.get("workflow_task_id") or "").strip()
+        items = workflow_runs.list_workflow_analysis_items(self.db, workflow_run_id)["items"]
+        existing = next(
+            (item for item in items if item.get("workflow_task_id") == workflow_task_id),
+            None,
+        )
+        if existing is None:
+            raise AppError(404, "WORKFLOW_ANALYSIS_ITEM_NOT_FOUND", "Workflow 分析 Item 不存在。")
+        if existing.get("status") == "succeeded":
+            run = workflow_runs.get_workflow_run(self.db, workflow_run_id)
+            return _result(
+                result_type="data",
+                status=str(run["status"]),
+                resource=_resource("workflow_analysis_item", workflow_task_id),
+                data=run,
+                terminal=True,
+                message="该 Workflow Item 已保存，未重复写入岗位评估。",
+            )
+        context = workflow_runs.get_workflow_analysis_item_context(
+            self.db, workflow_run_id, workflow_task_id
+        )
+        item_snapshot = context["item_context_snapshot"]
+        sections = item_snapshot.get("sections", []) if isinstance(item_snapshot, dict) else []
+        job_material = next(
+            (item.get("content") for item in sections if isinstance(item, dict) and item.get("section_id") == "job_material"),
+            {},
+        )
+        shared = workflow_runs.get_context_snapshot(self.db, workflow_run_id, "candidate_analysis")
+        profile = next(
+            (item.get("content") for item in shared.get("sections", []) if isinstance(item, dict) and item.get("section_id") == "candidate_facts"),
+            {},
+        )
+        if not isinstance(job_material, dict) or not isinstance(profile, dict):
+            raise AppError(409, "WORKFLOW_CONTEXT_INVALID", "Workflow 分析上下文不完整，请重新读取 Item Context。")
+        decision = str(arguments.get("decision") or arguments.get("conclusion") or "review")
+        saved = self.save_job_evaluation(
+            {
+                "job_id": str(context["job_id"]),
+                "profile_id": str(profile.get("profile_id") or ""),
+                "profile_context_version": int((profile.get("versions") or {}).get("context_version") or 0),
+                "job_detail_version": int(job_material.get("job_detail_version") or 0),
+                "decision": decision,
+                "confidence": arguments.get("confidence"),
+                "reasons": arguments.get("reasons") or [],
+                "risks": arguments.get("risks") or [],
+                "matches": arguments.get("matches") or arguments.get("strengths") or [],
+                "gaps": arguments.get("gaps") or [],
+                "suggestion": arguments.get("summary") or arguments.get("suggestion") or "",
+            }
+        )
+        saved_data = saved.get("data") if isinstance(saved.get("data"), dict) else {}
+        result = workflow_runs.record_workflow_analysis_result(
+            self.db,
+            self.config,
+            workflow_run_id,
+            workflow_task_id,
+            decision=decision,
+            evaluation_id=str(saved_data.get("evaluation_id") or ""),
+            evaluation={
+                "decision": decision,
+                "confidence": arguments.get("confidence") or 0,
+                "summary": arguments.get("summary") or arguments.get("suggestion") or "",
+                "reasons": arguments.get("reasons") or [],
+                "risks": arguments.get("risks") or [],
+                "matches": arguments.get("matches") or arguments.get("strengths") or [],
+                "gaps": arguments.get("gaps") or [],
+                "source": "codex_workflow",
+            },
+        )
+        return _result(
+            result_type="data",
+            status=str(result["status"]),
+            resource=_resource("workflow_analysis_item", workflow_task_id),
+            data=result,
+            terminal=True,
+            message="Workflow Item 分析已保存，并已按正式 recommend 结果更新 Run 进度。",
         )
 
     def list_companies(self, arguments: dict[str, Any]) -> dict[str, object]:
