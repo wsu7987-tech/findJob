@@ -19,6 +19,7 @@ export const useFineJobBossHistoryStore = defineStore("fineJobBossHistory", () =
   const detailTask = ref<FineJobBossCaptureTask | null>(null);
   const detailJobId = ref<string | null>(null);
   const deliveryJobId = ref<string | null>(null);
+  const deletingJobId = ref<string | null>(null);
   let detailPollTimer: ReturnType<typeof setTimeout> | null = null;
 
   const load = async (query: FineJobBossHistoryQuery = {}) => {
@@ -84,6 +85,21 @@ export const useFineJobBossHistoryStore = defineStore("fineJobBossHistory", () =
     }
   };
 
+  const deleteHistoryJob = async (historyJobId: string) => {
+    error.value = null;
+    deletingJobId.value = historyJobId;
+    try {
+      await api.deleteFineJobBossCaptureHistoryJob(historyJobId);
+      items.value = items.value.filter((item) => item.id !== historyJobId);
+      total.value = Math.max(0, total.value - 1);
+    } catch (errorValue) {
+      error.value = mapError(errorValue);
+      throw errorValue;
+    } finally {
+      deletingJobId.value = null;
+    }
+  };
+
   const refreshDetailTask = async (taskId: string) => {
     try {
       detailTask.value = await api.getFineJobBossCaptureTask(taskId);
@@ -132,9 +148,11 @@ export const useFineJobBossHistoryStore = defineStore("fineJobBossHistory", () =
     detailTask,
     detailJobId,
     deliveryJobId,
+    deletingJobId,
     load,
     captureDetails,
     evaluateDelivery,
+    deleteHistoryJob,
     stopDetailPolling,
     clearDetailTask
   };
@@ -144,5 +162,5 @@ const mapError = (errorValue: unknown) => {
   if (errorValue instanceof ApiError || errorValue instanceof NetworkError) {
     return errorValue.message;
   }
-  return (errorValue as Error).message || "历史采集记录加载失败。";
+  return (errorValue as Error).message || "岗位记录加载失败。";
 };

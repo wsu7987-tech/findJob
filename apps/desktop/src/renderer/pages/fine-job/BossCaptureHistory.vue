@@ -6,13 +6,11 @@ import { useRoute, useRouter } from "vue-router";
 import { ApiError, api } from "@/services/api";
 import { formatDateTime } from "@/services/format";
 import { useFineJobBossCaptureStore } from "@/stores/fineJobBossCapture";
-import { useFineJobBossExecutorStore } from "@/stores/fineJobBossExecutor";
 import { useFineJobBossHistoryStore } from "@/stores/fineJobBossHistory";
 import { useFineJobStrategiesStore } from "@/stores/fineJobStrategies";
 import type { FineJobBossHistoryJob, FineJobBossHistorySortField, FineJobJobJourney } from "@/types";
 
 const captureStore = useFineJobBossCaptureStore();
-const executorStore = useFineJobBossExecutorStore();
 const historyStore = useFineJobBossHistoryStore();
 const strategiesStore = useFineJobStrategiesStore();
 const route = useRoute();
@@ -43,6 +41,9 @@ const filters = reactive({
   companyIndustry: "",
   companyStage: "",
   detailStatus: "",
+  filterStatus: "",
+  deliveryDecision: "",
+  pipelineStage: "",
   repeatStatus: "all" as "all" | "first_seen" | "repeated",
   sortBy: "last_collected_at" as FineJobBossHistorySortField,
   sortOrder: "desc" as "asc" | "desc"
@@ -67,6 +68,9 @@ const queryPayload = computed(() => ({
   company_industry: filters.companyIndustry,
   company_stage: filters.companyStage,
   detail_status: filters.detailStatus,
+  filter_status: filters.filterStatus,
+  delivery_decision: filters.deliveryDecision,
+  pipeline_stage: filters.pipelineStage,
   repeat_status: filters.repeatStatus,
   collected_from: dateRange.value[0] ? `${dateRange.value[0]}T00:00:00Z` : "",
   collected_to: dateRange.value[1] ? `${dateRange.value[1]}T23:59:59Z` : "",
@@ -79,7 +83,9 @@ const detailTaskRunning = computed(
   () => historyStore.detailTask?.status === "queued" || historyStore.detailTask?.status === "running"
 );
 const historyActionRunning = computed(
-  () => detailTaskRunning.value || historyStore.deliveryJobId !== null
+  () => detailTaskRunning.value
+    || historyStore.deliveryJobId !== null
+    || historyStore.deletingJobId !== null
 );
 const detailProgressPercentage = computed(() => {
   const task = historyStore.detailTask;
@@ -91,7 +97,7 @@ const loadHistory = async () => {
   try {
     await historyStore.load(queryPayload.value);
   } catch {
-    ElMessage.error(historyStore.error ?? "历史采集记录加载失败");
+    ElMessage.error(historyStore.error ?? "岗位记录加载失败");
   }
 };
 
@@ -109,6 +115,9 @@ const reset = async () => {
     companyIndustry: "",
     companyStage: "",
     detailStatus: "",
+    filterStatus: "",
+    deliveryDecision: "",
+    pipelineStage: "",
     repeatStatus: "all"
   });
   dateRange.value = [];
@@ -220,17 +229,42 @@ const loadJourney = async (jobId: string) => {
 const openDetail = (job: FineJobBossHistoryJob) => {
   selectedJob.value = job;
   selectedJourney.value = null;
-  expandedJourneySections.value = [];
+  expandedJourneySections.value = ["journey"];
   detailDrawerOpen.value = true;
   void loadJourney(job.id);
 };
 
-const openInDedicatedBrowser = async (job: FineJobBossHistoryJob) => {
+const viewJobChat = async (job: FineJobBossHistoryJob) => {
+  if (!job.session_id) return;
+  await router.push({ name: "fine-job-chat", query: { session_id: job.session_id } });
+};
+
+const deleteHistoryJob = async (job: FineJobBossHistoryJob) => {
   try {
-    await executorStore.openJob(job.id, "history");
-    ElMessage.success("已在FineJob专用浏览器打开该岗位；未执行打招呼");
+    await ElMessageBox.confirm(
+      `将删除“${job.title || "该岗位"}”的岗位记录和投递建议。聊天、求职链路与申请记录会保留。`,
+      "删除岗位记录",
+      {
+        type: "warning",
+        confirmButtonText: "删除",
+        cancelButtonText: "取消"
+      }
+    );
   } catch {
-    ElMessage.error(executorStore.error ?? "打开岗位页面失败");
+    return;
+  }
+  try {
+    await historyStore.deleteHistoryJob(job.id);
+    if (selectedJob.value?.id === job.id) {
+      detailDrawerOpen.value = false;
+      selectedJob.value = null;
+      selectedJourney.value = null;
+    }
+    if (!historyStore.items.length && historyStore.page > 1) historyStore.page -= 1;
+    await loadHistory();
+    ElMessage.success("岗位记录已删除");
+  } catch {
+    ElMessage.error(historyStore.error ?? "删除岗位记录失败");
   }
 };
 
@@ -423,7 +457,7 @@ onMounted(async () => {
       detailDrawerOpen.value = true;
       await loadJourney(historyId);
     } catch (error) {
-      ElMessage.error((error as Error).message || "历史岗位详情加载失败");
+      ElMessage.error((error as Error).message || "岗位详情加载失败");
     }
   }
 });
@@ -452,8 +486,8 @@ watch(
   <section class="page-stack fine-job-page">
     <div class="page-heading">
       <div>
-        <p class="panel-eyebrow">BOSS Capture History</p>
-        <h1>历史采集</h1>
+        <p class="panel-eyebrow">Job Records</p>
+        <h1>岗位记录</h1>
         <p class="secondary-text">按岗位去重保存；重复采集会更新最后采集时间和采集次数。</p>
       </div>
       <el-tag type="info">共 {{ historyStore.total }} 个岗位</el-tag>
@@ -462,7 +496,7 @@ watch(
     <el-alert
       v-if="historyStore.error"
       type="error"
-      title="历史采集操作失败"
+      title="岗位记录操作失败"
       :description="historyStore.error"
       show-icon
     />
@@ -503,6 +537,36 @@ watch(
               <el-option label="详情失败" value="failed" />
             </el-select>
           </el-form-item>
+          <el-form-item label="筛选状态">
+            <el-select v-model="filters.filterStatus" clearable placeholder="全部筛选状态">
+              <el-option label="通过" value="pass" />
+              <el-option label="跳过" value="pass_for_human" />
+              <el-option label="待判断" value="review" />
+              <el-option label="不通过" value="reject" />
+              <el-option label="冷却排除" value="exclude" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="投递建议">
+            <el-select v-model="filters.deliveryDecision" clearable placeholder="全部建议">
+              <el-option label="建议投递" value="recommend" />
+              <el-option label="待判断" value="review" />
+              <el-option label="不建议" value="reject" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="求职进度">
+            <el-select v-model="filters.pipelineStage" clearable placeholder="全部进度">
+              <el-option label="已发现" value="discovered" />
+              <el-option label="已筛选" value="shortlisted" />
+              <el-option label="已打招呼" value="greeted" />
+              <el-option label="沟通中" value="communicating" />
+              <el-option label="已投递简历" value="resume_submitted" />
+              <el-option label="简历已查看" value="resume_viewed" />
+              <el-option label="面试中" value="interviewing" />
+              <el-option label="Offer" value="offer" />
+              <el-option label="已拒绝" value="rejected" />
+              <el-option label="已关闭" value="closed" />
+            </el-select>
+          </el-form-item>
           <el-form-item label="采集次数">
             <el-select v-model="filters.repeatStatus">
               <el-option label="全部岗位" value="all" />
@@ -521,17 +585,19 @@ watch(
               clearable
             />
           </el-form-item>
+          <el-form-item label="建议投递策略">
+            <el-select v-model="recommendationStrategyId" clearable placeholder="选择建议投递策略">
+              <el-option
+                v-for="item in strategiesStore.recommendations"
+                :key="item.id"
+                :label="item.name"
+                :value="item.id"
+              />
+            </el-select>
+          </el-form-item>
         </div>
       </el-form>
       <div class="history-filter-actions">
-        <el-select v-model="recommendationStrategyId" clearable placeholder="选择建议投递策略">
-          <el-option
-            v-for="item in strategiesStore.recommendations"
-            :key="item.id"
-            :label="item.name"
-            :value="item.id"
-          />
-        </el-select>
         <el-button type="primary" :loading="historyStore.loading" @click="search">查询</el-button>
         <el-button :disabled="historyStore.loading" @click="reset">重置</el-button>
       </div>
@@ -561,11 +627,11 @@ watch(
         row-key="id"
         max-height="500"
         :default-sort="{ prop: 'last_collected_at', order: 'descending' }"
-        empty-text="暂无历史采集岗位"
+        empty-text="暂无岗位记录"
         @sort-change="handleSortChange"
         @row-click="openDetail"
       >
-                <el-table-column label="筛选" width="100">
+        <el-table-column label="筛选" width="100">
           <template #default="{ row }">
             <el-tag :type="filterStatusType(row.filter_status)" size="small">
               {{ filterStatusLabel(row.filter_status) }}
@@ -588,8 +654,18 @@ watch(
             <span v-else class="secondary-text">尚无求职进展</span>
           </template>
         </el-table-column>
-
-        <el-table-column prop="title" label="岗位" min-width="180" show-overflow-tooltip sortable="custom" />
+        <el-table-column label="是否建议投递" width="120">
+          <template #default="{ row }">
+            <el-tag :type="deliveryDecisionType(row.delivery_evaluation?.decision)" size="small">
+              {{ deliveryDecisionLabel(row.delivery_evaluation?.decision) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="title" label="岗位" min-width="180" show-overflow-tooltip sortable="custom">
+          <template #default="{ row }">
+            <el-link type="primary" :underline="false" @click.stop="openDetail(row)">{{ row.title }}</el-link>
+          </template>
+        </el-table-column>
         <el-table-column prop="boss_name" label="公司" min-width="190" sortable="custom">
           <template #default="{ row }">
             <span>{{ row.boss_name }}</span>
@@ -598,11 +674,7 @@ watch(
           </template>
         </el-table-column>
         <el-table-column prop="salary" label="薪资" width="110" />
-                <el-table-column label="投递建议" min-width="130" show-overflow-tooltip>
-          <template #default="{ row }">
-            {{ row.delivery_evaluation?.summary || row.recommendation_reason || "未获取" }}
-          </template>
-        </el-table-column>
+
         <el-table-column prop="company_scale" label="公司规模" width="120" />
 
         <el-table-column prop="search_keyword" label="搜索词" min-width="130" show-overflow-tooltip />
@@ -636,17 +708,12 @@ watch(
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="150" fixed="right">
+        <el-table-column label="操作" width="190" fixed="right">
           <template #default="{ row }">
-            <el-button link type="primary" @click.stop="openDetail(row)">详情</el-button>
             <el-button
-              link
-              type="primary"
-              :loading="executorStore.openingJobId === row.id"
-              @click.stop="openInDedicatedBrowser(row)"
-            >
-              打开
-            </el-button>
+              v-if="row.session_id"
+              link type="primary" @click.stop="viewJobChat(row)"
+            >聊天</el-button>
             <el-button
               v-if="row.detail_status === 'completed' && !row.delivery_evaluation"
               link
@@ -667,6 +734,13 @@ watch(
             >
               {{ detailActionLabel(row) }}
             </el-button>
+            <el-button
+              link
+              type="danger"
+              :loading="historyStore.deletingJobId === row.id"
+              :disabled="historyActionRunning && historyStore.deletingJobId !== row.id"
+              @click.stop="deleteHistoryJob(row)"
+            >删除</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -710,7 +784,7 @@ watch(
             <el-collapse-item name="journey">
               <template #title>
                 <div class="journey-title-row">
-                  <strong>求职链路</strong>
+                  <strong>求职链路与沟通</strong>
                   <el-tag v-if="selectedJourney?.pipeline" type="success" size="small">
                     {{ pipelineStageLabel(selectedJourney.pipeline.stage) }}
                   </el-tag>
@@ -915,15 +989,8 @@ watch(
           {{ detailActionLabel(selectedJob) }}
         </el-button>
         <el-divider />
-        <el-button
-          type="primary"
-          :loading="executorStore.openingJobId === selectedJob.id"
-          @click="openInDedicatedBrowser(selectedJob)"
-        >
-          在专用浏览器打开（不打招呼）
-        </el-button>
         <el-link v-if="selectedJob.job_link" :href="selectedJob.job_link" target="_blank" type="primary">
-          打开 BOSS 原始岗位页面
+          查看 BOSS 原始岗位页面
         </el-link>
       </template>
     </el-drawer>

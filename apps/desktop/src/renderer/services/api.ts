@@ -741,6 +741,12 @@ export const api = {
       `/api/fine-job/boss-capture/history${suffix}`
     );
   },
+  async deleteFineJobBossCaptureHistoryJob(historyJobId: string) {
+    return request<{ id: string }>(
+      `/api/fine-job/boss-capture/history/${encodeURIComponent(historyJobId)}`,
+      { method: "DELETE" }
+    );
+  },
   async captureSelectedFineJobBossDetails(
     taskId: string,
     jobIds: string[],

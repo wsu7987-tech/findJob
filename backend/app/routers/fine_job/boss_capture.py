@@ -31,6 +31,7 @@ from backend.app.services.fine_job.boss_capture_tasks import boss_capture_task_m
 from backend.app.services.fine_job.boss_capture_history import (
     HistorySortField,
     HistorySortOrder,
+    delete_capture_history_job,
     get_capture_history_job,
     list_capture_history,
     update_capture_job_delivery_evaluation,
@@ -217,6 +218,9 @@ def get_boss_capture_history(
     company_industry: str = "",
     company_stage: str = "",
     detail_status: str = "",
+    filter_status: str = "",
+    delivery_decision: str = "",
+    pipeline_stage: str = "",
     repeat_status: str = Query(default="all", pattern="^(all|first_seen|repeated)$"),
     collected_from: str = "",
     collected_to: str = "",
@@ -236,6 +240,9 @@ def get_boss_capture_history(
             company_industry=company_industry,
             company_stage=company_stage,
             detail_status=detail_status,
+            filter_status=filter_status,
+            delivery_decision=delivery_decision,
+            pipeline_stage=pipeline_stage,
             repeat_status=repeat_status,
             collected_from=collected_from,
             collected_to=collected_to,
@@ -633,12 +640,22 @@ async def evaluate_history_job_delivery(
         context_revision_id=_context_revision_id(evaluation_context),
         context_dependency_versions=_context_dependencies(evaluation_context),
     )
+
     if route_result is not None and route_result.get("action") is not None:
         await boss_executor.notify_queue_changed(db)
     return BossHistoryDeliveryEvaluationResponse(
         evaluation=evaluation,
         job=get_capture_history_job(db, history_job_id),
     )
+
+
+@router.delete("/history/{history_job_id}")
+def delete_boss_capture_history_job(
+    history_job_id: str,
+    db: Database = Depends(get_database),
+) -> dict[str, str]:
+    delete_capture_history_job(db, history_job_id)
+    return {"id": history_job_id}
 
 
 def _context_content(context: dict[str, object] | None) -> str:

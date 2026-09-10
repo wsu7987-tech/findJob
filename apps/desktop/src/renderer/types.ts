@@ -426,6 +426,9 @@ export interface FineJobBossHistoryQuery {
   company_industry?: string;
   company_stage?: string;
   detail_status?: string;
+  filter_status?: string;
+  delivery_decision?: string;
+  pipeline_stage?: string;
   repeat_status?: "all" | "first_seen" | "repeated";
   collected_from?: string;
   collected_to?: string;
@@ -446,6 +449,7 @@ export interface FineJobBossHistoryJob extends FineJobBossCapturedJob {
   waiting_on?: FineJobWaitingOn;
   contact_origin?: FineJobContactOrigin;
   attention_status?: string;
+  session_id?: string | null;
 }
 
 export interface FineJobBossHistoryResponse {

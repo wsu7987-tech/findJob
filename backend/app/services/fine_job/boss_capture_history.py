@@ -235,7 +235,8 @@ def record_capture_jobs(
                         detail_json = ?, detail_status = ?, detail_error = ?,
                         delivery_evaluation_json = ?,
                         detail_collected_at = COALESCE(?, detail_collected_at),
-                        last_collected_at = ?, collect_count = ?, latest_batch_id = ?
+                        last_collected_at = ?, collect_count = ?, latest_batch_id = ?,
+                        deleted_at = NULL
                     WHERE id = ?
                     """,
                     (
@@ -586,6 +587,30 @@ def update_capture_job_delivery_evaluation(
             """,
             (_json(evaluation), _json(payload), identity_value),
         )
+
+
+def delete_capture_history_job(db: Database, history_job_id: str) -> None:
+    """隐藏岗位记录并清除投递建议，保留聊天、链路和申请数据。"""
+    now = utc_now()
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT id FROM fj_boss_jobs WHERE id = ? AND deleted_at IS NULL",
+            (history_job_id,),
+        ).fetchone()
+        if row is None:
+            raise AppError(404, "NOT_FOUND", "岗位记录不存在。")
+        # 投递建议关联的待确认与自动动作随评估一并清理。
+        connection.execute("DELETE FROM fj_job_evaluations WHERE job_id = ?", (history_job_id,))
+        connection.execute(
+            """
+            UPDATE fj_boss_jobs
+            SET deleted_at = ?, delivery_evaluation_json = NULL
+            WHERE id = ?
+            """,
+            (now, history_job_id),
+        )
+
+
 def get_capture_history_job(db: Database, history_job_id: str) -> dict[str, object]:
     with db.connect() as connection:
         row = connection.execute(
@@ -603,6 +628,9 @@ def get_capture_history_job(db: Database, history_job_id: str) -> dict[str, obje
                     JOIN fj_chat_sessions s ON s.id = a.session_id
                     WHERE s.job_id = fj_boss_jobs.id
                     ORDER BY a.updated_at DESC LIMIT 1) AS attention_status,
+                   (SELECT id FROM fj_chat_sessions s
+                    WHERE s.job_id = fj_boss_jobs.id
+                    ORDER BY s.updated_at DESC LIMIT 1) AS session_id,
                    company_scale, company_stage, company_industry, welfare,
                    salary, location, experience, degree,
                    boss_active_status, job_link, tags, skills, job_labels, search_keyword, payload_json,
@@ -610,7 +638,7 @@ def get_capture_history_job(db: Database, history_job_id: str) -> dict[str, obje
                    first_collected_at, last_collected_at, collect_count,
                    latest_batch_id
             FROM fj_boss_jobs
-            WHERE id = ?
+            WHERE id = ? AND deleted_at IS NULL
             """,
             (history_job_id,),
         ).fetchone()
@@ -633,6 +661,9 @@ def list_capture_history(
     company_industry: str = "",
     company_stage: str = "",
     detail_status: str = "",
+    filter_status: str = "",
+    delivery_decision: str = "",
+    pipeline_stage: str = "",
     repeat_status: str = "all",
     collected_from: str = "",
     collected_to: str = "",
@@ -645,7 +676,7 @@ def list_capture_history(
 
     sync_succeeded_applications(db)
     # 执行器验证岗位只通过专用测试接口读取，不进入用户历史采集列表。
-    conditions: list[str] = ["is_test = 0"]
+    conditions: list[str] = ["is_test = 0", "deleted_at IS NULL"]
     values: list[object] = []
     if query.strip():
         like = f"%{query.strip()}%"
@@ -669,6 +700,18 @@ def list_capture_history(
     if detail_status.strip():
         conditions.append("detail_status = ?")
         values.append(detail_status.strip())
+    if filter_status.strip():
+        conditions.append("json_extract(payload_json, '$.filter_status') = ?")
+        values.append(filter_status.strip())
+    if delivery_decision.strip():
+        conditions.append("json_extract(delivery_evaluation_json, '$.decision') = ?")
+        values.append(delivery_decision.strip())
+    if pipeline_stage.strip():
+        conditions.append(
+            "EXISTS (SELECT 1 FROM fj_job_pipeline_snapshots p "
+            "WHERE p.job_id = fj_boss_jobs.id AND p.stage = ?)"
+        )
+        values.append(pipeline_stage.strip())
     if repeat_status == "repeated":
         conditions.append("collect_count > 1")
     elif repeat_status == "first_seen":
@@ -705,6 +748,9 @@ def list_capture_history(
                     JOIN fj_chat_sessions s ON s.id = a.session_id
                     WHERE s.job_id = fj_boss_jobs.id
                     ORDER BY a.updated_at DESC LIMIT 1) AS attention_status,
+                   (SELECT id FROM fj_chat_sessions s
+                    WHERE s.job_id = fj_boss_jobs.id
+                    ORDER BY s.updated_at DESC LIMIT 1) AS session_id,
                    company_scale, salary,
                    company_stage, company_industry, welfare, location, experience,
                    degree, boss_active_status, job_link,
@@ -774,6 +820,7 @@ def _serialize_history_row(row) -> dict[str, object]:
         "waiting_on": row["waiting_on"] or "unknown",
         "contact_origin": row["contact_origin"] or "unknown",
         "attention_status": row["attention_status"] or "",
+        "session_id": row["session_id"],
         "company_scale": row["company_scale"],
         "company_stage": row["company_stage"],
         "company_industry": row["company_industry"],

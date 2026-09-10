@@ -55,7 +55,7 @@ export const router = createRouter({
       path: "/fine-job/capture-history",
       name: "fine-job-capture-history",
       component: BossCaptureHistoryPage,
-      meta: { title: "历史采集" }
+      meta: { title: "岗位记录" }
     },
     {
       path: "/fine-job/strategy",

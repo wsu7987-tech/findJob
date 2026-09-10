@@ -1013,6 +1013,7 @@ CREATE TABLE IF NOT EXISTS fj_boss_jobs (
   detail_error TEXT,
   delivery_evaluation_json TEXT,
   detail_collected_at TEXT,
+  deleted_at TEXT,
   first_collected_at TEXT NOT NULL,
   last_collected_at TEXT NOT NULL,
   collect_count INTEGER NOT NULL DEFAULT 1,
@@ -2792,6 +2793,7 @@ class Database:
             ),
             "company_id": "ALTER TABLE fj_boss_jobs ADD COLUMN company_id TEXT",
             "is_test": "ALTER TABLE fj_boss_jobs ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0",
+            "deleted_at": "ALTER TABLE fj_boss_jobs ADD COLUMN deleted_at TEXT",
         }
         for column, ddl in migrations.items():
             if column not in columns:
