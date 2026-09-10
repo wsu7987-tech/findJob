@@ -74,6 +74,21 @@ const desktopBridge = {
       isElectron: boolean;
       version: string;
     }>,
+  getExternalCodexIntegrationStatus: () =>
+    ipcRenderer.invoke("external-codex:status") as Promise<{
+      mcp: { configPath: string; installed: boolean; launcherPath: string };
+      skills: Array<{ installed: boolean; name: "finejob" | "finejob-profile"; path: string }>;
+    }>,
+  installExternalCodexMcp: () =>
+    ipcRenderer.invoke("external-codex:install-mcp") as Promise<{
+      mcp: { configPath: string; installed: boolean; launcherPath: string };
+      skills: Array<{ installed: boolean; name: "finejob" | "finejob-profile"; path: string }>;
+    }>,
+  installExternalCodexSkills: () =>
+    ipcRenderer.invoke("external-codex:install-skills") as Promise<{
+      mcp: { configPath: string; installed: boolean; launcherPath: string };
+      skills: Array<{ installed: boolean; name: "finejob" | "finejob-profile"; path: string }>;
+    }>,
   startCodex: (size?: { cols?: number; rows?: number }) =>
     ipcRenderer.invoke("codex:start", size) as Promise<{ status: string; runId: string | null }>,
   resumeCodex: (size?: { cols?: number; rows?: number }) =>

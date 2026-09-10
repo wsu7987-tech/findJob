@@ -67,6 +67,21 @@ def _authorize(
     return _registry(request).require(_bearer(authorization))
 
 
+def _authorize_external_local(
+    request: Request,
+    authorization: str,
+    contract: str,
+    api_version: str,
+    local_external: str,
+):
+    _require_loopback(request)
+    _require_versions(contract, api_version)
+    if local_external == "1":
+        # 本机自用模式复用现有业务工具，外部 Codex 无需由内置工作台创建运行凭证。
+        return None
+    return _registry(request).require(_bearer(authorization))
+
+
 @router.post("/runtime", response_model=CodexRuntimeResponse)
 def create_runtime(
     request: Request,
@@ -116,9 +131,13 @@ def handshake(
     authorization: str = Header(default=""),
     contract: str = Header(default="", alias="X-FineJob-MCP-Contract-Version"),
     api_version: str = Header(default="", alias="X-FineJob-Internal-API-Version"),
+    local_external: str = Header(default="", alias="X-FineJob-Local-External"),
 ) -> CodexHandshakeResponse:
-    runtime = _authorize(request, authorization, contract, api_version)
-    return CodexHandshakeResponse(run_id=runtime.run_id, sensitive_actions_allowed=True)
+    runtime = _authorize_external_local(request, authorization, contract, api_version, local_external)
+    return CodexHandshakeResponse(
+        run_id=runtime.run_id if runtime else "local-external",
+        sensitive_actions_allowed=True,
+    )
 
 
 @router.get("/capabilities")
@@ -127,10 +146,11 @@ def capabilities(
     authorization: str = Header(default=""),
     contract: str = Header(default="", alias="X-FineJob-MCP-Contract-Version"),
     api_version: str = Header(default="", alias="X-FineJob-Internal-API-Version"),
+    local_external: str = Header(default="", alias="X-FineJob-Local-External"),
     db: Database = Depends(get_database),
     config: AppConfig = Depends(get_config),
 ):
-    _authorize(request, authorization, contract, api_version)
+    _authorize_external_local(request, authorization, contract, api_version, local_external)
     return CodexToolService(db, config).get_capabilities({})
 
 
@@ -142,10 +162,11 @@ async def invoke_tool(
     authorization: str = Header(default=""),
     contract: str = Header(default="", alias="X-FineJob-MCP-Contract-Version"),
     api_version: str = Header(default="", alias="X-FineJob-Internal-API-Version"),
+    local_external: str = Header(default="", alias="X-FineJob-Local-External"),
     db: Database = Depends(get_database),
     config: AppConfig = Depends(get_config),
 ):
-    _authorize(request, authorization, contract, api_version)
+    _authorize_external_local(request, authorization, contract, api_version, local_external)
     result = CodexToolService(db, config).call(f"finejob.{tool_name}", payload.arguments)
     if _result_changes_boss_queue(result):
         await boss_executor.notify_queue_changed(db)
@@ -167,10 +188,11 @@ def operation_status(
     authorization: str = Header(default=""),
     contract: str = Header(default="", alias="X-FineJob-MCP-Contract-Version"),
     api_version: str = Header(default="", alias="X-FineJob-Internal-API-Version"),
+    local_external: str = Header(default="", alias="X-FineJob-Local-External"),
     db: Database = Depends(get_database),
     config: AppConfig = Depends(get_config),
 ):
-    _authorize(request, authorization, contract, api_version)
+    _authorize_external_local(request, authorization, contract, api_version, local_external)
     return CodexToolService(db, config).get_operation_status(
         {"resource_type": resource_type, "resource_id": resource_id}
     )

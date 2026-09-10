@@ -3,7 +3,15 @@ import { computed, reactive, ref, watch } from "vue";
 import { FolderOpened, InfoFilled, Loading } from "@element-plus/icons-vue";
 import { ElMessageBox } from "element-plus";
 
-import { chooseDirectory, hasDirectoryPicker, updateShellConfig } from "@/services/desktop-bridge";
+import {
+  chooseDirectory,
+  getExternalCodexIntegrationStatus,
+  hasDirectoryPicker,
+  installExternalCodexMcp,
+  installExternalCodexSkills,
+  updateShellConfig
+} from "@/services/desktop-bridge";
+import type { ExternalCodexIntegrationStatus } from "@/services/desktop-bridge";
 import { formatDateTime } from "@/services/format";
 import { buildSettingsSavePayload } from "@/services/settingsShellConfig";
 import { api } from "@/services/api";
@@ -24,6 +32,9 @@ const emit = defineEmits<{
 const configStore = useConfigStore();
 const noticesStore = useNoticesStore();
 const supportsDirectoryPicker = hasDirectoryPicker();
+const externalCodexIntegration = ref<ExternalCodexIntegrationStatus | null>(null);
+const externalCodexMcpInstalling = ref(false);
+const externalCodexSkillsInstalling = ref(false);
 
 const form = reactive({
   output_root: "",
@@ -267,6 +278,68 @@ const syncFormFromStore = () => {
   savedFormSnapshot.value = JSON.stringify(form);
 };
 
+const loadExternalCodexIntegration = async () => {
+  externalCodexIntegration.value = await getExternalCodexIntegrationStatus();
+};
+
+const refreshExternalCodexMcp = async () => {
+  externalCodexMcpInstalling.value = true;
+  try {
+    const result = await installExternalCodexMcp();
+    if (!result) {
+      noticesStore.push({
+        kind: "warning",
+        title: "仅桌面端可安装 MCP",
+        message: "请在 FineJob 桌面应用中执行此操作。"
+      });
+      return;
+    }
+    externalCodexIntegration.value = result;
+    noticesStore.push({
+      kind: "success",
+      title: "FineJob MCP 已刷新",
+      message: "请新开一个 Codex 会话，它会加载当前项目中的 MCP 工具。"
+    });
+  } catch (errorValue) {
+    noticesStore.push({
+      kind: "error",
+      title: "FineJob MCP 刷新失败",
+      message: errorValue instanceof Error ? errorValue.message : "请检查本地项目和 Python 路径。"
+    });
+  } finally {
+    externalCodexMcpInstalling.value = false;
+  }
+};
+
+const refreshExternalCodexSkills = async () => {
+  externalCodexSkillsInstalling.value = true;
+  try {
+    const result = await installExternalCodexSkills();
+    if (!result) {
+      noticesStore.push({
+        kind: "warning",
+        title: "仅桌面端可刷新 Skill",
+        message: "请在 FineJob 桌面应用中执行此操作。"
+      });
+      return;
+    }
+    externalCodexIntegration.value = result;
+    noticesStore.push({
+      kind: "success",
+      title: "FineJob Skill 已刷新",
+      message: "请新开一个 Codex 会话，它会按任务自动加载最新的岗位与简历流程。"
+    });
+  } catch (errorValue) {
+    noticesStore.push({
+      kind: "error",
+      title: "FineJob Skill 刷新失败",
+      message: errorValue instanceof Error ? errorValue.message : "请检查项目中的 Skill 资源。"
+    });
+  } finally {
+    externalCodexSkillsInstalling.value = false;
+  }
+};
+
 loadCachedCodexModels();
 
 watch(
@@ -277,6 +350,7 @@ watch(
     }
     await configStore.load();
     syncFormFromStore();
+    await loadExternalCodexIntegration();
   },
   { immediate: true }
 );
@@ -660,6 +734,47 @@ const pickDirectory = async (
               show-icon
             />
           </template>
+        </section>
+
+        <section class="settings-section">
+          <div class="settings-section__header">
+            <div>
+              <p class="panel-eyebrow">External Codex</p>
+              <h4>本机外部 Codex 接入</h4>
+            </div>
+            <el-tag size="small" :type="externalCodexIntegration?.mcp.installed ? 'success' : 'info'">
+              {{ externalCodexIntegration?.mcp.installed ? "MCP 已安装" : "MCP 未安装" }}
+            </el-tag>
+          </div>
+          <p class="secondary-text">
+            MCP 与 Skill 可分别刷新。刷新后新开 Codex 会话；岗位搜索、筛选和评估仍会保存到 FineJob。
+          </p>
+          <div class="setting-actions">
+            <el-button
+              type="primary"
+              plain
+              :loading="externalCodexMcpInstalling"
+              @click="refreshExternalCodexMcp"
+            >
+              安装/刷新 FineJob MCP
+            </el-button>
+            <el-button
+              type="primary"
+              plain
+              :loading="externalCodexSkillsInstalling"
+              @click="refreshExternalCodexSkills"
+            >
+              安装/刷新 FineJob Skills
+            </el-button>
+          </div>
+          <div v-if="externalCodexIntegration" class="setting-note">
+            <span>
+              Skills：{{ externalCodexIntegration.skills.filter((item) => item.installed).length }}/{{
+                externalCodexIntegration.skills.length
+              }} 已安装
+            </span>
+            <span>在新会话中说“用 FineJob 找岗位”即可按任务自动调用。</span>
+          </div>
         </section>
 
         <section class="settings-section">

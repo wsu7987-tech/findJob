@@ -6,6 +6,10 @@ import type { Event as ElectronEvent, OpenDialogOptions } from "electron";
 import { createBackendProcessController } from "./backend-process";
 import { registerCodexIpc } from "./codex-ipc";
 import { createCodexSessionController } from "./codex-session";
+import {
+  createExternalCodexIntegration
+} from "./external-codex-integration";
+import { registerExternalCodexIntegrationIpc } from "./external-codex-ipc";
 import { registerQuickCaptureIpc } from "./quick-capture-ipc";
 import { createQuitState } from "./quit-state";
 import { loadShellConfig } from "./shell-config";
@@ -112,6 +116,14 @@ const codexSessionController = createCodexSessionController({
   debugLog
 });
 
+const externalCodexIntegration = createExternalCodexIntegration({
+  appDataDir,
+  backendOrigin,
+  homeDir: app.getPath("home"),
+  pythonPath,
+  workspaceRoot
+});
+
 const reloadShellConfig = () => {
   shellConfig = loadShellConfig();
   return shortcutController.register(shellConfig);
@@ -158,6 +170,7 @@ app.whenReady().then(async () => {
     codexSessionController,
     () => windowManager.getMainWindow()?.webContents ?? null
   );
+  registerExternalCodexIntegrationIpc(ipcMain, externalCodexIntegration);
 
   try {
     await backendController.start();

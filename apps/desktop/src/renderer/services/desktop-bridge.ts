@@ -14,6 +14,11 @@ type SaveTextFileOptions = {
   filters?: Array<{ name: string; extensions: string[] }>;
 };
 
+export type ExternalCodexIntegrationStatus = {
+  mcp: { configPath: string; installed: boolean; launcherPath: string };
+  skills: Array<{ installed: boolean; name: "finejob" | "finejob-profile"; path: string }>;
+};
+
 type DesktopBridgeShape = {
   chooseFile?: (options?: FilePickerOptions) => Promise<string | null>;
   chooseDirectory?: (options?: DirectoryPickerOptions) => Promise<string | null>;
@@ -46,6 +51,9 @@ type DesktopBridgeShape = {
     isElectron: boolean;
     version: string;
   }>;
+  getExternalCodexIntegrationStatus?: () => Promise<ExternalCodexIntegrationStatus>;
+  installExternalCodexMcp?: () => Promise<ExternalCodexIntegrationStatus>;
+  installExternalCodexSkills?: () => Promise<ExternalCodexIntegrationStatus>;
   startCodex?: (size?: { cols?: number; rows?: number }) => Promise<{ status: string; runId: string | null }>;
   resumeCodex?: (size?: { cols?: number; rows?: number }) => Promise<{ status: string; runId: string | null }>;
   getCodexState?: () => Promise<{ status: string; runId: string | null }>;
@@ -229,6 +237,30 @@ export const updateShellConfig = async (
   }
 
   return bridge.updateShellConfig(updates);
+};
+
+export const getExternalCodexIntegrationStatus = async (windowLike: WindowLike = window) => {
+  const bridge = getDesktopBridge(windowLike);
+  if (!bridge?.getExternalCodexIntegrationStatus) {
+    return null;
+  }
+  return bridge.getExternalCodexIntegrationStatus();
+};
+
+export const installExternalCodexMcp = async (windowLike: WindowLike = window) => {
+  const bridge = getDesktopBridge(windowLike);
+  if (!bridge?.installExternalCodexMcp) {
+    return null;
+  }
+  return bridge.installExternalCodexMcp();
+};
+
+export const installExternalCodexSkills = async (windowLike: WindowLike = window) => {
+  const bridge = getDesktopBridge(windowLike);
+  if (!bridge?.installExternalCodexSkills) {
+    return null;
+  }
+  return bridge.installExternalCodexSkills();
 };
 
 export const getCodexBridge = (windowLike: WindowLike = window) => {

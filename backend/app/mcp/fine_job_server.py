@@ -12,6 +12,7 @@ MCP_CONTRACT_VERSION = "v1"
 INTERNAL_API_VERSION = "v1"
 BACKEND_ORIGIN = os.environ.get("FINE_JOB_BACKEND_ORIGIN", "http://127.0.0.1:8000").rstrip("/")
 RUN_TOKEN = os.environ.get("FINE_JOB_MCP_RUN_TOKEN", "")
+LOCAL_EXTERNAL = os.environ.get("FINE_JOB_MCP_LOCAL_EXTERNAL", "") == "1"
 _handshake_complete = False
 
 server = MCPServer(
@@ -42,16 +43,21 @@ server = MCPServer(
 
 
 def _headers() -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {RUN_TOKEN}",
+    headers = {
         "X-FineJob-MCP-Contract-Version": MCP_CONTRACT_VERSION,
         "X-FineJob-Internal-API-Version": INTERNAL_API_VERSION,
     }
+    if RUN_TOKEN:
+        headers["Authorization"] = f"Bearer {RUN_TOKEN}"
+    if LOCAL_EXTERNAL:
+        # 本机外部 Codex 通过固定的回环入口调用，无需内置工作台运行凭证。
+        headers["X-FineJob-Local-External"] = "1"
+    return headers
 
 
 async def _invoke(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """统一通过本机内部 API 调用 FineJob 领域服务。"""
-    if not RUN_TOKEN:
+    if not RUN_TOKEN and not LOCAL_EXTERNAL:
         return _error("CODEX_RUNTIME_UNAUTHORIZED", "缺少 FineJob MCP 运行凭证。")
     try:
         # MCP 只访问本机后端，绕过系统代理，避免代理将回环请求转成 502。

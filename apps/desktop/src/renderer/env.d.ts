@@ -57,6 +57,18 @@ declare global {
         isElectron: boolean;
         version: string;
       }>;
+      getExternalCodexIntegrationStatus: () => Promise<{
+        mcp: { configPath: string; installed: boolean; launcherPath: string };
+        skills: Array<{ installed: boolean; name: "finejob" | "finejob-profile"; path: string }>;
+      }>;
+      installExternalCodexMcp: () => Promise<{
+        mcp: { configPath: string; installed: boolean; launcherPath: string };
+        skills: Array<{ installed: boolean; name: "finejob" | "finejob-profile"; path: string }>;
+      }>;
+      installExternalCodexSkills: () => Promise<{
+        mcp: { configPath: string; installed: boolean; launcherPath: string };
+        skills: Array<{ installed: boolean; name: "finejob" | "finejob-profile"; path: string }>;
+      }>;
       startCodex: (size?: { cols?: number; rows?: number }) => Promise<{
         status: string;
         runId: string | null;
