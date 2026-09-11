@@ -538,6 +538,18 @@ def _transform_message(
     }
 
 
+def _resume_invite_transform(direction: str, body_type: int | None) -> dict[str, str] | None:
+    """将 HR 附件邀请卡片保存为可接受的简历投递动作。"""
+    if direction != "inbound" or body_type != 7:
+        return None
+    return {
+        "message_type": "system",
+        "content": "HR 邀请发送附件简历",
+        "display_kind": "action",
+        "action_type": "resume_invite",
+    }
+
+
 def save_resume_attachment_snapshot(db: Database, captured: dict[str, Any]) -> dict[str, Any]:
     """保存当前账号的附件简历快照，并返回可直接给页面使用的结果。"""
     account_uid = str(captured.get("account_uid") or "").strip()
@@ -1078,6 +1090,15 @@ def _record_message_activity(
             dedupe_key=f"chat_message:{message_id}:{event_type}",
         )
 
+    if direction == "inbound" and action_type == "resume_invite":
+        append_job_activity_with_connection(
+            connection, job_id=job_id, chat_session_id=session_id, event_type="resume_requested",
+            occurred_at=occurred_at, source="chat", source_ref_type="chat_message",
+            source_ref_id=message_id, evidence_level="direct",
+            payload={"invite_message_id": platform_message_id},
+            dedupe_key=f"chat_message:{message_id}:resume_invite",
+        )
+
     # 聊天动作和 HR 的明确文案直接形成事实，不依赖 AI 推断。
     rule_event = {
         "resume_sent": "resume_submitted",
@@ -1266,7 +1287,7 @@ def sync_history_messages(
             message_type = "text" if body_type == 1 else "system"
             sent_at = _epoch_ms_to_iso(raw.get("time")) or now
             message_status = _history_message_status(raw)
-            transformed = _transform_message(
+            transformed = _resume_invite_transform(direction, body_type) or _transform_message(
                 connection,
                 session_id=session_id,
                 direction=direction,
@@ -1321,6 +1342,12 @@ def sync_history_messages(
                         now,
                         existing["id"],
                     ),
+                )
+                _record_message_activity(
+                    connection, session_id=session_id, message_id=str(existing["id"]),
+                    direction=direction, occurred_at=sent_at, platform_message_id=message_id,
+                    message_type=transformed["message_type"], content=transformed["content"],
+                    display_kind=transformed["display_kind"], action_type=transformed["action_type"],
                 )
                 continue
             if provisional is not None:
@@ -1853,7 +1880,11 @@ def ingest_events(
                 account_uid=event["account_uid"],
                 message=message,
             )
-            transformed = _transform_message(
+            raw_meta = message.get("raw_meta") if isinstance(message.get("raw_meta"), dict) else {}
+            body_type = _optional_int(raw_meta.get("bodyType"))
+            transformed = _resume_invite_transform(
+                str(message.get("direction") or "inbound"), body_type
+            ) or _transform_message(
                 connection,
                 session_id=str(session["id"]),
                 direction=str(message.get("direction") or "inbound"),
@@ -3368,9 +3399,16 @@ def confirm_reply(db: Database, task_id: str, payload: dict[str, Any]) -> dict[s
         return _action_payload(connection, action_id)
 
 
-def _create_resume_support_task(connection: sqlite3.Connection, session: sqlite3.Row) -> str:
+def _create_resume_support_task(
+    connection: sqlite3.Connection,
+    session: sqlite3.Row,
+    *,
+    based_on_message_id: str = "",
+) -> str:
     """复用既有动作外键，为非文本聊天动作保存最小关联记录。"""
-    based_on_message_id = str(session["latest_message_id"] or session["latest_inbound_message_id"] or "")
+    based_on_message_id = based_on_message_id or str(
+        session["latest_message_id"] or session["latest_inbound_message_id"] or ""
+    )
     if not based_on_message_id:
         raise AppError(status_code=409, error_category="CHAT_RESUME_CONTEXT_INVALID", error_message="当前会话缺少可关联的聊天消息。")
     now = _now()
@@ -3447,7 +3485,20 @@ def _create_resume_action(
         direct_execution = operation_kind == "resume" and bool(runtime["direct_execution_enabled"])
         if direct_execution and not runtime["send_enabled"]:
             raise AppError(status_code=409, error_category="CHAT_SEND_DISABLED", error_message="请先在自动代聊设置中启用发送。")
-        task_id = _create_resume_support_task(connection, session)
+        invite = connection.execute(
+            """
+            SELECT id, platform_message_id FROM fj_chat_messages
+            WHERE session_id = ? AND direction = 'inbound' AND action_type = 'resume_invite'
+            ORDER BY sent_at DESC, rowid DESC LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        invite_message_id = str(invite["platform_message_id"] or "") if invite else ""
+        task_id = _create_resume_support_task(
+            connection,
+            session,
+            based_on_message_id=str(invite["id"]) if invite else "",
+        )
         now = _now()
         action_id = _id("chat_resume")
         # 简历任务沿用统一开关决定进入待确认或执行队列。
@@ -3456,14 +3507,14 @@ def _create_resume_action(
         connection.execute(
             """
             INSERT INTO fj_chat_send_actions (
-              id, reply_task_id, session_id, operation_kind, encrypt_resume_id, resume_filename,
+              id, reply_task_id, session_id, operation_kind, encrypt_resume_id, resume_filename, resume_invite_message_id,
               confirmation_status, status, text, canonical_status, canonical_updated_at, canonical_reason,
               created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', '', 'pending', ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', '', 'pending', ?, ?, ?, ?)
             """,
             (
                 action_id, task_id, session_id, operation_kind, encrypt_resume_id, resume_filename,
-                confirmation_status, now, canonical_reason, now, now,
+                invite_message_id, confirmation_status, now, canonical_reason, now, now,
             ),
         )
         return _action_payload(connection, action_id)

@@ -69,7 +69,21 @@ def build_job_progress_with_connection(
         (job_id,),
     ).fetchone()
     stage = str(snapshot["stage"])
+    stage_updated_at = str(snapshot["stage_updated_at"])
     waiting_on = str(snapshot["waiting_on"] or "unknown")
+    resume_delivery = _resume_delivery(connection, selected_session_id)
+    recruiter_contact = _pending_resume_recruiter_contact(
+        connection,
+        job_id=job_id,
+        session_id=selected_session_id,
+        stage=stage,
+        resume_delivery=resume_delivery,
+    )
+    # 招聘方主动触达后，未实际发送简历的会话统一引导到发简历。
+    if recruiter_contact is not None:
+        stage = "resume_requested"
+        stage_updated_at = str(recruiter_contact["occurred_at"])
+        waiting_on = "candidate"
     reason_source = str(snapshot["rejection_reason_source"] or "unknown")
     reason_category = str(snapshot["rejection_reason_category"] or "unknown")
     rejection_party = _rejection_party(connection, snapshot["stage_event_id"])
@@ -85,7 +99,7 @@ def build_job_progress_with_connection(
         "job_id": job_id,
         "session_id": selected_session_id,
         "stage": stage,
-        "stage_updated_at": str(snapshot["stage_updated_at"]),
+        "stage_updated_at": stage_updated_at,
         "waiting_on": waiting_on,
         "waiting_since_at": snapshot["waiting_since_at"],
         "contact_origin": str(snapshot["contact_origin"] or "unknown"),
@@ -106,10 +120,36 @@ def build_job_progress_with_connection(
             "rejection_reason_summary": str(snapshot["rejection_reason_summary"] or ""),
             "rejection_party": rejection_party,
         },
-        "resume_delivery": _resume_delivery(connection, selected_session_id),
+        "resume_delivery": resume_delivery,
         "primary_action": primary_action,
         "analysis_updated_at": analysis_updated_at,
     }
+
+
+def _pending_resume_recruiter_contact(
+    connection: sqlite3.Connection,
+    *,
+    job_id: str,
+    session_id: str | None,
+    stage: str,
+    resume_delivery: dict[str, Any],
+) -> sqlite3.Row | None:
+    """找出需要候选人发送简历的招聘方主动触达。"""
+    if not session_id or stage in {"offer", "rejected", "closed"}:
+        return None
+    if str(resume_delivery.get("status") or "") in {"sent", "received", "viewed", "withdrawn"}:
+        return None
+    return connection.execute(
+        """
+        SELECT occurred_at
+        FROM fj_job_activity_events
+        WHERE job_id = ? AND chat_session_id = ?
+          AND event_type IN ('recruiter_initiated_contact', 'recruiter_replied')
+        ORDER BY occurred_at DESC, created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (job_id, session_id),
+    ).fetchone()
 
 
 def _latest_session_id(connection: sqlite3.Connection, job_id: str) -> str | None:

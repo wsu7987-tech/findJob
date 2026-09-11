@@ -144,7 +144,9 @@ export class BossChatSender {
       const normalized = operationKind === "resume" ? {
         transport: "http",
         method: "POST",
-        endpoint: "/wapi/zpchat/exchange/request"
+        endpoint: action.resume_invite_message_id
+          ? "/wapi/zpchat/exchange/accept"
+          : "/wapi/zpchat/exchange/request"
       } : {
         transport: "mqtt",
         topic: "chat",
@@ -174,61 +176,79 @@ export class BossChatSender {
       let payload: Uint8Array;
       if (operationKind === "resume") {
         const resumeId = action.encrypt_resume_id ?? "";
+        const inviteMessageId = action.resume_invite_message_id ?? "";
         const liveZpToken = await options.getLiveZpToken?.() ?? "";
         if (!liveZpToken) throw new Error("未取得当前聊天页 BOSS 请求凭证");
-        const request = new URLSearchParams({
-          securityId: action.security_id,
-          type: "3",
-          encryptResumeId: resumeId,
-          mid: ""
-        });
         let body: { code?: number; message?: string; zpData?: { status?: number } };
         try {
-          const traceId = `F-${crypto.randomUUID().replaceAll("-", "")}`;
-          // 使用聊天页当前登录态发起 BOSS 简历交换请求。
-          resumeExchangeEvidence = {
-            endpoint: "/wapi/zpchat/exchange/request",
-            method: "POST",
-            request_started: true,
-            trace_id: traceId,
-            request_headers: ["Content-Type", "zp_token", "X-Requested-With", "Accept", "traceid"],
-            request_parameters: {
-              securityId: action.security_id,
-              type: "3",
-              encryptResumeId: resumeId,
-              mid: ""
+          const submitExchange = async (endpoint: string, request: URLSearchParams, step: string) => {
+            const traceId = `F-${crypto.randomUUID().replaceAll("-", "")}`;
+            const response = await fetch(`https://www.zhipin.com${endpoint}`, {
+              method: "POST", credentials: "include",
+              headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "zp_token": liveZpToken,
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "application/json, text/plain, */*",
+                "traceid": traceId
+              },
+              body: request
+            });
+            const contentType = response.headers.get("content-type") ?? "";
+            const responseText = await response.text();
+            let responseBody: { code?: number; message?: string; zpData?: { status?: number } };
+            try {
+              responseBody = JSON.parse(responseText) as { code?: number; message?: string; zpData?: { status?: number } };
+            } catch {
+              const responseKind = responseText.trimStart().startsWith("<") ? "HTML" : "非 JSON 内容";
+              throw new Error(`BOSS 简历${step}返回${responseKind}（HTTP ${response.status}，${contentType || "未提供 Content-Type"}）`);
             }
+            if (responseBody.code !== 0 || responseBody.zpData?.status !== 0) {
+              throw new Error(`BOSS 简历${step}失败：${responseBody.message ?? "未知错误"}`);
+            }
+            return { responseBody, traceId, httpStatus: response.status, contentType };
           };
-          const response = await fetch("https://www.zhipin.com/wapi/zpchat/exchange/request", {
-            method: "POST", credentials: "include",
-            headers: {
-              "Content-Type": "application/x-www-form-urlencoded",
-              "zp_token": liveZpToken,
-              "X-Requested-With": "XMLHttpRequest",
-              "Accept": "application/json, text/plain, */*",
-              "traceid": traceId
-            },
-            body: request
-          });
-          const contentType = response.headers.get("content-type") ?? "";
-          const responseText = await response.text();
-          resumeExchangeEvidence = {
-            ...resumeExchangeEvidence,
-            http_status: response.status,
-            response_content_type: contentType
-          };
-          try {
-            body = JSON.parse(responseText) as { code?: number; message?: string; zpData?: { status?: number } };
-          } catch {
-            const responseKind = responseText.trimStart().startsWith("<") ? "HTML" : "非 JSON 内容";
-            resumeExchangeEvidence = { ...resumeExchangeEvidence, response_kind: responseKind };
-            throw new Error(`BOSS 简历交换请求返回${responseKind}（HTTP ${response.status}，${contentType || "未提供 Content-Type"}）`);
+          if (inviteMessageId) {
+            // HR 邀请投递必须接受原卡片，mid 绑定该卡片的消息 ID。
+            const preflight = await submitExchange(
+              "/wapi/zpchat/exchange/testAccept",
+              new URLSearchParams({ securityId: action.security_id, type: "4", mid: inviteMessageId }),
+              "邀请预检"
+            );
+            const accepted = await submitExchange(
+              "/wapi/zpchat/exchange/accept",
+              new URLSearchParams({
+                securityId: action.security_id,
+                type: "4",
+                mid: inviteMessageId,
+                encryptResumeId: resumeId,
+                scene: ""
+              }),
+              "邀请接受"
+            );
+            body = accepted.responseBody;
+            resumeExchangeEvidence = {
+              flow: "invite_accept",
+              invitation_message_id: inviteMessageId,
+              preflight: { endpoint: "/wapi/zpchat/exchange/testAccept", trace_id: preflight.traceId, http_status: preflight.httpStatus, response_content_type: preflight.contentType },
+              accept: { endpoint: "/wapi/zpchat/exchange/accept", trace_id: accepted.traceId, http_status: accepted.httpStatus, response_content_type: accepted.contentType },
+              boss_code: body.code ?? null,
+              boss_status: body.zpData?.status ?? null
+            };
+          } else {
+            const requested = await submitExchange(
+              "/wapi/zpchat/exchange/request",
+              new URLSearchParams({ securityId: action.security_id, type: "3", encryptResumeId: resumeId, mid: "" }),
+              "交换请求"
+            );
+            body = requested.responseBody;
+            resumeExchangeEvidence = {
+              flow: "direct_request",
+              request: { endpoint: "/wapi/zpchat/exchange/request", trace_id: requested.traceId, http_status: requested.httpStatus, response_content_type: requested.contentType },
+              boss_code: body.code ?? null,
+              boss_status: body.zpData?.status ?? null
+            };
           }
-          resumeExchangeEvidence = {
-            ...resumeExchangeEvidence,
-            boss_code: body.code ?? null,
-            boss_status: body.zpData?.status ?? null
-          };
         } catch (error) { throw error; }
         if (body.code !== 0 || body.zpData?.status !== 0) {
           throw new Error(`请求发送 BOSS 附件简历失败：${body.message ?? "未知错误"}`);

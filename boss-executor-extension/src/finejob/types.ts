@@ -129,6 +129,7 @@ export type FineJobChatSendAction = {
   operation_kind?: "text" | "resume_list" | "resume";
   encrypt_resume_id?: string;
   resume_filename?: string;
+  resume_invite_message_id?: string;
 };
 
 export type ChatSendCommand = {
