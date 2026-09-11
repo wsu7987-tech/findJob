@@ -2433,6 +2433,23 @@ export interface FineJobWorkflowRun {
   waiting_for_user: boolean;
   stop_reason: string;
   telemetry: Record<string, number>;
+  progress: {
+    current_keyword: string;
+    current_city: string;
+    search_depth: number;
+    search_batch_count: number;
+    jobs_seen: number;
+    fresh_jobs: number;
+    duplicate_jobs: number;
+    candidates: number;
+    current_batch_new_jobs: number;
+    current_batch_duplicates: number;
+    jd_total: number;
+    jd_completed: number;
+    recommend_count: number;
+    review_count: number;
+    reject_count: number;
+  };
   completion_contract?: { target_count?: number };
 }
 

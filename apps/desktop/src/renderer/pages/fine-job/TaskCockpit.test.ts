@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   push: vi.fn(),
   getSnapshot: vi.fn(),
   getRun: vi.fn(),
+  getLatestRun: vi.fn(),
+  advance: vi.fn(),
   listStrategies: vi.fn()
 }));
 
@@ -15,12 +17,45 @@ vi.mock("@/services/api", () => ({
   api: {
     getFineJobWorkflowContextSnapshot: mocks.getSnapshot,
     getFineJobWorkflowRun: mocks.getRun,
+    getLatestFineJobWorkflowRun: mocks.getLatestRun,
+    advanceFineJobWorkflowRun: mocks.advance,
     listFineJobFilterStrategies: mocks.listStrategies
   }
 }));
 
+vi.mock("@/stores/fineJobWorkflowRun", async () => {
+  const { ref } = await import("vue");
+  const currentRun = ref<ReturnType<typeof run> | null>(null);
+  const refresh = async (id?: string) => {
+    if (!id) return null;
+    currentRun.value = await mocks.getRun(id);
+    return currentRun.value;
+  };
+  return {
+    useFineJobWorkflowRunStore: () => ({
+      get currentRun() {
+        return currentRun.value;
+      },
+      loading: false,
+      advancing: false,
+      refresh,
+      advance: mocks.advance,
+      create: vi.fn(),
+      restoreLatest: async () => {
+        const response = await mocks.getLatestRun();
+        currentRun.value = response.workflow_run;
+        return currentRun.value;
+      },
+      pause: vi.fn(),
+      resume: vi.fn(),
+      cancel: vi.fn()
+    })
+  };
+});
+
 vi.mock("vue-router", () => ({
-  useRouter: () => ({ push: mocks.push })
+  useRouter: () => ({ push: mocks.push }),
+  useRoute: () => ({ query: {} })
 }));
 
 import TaskCockpit from "./TaskCockpit.vue";
@@ -66,6 +101,23 @@ const run = (status: string) => ({
   waiting_for_user: false,
   stop_reason: "",
   telemetry: { fresh_candidates: 3 },
+  progress: {
+    current_keyword: "AI Agent",
+    current_city: "广州",
+    search_depth: 5,
+    search_batch_count: 1,
+    jobs_seen: 10,
+    fresh_jobs: 3,
+    duplicate_jobs: 7,
+    candidates: 3,
+    current_batch_new_jobs: 3,
+    current_batch_duplicates: 7,
+    jd_total: 0,
+    jd_completed: 0,
+    recommend_count: 0,
+    review_count: 0,
+    reject_count: 0
+  },
   completion_contract: { target_count: 2 }
 });
 
@@ -99,6 +151,8 @@ describe("TaskCockpit", () => {
     mocks.push.mockReset().mockResolvedValue(undefined);
     mocks.getSnapshot.mockReset().mockResolvedValue(snapshot);
     mocks.getRun.mockReset().mockResolvedValue(run("waiting_codex"));
+    mocks.getLatestRun.mockReset().mockResolvedValue({ workflow_run: null });
+    mocks.advance.mockReset().mockResolvedValue(run("waiting_codex"));
     mocks.listStrategies.mockReset().mockResolvedValue({ strategies: [] });
   });
 

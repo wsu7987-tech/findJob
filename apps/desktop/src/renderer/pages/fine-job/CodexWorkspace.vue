@@ -1,16 +1,20 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref } from "vue";
-import { useRoute } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 
 import CodexTerminal from "@/components/CodexTerminal.vue";
+import { api } from "@/services/api";
 import { getCodexBridge } from "@/services/desktop-bridge";
 import { useFineJobCodexStore } from "@/stores/fineJobCodex";
 import { useFineJobStrategiesStore } from "@/stores/fineJobStrategies";
+import { useFineJobWorkflowRunStore } from "@/stores/fineJobWorkflowRun";
 import type { FineJobCodexPermissions } from "@/types";
 
 const store = useFineJobCodexStore();
+const workflowStore = useFineJobWorkflowRunStore();
 const strategiesStore = useFineJobStrategiesStore();
 const route = useRoute();
+const router = useRouter();
 const terminal = ref<{
   clear: () => void;
   copyAll: () => Promise<boolean>;
@@ -128,7 +132,13 @@ const submitDeepJobSearchTask = async () => {
   }
   workflowAnalysisMessage.value = "正在启动新的 Codex 会话并提交 Workflow 分析任务……";
   try {
+    await workflowStore.refresh(task.workflowRunId);
     await start(false);
+    if (store.runId) {
+      await api.attachFineJobWorkflowCodexSession(task.workflowRunId, {
+        codex_session_ref: store.runId
+      });
+    }
     const submitted = await bridge.submitCodexPrompt(
       `使用 $finejob 继续处理 deep_job_search Workflow，workflow_run_id=${task.workflowRunId}。严格根据 Workflow Run 状态、Completion Contract 和 FineJob Skill 执行，直到 completed 或 waiting_for_user。`
     );
@@ -138,6 +148,15 @@ const submitDeepJobSearchTask = async () => {
   } catch (error) {
     workflowAnalysisMessage.value = `Workflow 分析任务提交失败：${error instanceof Error ? error.message : String(error)}`;
   }
+};
+
+const returnToTaskCockpit = async () => {
+  const task = deepJobSearchTask();
+  if (!task) return;
+  await router.push({
+    name: "fine-job-task-cockpit",
+    query: { workflow_run_id: task.workflowRunId }
+  });
 };
 
 const submitQuickTask = async (taskType: "filter" | "recommendation") => {
@@ -254,6 +273,14 @@ onMounted(async () => {
       show-icon
     />
     <el-alert
+      v-if="deepJobSearchTask()"
+      :title="`当前 Workflow Run：${deepJobSearchTask()?.workflowRunId}`"
+      description="业务执行进度请在任务驾驶舱查看；本页保留 Codex 的实际执行过程。"
+      type="info"
+      :closable="false"
+      show-icon
+    />
+    <el-alert
       v-if="store.statusMessage"
       :title="store.statusMessage"
       :type="store.status === 'failed' ? 'error' : 'info'"
@@ -351,6 +378,7 @@ onMounted(async () => {
       <div class="terminal-toolbar">
         <span class="secondary-text">拖动选择文本后可按 Ctrl/Cmd+C 复制</span>
         <div class="card-actions">
+          <el-button v-if="deepJobSearchTask()" @click="returnToTaskCockpit">返回任务驾驶舱</el-button>
           <span v-if="copyMessage" class="secondary-text">{{ copyMessage }}</span>
           <el-button :disabled="!terminal" @click="paste">粘贴</el-button>
           <el-button :disabled="!terminal" @click="clearTerminal">Clear</el-button>

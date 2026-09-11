@@ -73,6 +73,73 @@ def test_create_workflow_run_exposes_real_search_context_snapshot(configured_cli
     )
 
 
+def test_latest_workflow_run_restores_the_recent_unfinished_run(configured_client) -> None:
+    run = _create_run(configured_client)
+
+    response = configured_client.get("/api/fine-job/workflow-runs/latest")
+
+    assert response.status_code == 200
+    assert response.json()["workflow_run"]["workflow_run_id"] == run["workflow_run_id"]
+
+
+def test_pause_preserves_running_capture_and_resume_allows_auto_advance(
+    configured_client, monkeypatch
+) -> None:
+    run = _create_run(configured_client)
+    monkeypatch.setattr(
+        workflow_runs.boss_scraper_service,
+        "get_browser_status",
+        lambda: BossBrowserStatus(running=True, cdp_port=9222),
+    )
+    monkeypatch.setattr(
+        workflow_runs.boss_capture_task_manager,
+        "start_capture",
+        lambda request, **kwargs: {"id": "capture-running"},
+    )
+
+    configured_client.post(f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/advance")
+    paused = configured_client.post(f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/pause")
+    resumed = configured_client.post(f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/resume")
+
+    assert paused.status_code == 200
+    assert paused.json()["status"] == "paused"
+    assert paused.json()["tasks"][0]["status"] == "running"
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "running"
+
+
+def test_cancel_stops_active_list_capture_and_blocks_future_tasks(
+    configured_client, monkeypatch
+) -> None:
+    run = _create_run(configured_client)
+    monkeypatch.setattr(
+        workflow_runs.boss_scraper_service,
+        "get_browser_status",
+        lambda: BossBrowserStatus(running=True, cdp_port=9222),
+    )
+    monkeypatch.setattr(
+        workflow_runs.boss_capture_task_manager,
+        "start_capture",
+        lambda request, **kwargs: {"id": "capture-running"},
+    )
+    stopped: list[str] = []
+    monkeypatch.setattr(
+        workflow_runs.boss_capture_task_manager,
+        "stop_capture",
+        lambda task_id: (stopped.append(task_id) or {"id": task_id}),
+    )
+
+    configured_client.post(f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/advance")
+    cancelled = configured_client.post(f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/cancel")
+    advanced = configured_client.post(f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/advance")
+
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+    assert stopped == ["capture-running"]
+    assert all(task["status"] == "skipped" for task in cancelled.json()["tasks"])
+    assert advanced.json()["status"] == "cancelled"
+
+
 def test_context_soft_budget_blocks_run_before_search_starts(configured_client) -> None:
     strategy = configured_client.post(
         "/api/fine-job/strategies/filters",
@@ -201,6 +268,12 @@ def test_fresh_only_count_excludes_historical_discoveries_and_records_source(
     assert discovery["scroll_depth"] == 5
     assert discovery["is_filter_candidate"] == 1
     assert refreshed["telemetry"]["fresh_candidates"] == 1
+    assert refreshed["progress"]["current_keyword"] == "AI Agent"
+    assert refreshed["progress"]["current_city"] == "广州"
+    assert refreshed["progress"]["jobs_seen"] == 2
+    assert refreshed["progress"]["fresh_jobs"] == 1
+    assert refreshed["progress"]["duplicate_jobs"] == 1
+    assert refreshed["progress"]["candidates"] == 1
     assert refreshed["completed_count"] == 0
     assert refreshed["remaining_count"] == 2
 

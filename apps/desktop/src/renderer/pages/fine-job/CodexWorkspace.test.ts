@@ -11,12 +11,16 @@ const mocks = vi.hoisted(() => ({
   start: vi.fn(),
   strategiesLoad: vi.fn(),
   submitPrompt: vi.fn(),
+  attachWorkflowSession: vi.fn(),
+  refreshWorkflow: vi.fn(),
+  push: vi.fn(),
   routeQuery: {} as Record<string, string>
 }));
 
 vi.mock("@/stores/fineJobCodex", () => ({
   useFineJobCodexStore: () => ({
     status: "idle",
+    runId: "codex-session-1",
     statusMessage: "",
     permissions: null,
     pending: { greetings: [], chat_replies: [] },
@@ -28,6 +32,14 @@ vi.mock("@/stores/fineJobCodex", () => ({
     savePermissions: vi.fn(),
     decide: vi.fn()
   })
+}));
+
+vi.mock("@/stores/fineJobWorkflowRun", () => ({
+  useFineJobWorkflowRunStore: () => ({ refresh: mocks.refreshWorkflow })
+}));
+
+vi.mock("@/services/api", () => ({
+  api: { attachFineJobWorkflowCodexSession: mocks.attachWorkflowSession }
 }));
 
 vi.mock("@/stores/fineJobStrategies", () => ({
@@ -43,7 +55,8 @@ vi.mock("@/services/desktop-bridge", () => ({
 }));
 
 vi.mock("vue-router", () => ({
-  useRoute: () => ({ query: mocks.routeQuery })
+  useRoute: () => ({ query: mocks.routeQuery }),
+  useRouter: () => ({ push: mocks.push })
 }));
 
 import CodexWorkspace from "./CodexWorkspace.vue";
@@ -74,6 +87,9 @@ describe("CodexWorkspace", () => {
     mocks.start.mockReset().mockResolvedValue(undefined);
     mocks.strategiesLoad.mockReset().mockResolvedValue(undefined);
     mocks.submitPrompt.mockReset().mockResolvedValue(true);
+    mocks.attachWorkflowSession.mockReset().mockResolvedValue(undefined);
+    mocks.refreshWorkflow.mockReset().mockResolvedValue(undefined);
+    mocks.push.mockReset().mockResolvedValue(undefined);
     mocks.routeQuery = {};
   });
 
@@ -184,5 +200,8 @@ describe("CodexWorkspace", () => {
     expect(mocks.submitPrompt).toHaveBeenCalledWith(
       "使用 $finejob 继续处理 deep_job_search Workflow，workflow_run_id=workflow-run-1。严格根据 Workflow Run 状态、Completion Contract 和 FineJob Skill 执行，直到 completed 或 waiting_for_user。"
     );
+    expect(mocks.attachWorkflowSession).toHaveBeenCalledWith("workflow-run-1", {
+      codex_session_ref: "codex-session-1"
+    });
   });
 });

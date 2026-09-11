@@ -1839,6 +1839,9 @@ CREATE TABLE IF NOT EXISTS fj_workflow_runs (
   next_action TEXT NOT NULL DEFAULT '',
   next_action_reason TEXT NOT NULL DEFAULT '',
   waiting_for_user INTEGER NOT NULL DEFAULT 0,
+  paused INTEGER NOT NULL DEFAULT 0,
+  paused_from_next_action TEXT NOT NULL DEFAULT '',
+  paused_from_next_action_reason TEXT NOT NULL DEFAULT '',
   stop_reason TEXT NOT NULL DEFAULT '',
   codex_session_ref TEXT,
   codex_runtime_id TEXT,
@@ -1849,6 +1852,7 @@ CREATE TABLE IF NOT EXISTS fj_workflow_runs (
   CHECK (workflow_type IN ('deep_job_search')),
   CHECK (status IN ('pending', 'running', 'waiting_for_user', 'waiting_codex', 'completed', 'completed_with_errors', 'cancelled', 'failed')),
   CHECK (waiting_for_user IN (0, 1))
+  ,CHECK (paused IN (0, 1))
 );
 
 CREATE INDEX IF NOT EXISTS idx_fj_workflow_runs_created_at
@@ -2177,7 +2181,25 @@ class Database:
             initialize_execution_observability(connection)
 
     def _ensure_workflow_run_schema(self, connection: sqlite3.Connection) -> None:
-        """为已创建的 Workflow Run 表补齐可筛选候选标记。"""
+        """为已创建的 Workflow Run 表补齐运行控制与候选标记。"""
+        run_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(fj_workflow_runs)")
+        }
+        run_migrations = {
+            "paused": "ALTER TABLE fj_workflow_runs ADD COLUMN paused INTEGER NOT NULL DEFAULT 0",
+            "paused_from_next_action": (
+                "ALTER TABLE fj_workflow_runs "
+                "ADD COLUMN paused_from_next_action TEXT NOT NULL DEFAULT ''"
+            ),
+            "paused_from_next_action_reason": (
+                "ALTER TABLE fj_workflow_runs "
+                "ADD COLUMN paused_from_next_action_reason TEXT NOT NULL DEFAULT ''"
+            ),
+        }
+        for column, statement in run_migrations.items():
+            if column not in run_columns:
+                connection.execute(statement)
         table = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fj_workflow_job_discoveries'"
         ).fetchone()

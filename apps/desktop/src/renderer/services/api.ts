@@ -1431,6 +1431,11 @@ export const api = {
       `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}`
     );
   },
+  async getLatestFineJobWorkflowRun() {
+    return request<{ workflow_run: FineJobWorkflowRun | null }>(
+      "/api/fine-job/workflow-runs/latest"
+    );
+  },
   async createFineJobDeepJobSearchRun(payload: {
     filter_strategy_id: string;
     target_count: number;
@@ -1462,6 +1467,27 @@ export const api = {
     return request<FineJobWorkflowRun>(
       `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/resume`,
       { method: "POST" }
+    );
+  },
+  async pauseFineJobWorkflowRun(workflowRunId: string) {
+    return request<FineJobWorkflowRun>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/pause`,
+      { method: "POST" }
+    );
+  },
+  async cancelFineJobWorkflowRun(workflowRunId: string) {
+    return request<FineJobWorkflowRun>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/cancel`,
+      { method: "POST" }
+    );
+  },
+  async attachFineJobWorkflowCodexSession(
+    workflowRunId: string,
+    payload: { codex_session_ref: string; codex_runtime_id?: string }
+  ) {
+    return request<FineJobWorkflowRun>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/codex-session`,
+      { method: "PATCH", body: JSON.stringify(payload) }
     );
   },
   async listFineJobChatExecutedTasks() {

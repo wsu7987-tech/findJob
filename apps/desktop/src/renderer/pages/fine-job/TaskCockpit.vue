@@ -1,19 +1,18 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
-import { useRouter } from "vue-router";
+import { computed, onMounted, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
 
 import { api } from "@/services/api";
+import { useFineJobWorkflowRunStore } from "@/stores/fineJobWorkflowRun";
 import type {
   FineJobFilterStrategy,
-  FineJobWorkflowContextSnapshot,
-  FineJobWorkflowRun
+  FineJobWorkflowContextSnapshot
 } from "@/types";
 
 const workflowRunId = ref("");
 const contextChannel = ref("deep_job_search");
 const analysisTaskId = ref("");
 const snapshot = ref<FineJobWorkflowContextSnapshot | null>(null);
-const workflowRun = ref<FineJobWorkflowRun | null>(null);
 const strategies = ref<FineJobFilterStrategy[]>([]);
 const selectedStrategyId = ref("");
 const selectedKeywords = ref<string[]>([]);
@@ -22,10 +21,10 @@ const targetCount = ref(5);
 const candidateTargetCount = ref(15);
 const contextSoftBudgetCharacters = ref(12000);
 const router = useRouter();
+const route = useRoute();
+const workflowStore = useFineJobWorkflowRunStore();
 const error = ref("");
-const loading = ref(false);
-const creating = ref(false);
-const advancing = ref(false);
+const workflowRun = computed(() => workflowStore.currentRun);
 
 const selectedStrategy = computed(
   () => strategies.value.find((item) => item.id === selectedStrategyId.value) ?? null
@@ -39,7 +38,6 @@ const syncStrategyScope = () => {
 const loadSnapshot = async () => {
   const identifier = workflowRunId.value.trim();
   if (!identifier) return;
-  loading.value = true;
   error.value = "";
   try {
     const channel = contextChannel.value === "analysis_item"
@@ -49,16 +47,13 @@ const loadSnapshot = async () => {
       error.value = "查看单个分析 Item Context 前，请输入 Workflow Task ID。";
       return;
     }
-    const [loadedSnapshot, loadedRun] = await Promise.all([
+    const [loadedSnapshot] = await Promise.all([
       api.getFineJobWorkflowContextSnapshot(identifier, channel),
-      api.getFineJobWorkflowRun(identifier)
+      workflowStore.refresh(identifier)
     ]);
     snapshot.value = loadedSnapshot;
-    workflowRun.value = loadedRun;
   } catch (value) {
     error.value = value instanceof Error ? value.message : String(value);
-  } finally {
-    loading.value = false;
   }
 };
 
@@ -68,10 +63,9 @@ const createRun = async () => {
     error.value = "请先选择策略，并至少保留一个搜索词和城市。";
     return;
   }
-  creating.value = true;
   error.value = "";
   try {
-    workflowRun.value = await api.createFineJobDeepJobSearchRun({
+    const run = await workflowStore.create({
       filter_strategy_id: strategy.id,
       target_count: targetCount.value,
       candidate_target_count: candidateTargetCount.value,
@@ -79,41 +73,56 @@ const createRun = async () => {
       allowed_cities: selectedCities.value,
       context_soft_budget_characters: contextSoftBudgetCharacters.value
     });
-    workflowRunId.value = workflowRun.value.workflow_run_id;
+    workflowRunId.value = run?.workflow_run_id ?? "";
     await loadSnapshot();
   } catch (value) {
     error.value = value instanceof Error ? value.message : String(value);
-  } finally {
-    creating.value = false;
   }
 };
 
 const advanceRun = async () => {
   const identifier = workflowRunId.value.trim();
   if (!identifier) return;
-  advancing.value = true;
   error.value = "";
   try {
-    workflowRun.value = await api.advanceFineJobWorkflowRun(identifier);
+    await workflowStore.refresh(identifier);
+    await workflowStore.advance();
     await loadSnapshot();
   } catch (value) {
     error.value = value instanceof Error ? value.message : String(value);
-  } finally {
-    advancing.value = false;
   }
 };
 
 const resumeRun = async () => {
   const identifier = workflowRunId.value.trim();
   if (!identifier) return;
-  advancing.value = true;
   error.value = "";
   try {
-    workflowRun.value = await api.resumeFineJobWorkflowRun(identifier);
+    await workflowStore.refresh(identifier);
+    await workflowStore.resume();
+    await loadSnapshot();
   } catch (value) {
     error.value = value instanceof Error ? value.message : String(value);
-  } finally {
-    advancing.value = false;
+  }
+};
+
+const pauseRun = async () => {
+  if (!workflowRun.value) return;
+  error.value = "";
+  try {
+    await workflowStore.pause();
+  } catch (value) {
+    error.value = value instanceof Error ? value.message : String(value);
+  }
+};
+
+const cancelRun = async () => {
+  if (!workflowRun.value) return;
+  error.value = "";
+  try {
+    await workflowStore.cancel();
+  } catch (value) {
+    error.value = value instanceof Error ? value.message : String(value);
   }
 };
 
@@ -129,9 +138,22 @@ const handoffToCodex = async () => {
 onMounted(async () => {
   try {
     strategies.value = (await api.listFineJobFilterStrategies()).strategies.filter((item) => item.enabled);
+    const routeRunId = String(route.query.workflow_run_id || "").trim();
+    if (routeRunId) {
+      workflowRunId.value = routeRunId;
+      await workflowStore.refresh(routeRunId);
+    } else {
+      const restored = await workflowStore.restoreLatest();
+      workflowRunId.value = restored?.workflow_run_id ?? "";
+    }
+    if (workflowRunId.value) await loadSnapshot();
   } catch (value) {
     error.value = value instanceof Error ? value.message : String(value);
   }
+});
+
+watch(workflowRun, (run) => {
+  if (run) workflowRunId.value = run.workflow_run_id;
 });
 </script>
 
@@ -173,7 +195,7 @@ onMounted(async () => {
             <el-checkbox v-for="city in selectedStrategy?.cities ?? []" :key="city" :label="city">{{ city }}</el-checkbox>
           </el-checkbox-group>
         </el-form-item>
-        <el-button type="primary" :loading="creating" @click="createRun">建立 Run</el-button>
+        <el-button type="primary" :loading="workflowStore.loading" @click="createRun">建立并自动推进</el-button>
       </el-form>
     </el-card>
     <div class="inspector-input">
@@ -184,9 +206,11 @@ onMounted(async () => {
         <el-option label="分析 Item Context" value="analysis_item" />
       </el-select>
       <el-input v-if="contextChannel === 'analysis_item'" v-model="analysisTaskId" placeholder="Workflow Task ID" />
-      <el-button type="primary" :loading="loading" @click="loadSnapshot">查看本轮上下文</el-button>
-      <el-button :loading="advancing" :disabled="!workflowRunId" @click="advanceRun">推进 Run</el-button>
-      <el-button v-if="workflowRun?.status === 'waiting_for_user' && ['capture_interrupted', 'browser_not_running'].includes(workflowRun.stop_reason)" :loading="advancing" @click="resumeRun">确认恢复</el-button>
+      <el-button type="primary" :loading="workflowStore.loading" @click="loadSnapshot">查看本轮上下文</el-button>
+      <el-button :loading="workflowStore.advancing" :disabled="!workflowRunId" @click="advanceRun">立即推进</el-button>
+      <el-button v-if="workflowRun && workflowRun.status !== 'paused' && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)" @click="pauseRun">暂停</el-button>
+      <el-button v-if="workflowRun?.status === 'paused' || (workflowRun?.status === 'waiting_for_user' && ['capture_interrupted', 'browser_not_running'].includes(workflowRun.stop_reason))" :loading="workflowStore.advancing" @click="resumeRun">继续</el-button>
+      <el-button v-if="workflowRun && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)" type="danger" plain @click="cancelRun">停止任务</el-button>
       <el-button v-if="workflowRun?.status === 'waiting_codex'" type="primary" @click="handoffToCodex">交给 Codex 分析</el-button>
     </div>
     <el-alert v-if="error" :title="error" type="error" :closable="false" />
@@ -199,11 +223,18 @@ onMounted(async () => {
       show-icon
     />
     <el-descriptions v-if="workflowRun" :column="3" border>
+      <el-descriptions-item label="Workflow Run ID"><code>{{ workflowRun.workflow_run_id }}</code></el-descriptions-item>
       <el-descriptions-item label="目标推荐数">{{ workflowRun.completion_contract?.target_count ?? targetCount }}</el-descriptions-item>
       <el-descriptions-item label="正式 recommend">{{ workflowRun.completed_count }}</el-descriptions-item>
       <el-descriptions-item label="剩余目标">{{ workflowRun.remaining_count }}</el-descriptions-item>
-      <el-descriptions-item label="fresh candidates">{{ workflowRun.telemetry.fresh_candidates ?? 0 }}</el-descriptions-item>
+      <el-descriptions-item label="当前搜索">{{ workflowRun.progress.current_keyword || '等待开始' }} / {{ workflowRun.progress.current_city || '—' }}</el-descriptions-item>
+      <el-descriptions-item label="搜索深度 / 批次">{{ workflowRun.progress.search_depth }} / {{ workflowRun.progress.search_batch_count }}</el-descriptions-item>
+      <el-descriptions-item label="岗位：已见 / Fresh / 重复">{{ workflowRun.progress.jobs_seen }} / {{ workflowRun.progress.fresh_jobs }} / {{ workflowRun.progress.duplicate_jobs }}</el-descriptions-item>
+      <el-descriptions-item label="初筛候选">{{ workflowRun.progress.candidates }}</el-descriptions-item>
+      <el-descriptions-item label="JD：完成 / 已建">{{ workflowRun.progress.jd_completed }} / {{ workflowRun.progress.jd_total }}</el-descriptions-item>
+      <el-descriptions-item label="分析：推荐 / 复核 / 拒绝">{{ workflowRun.progress.recommend_count }} / {{ workflowRun.progress.review_count }} / {{ workflowRun.progress.reject_count }}</el-descriptions-item>
       <el-descriptions-item label="当前状态">{{ workflowRun.status }} / {{ workflowRun.current_step }}</el-descriptions-item>
+      <el-descriptions-item label="下一步">{{ workflowRun.next_action }}</el-descriptions-item>
       <el-descriptions-item label="下一步原因">{{ workflowRun.next_action_reason }}</el-descriptions-item>
     </el-descriptions>
     <template v-if="snapshot">

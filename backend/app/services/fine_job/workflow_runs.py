@@ -81,9 +81,9 @@ def create_deep_job_search_run(
             INSERT INTO fj_workflow_runs (
               id, workflow_type, completion_contract_json, status, completed_count,
               remaining_count, current_step, next_action, next_action_reason,
-              waiting_for_user, telemetry_json, created_at, updated_at
+              waiting_for_user, paused, telemetry_json, created_at, updated_at
             ) VALUES (?, 'deep_job_search', ?, 'pending', 0, ?, 'created',
-                      'start_search', '等待开始第一个已批准搜索组合。', 0, '{}', ?, ?)
+                      'start_search', '等待开始第一个已批准搜索组合。', 0, 0, '{}', ?, ?)
             """,
             (workflow_run_id, _dump(contract), target_count, now, now),
         )
@@ -107,6 +107,8 @@ def create_deep_job_search_run(
 def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: str) -> dict[str, object]:
     """推进一个采集批次；Codex 只在候选池准备完成后参与。"""
     run = _require_run(db, workflow_run_id)
+    if bool(run["paused"]):
+        return get_workflow_run(db, workflow_run_id)
     if run["status"] in {"completed", "cancelled", "failed", "waiting_codex", "waiting_for_user"}:
         return get_workflow_run(db, workflow_run_id)
     contract = _load(run["completion_contract_json"], {})
@@ -157,9 +159,24 @@ def get_workflow_run(db: Database, workflow_run_id: str) -> dict[str, object]:
         snapshots = connection.execute("SELECT * FROM fj_workflow_context_snapshots WHERE workflow_run_id = ? ORDER BY created_at", (workflow_run_id,)).fetchall()
     return {
         **_serialize_run(run),
+        "progress": _get_run_progress(db, workflow_run_id),
         "tasks": [_serialize_task(row) for row in tasks],
         "context_snapshots": [_serialize_snapshot(row) for row in snapshots],
     }
+
+
+def get_latest_active_workflow_run(db: Database) -> dict[str, object] | None:
+    """返回最近一个仍可继续查看或推进的 Workflow Run。"""
+    with db.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT * FROM fj_workflow_runs
+            WHERE status NOT IN ('completed', 'completed_with_errors', 'cancelled', 'failed')
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    return get_workflow_run(db, str(row["id"])) if row is not None else None
 
 
 def get_context_snapshot(db: Database, workflow_run_id: str, channel: str = "deep_job_search") -> dict[str, object]:
@@ -298,6 +315,17 @@ def attach_codex_session(db: Database, workflow_run_id: str, codex_session_ref: 
 def resume_deep_job_search_run(db: Database, workflow_run_id: str) -> dict[str, object]:
     """仅在用户确认后恢复中断的采集组合，避免后台静默重复采集。"""
     run = _require_run(db, workflow_run_id)
+    if bool(run["paused"]):
+        _update_run(
+            db,
+            workflow_run_id,
+            paused=0,
+            next_action=str(run["paused_from_next_action"] or "continue_workflow"),
+            next_action_reason=str(run["paused_from_next_action_reason"] or "已恢复 Workflow 自动推进。"),
+            paused_from_next_action="",
+            paused_from_next_action_reason="",
+        )
+        return get_workflow_run(db, workflow_run_id)
     if run["status"] != "waiting_for_user":
         raise AppError(409, "WORKFLOW_NOT_WAITING", "当前 Workflow Run 不在等待用户恢复状态。")
     if str(run["stop_reason"] or "") not in {"capture_interrupted", "browser_not_running"}:
@@ -321,6 +349,72 @@ def resume_deep_job_search_run(db: Database, workflow_run_id: str) -> dict[str, 
         next_action_reason="用户已确认恢复，将重新开始中断的搜索组合。",
         waiting_for_user=0,
         stop_reason="",
+    )
+    return get_workflow_run(db, workflow_run_id)
+
+
+def pause_deep_job_search_run(db: Database, workflow_run_id: str) -> dict[str, object]:
+    """暂停 Workflow 自动推进，保留已启动采集和所有已获得成果。"""
+    run = _require_run(db, workflow_run_id)
+    if run["status"] in {"completed", "completed_with_errors", "cancelled", "failed"}:
+        raise AppError(409, "WORKFLOW_NOT_PAUSABLE", "当前 Workflow Run 已结束，不能暂停。")
+    if bool(run["paused"]):
+        return get_workflow_run(db, workflow_run_id)
+    _update_run(
+        db,
+        workflow_run_id,
+        paused=1,
+        paused_from_next_action=str(run["next_action"] or "continue_workflow"),
+        paused_from_next_action_reason=str(run["next_action_reason"] or "已暂停 Workflow 自动推进。"),
+        next_action="resume_workflow",
+        next_action_reason="Workflow 已暂停；当前采集与已获得成果会保留，恢复后继续自动推进。",
+    )
+    return get_workflow_run(db, workflow_run_id)
+
+
+def cancel_deep_job_search_run(db: Database, workflow_run_id: str) -> dict[str, object]:
+    """停止 Workflow，并在列表采集仍运行时请求已有采集器安全停止。"""
+    run = _require_run(db, workflow_run_id)
+    if run["status"] in {"completed", "completed_with_errors", "cancelled", "failed"}:
+        return get_workflow_run(db, workflow_run_id)
+    with db.connect() as connection:
+        active_tasks = connection.execute(
+            """
+            SELECT * FROM fj_workflow_tasks
+            WHERE workflow_run_id = ? AND status IN ('pending', 'running', 'waiting_for_user')
+            """,
+            (workflow_run_id,),
+        ).fetchall()
+    for task in active_tasks:
+        operation_id = str(task["operation_ref_id"] or "")
+        if task["operation_ref_type"] == "capture_task" and operation_id:
+            try:
+                boss_capture_task_manager.stop_capture(operation_id)
+            except AppError:
+                # 详情采集与已结束任务继续保留其当前执行结果，Run 不再创建后续任务。
+                pass
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_workflow_tasks
+            SET status = 'skipped', updated_at = ?, completed_at = COALESCE(completed_at, ?)
+            WHERE workflow_run_id = ? AND status IN ('pending', 'running', 'waiting_for_user')
+            """,
+            (utc_now(), utc_now(), workflow_run_id),
+        )
+    _update_run(
+        db,
+        workflow_run_id,
+        status="cancelled",
+        current_step="cancelled",
+        next_action="",
+        next_action_reason="用户已停止 Workflow；系统不会再创建后续任务。",
+        waiting_for_user=0,
+        paused=0,
+        paused_from_next_action="",
+        paused_from_next_action_reason="",
+        stop_reason="cancelled_by_user",
+        completed_at=utc_now(),
     )
     return get_workflow_run(db, workflow_run_id)
 
@@ -720,7 +814,7 @@ def _refresh_counts(db: Database, workflow_run_id: str) -> None:
         telemetry = _load(run["telemetry_json"], {})
         telemetry["fresh_candidates"] = fresh
         telemetry["available_fresh_candidates"] = available
-        telemetry["search_batches"] = int(connection.execute("SELECT COUNT(*) FROM fj_workflow_tasks WHERE workflow_run_id = ?", (workflow_run_id,)).fetchone()[0])
+        telemetry["search_batches"] = int(connection.execute("SELECT COUNT(*) FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search'", (workflow_run_id,)).fetchone()[0])
         connection.execute("UPDATE fj_workflow_runs SET completed_count = ?, remaining_count = ?, telemetry_json = ?, updated_at = ? WHERE id = ?", (completed, max(0, target - completed), _dump(telemetry), utc_now(), workflow_run_id))
 
 
@@ -765,7 +859,77 @@ def _require_run(db: Database, workflow_run_id: str):
 
 
 def _serialize_run(row: Any) -> dict[str, object]:
-    return {"workflow_run_id": row["id"], "workflow_type": row["workflow_type"], "completion_contract": _load(row["completion_contract_json"], {}), "status": row["status"], "completed_count": row["completed_count"], "remaining_count": row["remaining_count"], "current_step": row["current_step"], "next_action": row["next_action"], "next_action_reason": row["next_action_reason"], "waiting_for_user": bool(row["waiting_for_user"]), "stop_reason": row["stop_reason"], "codex_session_ref": row["codex_session_ref"], "codex_runtime_id": row["codex_runtime_id"], "telemetry": _load(row["telemetry_json"], {}), "created_at": row["created_at"], "updated_at": row["updated_at"], "completed_at": row["completed_at"]}
+    return {"workflow_run_id": row["id"], "workflow_type": row["workflow_type"], "completion_contract": _load(row["completion_contract_json"], {}), "status": "paused" if bool(row["paused"]) else row["status"], "completed_count": row["completed_count"], "remaining_count": row["remaining_count"], "current_step": row["current_step"], "next_action": row["next_action"], "next_action_reason": row["next_action_reason"], "waiting_for_user": bool(row["waiting_for_user"]), "stop_reason": row["stop_reason"], "codex_session_ref": row["codex_session_ref"], "codex_runtime_id": row["codex_runtime_id"], "telemetry": _load(row["telemetry_json"], {}), "created_at": row["created_at"], "updated_at": row["updated_at"], "completed_at": row["completed_at"]}
+
+
+def _get_run_progress(db: Database, workflow_run_id: str) -> dict[str, object]:
+    """从 Run 的持久化任务与 discovery 记录生成业务过程快照。"""
+    with db.connect() as connection:
+        search_task = connection.execute(
+            """
+            SELECT * FROM fj_workflow_tasks
+            WHERE workflow_run_id = ? AND task_type = 'deep_job_search'
+            ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            (workflow_run_id,),
+        ).fetchone()
+        discovery = connection.execute(
+            """
+            SELECT
+              COUNT(*) AS jobs_seen,
+              COALESCE(SUM(CASE WHEN is_run_first_discovery = 1 AND is_historical_duplicate = 0 THEN 1 ELSE 0 END), 0) AS fresh_jobs,
+              COALESCE(SUM(CASE WHEN is_run_first_discovery = 1 AND is_historical_duplicate = 0 AND is_filter_candidate = 1 THEN 1 ELSE 0 END), 0) AS candidates
+            FROM fj_workflow_job_discoveries
+            WHERE workflow_run_id = ?
+            """,
+            (workflow_run_id,),
+        ).fetchone()
+        jd = connection.execute(
+            """
+            SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS completed
+            FROM fj_workflow_tasks
+            WHERE workflow_run_id = ? AND task_type = 'deep_job_search_jd'
+            """,
+            (workflow_run_id,),
+        ).fetchone()
+        analysis_rows = connection.execute(
+            """
+            SELECT result_json FROM fj_workflow_tasks
+            WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis' AND status = 'succeeded'
+            """,
+            (workflow_run_id,),
+        ).fetchall()
+        batch_count = int(connection.execute(
+            "SELECT COUNT(*) FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search'",
+            (workflow_run_id,),
+        ).fetchone()[0])
+    task_payload = _load(search_task["payload_json"], {}) if search_task is not None else {}
+    task_result = _load(search_task["result_json"], {}) if search_task is not None else {}
+    decisions = {"recommend": 0, "review": 0, "reject": 0}
+    for row in analysis_rows:
+        decision = str(_load(row["result_json"], {}).get("decision") or "")
+        if decision in decisions:
+            decisions[decision] += 1
+    jobs_seen = int(discovery["jobs_seen"] or 0)
+    fresh_jobs = int(discovery["fresh_jobs"] or 0)
+    return {
+        "current_keyword": str(task_payload.get("keyword") or ""),
+        "current_city": str(task_payload.get("city") or ""),
+        "search_depth": int(task_payload.get("depth") or 0),
+        "search_batch_count": batch_count,
+        "jobs_seen": jobs_seen,
+        "fresh_jobs": fresh_jobs,
+        "duplicate_jobs": max(0, jobs_seen - fresh_jobs),
+        "candidates": int(discovery["candidates"] or 0),
+        "current_batch_new_jobs": int(task_result.get("new_jobs") or 0),
+        "current_batch_duplicates": int(task_result.get("duplicates") or 0),
+        "jd_total": int(jd["total"] or 0),
+        "jd_completed": int(jd["completed"] or 0),
+        "recommend_count": decisions["recommend"],
+        "review_count": decisions["review"],
+        "reject_count": decisions["reject"],
+    }
 
 
 def _serialize_task(row: Any) -> dict[str, object]:

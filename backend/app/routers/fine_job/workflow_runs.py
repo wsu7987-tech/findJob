@@ -22,6 +22,11 @@ def create(payload: WorkflowRunCreateRequest, config: AppConfig = Depends(get_co
     return workflow_runs.create_deep_job_search_run(db, config, payload.deep_job_search.model_dump(), created_from=payload.created_from)
 
 
+@router.get("/latest")
+def latest(db: Database = Depends(get_database)):
+    return {"workflow_run": workflow_runs.get_latest_active_workflow_run(db)}
+
+
 @router.get("/{workflow_run_id}")
 def get(workflow_run_id: str, db: Database = Depends(get_database)):
     return workflow_runs.get_workflow_run(db, workflow_run_id)
@@ -35,6 +40,16 @@ def advance(workflow_run_id: str, config: AppConfig = Depends(get_config), db: D
 @router.post("/{workflow_run_id}/resume")
 def resume(workflow_run_id: str, db: Database = Depends(get_database)):
     return workflow_runs.resume_deep_job_search_run(db, workflow_run_id)
+
+
+@router.post("/{workflow_run_id}/pause")
+def pause(workflow_run_id: str, db: Database = Depends(get_database)):
+    return workflow_runs.pause_deep_job_search_run(db, workflow_run_id)
+
+
+@router.post("/{workflow_run_id}/cancel")
+def cancel(workflow_run_id: str, db: Database = Depends(get_database)):
+    return workflow_runs.cancel_deep_job_search_run(db, workflow_run_id)
 
 
 @router.get("/{workflow_run_id}/context-snapshot")
