@@ -15,7 +15,8 @@ const mocks = vi.hoisted(() => ({
   getConfig: vi.fn(),
   listModels: vi.fn(),
   listItems: vi.fn(),
-  getItemContext: vi.fn()
+  getItemContext: vi.fn(),
+  codexState: { status: "idle", sessionRef: null as string | null }
 }));
 
 vi.mock("@/services/api", () => ({
@@ -62,6 +63,13 @@ vi.mock("@/stores/fineJobWorkflowRun", async () => {
     })
   };
 });
+
+vi.mock("@/stores/fineJobCodex", () => ({
+  useFineJobCodexStore: () => ({
+    get status() { return mocks.codexState.status; },
+    get sessionRef() { return mocks.codexState.sessionRef; }
+  })
+}));
 
 vi.mock("vue-router", () => ({
   useRouter: () => ({ push: mocks.push }),
@@ -173,9 +181,11 @@ describe("TaskCockpit", () => {
     mocks.listModels.mockReset().mockResolvedValue({ models: [] });
     mocks.listItems.mockReset().mockResolvedValue({ items: [] });
     mocks.getItemContext.mockReset().mockResolvedValue({});
+    mocks.codexState.status = "idle";
+    mocks.codexState.sessionRef = null;
   });
 
-  it("仅 waiting_codex 显示并交接到现有 Codex 工作台", async () => {
+  it("waiting_codex 显示交给 Codex 分析，并明确提交待分析批次", async () => {
     const wrapper = mountCockpit();
     await flushPromises();
     await wrapper.find('[placeholder="输入 Workflow Run ID 查看本轮上下文"]').setValue("workflow-run-1");
@@ -187,7 +197,11 @@ describe("TaskCockpit", () => {
     await handoff!.trigger("click");
     expect(mocks.push).toHaveBeenCalledWith({
       name: "fine-job-codex",
-      query: { task: "deep-job-search", workflow_run_id: "workflow-run-1" }
+      query: {
+        task: "deep-job-search",
+        workflow_run_id: "workflow-run-1",
+        workflow_action: "submit"
+      }
     });
   });
 
@@ -200,5 +214,45 @@ describe("TaskCockpit", () => {
     await flushPromises();
 
     expect(wrapper.findAll("button").some((item) => item.text() === "交给 Codex 分析")).toBe(false);
+  });
+
+  it("当前存活 sessionRef 匹配时显示查看 Codex 分析，并使用 view action", async () => {
+    mocks.getRun.mockResolvedValue({
+      ...run("running"),
+      codex_session_ref: "runtime:workflow-runtime-1"
+    });
+    mocks.codexState.status = "running";
+    mocks.codexState.sessionRef = "runtime:workflow-runtime-1";
+    const wrapper = mountCockpit();
+    await flushPromises();
+    await wrapper.find('[placeholder="输入 Workflow Run ID 查看本轮上下文"]').setValue("workflow-run-1");
+    await wrapper.findAll("button").find((item) => item.text() === "查看本轮上下文")!.trigger("click");
+    await flushPromises();
+
+    const view = wrapper.findAll("button").find((item) => item.text() === "查看 Codex 分析");
+    expect(view).toBeDefined();
+    await view!.trigger("click");
+    expect(mocks.push).toHaveBeenCalledWith({
+      name: "fine-job-codex",
+      query: {
+        task: "deep-job-search",
+        workflow_run_id: "workflow-run-1",
+        workflow_action: "view"
+      }
+    });
+  });
+
+  it("已结束的 runtime session 不显示无效果的查看按钮", async () => {
+    mocks.getRun.mockResolvedValue({
+      ...run("running"),
+      codex_session_ref: "runtime:ended-runtime-1"
+    });
+    const wrapper = mountCockpit();
+    await flushPromises();
+    await wrapper.find('[placeholder="输入 Workflow Run ID 查看本轮上下文"]').setValue("workflow-run-1");
+    await wrapper.findAll("button").find((item) => item.text() === "查看本轮上下文")!.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.findAll("button").some((item) => item.text() === "查看 Codex 分析")).toBe(false);
   });
 });

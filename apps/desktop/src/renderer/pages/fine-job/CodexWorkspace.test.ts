@@ -15,14 +15,19 @@ const mocks = vi.hoisted(() => ({
   attachWorkflowSession: vi.fn(),
   refreshWorkflow: vi.fn(),
   push: vi.fn(),
-  routeQuery: {} as Record<string, string>
+  routeQuery: {} as Record<string, string>,
+  codexState: {
+    status: "idle",
+    runtimeId: "runtime-1" as string | null,
+    sessionRef: "runtime:runtime-1" as string | null
+  }
 }));
 
 vi.mock("@/stores/fineJobCodex", () => ({
   useFineJobCodexStore: () => ({
-    status: "idle",
-    runtimeId: "runtime-1",
-    sessionRef: "runtime:runtime-1",
+    get status() { return mocks.codexState.status; },
+    get runtimeId() { return mocks.codexState.runtimeId; },
+    get sessionRef() { return mocks.codexState.sessionRef; },
     statusMessage: "",
     permissions: null,
     pending: { greetings: [], chat_replies: [] },
@@ -100,6 +105,9 @@ describe("CodexWorkspace", () => {
     mocks.refreshWorkflow.mockReset().mockResolvedValue(undefined);
     mocks.push.mockReset().mockResolvedValue(undefined);
     mocks.routeQuery = {};
+    mocks.codexState.status = "idle";
+    mocks.codexState.runtimeId = "runtime-1";
+    mocks.codexState.sessionRef = "runtime:runtime-1";
   });
 
   it("新建会话完成后将焦点交给 Codex 终端", async () => {
@@ -185,8 +193,12 @@ describe("CodexWorkspace", () => {
     );
   });
 
-  it("deep_job_search 使用独立 sessionRef 并在不可恢复时提示从 Workflow 状态新建", async () => {
-    mocks.routeQuery = { task: "deep-job-search", workflow_run_id: "workflow-run-1" };
+  it("首次 handoff 只提交一次 Workflow Prompt，并在不可恢复时提示从 Workflow 状态新建", async () => {
+    mocks.routeQuery = {
+      task: "deep-job-search",
+      workflow_run_id: "workflow-run-1",
+      workflow_action: "submit"
+    };
     mocks.refreshWorkflow.mockResolvedValue({
       codex_session_ref: "runtime:closed-runtime-1",
       completion_contract: {
@@ -226,5 +238,70 @@ describe("CodexWorkspace", () => {
       codex_runtime_id: "runtime-2"
     });
     expect(wrapper.html()).toContain("原 Codex 会话不可恢复，已基于 Workflow 状态建立新分析会话");
+  });
+
+  it("live_reused + view 只进入现有 Workflow 会话，不重复提交 Prompt", async () => {
+    mocks.routeQuery = {
+      task: "deep-job-search",
+      workflow_run_id: "workflow-run-1",
+      workflow_action: "view"
+    };
+    mocks.codexState.status = "running";
+    mocks.codexState.sessionRef = "runtime:workflow-runtime-1";
+    mocks.refreshWorkflow.mockResolvedValue({
+      codex_session_ref: "runtime:workflow-runtime-1",
+      completion_contract: {
+        codex_execution_config: { model: "gpt-5.6-luna", reasoning_effort: "high" }
+      }
+    });
+    mocks.startWorkflow.mockResolvedValue({
+      status: "running",
+      runtimeId: "runtime-1",
+      sessionRef: "runtime:workflow-runtime-1",
+      workflowSessionMode: "live_reused"
+    });
+
+    const wrapper = mount(CodexWorkspace, { global: { stubs: {
+      CodexTerminal: CodexTerminalStub, ElAlert: GenericStub, ElButton: ElButtonStub,
+      ElEmpty: GenericStub, ElInputNumber: GenericStub, ElOption: GenericStub,
+      ElSelect: GenericStub, ElTag: GenericStub, ElSwitch: GenericStub
+    } } });
+    await flushPromises();
+
+    expect(mocks.startWorkflow).toHaveBeenCalledTimes(1);
+    expect(mocks.submitPrompt).not.toHaveBeenCalled();
+    expect(mocks.attachWorkflowSession).not.toHaveBeenCalled();
+    expect(wrapper.html()).toContain("已进入当前 Workflow 的 Codex 分析会话");
+  });
+
+  it("live_reused + submit 明确继续待分析批次时提交一次 Prompt", async () => {
+    mocks.routeQuery = {
+      task: "deep-job-search",
+      workflow_run_id: "workflow-run-1",
+      workflow_action: "submit"
+    };
+    mocks.codexState.status = "running";
+    mocks.codexState.sessionRef = "runtime:workflow-runtime-1";
+    mocks.refreshWorkflow.mockResolvedValue({
+      codex_session_ref: "runtime:workflow-runtime-1",
+      completion_contract: {
+        codex_execution_config: { model: "gpt-5.6-luna", reasoning_effort: "high" }
+      }
+    });
+    mocks.startWorkflow.mockResolvedValue({
+      status: "running",
+      runtimeId: "runtime-1",
+      sessionRef: "runtime:workflow-runtime-1",
+      workflowSessionMode: "live_reused"
+    });
+
+    mount(CodexWorkspace, { global: { stubs: {
+      CodexTerminal: CodexTerminalStub, ElAlert: GenericStub, ElButton: ElButtonStub,
+      ElEmpty: GenericStub, ElInputNumber: GenericStub, ElOption: GenericStub,
+      ElSelect: GenericStub, ElTag: GenericStub, ElSwitch: GenericStub
+    } } });
+    await flushPromises();
+
+    expect(mocks.submitPrompt).toHaveBeenCalledTimes(1);
   });
 });

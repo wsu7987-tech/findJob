@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
 import { api } from "@/services/api";
+import { useFineJobCodexStore } from "@/stores/fineJobCodex";
 import { useFineJobWorkflowRunStore } from "@/stores/fineJobWorkflowRun";
 import type {
   FineJobFilterStrategy,
@@ -35,9 +36,19 @@ const candidateTargetCount = ref(15);
 const contextSoftBudgetCharacters = ref(12000);
 const router = useRouter();
 const route = useRoute();
+const codexStore = useFineJobCodexStore();
 const workflowStore = useFineJobWorkflowRunStore();
 const error = ref("");
 const workflowRun = computed(() => workflowStore.currentRun);
+const hasCurrentWorkflowCodexSession = computed(() => Boolean(
+  workflowRun.value?.codex_session_ref
+    && codexStore.status === "running"
+    && workflowRun.value.codex_session_ref === codexStore.sessionRef
+));
+const hasEndedRuntimeWorkflowSession = computed(() => Boolean(
+  workflowRun.value?.codex_session_ref?.startsWith("runtime:")
+    && !hasCurrentWorkflowCodexSession.value
+));
 
 const selectedStrategy = computed(
   () => strategies.value.find((item) => item.id === selectedStrategyId.value) ?? null
@@ -182,12 +193,18 @@ const cancelRun = async () => {
   }
 };
 
-const handoffToCodex = async () => {
+const openWorkflowCodex = async (action: "submit" | "view") => {
   const currentRun = workflowRun.value;
-  if (!currentRun || currentRun.status !== "waiting_codex") return;
+  if (!currentRun) return;
+  if (action === "submit" && currentRun.status !== "waiting_codex") return;
+  if (action === "view" && !hasCurrentWorkflowCodexSession.value) return;
   await router.push({
     name: "fine-job-codex",
-    query: { task: "deep-job-search", workflow_run_id: currentRun.workflow_run_id }
+    query: {
+      task: "deep-job-search",
+      workflow_run_id: currentRun.workflow_run_id,
+      workflow_action: action
+    }
   });
 };
 
@@ -306,10 +323,17 @@ watch(workflowRun, (run) => {
       <el-button v-if="workflowRun && workflowRun.status !== 'paused' && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)" @click="pauseRun">暂停</el-button>
       <el-button v-if="workflowRun?.status === 'paused' || (workflowRun?.status === 'waiting_for_user' && ['capture_interrupted', 'browser_not_running'].includes(workflowRun.stop_reason))" :loading="workflowStore.advancing" @click="resumeRun">继续</el-button>
       <el-button v-if="workflowRun && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)" type="danger" plain @click="cancelRun">停止任务</el-button>
-      <el-button v-if="workflowRun?.status === 'waiting_codex' && !workflowRun.codex_session_ref" type="primary" @click="handoffToCodex">交给 Codex 分析</el-button>
-      <el-button v-if="workflowRun?.codex_session_ref" type="primary" @click="handoffToCodex">查看 Codex 分析</el-button>
+      <el-button v-if="workflowRun?.status === 'waiting_codex'" type="primary" @click="openWorkflowCodex('submit')">交给 Codex 分析</el-button>
+      <el-button v-else-if="hasCurrentWorkflowCodexSession" type="primary" @click="openWorkflowCodex('view')">查看 Codex 分析</el-button>
     </div>
     <el-alert v-if="error" :title="error" type="error" :closable="false" />
+    <el-alert
+      v-if="hasEndedRuntimeWorkflowSession"
+      title="原 Codex 会话不可恢复；下一批进入 waiting_codex 后可重新交给 Codex 分析。"
+      type="info"
+      :closable="false"
+      show-icon
+    />
     <el-alert
       v-if="workflowRun"
       :title="`Run 状态：${workflowRun.status}；当前步骤：${workflowRun.current_step}`"

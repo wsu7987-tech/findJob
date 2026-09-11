@@ -119,7 +119,9 @@ const deepJobSearchTask = () => {
   const query = route?.query ?? {};
   if (query.task !== "deep-job-search") return null;
   const workflowRunId = String(query.workflow_run_id || "").trim();
-  return workflowRunId ? { workflowRunId } : null;
+  const action = String(query.workflow_action || "").trim();
+  if (!workflowRunId || (action !== "submit" && action !== "view")) return null;
+  return { workflowRunId, action };
 };
 
 const submitDeepJobSearchTask = async () => {
@@ -129,7 +131,14 @@ const submitDeepJobSearchTask = async () => {
   workflowAnalysisMessage.value = "正在连接该 Workflow 的 Codex 分析会话……";
   try {
     const run = await workflowStore.refresh(task.workflowRunId);
-    if (isRunning.value && run?.codex_session_ref !== store.sessionRef) {
+    const sameLiveSession = isRunning.value && run?.codex_session_ref === store.sessionRef;
+    if (task.action === "view" && !sameLiveSession) {
+      workflowAnalysisMessage.value = run?.codex_session_ref?.startsWith("runtime:")
+        ? "原 Codex 会话不可恢复，请在下一批 waiting_codex 时重新交给 Codex 分析。"
+        : "当前 Workflow 没有可查看的存活 Codex 会话。";
+      return;
+    }
+    if (task.action === "submit" && isRunning.value && !sameLiveSession) {
       workflowAnalysisMessage.value = "当前 Codex 会话属于其他任务；请先结束它，再进入此 Workflow。";
       return;
     }
@@ -144,6 +153,12 @@ const submitDeepJobSearchTask = async () => {
       reasoningEffort: execution.reasoning_effort,
       sessionRef: run?.codex_session_ref || undefined
     });
+    if (task.action === "view") {
+      workflowAnalysisMessage.value = session.workflowSessionMode === "live_reused"
+        ? "已进入当前 Workflow 的 Codex 分析会话。"
+        : "当前 Workflow 没有可查看的存活 Codex 会话。";
+      return;
+    }
     if (session.sessionRef) {
       await api.attachFineJobWorkflowCodexSession(task.workflowRunId, {
         codex_session_ref: session.sessionRef,

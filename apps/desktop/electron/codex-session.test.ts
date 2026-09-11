@@ -81,6 +81,7 @@ describe("buildCodexInteractiveArgs", () => {
     expect(args).toContain('model_reasoning_effort="high"');
     expect(isResumableCodexSessionId("runtime:workflow-runtime-123")).toBe(false);
     expect(isResumableCodexSessionId("workflow-session-123")).toBe(false);
+    expect(isResumableCodexSessionId("6bbf9b35-d4d4-45a5-bfb4-8f8f1ed544 f0")).toBe(false);
     expect(isResumableCodexSessionId("6bbf9b35-d4d4-45a5-bfb4-8f8f1ed544f0")).toBe(true);
   });
 });
