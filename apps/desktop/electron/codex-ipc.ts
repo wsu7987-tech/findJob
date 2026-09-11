@@ -3,6 +3,13 @@ import type { IpcMain, WebContents } from "electron";
 interface CodexController {
   start: (cols?: number, rows?: number) => Promise<unknown>;
   resume: (cols?: number, rows?: number) => Promise<unknown>;
+  startWorkflow: (launch: {
+    cols?: number;
+    rows?: number;
+    model: string;
+    reasoningEffort: string;
+    sessionRef?: string;
+  }) => Promise<unknown>;
   write: (data: string) => void;
   submitPrompt?: (prompt: string) => Promise<boolean>;
   resize: (cols: number, rows: number) => void;
@@ -22,6 +29,13 @@ export const registerCodexIpc = (
   ipcMain.handle("codex:resume", (_event, size?: { cols?: number; rows?: number }) =>
     controller.resume(size?.cols, size?.rows)
   );
+  ipcMain.handle("codex:start-workflow", (_event, launch: {
+    cols?: number;
+    rows?: number;
+    model: string;
+    reasoningEffort: string;
+    sessionRef?: string;
+  }) => controller.startWorkflow(launch));
   ipcMain.handle("codex:state", () => controller.state());
   ipcMain.on("codex:input", (_event, data: string) => {
     if (typeof data === "string") controller.write(data);

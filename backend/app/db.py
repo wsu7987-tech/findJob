@@ -1924,6 +1924,25 @@ CREATE TABLE IF NOT EXISTS fj_workflow_job_discoveries (
 CREATE INDEX IF NOT EXISTS idx_fj_workflow_job_discoveries_job
   ON fj_workflow_job_discoveries(job_id, discovered_at DESC);
 
+-- Workflow 分析反馈只记录本轮评估质量，不修改正式策略。
+CREATE TABLE IF NOT EXISTS fj_workflow_evaluation_feedback (
+  id TEXT PRIMARY KEY,
+  workflow_run_id TEXT NOT NULL,
+  workflow_task_id TEXT NOT NULL,
+  evaluation_id TEXT,
+  sentiment TEXT NOT NULL,
+  reason TEXT,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE CASCADE,
+  FOREIGN KEY (workflow_task_id) REFERENCES fj_workflow_tasks(id) ON DELETE CASCADE,
+  FOREIGN KEY (evaluation_id) REFERENCES fj_job_evaluations(id) ON DELETE SET NULL,
+  CHECK (sentiment IN ('expected', 'unexpected'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_workflow_evaluation_feedback_task
+  ON fj_workflow_evaluation_feedback(workflow_task_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS fj_fact_resume_links (
   fact_id TEXT NOT NULL,
   resume_version_id TEXT NOT NULL,

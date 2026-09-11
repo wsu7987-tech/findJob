@@ -13,6 +13,7 @@ describe("registerCodexIpc", () => {
     const controller = {
       start: vi.fn(async () => ({ status: "running", runId: "run-1" })),
       resume: vi.fn(async () => ({ status: "running", runId: "run-1" })),
+      startWorkflow: vi.fn(async () => ({ status: "running", runId: "run-1", sessionRef: "session-1" })),
       write: vi.fn(),
       resize: vi.fn(),
       interrupt: vi.fn(),
@@ -28,6 +29,12 @@ describe("registerCodexIpc", () => {
     expect(controller.start).toHaveBeenCalledWith(100, 30);
     expect(controller.write).toHaveBeenCalledWith("你好");
     expect(controller.resize).toHaveBeenCalledWith(120, 40);
+    await handlers.get("codex:start-workflow")?.({}, {
+      model: "gpt-5.6-luna", reasoningEffort: "high", sessionRef: "session-1"
+    });
+    expect(controller.startWorkflow).toHaveBeenCalledWith({
+      model: "gpt-5.6-luna", reasoningEffort: "high", sessionRef: "session-1"
+    });
   });
 
   it("限制超出边界的 IPC 输入", () => {
@@ -37,7 +44,7 @@ describe("registerCodexIpc", () => {
       on: vi.fn((channel: string, handler: (...args: any[]) => unknown) => listeners.set(channel, handler))
     };
     const controller = {
-      start: vi.fn(), resume: vi.fn(), write: vi.fn(), resize: vi.fn(),
+      start: vi.fn(), resume: vi.fn(), startWorkflow: vi.fn(), write: vi.fn(), resize: vi.fn(),
       interrupt: vi.fn(), stop: vi.fn(), state: vi.fn()
     };
     registerCodexIpc(ipcMain as never, controller, () => null);

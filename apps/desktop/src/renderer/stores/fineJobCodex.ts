@@ -77,6 +77,23 @@ export const useFineJobCodexStore = defineStore("fine-job-codex", () => {
     }
   };
 
+  const startWorkflow = async (launch: {
+    cols: number;
+    rows: number;
+    model: string;
+    reasoningEffort: string;
+    sessionRef?: string;
+  }) => {
+    const bridge = getCodexBridge();
+    if (!bridge?.startWorkflowCodex) {
+      throw new Error("当前桌面端不支持按 Workflow Session 启动 Codex。");
+    }
+    const state = await bridge.startWorkflowCodex(launch);
+    status.value = state.status as FineJobCodexSessionStatus;
+    runId.value = state.runId;
+    return state;
+  };
+
   const savePermissions = async (next: FineJobCodexPermissions) => {
     permissions.value = await api.updateFineJobCodexPermissions({
       enabled: next.enabled,
@@ -108,6 +125,7 @@ export const useFineJobCodexStore = defineStore("fine-job-codex", () => {
     error,
     load,
     start,
+    startWorkflow,
     savePermissions,
     decide
   };

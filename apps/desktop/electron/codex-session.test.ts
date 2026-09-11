@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-import { buildCodexExitMessage, writeManagedWorkspace } from "./codex-session";
+import { buildCodexExitMessage, buildCodexInteractiveArgs, isExplicitCodexSessionId, writeManagedWorkspace } from "./codex-session";
 
 describe("buildCodexExitMessage", () => {
   it("在非零退出状态中保留去除终端控制符后的错误摘要", () => {
@@ -58,5 +58,23 @@ describe("buildCodexExitMessage", () => {
     } finally {
       fs.rmSync(appDataDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("buildCodexInteractiveArgs", () => {
+  it("Workflow 恢复只使用明确的 Session Ref，并传递模型与推理配置", () => {
+    const args = buildCodexInteractiveArgs({
+      tuiWorkspace: "D:/workflow-workspace",
+      resumeSessionRef: "workflow-session-123",
+      model: "gpt-5.6-luna",
+      reasoningEffort: "high",
+    });
+
+    expect(args).toContain("workflow-session-123");
+    expect(args).not.toContain("--last");
+    expect(args).toContain("gpt-5.6-luna");
+    expect(args).toContain('model_reasoning_effort="high"');
+    expect(isExplicitCodexSessionId("runtime:workflow-runtime-123")).toBe(false);
+    expect(isExplicitCodexSessionId("workflow-session-123")).toBe(true);
   });
 });

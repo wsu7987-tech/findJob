@@ -56,6 +56,13 @@ type DesktopBridgeShape = {
   installExternalCodexSkills?: () => Promise<ExternalCodexIntegrationStatus>;
   startCodex?: (size?: { cols?: number; rows?: number }) => Promise<{ status: string; runId: string | null }>;
   resumeCodex?: (size?: { cols?: number; rows?: number }) => Promise<{ status: string; runId: string | null }>;
+  startWorkflowCodex?: (launch: {
+    cols?: number;
+    rows?: number;
+    model: string;
+    reasoningEffort: string;
+    sessionRef?: string;
+  }) => Promise<{ status: string; runId: string | null; sessionRef: string | null }>;
   getCodexState?: () => Promise<{ status: string; runId: string | null }>;
   writeCodex?: (data: string) => void;
   submitCodexPrompt?: (prompt: string) => Promise<boolean>;

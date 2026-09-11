@@ -7,6 +7,8 @@ from backend.app.dependencies import get_config, get_database
 from backend.app.db import Database
 from backend.app.schemas.fine_job.workflow_runs import (
     WorkflowAnalysisSaveRequest,
+    WorkflowAnalysisFeedbackRequest,
+    WorkflowAnalysisGuidanceUpdateRequest,
     WorkflowRunCodexSessionRequest,
     WorkflowRunCreateRequest,
 )
@@ -67,6 +69,18 @@ def analysis_item_context(workflow_run_id: str, workflow_task_id: str, db: Datab
     return workflow_runs.get_workflow_analysis_item_context(db, workflow_run_id, workflow_task_id)
 
 
+@router.post("/{workflow_run_id}/analysis-items/{workflow_task_id}/feedback")
+def save_analysis_feedback(
+    workflow_run_id: str,
+    workflow_task_id: str,
+    payload: WorkflowAnalysisFeedbackRequest,
+    db: Database = Depends(get_database),
+):
+    return workflow_runs.save_workflow_analysis_feedback(
+        db, workflow_run_id, workflow_task_id, payload.model_dump()
+    )
+
+
 @router.post("/{workflow_run_id}/analysis-items/{workflow_task_id}/save")
 def save_analysis_item(
     workflow_run_id: str,
@@ -84,3 +98,14 @@ def save_analysis_item(
 @router.patch("/{workflow_run_id}/codex-session")
 def attach_codex_session(workflow_run_id: str, payload: WorkflowRunCodexSessionRequest, db: Database = Depends(get_database)):
     return workflow_runs.attach_codex_session(db, workflow_run_id, payload.codex_session_ref, payload.codex_runtime_id)
+
+
+@router.patch("/{workflow_run_id}/analysis-guidance")
+def update_analysis_guidance(
+    workflow_run_id: str,
+    payload: WorkflowAnalysisGuidanceUpdateRequest,
+    db: Database = Depends(get_database),
+):
+    return workflow_runs.update_workflow_analysis_guidance(
+        db, workflow_run_id, payload.analysis_guidance
+    )

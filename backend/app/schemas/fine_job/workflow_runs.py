@@ -7,6 +7,10 @@ from pydantic import BaseModel, Field
 
 class DeepJobSearchConfig(BaseModel):
     filter_strategy_id: str = Field(min_length=1, max_length=100)
+    recommendation_strategy_id: str = Field(min_length=1, max_length=100)
+    codex_model: str = Field(min_length=1, max_length=128)
+    codex_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"]
+    analysis_guidance: str = Field(default="", max_length=4000)
     target_count: int = Field(ge=1, le=100)
     candidate_target_count: int | None = Field(default=None, ge=1, le=500)
     allowed_search_keywords: list[str] = Field(min_length=1, max_length=50)
@@ -34,6 +38,26 @@ class WorkflowRunCodexSessionRequest(BaseModel):
     codex_runtime_id: str | None = Field(default=None, max_length=200)
 
 
+class WorkflowAnalysisGuidanceUpdateRequest(BaseModel):
+    analysis_guidance: str = Field(max_length=4000)
+
+
+class WorkflowAnalysisFeedbackRequest(BaseModel):
+    sentiment: Literal["expected", "unexpected"]
+    reason: Literal[
+        "technical_direction",
+        "salary",
+        "company",
+        "experience_or_education",
+        "work_schedule",
+        "location",
+        "jd_understanding",
+        "candidate_understanding",
+        "other",
+    ] | None = None
+    note: str = Field(default="", max_length=1000)
+
+
 class WorkflowAnalysisSaveRequest(BaseModel):
     decision: Literal["recommend", "review", "reject"]
     confidence: float = Field(default=0, ge=0, le=1)
@@ -42,3 +66,8 @@ class WorkflowAnalysisSaveRequest(BaseModel):
     risks: list[str] = Field(default_factory=list, max_length=30)
     strengths: list[str] = Field(default_factory=list, max_length=30)
     gaps: list[str] = Field(default_factory=list, max_length=30)
+    hard_requirements: list[object] = Field(default_factory=list, max_length=30)
+    match_dimensions: dict[str, object] = Field(default_factory=dict)
+    missing_information: list[str] = Field(default_factory=list, max_length=30)
+    jd_evidence: list[str] = Field(default_factory=list, max_length=30)
+    candidate_evidence: list[str] = Field(default_factory=list, max_length=30)

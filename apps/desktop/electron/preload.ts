@@ -93,6 +93,17 @@ const desktopBridge = {
     ipcRenderer.invoke("codex:start", size) as Promise<{ status: string; runId: string | null }>,
   resumeCodex: (size?: { cols?: number; rows?: number }) =>
     ipcRenderer.invoke("codex:resume", size) as Promise<{ status: string; runId: string | null }>,
+  startWorkflowCodex: (launch: {
+    cols?: number;
+    rows?: number;
+    model: string;
+    reasoningEffort: string;
+    sessionRef?: string;
+  }) => ipcRenderer.invoke("codex:start-workflow", launch) as Promise<{
+    status: string;
+    runId: string | null;
+    sessionRef: string | null;
+  }>,
   getCodexState: () =>
     ipcRenderer.invoke("codex:state") as Promise<{ status: string; runId: string | null }>,
   writeCodex: (data: string) => ipcRenderer.send("codex:input", data),

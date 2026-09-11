@@ -10,7 +10,12 @@ const mocks = vi.hoisted(() => ({
   getRun: vi.fn(),
   getLatestRun: vi.fn(),
   advance: vi.fn(),
-  listStrategies: vi.fn()
+  listStrategies: vi.fn(),
+  listRecommendations: vi.fn(),
+  getConfig: vi.fn(),
+  listModels: vi.fn(),
+  listItems: vi.fn(),
+  getItemContext: vi.fn()
 }));
 
 vi.mock("@/services/api", () => ({
@@ -19,7 +24,12 @@ vi.mock("@/services/api", () => ({
     getFineJobWorkflowRun: mocks.getRun,
     getLatestFineJobWorkflowRun: mocks.getLatestRun,
     advanceFineJobWorkflowRun: mocks.advance,
-    listFineJobFilterStrategies: mocks.listStrategies
+    listFineJobFilterStrategies: mocks.listStrategies,
+    listFineJobRecommendationStrategies: mocks.listRecommendations,
+    getConfig: mocks.getConfig,
+    listCodexModels: mocks.listModels,
+    listFineJobWorkflowAnalysisItems: mocks.listItems,
+    getFineJobWorkflowAnalysisItemContext: mocks.getItemContext
   }
 }));
 
@@ -74,7 +84,9 @@ const InputStub = defineComponent({
 });
 
 const GenericStub = defineComponent({ template: "<div><slot /></div>" });
-const TableColumnStub = defineComponent({ template: "<div><slot :row=\"{}\" /></div>" });
+const TableColumnStub = defineComponent({
+  template: "<div><slot :row=\"{ job: { title: '', company: '', salary: '', city: '', discovery_keyword: '', discovery_depth: 0, filter_result: '', filter_reasons: [], jd_status: '' }, status: '', analysis_result: {} }\" /></div>"
+});
 
 const snapshot = {
   context_snapshot_id: "snapshot-1",
@@ -133,6 +145,8 @@ const mountCockpit = () => mount(TaskCockpit, {
       ElCollapseItem: GenericStub,
       ElDescriptions: GenericStub,
       ElDescriptionsItem: GenericStub,
+      ElDialog: GenericStub,
+      ElEmpty: GenericStub,
       ElForm: GenericStub,
       ElFormItem: GenericStub,
       ElInput: InputStub,
@@ -154,12 +168,17 @@ describe("TaskCockpit", () => {
     mocks.getLatestRun.mockReset().mockResolvedValue({ workflow_run: null });
     mocks.advance.mockReset().mockResolvedValue(run("waiting_codex"));
     mocks.listStrategies.mockReset().mockResolvedValue({ strategies: [] });
+    mocks.listRecommendations.mockReset().mockResolvedValue({ strategies: [] });
+    mocks.getConfig.mockReset().mockResolvedValue({ codex_model: "gpt-5.6-luna", codex_reasoning_effort: "medium", codex_cli_path: "codex" });
+    mocks.listModels.mockReset().mockResolvedValue({ models: [] });
+    mocks.listItems.mockReset().mockResolvedValue({ items: [] });
+    mocks.getItemContext.mockReset().mockResolvedValue({});
   });
 
   it("仅 waiting_codex 显示并交接到现有 Codex 工作台", async () => {
     const wrapper = mountCockpit();
     await flushPromises();
-    await wrapper.find("input").setValue("workflow-run-1");
+    await wrapper.find('[placeholder="输入 Workflow Run ID 查看本轮上下文"]').setValue("workflow-run-1");
     await wrapper.findAll("button").find((item) => item.text() === "查看本轮上下文")!.trigger("click");
     await flushPromises();
 
@@ -176,7 +195,7 @@ describe("TaskCockpit", () => {
     mocks.getRun.mockResolvedValue(run("running"));
     const wrapper = mountCockpit();
     await flushPromises();
-    await wrapper.find("input").setValue("workflow-run-1");
+    await wrapper.find('[placeholder="输入 Workflow Run ID 查看本轮上下文"]').setValue("workflow-run-1");
     await wrapper.findAll("button").find((item) => item.text() === "查看本轮上下文")!.trigger("click");
     await flushPromises();
 

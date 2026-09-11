@@ -99,6 +99,7 @@
   FineJobCodexPendingWork,
   FineJobCodexPermissions,
   FineJobWorkflowContextSnapshot,
+  FineJobWorkflowAnalysisItem,
   FineJobWorkflowRun,
   FineJobCompanyEnvelope,
   FineJobCompanyListEnvelope,
@@ -1445,6 +1446,10 @@ export const api = {
   },
   async createFineJobDeepJobSearchRun(payload: {
     filter_strategy_id: string;
+    recommendation_strategy_id: string;
+    codex_model: string;
+    codex_reasoning_effort: "minimal" | "low" | "medium" | "high" | "xhigh";
+    analysis_guidance?: string;
     target_count: number;
     candidate_target_count?: number;
     allowed_search_keywords: string[];
@@ -1495,6 +1500,32 @@ export const api = {
     return request<FineJobWorkflowRun>(
       `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/codex-session`,
       { method: "PATCH", body: JSON.stringify(payload) }
+    );
+  },
+  async listFineJobWorkflowAnalysisItems(workflowRunId: string) {
+    return request<{ workflow_run_id: string; items: FineJobWorkflowAnalysisItem[] }>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/analysis-items`
+    );
+  },
+  async getFineJobWorkflowAnalysisItemContext(workflowRunId: string, workflowTaskId: string) {
+    return request<Record<string, unknown>>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/analysis-items/${encodeURIComponent(workflowTaskId)}/context`
+    );
+  },
+  async saveFineJobWorkflowAnalysisFeedback(
+    workflowRunId: string,
+    workflowTaskId: string,
+    payload: { sentiment: "expected" | "unexpected"; reason?: string; note?: string }
+  ) {
+    return request<Record<string, string>>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/analysis-items/${encodeURIComponent(workflowTaskId)}/feedback`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
+  async updateFineJobWorkflowAnalysisGuidance(workflowRunId: string, analysisGuidance: string) {
+    return request<FineJobWorkflowRun>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/analysis-guidance`,
+      { method: "PATCH", body: JSON.stringify({ analysis_guidance: analysisGuidance }) }
     );
   },
   async listFineJobChatExecutedTasks() {

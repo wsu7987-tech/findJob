@@ -44,6 +44,32 @@ export interface CodexSessionOptions {
   debugLog: (message: string) => void;
 }
 
+export interface CodexWorkflowLaunchOptions {
+  cols?: number;
+  rows?: number;
+  model: string;
+  reasoningEffort: string;
+  sessionRef?: string;
+}
+
+export const buildCodexInteractiveArgs = (options: {
+  tuiWorkspace: string;
+  resumeSessionRef?: string;
+  model?: string;
+  reasoningEffort?: string;
+}) => {
+  const args = [
+    ...(options.resumeSessionRef ? ["resume", options.resumeSessionRef] : []),
+    "--sandbox", "read-only", "--ask-for-approval", "on-request", "--no-alt-screen", "-C", options.tuiWorkspace
+  ];
+  if (options.model) args.push("--model", options.model);
+  if (options.reasoningEffort) args.push("--config", `model_reasoning_effort=\"${options.reasoningEffort}\"`);
+  return args;
+};
+
+export const isExplicitCodexSessionId = (sessionRef: string | undefined) =>
+  Boolean(sessionRef && !sessionRef.startsWith("runtime:"));
+
 const MANAGED_SKILLS = ["finejob", "finejob-profile"] as const;
 
 const quoteBatchValue = (value: string) => `"${value.replace(/"/g, '""')}"`;
@@ -121,6 +147,7 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
   let status: SessionStatus = "idle";
   let runId: string | null = null;
   let runtimeToken: string | null = null;
+  let sessionRef: string | null = null;
   let recentOutput = "";
   let firstOutputPromise: Promise<void> | null = null;
   let resolveFirstOutput: (() => void) | null = null;
@@ -130,9 +157,15 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
     options.emit("codex:status", { status, runId, message });
   };
 
-  const start = async (resume: boolean, cols = 120, rows = 36) => {
+  const start = async (
+    resume: boolean,
+    cols = 120,
+    rows = 36,
+    workflow?: Pick<CodexWorkflowLaunchOptions, "model" | "reasoningEffort" | "sessionRef">
+  ) => {
     if (terminal) {
-      return { status, runId };
+      if (!workflow || workflow.sessionRef === sessionRef) return { status, runId, sessionRef };
+      throw new Error("当前 Codex 会话属于其他 Workflow，结束后再切换。");
     }
     setStatus("starting");
     recentOutput = "";
@@ -141,18 +174,20 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
       const codexPath = await options.getCodexPath();
       runId = runtime.run_id;
       runtimeToken = runtime.token;
+      // runtime: 前缀只表示本地 Workflow 绑定，无法证明它是可由 CLI 恢复的线程 ID。
+      sessionRef = isExplicitCodexSessionId(workflow?.sessionRef)
+        ? workflow!.sessionRef!
+        : `runtime:${runtime.run_id}`;
       const tuiWorkspace = writeManagedWorkspace(options);
-      const args = [
-        ...(resume ? ["resume", "--last"] : []),
-        "--sandbox",
-        "read-only",
-        "--ask-for-approval",
-        "on-request",
-        // 使用内联终端保留 Codex 的完整会话滚动历史。
-        "--no-alt-screen",
-        "-C",
-        tuiWorkspace
-      ];
+      // Workflow 仅传入已经绑定的明确 Session Ref；通用恢复最近会话不会进入该分支。
+      const args = buildCodexInteractiveArgs({
+        tuiWorkspace,
+        resumeSessionRef: resume ? "--last" : (
+          isExplicitCodexSessionId(workflow?.sessionRef) ? workflow?.sessionRef : undefined
+        ),
+        model: workflow?.model,
+        reasoningEffort: workflow?.reasoningEffort,
+      });
       const resolvedLaunch = resolveCodexLaunch(codexPath, []);
       const launch =
         process.platform === "win32"
@@ -206,9 +241,10 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
         );
       });
       setStatus("running");
-      return { status, runId };
+      return { status, runId, sessionRef };
     } catch (error) {
       terminal = null;
+      sessionRef = null;
       resolveFirstOutput?.();
       resolveFirstOutput = null;
       firstOutputPromise = null;
@@ -229,6 +265,8 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
   return {
     start: (cols?: number, rows?: number) => start(false, cols, rows),
     resume: (cols?: number, rows?: number) => start(true, cols, rows),
+    startWorkflow: (launch: CodexWorkflowLaunchOptions) =>
+      start(false, launch.cols, launch.rows, launch),
     write(data: string) {
       if (terminal && data.length <= 16_384) {
         terminal.write(data);
@@ -259,8 +297,9 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
     stop() {
       terminal?.kill();
       terminal = null;
+      sessionRef = null;
       setStatus("idle");
     },
-    state: () => ({ status, runId })
+    state: () => ({ status, runId, sessionRef })
   };
 };

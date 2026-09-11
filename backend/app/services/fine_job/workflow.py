@@ -31,6 +31,7 @@ def record_evaluation_and_route(
     resume_version_id: str | None = None,
     context_revision_id: str | None = None,
     context_dependency_versions: dict[str, object] | None = None,
+    external_action_policy: str = "normal",
 ) -> dict[str, object] | None:
     """保存不可变评估，并按已确认的自动化策略路由到审批或执行任务。"""
     job_id = _resolve_history_job_id(db, job)
@@ -109,6 +110,7 @@ def record_evaluation_and_route(
 
     auto_approved = bool(
         decision == "recommend"
+        and external_action_policy != "analysis_only"
         and delivery_strategy
         and delivery_strategy.get("ready")
         and delivery_strategy.get("automation_level") == "auto_greeting"
@@ -153,7 +155,9 @@ def record_evaluation_and_route(
                 decision,
                 draft_message,
                 draft_message if auto_approved else "",
-                "命中已确认的自动打招呼策略" if auto_approved else "",
+                "命中已确认的自动打招呼策略" if auto_approved else (
+                    "Workflow analysis_only：等待用户确认" if decision != "reject" else ""
+                ),
                 1 if auto_approved else 0,
                 now,
                 now,
@@ -179,6 +183,7 @@ def record_evaluation_and_route(
         "review_item_id": review_id,
         "review_status": status,
         "action": action,
+        "external_action_policy": external_action_policy,
     }
 
 

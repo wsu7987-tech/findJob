@@ -505,11 +505,17 @@ class CodexToolService:
         if not isinstance(job_material, dict) or not isinstance(profile, dict):
             raise AppError(409, "WORKFLOW_CONTEXT_INVALID", "Workflow 分析上下文不完整，请重新读取 Item Context。")
         decision = str(arguments.get("decision") or arguments.get("conclusion") or "review")
+        run = workflow_runs.get_workflow_run(self.db, workflow_run_id)
+        contract = dict(run.get("completion_contract") or {})
+        selected = dict(contract.get("selected_strategy_ids") or {})
+        candidate_facts = profile if isinstance(profile, dict) else {}
+        context_revision_id = str(candidate_facts.get("evaluation_context_revision_id") or "")
         saved = self.save_job_evaluation(
             {
                 "job_id": str(context["job_id"]),
-                "profile_id": str(profile.get("profile_id") or ""),
-                "profile_context_version": int((profile.get("versions") or {}).get("context_version") or 0),
+                "recommendation_strategy_id": str(selected.get("recommendation_strategy_id") or ""),
+                "filter_strategy_id": str(selected.get("filter_strategy_id") or ""),
+                "context_revision_id": context_revision_id,
                 "job_detail_version": int(job_material.get("job_detail_version") or 0),
                 "decision": decision,
                 "confidence": arguments.get("confidence"),
@@ -518,25 +524,35 @@ class CodexToolService:
                 "matches": arguments.get("matches") or arguments.get("strengths") or [],
                 "gaps": arguments.get("gaps") or [],
                 "suggestion": arguments.get("summary") or arguments.get("suggestion") or "",
+                "hard_requirements": arguments.get("hard_requirements") or [],
+                "match_dimensions": arguments.get("match_dimensions") or {},
+                "missing_information": arguments.get("missing_information") or [],
+                "jd_evidence": arguments.get("jd_evidence") or [],
+                "candidate_evidence": arguments.get("candidate_evidence") or [],
+                "external_action_policy": str(contract.get("external_action_policy") or "analysis_only"),
             }
         )
         saved_data = saved.get("data") if isinstance(saved.get("data"), dict) else {}
+        route = saved_data.get("route") if isinstance(saved_data.get("route"), dict) else {}
+        evaluation_payload = saved_data.get("evaluation") if isinstance(saved_data.get("evaluation"), dict) else {}
         result = workflow_runs.record_workflow_analysis_result(
             self.db,
             self.config,
             workflow_run_id,
             workflow_task_id,
             decision=decision,
-            evaluation_id=str(saved_data.get("evaluation_id") or ""),
+            evaluation_id=str(route.get("evaluation_id") or ""),
             evaluation={
-                "decision": decision,
-                "confidence": arguments.get("confidence") or 0,
-                "summary": arguments.get("summary") or arguments.get("suggestion") or "",
-                "reasons": arguments.get("reasons") or [],
-                "risks": arguments.get("risks") or [],
-                "matches": arguments.get("matches") or arguments.get("strengths") or [],
-                "gaps": arguments.get("gaps") or [],
-                "source": "codex_workflow",
+                **evaluation_payload,
+                "review_item_id": route.get("review_item_id"),
+                "review_status": route.get("review_status"),
+                "applied_strategy": {
+                    "filter_strategy_id": selected.get("filter_strategy_id"),
+                    "recommendation_strategy_id": selected.get("recommendation_strategy_id"),
+                    "versions": contract.get("selected_strategy_versions") or {},
+                },
+                "applied_feedback_ids": contract.get("applied_feedback_ids") or [],
+                "applied_preference_ids": contract.get("applied_preference_ids") or [],
             },
         )
         return _result(
@@ -1500,6 +1516,8 @@ class CodexToolService:
             "risks": list(arguments.get("risks") or []),
             "missing_fields": list(arguments.get("missing_fields") or []),
             "missing_information": list(arguments.get("missing_information") or []),
+            "jd_evidence": list(arguments.get("jd_evidence") or []),
+            "candidate_evidence": list(arguments.get("candidate_evidence") or []),
             "hard_requirements": list(arguments.get("hard_requirements") or []),
             "match_dimensions": dict(arguments.get("match_dimensions") or {}),
             "strengths": list(arguments.get("strengths") or arguments.get("matches") or []),
@@ -1527,6 +1545,7 @@ class CodexToolService:
             context_dependency_versions=_loads(
                 context_revision["dependency_versions_json"], {}
             ),
+            external_action_policy=str(arguments.get("external_action_policy") or "normal"),
         )
         if route is None:
             raise AppError(409, "JOB_HISTORY_REQUIRED", "岗位尚未写入历史采集。")

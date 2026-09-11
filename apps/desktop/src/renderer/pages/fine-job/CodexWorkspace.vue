@@ -127,20 +127,34 @@ const submitDeepJobSearchTask = async () => {
   const bridge = getCodexBridge();
   if (!task || !bridge?.submitCodexPrompt) return;
   if (isRunning.value) {
-    workflowAnalysisMessage.value = "当前 Codex 会话仍在运行；请先结束它，再为该 Workflow 建立新会话。";
-    return;
+    const sameSession = workflowStore.currentRun?.codex_session_ref === store.runId;
+    if (!sameSession) {
+      workflowAnalysisMessage.value = "当前 Codex 会话属于其他任务；请先结束它，再进入此 Workflow。";
+      return;
+    }
   }
-  workflowAnalysisMessage.value = "正在启动新的 Codex 会话并提交 Workflow 分析任务……";
+  workflowAnalysisMessage.value = "正在连接该 Workflow 的 Codex 分析会话……";
   try {
-    await workflowStore.refresh(task.workflowRunId);
-    await start(false);
-    if (store.runId) {
+    const run = await workflowStore.refresh(task.workflowRunId);
+    const execution = run?.completion_contract?.codex_execution_config;
+    if (!execution?.model || !execution.reasoning_effort) {
+      throw new Error("本 Run 缺少已保存的 Codex 模型或推理强度。");
+    }
+    const session = await store.startWorkflow({
+      cols: terminalSize.value.cols,
+      rows: terminalSize.value.rows,
+      model: execution.model,
+      reasoningEffort: execution.reasoning_effort,
+      sessionRef: run?.codex_session_ref || undefined
+    });
+    if (session.sessionRef) {
       await api.attachFineJobWorkflowCodexSession(task.workflowRunId, {
-        codex_session_ref: store.runId
+        codex_session_ref: session.sessionRef,
+        codex_runtime_id: session.runId || undefined
       });
     }
     const submitted = await bridge.submitCodexPrompt(
-      `使用 $finejob 继续处理 deep_job_search Workflow，workflow_run_id=${task.workflowRunId}。严格根据 Workflow Run 状态、Completion Contract 和 FineJob Skill 执行，直到 completed 或 waiting_for_user。`
+      `使用 $finejob 继续处理 deep_job_search Workflow，workflow_run_id=${task.workflowRunId}。严格根据 Workflow Run 状态、Completion Contract 和 FineJob Skill 执行。后续批次读取同一 Run 的 Shared Base、Item Context 和 analysis_guidance；只保存结构化判断依据，不保存或展示内部思维链。external_action_policy=analysis_only，任何 recommend 只能进入正式待确认，不得发送或请求真实外部动作。`
     );
     workflowAnalysisMessage.value = submitted
       ? "Workflow 分析任务已提交，Codex 会通过 MCP 按需读取上下文并保存结果。"

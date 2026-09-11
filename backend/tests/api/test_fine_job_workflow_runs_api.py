@@ -28,8 +28,32 @@ def _create_run(configured_client, **updates):
     strategy = configured_client.post(
         "/api/fine-job/strategies/filters", json=_strategy_payload()
     ).json()["strategy"]
+    profile = configured_client.get("/api/fine-job/profiles").json()["profiles"][0]
+    resume = configured_client.post(
+        f"/api/fine-job/profiles/{profile['id']}/resume-versions",
+        json={
+            "name": "Workflow 分析简历",
+            "version_type": "base",
+            "current_role": "base",
+            "content": "具备 Python 与 AI Agent 项目经验。",
+        },
+    ).json()["resume_version"]
+    recommendation = configured_client.post(
+        "/api/fine-job/strategies/recommendations",
+        json={
+            "name": "Workflow 建议投递策略",
+            "enabled": True,
+            "filter_strategy_id": strategy["id"],
+            "candidate_profile_id": profile["id"],
+            "resume_version_id": resume["id"],
+            "evaluation_method": "hybrid",
+        },
+    ).json()["strategy"]
     deep_job_search = {
         "filter_strategy_id": strategy["id"],
+        "recommendation_strategy_id": recommendation["id"],
+        "codex_model": "gpt-5.6-luna",
+        "codex_reasoning_effort": "medium",
         "target_count": 2,
         "candidate_target_count": 4,
         "allowed_search_keywords": ["AI Agent"],
@@ -58,6 +82,12 @@ def test_create_workflow_run_exposes_real_search_context_snapshot(configured_cli
     assert run["completion_contract"]["counting_rule"] == "saved_unique_recommend"
     assert run["completion_contract"]["allow_historical_jobs"] is False
     assert run["completion_contract"]["applied_feedback_ids"] == ["feedback-1"]
+    assert run["completion_contract"]["selected_strategy_ids"]["recommendation_strategy_id"]
+    assert run["completion_contract"]["selected_strategy_versions"]["recommendation_strategy_version"] >= 1
+    assert run["completion_contract"]["codex_execution_config"] == {
+        "model": "gpt-5.6-luna", "reasoning_effort": "medium"
+    }
+    assert run["completion_contract"]["external_action_policy"] == "analysis_only"
     snapshot_response = configured_client.get(
         f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/context-snapshot"
     )
@@ -71,6 +101,30 @@ def test_create_workflow_run_exposes_real_search_context_snapshot(configured_cli
         item["section_id"] == "complete_resume" and not item["included"]
         for item in snapshot["sections"]
     )
+
+
+def test_workflow_rejects_recommendation_strategy_from_another_filter(configured_client) -> None:
+    run = _create_run(configured_client)
+    other = configured_client.post(
+        "/api/fine-job/strategies/filters", json=_strategy_payload(name="其他筛选策略")
+    ).json()["strategy"]
+    response = configured_client.post(
+        "/api/fine-job/workflow-runs",
+        json={
+            "task_type": "deep_job_search",
+            "deep_job_search": {
+                "filter_strategy_id": other["id"],
+                "recommendation_strategy_id": run["completion_contract"]["selected_strategy_ids"]["recommendation_strategy_id"],
+                "codex_model": "gpt-5.6-luna",
+                "codex_reasoning_effort": "medium",
+                "target_count": 1,
+                "allowed_search_keywords": ["AI Agent"],
+                "allowed_cities": ["广州"],
+            },
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["error_category"] == "RECOMMENDATION_FILTER_MISMATCH"
 
 
 def test_latest_workflow_run_restores_the_recent_unfinished_run(configured_client) -> None:
@@ -145,12 +199,27 @@ def test_context_soft_budget_blocks_run_before_search_starts(configured_client) 
         "/api/fine-job/strategies/filters",
         json=_strategy_payload(notes="上下文预算测试" * 500),
     ).json()["strategy"]
+    profile = configured_client.get("/api/fine-job/profiles").json()["profiles"][0]
+    resume = configured_client.post(
+        f"/api/fine-job/profiles/{profile['id']}/resume-versions",
+        json={"name": "预算测试简历", "version_type": "base", "current_role": "base", "content": "Python"},
+    ).json()["resume_version"]
+    recommendation = configured_client.post(
+        "/api/fine-job/strategies/recommendations",
+        json={
+            "name": "预算测试建议策略", "filter_strategy_id": strategy["id"],
+            "candidate_profile_id": profile["id"], "resume_version_id": resume["id"],
+        },
+    ).json()["strategy"]
     response = configured_client.post(
         "/api/fine-job/workflow-runs",
         json={
             "task_type": "deep_job_search",
             "deep_job_search": {
                 "filter_strategy_id": strategy["id"],
+                "recommendation_strategy_id": recommendation["id"],
+                "codex_model": "gpt-5.6-luna",
+                "codex_reasoning_effort": "medium",
                 "target_count": 1,
                 "allowed_search_keywords": ["AI Agent"],
                 "allowed_cities": ["广州"],
@@ -491,6 +560,8 @@ def test_candidate_pool_to_jd_to_waiting_codex_uses_compact_shared_and_item_cont
     shared = workflow_runs.get_context_snapshot(test_db, run["workflow_run_id"], "candidate_analysis")
     assert not any(item["section_id"] == "candidate_jds" for item in shared["sections"])
     assert any(item["section_id"] == "complete_resume" and not item["included"] for item in shared["sections"])
+    recommendation = next(item for item in shared["sections"] if item["section_id"] == "recommendation_strategy_summary")
+    assert recommendation["content"]["id"] == run["completion_contract"]["selected_strategy_ids"]["recommendation_strategy_id"]
 
     item_context = workflow_runs.get_workflow_analysis_item_context(
         test_db, run["workflow_run_id"], analysis_items[0]["workflow_task_id"]
@@ -503,6 +574,59 @@ def test_candidate_pool_to_jd_to_waiting_codex_uses_compact_shared_and_item_cont
     selected = next(job for job in jobs if job["history_record_id"] == material["job_id"])
     assert material["jd"]["job_description"] == f"当前岗位 JD {selected['job_id'].rsplit('-', 1)[1]}"
     assert sum(job["history_record_id"] == material["job_id"] for job in jobs) == 1
+
+
+def test_workflow_recommend_routes_to_pending_review_without_external_action(configured_client, test_db) -> None:
+    run, _jobs = _prepare_analysis_batch(configured_client, test_db, candidate_count=1, target_count=1)
+    item = workflow_runs.list_workflow_analysis_items(test_db, run["workflow_run_id"])["items"][0]
+    service = CodexToolService(test_db, configured_client.app.state.config)
+
+    result = service.call(
+        "finejob.save_workflow_analysis_item",
+        {
+            "workflow_run_id": run["workflow_run_id"],
+            "workflow_task_id": item["workflow_task_id"],
+            "decision": "recommend",
+            "confidence": 0.9,
+            "hard_requirements": ["通过"],
+            "strengths": ["Python 匹配"],
+            "gaps": ["领域待确认"],
+            "risks": ["团队规模未知"],
+            "missing_information": ["面试流程"],
+            "jd_evidence": ["JD 要求 Python"],
+            "candidate_evidence": ["候选人有 Python 经验证据"],
+            "reasons": ["策略要求满足"],
+        },
+    )["data"]
+
+    assert result["status"] == "completed"
+    reviews = configured_client.get("/api/fine-job/review-items?status=pending").json()["items"]
+    assert len(reviews) == 1
+    assert reviews[0]["ai_decision"] == "recommend"
+    with test_db.connect() as connection:
+        action_count = connection.execute("SELECT COUNT(*) FROM fj_automation_actions").fetchone()[0]
+    assert action_count == 0
+    item_after = workflow_runs.list_workflow_analysis_items(test_db, run["workflow_run_id"])["items"][0]
+    assert item_after["analysis_result"]["jd_evidence"] == ["JD 要求 Python"]
+    assert item_after["analysis_result"]["candidate_evidence"] == ["候选人有 Python 经验证据"]
+
+
+def test_workflow_analysis_feedback_is_persisted_without_changing_strategy(configured_client, test_db) -> None:
+    run, _jobs = _prepare_analysis_batch(configured_client, test_db, candidate_count=1, target_count=1)
+    item = workflow_runs.list_workflow_analysis_items(test_db, run["workflow_run_id"])["items"][0]
+    with test_db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_workflow_tasks SET status = 'succeeded', result_json = ? WHERE id = ?",
+            ('{"decision":"review"}', item["workflow_task_id"]),
+        )
+    saved = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/analysis-items/{item['workflow_task_id']}/feedback",
+        json={"sentiment": "unexpected", "reason": "jd_understanding", "note": "JD 解析遗漏"},
+    )
+    assert saved.status_code == 200
+    refreshed = workflow_runs.list_workflow_analysis_items(test_db, run["workflow_run_id"])["items"][0]
+    assert refreshed["feedback"][0]["reason"] == "jd_understanding"
+    assert refreshed["feedback"][0]["note"] == "JD 解析遗漏"
 
 
 def test_mixed_analysis_results_refill_candidate_pool_and_complete_on_unique_recommends(

@@ -2452,7 +2452,38 @@ export interface FineJobWorkflowRun {
     review_count: number;
     reject_count: number;
   };
-  completion_contract?: { target_count?: number };
+  codex_session_ref?: string | null;
+  codex_runtime_id?: string | null;
+  completion_contract?: {
+    target_count?: number;
+    external_action_policy?: string;
+    selected_strategy_ids?: { filter_strategy_id?: string; recommendation_strategy_id?: string };
+    selected_strategy_versions?: Record<string, number>;
+    codex_execution_config?: { model?: string; reasoning_effort?: string };
+    analysis_guidance?: { text?: string; version?: number };
+  };
+}
+
+export interface FineJobWorkflowAnalysisItem {
+  workflow_task_id: string;
+  task_type: "deep_job_search_analysis";
+  status: string;
+  payload: Record<string, unknown>;
+  result: Record<string, unknown>;
+  analysis_result: Record<string, unknown>;
+  job: {
+    job_id: string;
+    title: string;
+    company: string;
+    salary: string;
+    city: string;
+    discovery_keyword: string;
+    discovery_depth: number;
+    filter_result: string;
+    filter_reasons: string[];
+    jd_status: string;
+  };
+  feedback: Array<{ feedback_id: string; sentiment: string; reason: string | null; note: string; created_at: string }>;
 }
 
 export interface PollFallbackInput {

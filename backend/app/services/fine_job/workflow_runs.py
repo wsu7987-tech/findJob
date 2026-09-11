@@ -7,16 +7,17 @@ from backend.app.config import AppConfig
 from backend.app.db import Database
 from backend.app.errors import AppError
 from backend.app.services.fine_job.boss_capture_tasks import boss_capture_task_manager
-from backend.app.services.fine_job.boss_capture_history import (
-    get_capture_history_job,
-    update_capture_job_delivery_evaluation,
-)
+from backend.app.services.fine_job.boss_capture_history import get_capture_history_job
 from backend.app.services.fine_job.boss_scraper.service import BossCaptureRequest, boss_scraper_service
 from backend.app.services.fine_job.filter_exclusions import apply_filter_exclusions
 from backend.app.services.fine_job.job_evaluation import evaluate_filter_strategy
-from backend.app.services.fine_job.profile_store import ensure_default_profile
+from backend.app.services.fine_job import profile_store, profile_v3
 from backend.app.services.fine_job.profile_context import get_profile_context
-from backend.app.services.fine_job.strategies import get_filter_strategy, list_search_keywords
+from backend.app.services.fine_job.strategies import (
+    get_filter_strategy,
+    get_recommendation_strategy,
+    list_search_keywords,
+)
 from backend.app.utils import new_id, utc_now
 
 
@@ -31,6 +32,11 @@ def create_deep_job_search_run(
     strategy = get_filter_strategy(db, filter_strategy_id)
     if not strategy.get("enabled"):
         raise AppError(409, "FILTER_STRATEGY_DISABLED", "岗位筛选策略当前未启用。")
+    recommendation_strategy = _require_workflow_recommendation_strategy(
+        db,
+        recommendation_strategy_id=str(payload["recommendation_strategy_id"]),
+        filter_strategy_id=filter_strategy_id,
+    )
     allowed_keywords = {str(item["keyword"]) for item in list_search_keywords(db, filter_strategy_id) if item.get("enabled")}
     requested_keywords = [str(value).strip() for value in payload["allowed_search_keywords"] if str(value).strip()]
     invalid_keywords = [value for value in requested_keywords if value not in allowed_keywords]
@@ -55,11 +61,26 @@ def create_deep_job_search_run(
         "target_count": target_count,
         "counting_rule": "saved_unique_recommend",
         "source_policy": "fresh_only",
-        "selected_strategy_ids": {"filter_strategy_id": filter_strategy_id},
+        "selected_strategy_ids": {
+            "filter_strategy_id": filter_strategy_id,
+            "recommendation_strategy_id": str(recommendation_strategy["id"]),
+        },
+        "selected_strategy_versions": {
+            "filter_strategy_version": int(strategy.get("strategy_version") or 1),
+            "recommendation_strategy_version": int(recommendation_strategy.get("strategy_version") or 1),
+        },
         "allowed_search_keywords": requested_keywords,
         "allowed_cities": requested_cities,
         "allow_historical_jobs": False,
         "external_action_policy": "analysis_only",
+        "codex_execution_config": {
+            "model": str(payload["codex_model"]),
+            "reasoning_effort": str(payload["codex_reasoning_effort"]),
+        },
+        "analysis_guidance": {
+            "text": str(payload.get("analysis_guidance") or "").strip(),
+            "version": 1,
+        },
         "applied_feedback_ids": list(payload.get("applied_feedback_ids") or []),
         "applied_preference_ids": list(payload.get("applied_preference_ids") or []),
         "stop_policy": {
@@ -98,7 +119,10 @@ def create_deep_job_search_run(
                     """,
                     (task_id, workflow_run_id, _dump({"keyword": keyword, "city": city, "depth": 0, "low_yield_streak": 0}), now, now),
                 )
-    snapshot = _create_search_context_snapshot(db, workflow_run_id, strategy, contract, int(payload.get("context_soft_budget_characters") or 12000))
+    snapshot = _create_search_context_snapshot(
+        db, workflow_run_id, strategy, recommendation_strategy, contract,
+        int(payload.get("context_soft_budget_characters") or 12000),
+    )
     if snapshot["status"] == "blocked":
         _wait_for_user(db, workflow_run_id, "context_budget_exceeded", str(snapshot["blocker_reason"]))
     return get_workflow_run(db, workflow_run_id)
@@ -198,7 +222,96 @@ def list_workflow_analysis_items(db: Database, workflow_run_id: str) -> dict[str
             """,
             (workflow_run_id,),
         ).fetchall()
-    return {"workflow_run_id": workflow_run_id, "items": [_serialize_task(row) for row in rows]}
+        discoveries = connection.execute(
+            """
+            SELECT d.*, j.title, j.company_name, j.salary, j.location, j.detail_status,
+                   j.payload_json
+            FROM fj_workflow_job_discoveries d
+            JOIN fj_boss_jobs j ON j.id = d.job_id
+            WHERE d.workflow_run_id = ?
+            ORDER BY d.discovered_at, d.job_id
+            """,
+            (workflow_run_id,),
+        ).fetchall()
+        feedback_rows = connection.execute(
+            """
+            SELECT * FROM fj_workflow_evaluation_feedback
+            WHERE workflow_run_id = ? ORDER BY created_at DESC
+            """,
+            (workflow_run_id,),
+        ).fetchall()
+    discoveries_by_job = {str(row["job_id"]): row for row in discoveries}
+    feedback_by_task: dict[str, list[dict[str, object]]] = {}
+    for row in feedback_rows:
+        feedback_by_task.setdefault(str(row["workflow_task_id"]), []).append(_serialize_feedback(row))
+    return {
+        "workflow_run_id": workflow_run_id,
+        "items": [
+            _serialize_analysis_item(
+                row,
+                discoveries_by_job.get(str(_load(row["payload_json"], {}).get("job_id") or "")),
+                feedback_by_task.get(str(row["id"]), []),
+            )
+            for row in rows
+        ],
+    }
+
+
+def save_workflow_analysis_feedback(
+    db: Database,
+    workflow_run_id: str,
+    workflow_task_id: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    """保存用户对本条评估的反馈，不自动改变任何正式策略。"""
+    _require_run(db, workflow_run_id)
+    with db.connect() as connection:
+        item = connection.execute(
+            """
+            SELECT result_json FROM fj_workflow_tasks
+            WHERE id = ? AND workflow_run_id = ? AND task_type = 'deep_job_search_analysis'
+            """,
+            (workflow_task_id, workflow_run_id),
+        ).fetchone()
+    if item is None:
+        raise AppError(404, "WORKFLOW_ANALYSIS_ITEM_NOT_FOUND", "Workflow 分析 Item 不存在。")
+    result = _load(item["result_json"], {})
+    feedback_id = new_id()
+    with db.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO fj_workflow_evaluation_feedback (
+              id, workflow_run_id, workflow_task_id, evaluation_id, sentiment, reason, note, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                feedback_id,
+                workflow_run_id,
+                workflow_task_id,
+                str(result.get("evaluation_id") or "") or None,
+                str(payload["sentiment"]),
+                str(payload.get("reason") or "") or None,
+                str(payload.get("note") or "").strip(),
+                utc_now(),
+            ),
+        )
+    return {"feedback_id": feedback_id, "workflow_run_id": workflow_run_id, "workflow_task_id": workflow_task_id}
+
+
+def update_workflow_analysis_guidance(
+    db: Database, workflow_run_id: str, guidance: str
+) -> dict[str, object]:
+    """记录仅作用于当前 Run 的临时分析指导，后续批次会从契约读取。"""
+    run = _require_run(db, workflow_run_id)
+    contract = _load(run["completion_contract_json"], {})
+    current = contract.get("analysis_guidance") if isinstance(contract.get("analysis_guidance"), dict) else {}
+    contract["analysis_guidance"] = {
+        "text": guidance.strip(),
+        "version": int(current.get("version") or 0) + 1,
+        "updated_at": utc_now(),
+    }
+    _update_run(db, workflow_run_id, completion_contract_json=_dump(contract))
+    return get_workflow_run(db, workflow_run_id)
 
 
 def get_workflow_analysis_item_context(
@@ -222,12 +335,16 @@ def get_workflow_analysis_item_context(
         raise AppError(409, "CAPTURE_NOT_READY", "当前 Item 缺少完整 JD，不能进入 Codex 分析。")
     contract = _load(run["completion_contract_json"], {})
     strategy = get_filter_strategy(db, str(contract["selected_strategy_ids"]["filter_strategy_id"]))
+    recommendation_strategy = get_recommendation_strategy(
+        db, str(contract["selected_strategy_ids"]["recommendation_strategy_id"])
+    )
     shared = get_context_snapshot(db, workflow_run_id, "candidate_analysis")
     sections = [
         _section("analysis_item", "analysis_item", {"workflow_task_id": workflow_task_id, "job_id": job_id}, "workflow_task", None, True, ""),
         _section("job_material", "analysis_item", _compact_job_for_analysis(job), "boss_job", int(job.get("detail_version") or 0), True, "只包含当前岗位的 JD 与必要岗位事实。"),
-        _section("strategy_reference", "analysis_item", {"filter_strategy_id": strategy["id"], "strategy_version": strategy.get("strategy_version")}, "filter_strategy", int(strategy.get("strategy_version") or 1), True, ""),
-        _section("shared_base_reference", "analysis_item", {"context_snapshot_id": shared["context_snapshot_id"], "profile_versions": _shared_profile_versions(shared)}, "workflow_context_snapshot", None, True, "候选人事实与偏好请复用已读取的 Shared Base。"),
+        _section("filter_strategy_reference", "analysis_item", {"filter_strategy_id": strategy["id"], "strategy_version": strategy.get("strategy_version")}, "filter_strategy", int(strategy.get("strategy_version") or 1), True, "筛选策略仅用于前置候选过滤。"),
+        _section("recommendation_strategy_reference", "analysis_item", {"recommendation_strategy_id": recommendation_strategy["id"], "strategy_version": recommendation_strategy.get("strategy_version")}, "recommendation_strategy", int(recommendation_strategy.get("strategy_version") or 1), True, "建议投递策略是最终 recommend、review、reject 的主要业务规则。"),
+        _section("shared_base_reference", "analysis_item", {"context_snapshot_id": shared["context_snapshot_id"], "profile_versions": _shared_profile_versions(shared), "analysis_guidance_version": ((contract.get("analysis_guidance") or {}).get("version"))}, "workflow_context_snapshot", None, True, "候选人紧凑事实、策略与已应用反馈请复用 Shared Base。"),
         _section("applied_feedback", "analysis_item", {"applied_feedback_ids": contract.get("applied_feedback_ids") or [], "applied_preference_ids": contract.get("applied_preference_ids") or []}, "workflow_contract", 1, True, ""),
         _section("complete_resume", "excluded", None, "resume", None, False, "单 Item 默认不注入完整简历。"),
         _section("historical_payload", "excluded", None, "boss_job", None, False, "单 Item 默认不注入历史岗位 payload。"),
@@ -249,7 +366,13 @@ def get_workflow_analysis_item_context(
         "job_id": job_id,
         "shared_context_snapshot_id": shared["context_snapshot_id"],
         "item_context_snapshot": snapshot,
-        "expected_output": {"decision": "recommend | review | reject", "confidence": "0 到 1", "summary": "简要结论", "reasons": ["依据"], "risks": ["风险"]},
+        "expected_output": {
+            "decision": "recommend | review | reject", "confidence": "0 到 1", "summary": "简要结论",
+            "hard_requirements": ["硬条件判断"], "match_dimensions": {"维度": "判断"},
+            "strengths": ["匹配点"], "gaps": ["差距"], "risks": ["风险"],
+            "missing_information": ["缺失信息"], "reasons": ["依据"],
+            "jd_evidence": ["JD 证据"], "candidate_evidence": ["候选人证据"],
+        },
     }
 
 
@@ -277,14 +400,12 @@ def record_workflow_analysis_result(
         return get_workflow_run(db, workflow_run_id)
     payload = _load(item["payload_json"], {})
     job_id = str(payload.get("job_id") or "")
-    job = get_capture_history_job(db, job_id)
-    update_capture_job_delivery_evaluation(db, job=job, evaluation=evaluation)
     _finish_task(
         db,
         workflow_task_id,
         "succeeded",
         payload,
-        {"job_id": job_id, "decision": decision, "evaluation_id": evaluation_id},
+        {"job_id": job_id, "decision": decision, "evaluation_id": evaluation_id, **evaluation},
     )
     _refresh_counts(db, workflow_run_id)
     refreshed = _require_run(db, workflow_run_id)
@@ -636,14 +757,34 @@ def _create_analysis_tasks(
 def _create_candidate_analysis_snapshot(
     db: Database, workflow_run_id: str, contract: dict[str, Any]
 ) -> dict[str, object]:
-    profile = ensure_default_profile(db)
-    profile_context = get_profile_context(db, str(profile["id"]), view="search", persist_artifact=False)
+    recommendation_strategy = _require_workflow_recommendation_strategy(
+        db,
+        recommendation_strategy_id=str(contract["selected_strategy_ids"]["recommendation_strategy_id"]),
+        filter_strategy_id=str(contract["selected_strategy_ids"]["filter_strategy_id"]),
+    )
+    profile_id = str(recommendation_strategy["candidate_profile_id"])
+    resume_version_id = str(recommendation_strategy["resume_version_id"])
+    resume_version = profile_store.get_resume_version(db, resume_version_id)
+    # 生成正式评估上下文修订供评估落库校验，但 Shared Base 只保留紧凑事实。
+    resolution = profile_v3.resolve_task_context(
+        db, profile_id, resume_version_id, "evaluation", "regenerate"
+    )
+    evaluation_context = dict((resolution.get("context") or {}).get("current_revision") or {})
+    profile_context = get_profile_context(
+        db,
+        profile_id,
+        view="search",
+        resume_family_id=str(resume_version.get("resume_family_id") or "") or None,
+        persist_artifact=False,
+    )
     strategy = get_filter_strategy(db, str(contract["selected_strategy_ids"]["filter_strategy_id"]))
     sections = [
         _section("task_goal", "shared_base", {"target_count": contract["target_count"], "counting_rule": "saved_unique_recommend", "external_action_policy": contract["external_action_policy"]}, "workflow_run", 1, True, ""),
-        _section("candidate_facts", "shared_base", {"profile_id": profile_context["profile_id"], "versions": profile_context["versions"], "facts_markdown": profile_context["markdown"]}, "candidate_profile", int(profile_context["artifact_version"]), True, "已使用 search 视图，不包含完整简历或 normalized resume。"),
+        _section("candidate_facts", "shared_base", {"profile_id": profile_context["profile_id"], "resume_version_id": resume_version_id, "resume_version": resume_version.get("content_version"), "versions": profile_context["versions"], "facts_markdown": profile_context["markdown"], "evaluation_context_revision_id": evaluation_context.get("id")}, "candidate_profile", int(profile_context["artifact_version"]), True, "已使用紧凑 search 视图；正式评估上下文仅保存修订引用，不注入完整简历。"),
         _section("filter_strategy_summary", "shared_base", _compact_filter_strategy(strategy), "filter_strategy", int(strategy.get("strategy_version") or 1), True, ""),
+        _section("recommendation_strategy_summary", "shared_base", _compact_recommendation_strategy(recommendation_strategy), "recommendation_strategy", int(recommendation_strategy.get("strategy_version") or 1), True, "最终投递建议的主要业务规则。"),
         _section("applied_feedback", "shared_base", {"applied_feedback_ids": contract.get("applied_feedback_ids") or [], "applied_preference_ids": contract.get("applied_preference_ids") or []}, "workflow_contract", 1, True, "仅保存已应用引用，不注入无关反馈全文。"),
+        _section("analysis_guidance", "shared_base", contract.get("analysis_guidance") or {}, "workflow_contract", int(((contract.get("analysis_guidance") or {}).get("version")) or 1), True, "仅作用于当前 Workflow Run，不修改长期正式策略。"),
         _section("complete_resume", "excluded", None, "resume", None, False, "岗位评估默认不注入完整简历。"),
         _section("normalized_resume", "excluded", None, "resume", None, False, "岗位评估默认不注入 normalized resume 全文。"),
         _section("historical_job_payload", "excluded", None, "boss_job", None, False, "岗位历史 payload 只在单 Item 中按需读取必要 JD 字段。"),
@@ -679,11 +820,19 @@ def _create_candidate_analysis_snapshot(
     return get_context_snapshot(db, workflow_run_id, "candidate_analysis")
 
 
-def _create_search_context_snapshot(db: Database, workflow_run_id: str, strategy: dict[str, object], contract: dict[str, Any], soft_budget: int) -> dict[str, object]:
-    profile = ensure_default_profile(db)
+def _create_search_context_snapshot(
+    db: Database,
+    workflow_run_id: str,
+    strategy: dict[str, object],
+    recommendation_strategy: dict[str, object],
+    contract: dict[str, Any],
+    soft_budget: int,
+) -> dict[str, object]:
+    profile = profile_store.get_profile(db, str(recommendation_strategy["candidate_profile_id"]))
     sections = [
         _section("task_goal", "shared_base", {"target_count": contract["target_count"], "source_policy": contract["source_policy"], "keywords": contract["allowed_search_keywords"], "cities": contract["allowed_cities"]}, "workflow_run", 1, True, ""),
         _section("filter_strategy", "task_channel", strategy, "filter_strategy", int(strategy.get("strategy_version") or 1), True, ""),
+        _section("recommendation_strategy", "task_channel", _compact_recommendation_strategy(recommendation_strategy), "recommendation_strategy", int(recommendation_strategy.get("strategy_version") or 1), True, "最终投递建议策略会在候选分析阶段作为主要规则。"),
         _section("candidate_compact_facts", "shared_base", {"profile_id": profile["id"], "versions": profile["versions"]}, "candidate_profile", int(profile["versions"]["facts_version"]), True, "搜索阶段只注入候选人版本摘要；详细事实在 JD 分析 Item 按需读取。"),
         _section("complete_resume", "excluded", None, "resume", None, False, "搜索阶段不需要完整简历。"),
         _section("historical_payload", "excluded", None, "boss_job", None, False, "fresh_only 搜索不注入历史岗位 payload。"),
@@ -712,6 +861,34 @@ def _compact_filter_strategy(strategy: dict[str, object]) -> dict[str, object]:
         "skill_include_all", "skill_exclude", "unknown_value_policy",
     )
     return {field: strategy.get(field) for field in fields}
+
+
+def _compact_recommendation_strategy(strategy: dict[str, object]) -> dict[str, object]:
+    fields = (
+        "id", "name", "strategy_version", "filter_strategy_id", "candidate_profile_id",
+        "resume_version_id", "evaluation_method", "desired_responsibilities", "required_skills",
+        "preferred_skills", "excluded_terms", "preferred_industries", "work_preferences",
+        "risk_notes", "minimum_confidence", "insufficient_info_action", "notes",
+    )
+    return {field: strategy.get(field) for field in fields}
+
+
+def _require_workflow_recommendation_strategy(
+    db: Database, *, recommendation_strategy_id: str, filter_strategy_id: str
+) -> dict[str, object]:
+    strategy = get_recommendation_strategy(db, recommendation_strategy_id)
+    if not strategy.get("enabled"):
+        raise AppError(409, "RECOMMENDATION_STRATEGY_DISABLED", "建议投递策略当前未启用。")
+    if str(strategy.get("filter_strategy_id") or "") != filter_strategy_id:
+        raise AppError(422, "RECOMMENDATION_FILTER_MISMATCH", "建议投递策略必须关联本轮选择的岗位筛选策略。")
+    resume_version_id = str(strategy.get("resume_version_id") or "")
+    profile_id = str(strategy.get("candidate_profile_id") or "")
+    if not resume_version_id or not profile_id:
+        raise AppError(422, "RECOMMENDATION_PROFILE_REQUIRED", "建议投递策略必须关联候选人档案和具体简历。")
+    resume_version = profile_store.get_resume_version(db, resume_version_id)
+    if str(resume_version.get("profile_id") or "") != profile_id:
+        raise AppError(409, "RECOMMENDATION_PROFILE_MISMATCH", "建议投递策略的候选人档案与具体简历不一致。")
+    return strategy
 
 
 def _compact_job_for_analysis(job: dict[str, object]) -> dict[str, object]:
@@ -934,6 +1111,39 @@ def _get_run_progress(db: Database, workflow_run_id: str) -> dict[str, object]:
 
 def _serialize_task(row: Any) -> dict[str, object]:
     return {"workflow_task_id": row["id"], "task_type": row["task_type"], "status": row["status"], "payload": _load(row["payload_json"], {}), "result": _load(row["result_json"], {}), "operation_ref_type": row["operation_ref_type"], "operation_ref_id": row["operation_ref_id"], "retryable": bool(row["retryable"])}
+
+
+def _serialize_analysis_item(
+    row: Any, discovery: Any | None, feedback: list[dict[str, object]]
+) -> dict[str, object]:
+    item = _serialize_task(row)
+    payload = _load(row["payload_json"], {})
+    job_payload = _load(discovery["payload_json"], {}) if discovery is not None else {}
+    item["job"] = {
+        "job_id": str(payload.get("job_id") or ""),
+        "title": str(discovery["title"] or "") if discovery is not None else "",
+        "company": str(discovery["company_name"] or "") if discovery is not None else "",
+        "salary": str(discovery["salary"] or "") if discovery is not None else "",
+        "city": str(discovery["location"] or "") if discovery is not None else "",
+        "discovery_keyword": str(discovery["search_keyword"] or "") if discovery is not None else "",
+        "discovery_depth": int(discovery["scroll_depth"] or 0) if discovery is not None else 0,
+        "filter_result": str(job_payload.get("final_filter_status") or job_payload.get("filter_status") or ""),
+        "filter_reasons": list(job_payload.get("filter_reasons") or []),
+        "jd_status": str(discovery["detail_status"] or "") if discovery is not None else "",
+    }
+    item["analysis_result"] = item["result"]
+    item["feedback"] = feedback
+    return item
+
+
+def _serialize_feedback(row: Any) -> dict[str, object]:
+    return {
+        "feedback_id": str(row["id"]),
+        "sentiment": str(row["sentiment"]),
+        "reason": row["reason"],
+        "note": str(row["note"] or ""),
+        "created_at": str(row["created_at"]),
+    }
 
 
 def _serialize_snapshot(row: Any) -> dict[str, object]:
