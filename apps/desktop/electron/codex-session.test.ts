@@ -51,6 +51,7 @@ describe("buildCodexExitMessage", () => {
       expect(config).toContain("[mcp_servers.finejob]");
       expect(config).toContain('args = ["-m", "backend.app.mcp.fine_job_server"]');
       expect(fineJobSkill).toContain("name: finejob");
+      expect(fineJobSkill).toContain("## deep_job_search Workflow");
       expect(fineJobNodes).toContain("# 岗位任务节点");
       expect(profileSkill).toContain("name: finejob-profile");
       expect(profileRules).toContain("# 分析规则");

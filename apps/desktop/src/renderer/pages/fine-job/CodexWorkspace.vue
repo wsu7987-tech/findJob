@@ -22,6 +22,7 @@ const terminalSize = ref({ cols: 120, rows: 36 });
 const savingPermissions = ref(false);
 const copyMessage = ref("");
 const profileAnalysisMessage = ref("");
+const workflowAnalysisMessage = ref("");
 const quickTaskMessage = ref("");
 const quickTaskSubmitting = ref<"filter" | "recommendation" | null>(null);
 const filterTaskStrategyId = ref<string | null>(null);
@@ -110,6 +111,35 @@ const submitProfileAnalysisTask = async () => {
   }
 };
 
+const deepJobSearchTask = () => {
+  const query = route?.query ?? {};
+  if (query.task !== "deep-job-search") return null;
+  const workflowRunId = String(query.workflow_run_id || "").trim();
+  return workflowRunId ? { workflowRunId } : null;
+};
+
+const submitDeepJobSearchTask = async () => {
+  const task = deepJobSearchTask();
+  const bridge = getCodexBridge();
+  if (!task || !bridge?.submitCodexPrompt) return;
+  if (isRunning.value) {
+    workflowAnalysisMessage.value = "当前 Codex 会话仍在运行；请先结束它，再为该 Workflow 建立新会话。";
+    return;
+  }
+  workflowAnalysisMessage.value = "正在启动新的 Codex 会话并提交 Workflow 分析任务……";
+  try {
+    await start(false);
+    const submitted = await bridge.submitCodexPrompt(
+      `使用 $finejob 继续处理 deep_job_search Workflow，workflow_run_id=${task.workflowRunId}。严格根据 Workflow Run 状态、Completion Contract 和 FineJob Skill 执行，直到 completed 或 waiting_for_user。`
+    );
+    workflowAnalysisMessage.value = submitted
+      ? "Workflow 分析任务已提交，Codex 会通过 MCP 按需读取上下文并保存结果。"
+      : "Codex 会话当前不可接收任务，请重新启动新会话后再试。";
+  } catch (error) {
+    workflowAnalysisMessage.value = `Workflow 分析任务提交失败：${error instanceof Error ? error.message : String(error)}`;
+  }
+};
+
 const submitQuickTask = async (taskType: "filter" | "recommendation") => {
   const bridge = getCodexBridge();
   if (!bridge?.submitCodexPrompt) {
@@ -187,6 +217,7 @@ onMounted(async () => {
   filterTaskStrategyId.value = enabledFilterStrategies.value[0]?.id ?? null;
   recommendationTaskStrategyId.value = enabledRecommendationStrategies.value[0]?.id ?? null;
   await submitProfileAnalysisTask();
+  await submitDeepJobSearchTask();
 });
 </script>
 
@@ -211,6 +242,13 @@ onMounted(async () => {
     <el-alert
       v-if="profileAnalysisMessage"
       :title="profileAnalysisMessage"
+      type="info"
+      :closable="false"
+      show-icon
+    />
+    <el-alert
+      v-if="workflowAnalysisMessage"
+      :title="workflowAnalysisMessage"
       type="info"
       :closable="false"
       show-icon

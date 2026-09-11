@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
+import { useRouter } from "vue-router";
 
 import { api } from "@/services/api";
 import type {
@@ -20,6 +21,7 @@ const selectedCities = ref<string[]>([]);
 const targetCount = ref(5);
 const candidateTargetCount = ref(15);
 const contextSoftBudgetCharacters = ref(12000);
+const router = useRouter();
 const error = ref("");
 const loading = ref(false);
 const creating = ref(false);
@@ -115,6 +117,15 @@ const resumeRun = async () => {
   }
 };
 
+const handoffToCodex = async () => {
+  const currentRun = workflowRun.value;
+  if (!currentRun || currentRun.status !== "waiting_codex") return;
+  await router.push({
+    name: "fine-job-codex",
+    query: { task: "deep-job-search", workflow_run_id: currentRun.workflow_run_id }
+  });
+};
+
 onMounted(async () => {
   try {
     strategies.value = (await api.listFineJobFilterStrategies()).strategies.filter((item) => item.enabled);
@@ -146,7 +157,7 @@ onMounted(async () => {
         </el-form-item>
         <el-form-item label="候选池目标">
           <el-input-number v-model="candidateTargetCount" :min="targetCount" :max="500" />
-          <p class="secondary-text">默认值为 15；候选池达到该数值后，只补齐 {{ targetCount }} 个高优先级 JD，再进入 Codex 分析。</p>
+          <p class="secondary-text">候选池达到阶段目标后，系统按确定性发现顺序以小批次获取 JD；recommend 不足时继续补下一批。</p>
         </el-form-item>
         <el-form-item label="本轮 Context 软预算（字符）">
           <el-input-number v-model="contextSoftBudgetCharacters" :min="1000" :max="200000" :step="1000" />
@@ -176,6 +187,7 @@ onMounted(async () => {
       <el-button type="primary" :loading="loading" @click="loadSnapshot">查看本轮上下文</el-button>
       <el-button :loading="advancing" :disabled="!workflowRunId" @click="advanceRun">推进 Run</el-button>
       <el-button v-if="workflowRun?.status === 'waiting_for_user' && ['capture_interrupted', 'browser_not_running'].includes(workflowRun.stop_reason)" :loading="advancing" @click="resumeRun">确认恢复</el-button>
+      <el-button v-if="workflowRun?.status === 'waiting_codex'" type="primary" @click="handoffToCodex">交给 Codex 分析</el-button>
     </div>
     <el-alert v-if="error" :title="error" type="error" :closable="false" />
     <el-alert

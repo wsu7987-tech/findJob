@@ -55,6 +55,7 @@ def test_create_workflow_run_exposes_real_search_context_snapshot(configured_cli
 
     assert run["status"] == "pending"
     assert run["completion_contract"]["source_policy"] == "fresh_only"
+    assert run["completion_contract"]["counting_rule"] == "saved_unique_recommend"
     assert run["completion_contract"]["allow_historical_jobs"] is False
     assert run["completion_contract"]["applied_feedback_ids"] == ["feedback-1"]
     snapshot_response = configured_client.get(

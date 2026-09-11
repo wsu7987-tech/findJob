@@ -82,6 +82,23 @@ description: 通过 FineJob MCP 编排可组合的求职业务节点，完成岗
 - 推进建议只保存为 `attention_status` / recommendation，不创建正式待执行任务。
 - 回复草稿只保存和展示，不发送，不创建发送动作，不调用 BOSS 发送接口。
 
+## deep_job_search Workflow
+
+当任务资源为 `deep_job_search` Workflow Run 时，严格以 Run 的状态和 Completion Contract 为准：
+
+1. 读取 `finejob.get_workflow_run(workflow_run_id)`，确认 `status`、`completed_count`、`remaining_count` 和 `next_action_reason`。
+2. Run 进入 `waiting_codex` 后，先读取一次 `finejob.get_workflow_context_snapshot(workflow_run_id, channel="candidate_analysis")`。这是 Shared Base，只读取一次并在同一 Codex 会话复用。
+3. 调用 `finejob.list_workflow_analysis_items(workflow_run_id)`，只处理状态为 `pending` 或 `running` 的 Item。
+4. 对每个 Item 调用 `finejob.get_workflow_analysis_item_context`。上下文只包含该岗位的 JD、必要岗位事实、策略引用和 Shared Base 引用；不得混用其他岗位的材料。
+5. 生成 `recommend`、`review` 或 `reject` 后，必须调用 `finejob.save_workflow_analysis_item` 保存。该工具会复用正式岗位评估保存能力，并由后端更新 Workflow 计数。
+6. 每次保存后重新读取 `finejob.get_workflow_run`。若仍要求 `codex_analysis`，继续处理待分析 Item；若后端转入 JD 补充或搜索，等待后端状态再次到达 `waiting_codex`；Run 为 `completed` 或 `waiting_for_user` 时结束。
+
+约束：
+
+- `completed_count` 只由本 Run 已正式保存的唯一 `recommend` 岗位计算，候选池数量不代表完成数量。
+- 不直接操作数据库，不自行判断“岗位已经够了”。
+- `review`、`reject` 也必须通过 Workflow 保存，使后端能够从候选池补充下一批 JD 或继续搜索。
+
 ## 边界
 
 - 调用 `finejob.get_capabilities` 返回的已注册工具，不复制 FineJob 已有采集、筛选、评估或路由逻辑。

@@ -10,7 +10,8 @@ const mocks = vi.hoisted(() => ({
   load: vi.fn(),
   start: vi.fn(),
   strategiesLoad: vi.fn(),
-  submitPrompt: vi.fn()
+  submitPrompt: vi.fn(),
+  routeQuery: {} as Record<string, string>
 }));
 
 vi.mock("@/stores/fineJobCodex", () => ({
@@ -41,6 +42,10 @@ vi.mock("@/services/desktop-bridge", () => ({
   getCodexBridge: () => ({ submitCodexPrompt: mocks.submitPrompt })
 }));
 
+vi.mock("vue-router", () => ({
+  useRoute: () => ({ query: mocks.routeQuery })
+}));
+
 import CodexWorkspace from "./CodexWorkspace.vue";
 
 const ElButtonStub = defineComponent({
@@ -69,6 +74,7 @@ describe("CodexWorkspace", () => {
     mocks.start.mockReset().mockResolvedValue(undefined);
     mocks.strategiesLoad.mockReset().mockResolvedValue(undefined);
     mocks.submitPrompt.mockReset().mockResolvedValue(true);
+    mocks.routeQuery = {};
   });
 
   it("新建会话完成后将焦点交给 Codex 终端", async () => {
@@ -151,6 +157,32 @@ describe("CodexWorkspace", () => {
     expect(mocks.submitPrompt).toHaveBeenNthCalledWith(
       2,
       "使用 $finejob，按建议投递策略“Agent 建议”（recommendation_strategy_id=recommendation-1）从新采集开始获取 10 条推荐投递岗位。开始前提醒当前自动招呼状态；本任务只生成建议并放入待确认，不执行真实招呼。"
+    );
+  });
+
+  it("deep_job_search 通过新会话提交最小 Workflow 身份提示词", async () => {
+    mocks.routeQuery = { task: "deep-job-search", workflow_run_id: "workflow-run-1" };
+
+    mount(CodexWorkspace, {
+      global: {
+        stubs: {
+          CodexTerminal: CodexTerminalStub,
+          ElAlert: GenericStub,
+          ElButton: ElButtonStub,
+          ElEmpty: GenericStub,
+          ElInputNumber: GenericStub,
+          ElOption: GenericStub,
+          ElSelect: GenericStub,
+          ElTag: GenericStub,
+          ElSwitch: GenericStub
+        }
+      }
+    });
+    await flushPromises();
+
+    expect(mocks.start).toHaveBeenCalledWith(120, 36, false);
+    expect(mocks.submitPrompt).toHaveBeenCalledWith(
+      "使用 $finejob 继续处理 deep_job_search Workflow，workflow_run_id=workflow-run-1。严格根据 Workflow Run 状态、Completion Contract 和 FineJob Skill 执行，直到 completed 或 waiting_for_user。"
     );
   });
 });

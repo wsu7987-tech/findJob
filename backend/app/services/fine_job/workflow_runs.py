@@ -53,7 +53,7 @@ def create_deep_job_search_run(
     contract = {
         "task_type": "deep_job_search",
         "target_count": target_count,
-        "counting_rule": "fresh_only_candidate",
+        "counting_rule": "saved_unique_recommend",
         "source_policy": "fresh_only",
         "selected_strategy_ids": {"filter_strategy_id": filter_strategy_id},
         "allowed_search_keywords": requested_keywords,
