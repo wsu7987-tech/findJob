@@ -1533,10 +1533,22 @@ export const api = {
       "/api/fine-job/boss-chat/resume-attachments"
     );
   },
-  async createFineJobChatResumeAction(sessionId: string, resumeId: string, filename: string) {
+  async createFineJobChatResumeAction(
+    sessionId: string,
+    resumeId: string,
+    filename: string,
+    resumeInviteMessageId = ""
+  ) {
     return request<FineJobChatSendActionEnvelope>(
       `/api/fine-job/boss-chat/sessions/${encodeURIComponent(sessionId)}/resume-actions`,
-      { method: "POST", body: JSON.stringify({ encrypt_resume_id: resumeId, filename }) }
+      {
+        method: "POST",
+        body: JSON.stringify({
+          encrypt_resume_id: resumeId,
+          filename,
+          resume_invite_message_id: resumeInviteMessageId
+        })
+      }
     );
   },
   async cancelFineJobChatReply(

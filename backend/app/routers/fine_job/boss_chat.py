@@ -329,7 +329,13 @@ async def create_resume_action(
     db: Database = Depends(get_database),
 ):
     """在用户选择附件并确认后创建同一聊天动作队列中的简历发送动作。"""
-    action = boss_chat.create_resume_send_action(db, session_id, payload.encrypt_resume_id, payload.filename)
+    action = boss_chat.create_resume_send_action(
+        db,
+        session_id,
+        payload.encrypt_resume_id,
+        payload.filename,
+        payload.resume_invite_message_id,
+    )
     if action["confirmation_status"] == "confirmed":
         await boss_executor_service.notify_queue_changed(db)
     return {"action": action}

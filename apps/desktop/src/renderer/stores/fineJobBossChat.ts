@@ -351,9 +351,14 @@ export const useFineJobBossChatStore = defineStore("fineJobBossChat", () => {
     }
   });
 
-  const confirmResume = async (resumeId: string, filename: string) => mutate(async () => {
+  const confirmResume = async (resumeId: string, filename: string, resumeInviteMessageId = "") => mutate(async () => {
     if (!selectedSessionId.value) throw new Error("请先选择聊天会话");
-    const result = await api.createFineJobChatResumeAction(selectedSessionId.value, resumeId, filename);
+    const result = await api.createFineJobChatResumeAction(
+      selectedSessionId.value,
+      resumeId,
+      filename,
+      resumeInviteMessageId
+    );
     await refreshSelected();
     return result.action;
   });

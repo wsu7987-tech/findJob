@@ -56,6 +56,20 @@ DEFAULT_MESSAGE_TRANSFORM_RULES = [
         "condition_branch": "always",
     },
     {
+        "id": "resume-invite",
+        "label": "HR 邀请投递附件简历",
+        "enabled": True,
+        "direction": "inbound",
+        "match_mode": "regex",
+        "pattern": r"^\s*(?:[^：:\s]+[：:]\s*)?(?:我想要一份您的附件简历[，,]您是否同意|附件请求)\s*$",
+        "output_kind": "action",
+        "display_content": "HR 邀请投递附件简历",
+        "action_type": "resume_invite",
+        "requires_resume_sent": False,
+        "condition_rule_id": "",
+        "condition_branch": "always",
+    },
+    {
         "id": "competitor-pk",
         "label": "竞争者 PK 推广",
         "enabled": True,
@@ -148,6 +162,20 @@ DEFAULT_MESSAGE_TRANSFORM_RULES = [
         "pattern": r"^\s*.+\.pdf\s*$",
         "output_kind": "action",
         "display_content": "我的简历已成功发送出去",
+        "action_type": "resume_sent_confirmed",
+        "requires_resume_sent": False,
+        "condition_rule_id": "",
+        "condition_branch": "always",
+    },
+    {
+        "id": "resume-sent-to-boss",
+        "label": "附件简历已发送给 Boss",
+        "enabled": True,
+        "direction": "inbound",
+        "match_mode": "regex",
+        "pattern": r"^\s*您的附件简历\s+.+?\s+已发送给\s*[Bb][Oo][Ss][Ss][，,]?\s*点击查看附件\s*$",
+        "output_kind": "action",
+        "display_content": "我已成功发送简历",
         "action_type": "resume_sent_confirmed",
         "requires_resume_sent": False,
         "condition_rule_id": "",
@@ -330,7 +358,14 @@ def _upgrade_legacy_default_transform_rules(rules: list[dict[str, Any]]) -> bool
                 rule[key] = default[key]
                 changed = True
     existing_rule_ids = {str(rule.get("id") or "") for rule in rules}
-    for rule_id in ("resume-viewed-by-hr", "resume-withdraw-requested", "resume-withdrawn", "resume-withdrawn-by-hr"):
+    for rule_id in (
+        "resume-invite",
+        "resume-sent-to-boss",
+        "resume-viewed-by-hr",
+        "resume-withdraw-requested",
+        "resume-withdrawn",
+        "resume-withdrawn-by-hr",
+    ):
         if rule_id not in existing_rule_ids:
             rules.append(dict(defaults_by_id[rule_id]))
             changed = True
@@ -535,18 +570,6 @@ def _transform_message(
         "content": clean_content,
         "display_kind": "chat",
         "action_type": "",
-    }
-
-
-def _resume_invite_transform(direction: str, body_type: int | None) -> dict[str, str] | None:
-    """将 HR 附件邀请卡片保存为可接受的简历投递动作。"""
-    if direction != "inbound" or body_type != 7:
-        return None
-    return {
-        "message_type": "system",
-        "content": "HR 邀请发送附件简历",
-        "display_kind": "action",
-        "action_type": "resume_invite",
     }
 
 
@@ -1287,7 +1310,7 @@ def sync_history_messages(
             message_type = "text" if body_type == 1 else "system"
             sent_at = _epoch_ms_to_iso(raw.get("time")) or now
             message_status = _history_message_status(raw)
-            transformed = _resume_invite_transform(direction, body_type) or _transform_message(
+            transformed = _transform_message(
                 connection,
                 session_id=session_id,
                 direction=direction,
@@ -1880,11 +1903,7 @@ def ingest_events(
                 account_uid=event["account_uid"],
                 message=message,
             )
-            raw_meta = message.get("raw_meta") if isinstance(message.get("raw_meta"), dict) else {}
-            body_type = _optional_int(raw_meta.get("bodyType"))
-            transformed = _resume_invite_transform(
-                str(message.get("direction") or "inbound"), body_type
-            ) or _transform_message(
+            transformed = _transform_message(
                 connection,
                 session_id=str(session["id"]),
                 direction=str(message.get("direction") or "inbound"),
@@ -2357,6 +2376,20 @@ def retransform_session_messages(db: Database, session_id: str) -> dict[str, Any
                         if str(row["platform_message_id"]) == str(session["platform_latest_msg_id"] or ""):
                             latest_platform_content = next_content
                             latest_platform_display_kind = "action"
+                if current_action_type == "resume_invite":
+                    # 已保存的邀请动作重新转义时也重放待发简历事实。
+                    _record_message_activity(
+                        connection,
+                        session_id=session_id,
+                        message_id=str(row["id"]),
+                        direction=str(row["direction"]),
+                        occurred_at=str(row["sent_at"]),
+                        platform_message_id=str(row["platform_message_id"]),
+                        message_type=str(row["message_type"]),
+                        content=str(row["content"]),
+                        display_kind="action",
+                        action_type=current_action_type,
+                    )
                 continue
             if current_display_kind != "chat":
                 continue
@@ -2395,6 +2428,20 @@ def retransform_session_messages(db: Database, session_id: str) -> dict[str, Any
                 """,
                 (next_message_type, next_content, next_display_kind, next_action_type, row["id"]),
             )
+            if next_action_type == "resume_invite":
+                # 重新转义命中邀请规则后，同步写入待发简历事实。
+                _record_message_activity(
+                    connection,
+                    session_id=session_id,
+                    message_id=str(row["id"]),
+                    direction=str(row["direction"]),
+                    occurred_at=str(row["sent_at"]),
+                    platform_message_id=str(row["platform_message_id"]),
+                    message_type=next_message_type,
+                    content=next_content,
+                    display_kind=next_display_kind,
+                    action_type=next_action_type,
+                )
             updated_count += 1
             if next_display_kind != "chat":
                 reclassified_message_ids.append(str(row["id"]))
@@ -3476,6 +3523,7 @@ def _create_resume_action(
     operation_kind: str,
     encrypt_resume_id: str = "",
     resume_filename: str = "",
+    resume_invite_message_id: str = "",
 ) -> dict[str, Any]:
     with db.connect() as connection:
         runtime = _ensure_runtime(connection)
@@ -3485,14 +3533,22 @@ def _create_resume_action(
         direct_execution = operation_kind == "resume" and bool(runtime["direct_execution_enabled"])
         if direct_execution and not runtime["send_enabled"]:
             raise AppError(status_code=409, error_category="CHAT_SEND_DISABLED", error_message="请先在自动代聊设置中启用发送。")
-        invite = connection.execute(
-            """
-            SELECT id, platform_message_id FROM fj_chat_messages
-            WHERE session_id = ? AND direction = 'inbound' AND action_type = 'resume_invite'
-            ORDER BY sent_at DESC, rowid DESC LIMIT 1
-            """,
-            (session_id,),
-        ).fetchone()
+        invite = None
+        if operation_kind == "resume" and resume_invite_message_id:
+            invite = connection.execute(
+                """
+                SELECT id, platform_message_id FROM fj_chat_messages
+                WHERE id = ? AND session_id = ? AND direction = 'inbound' AND action_type = 'resume_invite'
+                LIMIT 1
+                """,
+                (resume_invite_message_id, session_id),
+            ).fetchone()
+            if invite is None or not str(invite["platform_message_id"] or ""):
+                raise AppError(
+                    status_code=409,
+                    error_category="CHAT_RESUME_INVITE_INVALID",
+                    error_message="选择的邀请投递消息已失效，请重新转义消息后再试。",
+                )
         invite_message_id = str(invite["platform_message_id"] or "") if invite else ""
         task_id = _create_resume_support_task(
             connection,
@@ -3524,8 +3580,21 @@ def create_resume_list_action(db: Database, session_id: str) -> dict[str, Any]:
     return _create_resume_action(db, session_id, "resume_list")
 
 
-def create_resume_send_action(db: Database, session_id: str, encrypt_resume_id: str, resume_filename: str) -> dict[str, Any]:
-    return _create_resume_action(db, session_id, "resume", encrypt_resume_id, resume_filename)
+def create_resume_send_action(
+    db: Database,
+    session_id: str,
+    encrypt_resume_id: str,
+    resume_filename: str,
+    resume_invite_message_id: str = "",
+) -> dict[str, Any]:
+    return _create_resume_action(
+        db,
+        session_id,
+        "resume",
+        encrypt_resume_id,
+        resume_filename,
+        resume_invite_message_id,
+    )
 
 
 def list_review_tasks(db: Database) -> dict[str, list[dict[str, Any]]]:

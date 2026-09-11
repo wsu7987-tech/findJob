@@ -55,6 +55,10 @@ const showResumePanel = computed(() => (
   progress.value?.stage === "resume_requested"
   && progress.value.waiting_on === "candidate"
 ));
+const canUseResumeInvite = computed(() => (
+  progress.value?.stage === "resume_requested"
+  && progress.value.waiting_on === "candidate"
+));
 const canMarkRejected = computed(() => Boolean(
   session.value?.job_context_state === "linked"
   && !["offer", "rejected", "closed"].includes(progress.value?.stage ?? "")
@@ -105,6 +109,13 @@ const batchScopePendingChats = computed(() => batchScope.value?.counts.sessions_
 const batchScopePendingJobs = computed(() => batchScope.value?.counts.extra_jobs ?? 0);
 const resumeAttachments = computed(() => store.resumeAttachments);
 const latestResumeSendAction = computed(() => store.detail?.send_actions.find((item) => item.operation_kind === "resume") ?? null);
+const selectedResumeInviteMessageId = ref("");
+const activeResumeInviteMessageId = computed(() => {
+  const selectedId = selectedResumeInviteMessageId.value;
+  return store.detail?.messages.some((message) => (
+    message.id === selectedId && message.action_type === "resume_invite"
+  )) ? selectedId : "";
+});
 const resumeListLoading = computed(() => resumeListRefreshing.value);
 const resumeListFailed = computed(() => Boolean(store.resumeListError));
 const resumeListLoaded = computed(() => store.resumeListLoaded);
@@ -707,6 +718,11 @@ const refreshResumeAttachments = async () => {
   }
 };
 
+const selectResumeInvite = (messageId: string) => {
+  selectedResumeInviteMessageId.value = messageId;
+  ElMessage.success("已选择 HR 邀请投递，请选择附件简历后发送。");
+};
+
 const confirmResume = async () => {
   const selected = resumeAttachments.value.find((item) => item.resumeId === selectedResumeId.value);
   if (!selected) {
@@ -723,7 +739,7 @@ const confirmResume = async () => {
     return;
   }
   try {
-    await store.confirmResume(selected.resumeId, selected.showName);
+    await store.confirmResume(selected.resumeId, selected.showName, activeResumeInviteMessageId.value);
     ElMessage.success(
       store.runtime?.direct_execution_enabled ? "简历已进入发送队列" : "简历发送任务已进入待确认列表"
     );
@@ -1149,6 +1165,13 @@ onBeforeUnmount(() => {
                   <span v-if="message.display_kind !== 'action' && latestMessageStatusLabel(message.status)" class="message-bubble__status">{{ latestMessageStatusLabel(message.status) }}</span>
                   {{ message.content || `[${message.message_type}]` }}
                 </p>
+                <el-button
+                  v-if="message.action_type === 'resume_invite' && canUseResumeInvite"
+                  size="small"
+                  type="primary"
+                  plain
+                  @click="selectResumeInvite(message.id)"
+                >使用此邀请投递</el-button>
               </article>
             </div>
             <div v-if="session.history_has_more" class="message-more-actions">

@@ -202,3 +202,4 @@ class BossChatActionCompleteRequest(BaseModel):
 class BossChatResumeSendRequest(BaseModel):
     encrypt_resume_id: str = Field(min_length=1, max_length=240)
     filename: str = Field(min_length=1, max_length=300)
+    resume_invite_message_id: str = Field(default="", max_length=160)
