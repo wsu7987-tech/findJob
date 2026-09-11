@@ -396,6 +396,14 @@ def _serialize_company(
         """
         SELECT COUNT(DISTINCT j.id) AS job_count,
                COUNT(DISTINCT CASE WHEN a.status = 'communicating' THEN j.id END) AS applied_job_count,
+               EXISTS(
+                 SELECT 1
+                 FROM fj_chat_sessions s
+                 JOIN fj_boss_jobs chat_job
+                   ON chat_job.id = s.job_id
+                   OR (chat_job.encrypt_job_id <> '' AND chat_job.encrypt_job_id = s.encrypt_job_id)
+                 WHERE chat_job.company_id = ?
+               ) AS has_communication,
                MAX(j.detail_collected_at) AS last_detail_at,
                MAX(e.created_at) AS last_evaluated_at,
                MAX(CASE WHEN a.status = 'communicating' THEN a.applied_at END) AS last_applied_at
@@ -404,7 +412,7 @@ def _serialize_company(
         LEFT JOIN fj_job_evaluations e ON e.job_id = j.id
         WHERE j.company_id = ?
         """,
-        (row["id"],),
+        (row["id"], row["id"]),
     ).fetchone()
     return {
         "id": row["id"],
@@ -420,6 +428,7 @@ def _serialize_company(
         "aliases": [{"id": item["id"], "alias_name": item["alias_name"]} for item in aliases],
         "job_count": int(stats["job_count"] or 0),
         "applied_job_count": int(stats["applied_job_count"] or 0),
+        "has_communication": bool(stats["has_communication"]),
         "last_detail_at": stats["last_detail_at"],
         "last_evaluated_at": stats["last_evaluated_at"],
         "last_applied_at": stats["last_applied_at"],

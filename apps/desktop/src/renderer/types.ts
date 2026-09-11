@@ -450,6 +450,7 @@ export interface FineJobBossHistoryJob extends FineJobBossCapturedJob {
   contact_origin?: FineJobContactOrigin;
   attention_status?: string;
   session_id?: string | null;
+  company_has_communication?: boolean;
 }
 
 export interface FineJobBossHistoryResponse {
@@ -616,6 +617,7 @@ export interface FineJobCompany {
   aliases: Array<{ id: string; alias_name: string }>;
   job_count: number;
   applied_job_count: number;
+  has_communication: boolean;
   last_detail_at?: string | null;
   last_evaluated_at?: string | null;
   last_applied_at?: string | null;

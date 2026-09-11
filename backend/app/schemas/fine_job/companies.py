@@ -44,6 +44,7 @@ class CompanyResponse(BaseModel):
     aliases: list[dict[str, str]] = Field(default_factory=list)
     job_count: int = 0
     applied_job_count: int = 0
+    has_communication: bool = False
     last_detail_at: str | None = None
     last_evaluated_at: str | None = None
     last_applied_at: str | None = None

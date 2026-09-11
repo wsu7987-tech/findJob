@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
+import { useRouter } from "vue-router";
 
 import { api } from "@/services/api";
 import { formatDateTime } from "@/services/format";
 import type { FineJobCompany, FineJobCompanyType } from "@/types";
 
+const router = useRouter();
 const loading = ref(false);
 const saving = ref(false);
 const items = ref<FineJobCompany[]>([]);
@@ -36,6 +38,13 @@ const companyTypeLabel = (value: FineJobCompanyType) => ({
   direct: "直招公司",
   outsourcing: "外包公司"
 }[value]);
+
+const openCompanyChat = async (company: FineJobCompany) => {
+  await router.push({
+    name: "fine-job-chat",
+    query: { company_name: company.canonical_name }
+  });
+};
 
 const load = async () => {
   loading.value = true;
@@ -221,6 +230,13 @@ onMounted(load);
                   {{ companyTypeLabel(row.company_type) }}
                 </el-tag>
                 <el-tag v-if="row.is_blacklisted" type="danger" size="small">黑名单</el-tag>
+                <el-tag
+                  v-if="row.has_communication"
+                  class="company-chat-tag"
+                  type="primary"
+                  size="small"
+                  @click="openCompanyChat(row)"
+                >有过沟通</el-tag>
               </div>
             </div>
           </template>
@@ -316,6 +332,7 @@ onMounted(load);
 .company-filters { display: grid; grid-template-columns: minmax(240px, 1fr) 180px 180px auto; gap: 12px; }
 .company-name, .event-list { display: grid; gap: 6px; }
 .company-name > div, .alias-list { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.company-chat-tag { cursor: pointer; }
 .event-list { font-size: 12px; color: var(--el-text-color-secondary); }
 .form-help { margin: 8px 0 0; color: var(--el-text-color-secondary); font-size: 12px; }
 .table-panel .el-pagination { margin-top: 16px; justify-content: flex-end; }

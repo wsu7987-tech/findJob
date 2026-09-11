@@ -48,6 +48,7 @@
   FineJobBossSearchPageResponse,
   FineJobReviewBatchResponse,
   FineJobReviewChatLinkBatchResponse,
+  FineJobReviewItem,
   FineJobReviewItemListEnvelope,
   FineJobReviewQuery,
   FineJobAutomationActionEnvelope,
@@ -741,6 +742,12 @@ export const api = {
     const suffix = search.size ? `?${search.toString()}` : "";
     return request<FineJobBossHistoryResponse>(
       `/api/fine-job/boss-capture/history${suffix}`
+    );
+  },
+  async requestFineJobBossHistoryGreetingReview(historyJobId: string) {
+    return request<FineJobReviewItem>(
+      `/api/fine-job/boss-capture/history/${encodeURIComponent(historyJobId)}/greeting-review`,
+      { method: "POST" }
     );
   },
   async deleteFineJobBossCaptureHistoryJob(historyJobId: string) {

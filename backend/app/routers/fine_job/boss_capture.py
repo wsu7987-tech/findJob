@@ -27,6 +27,7 @@ from backend.app.schemas.fine_job.boss_capture import (
     BossSearchPageRequest,
     BossSearchPageResponse,
 )
+from backend.app.schemas.fine_job.workflow import FineJobReviewItemResponse
 from backend.app.services.fine_job.boss_capture_tasks import boss_capture_task_manager
 from backend.app.services.fine_job.boss_capture_history import (
     HistorySortField,
@@ -56,7 +57,10 @@ from backend.app.services.fine_job.strategies import (
     get_filter_strategy,
     get_recommendation_strategy,
 )
-from backend.app.services.fine_job.workflow import record_evaluation_and_route
+from backend.app.services.fine_job.workflow import (
+    record_evaluation_and_route,
+    request_manual_greeting_review,
+)
 from backend.app.services.fine_job.filter_exclusions import (
     apply_filter_exclusions,
     assert_job_action_allowed,
@@ -251,6 +255,19 @@ def get_boss_capture_history(
             page=page,
             page_size=page_size,
         )
+    )
+
+
+@router.post(
+    "/history/{history_job_id}/greeting-review",
+    response_model=FineJobReviewItemResponse,
+)
+def request_history_job_greeting_review(
+    history_job_id: str,
+    db: Database = Depends(get_database),
+) -> FineJobReviewItemResponse:
+    return FineJobReviewItemResponse(
+        **request_manual_greeting_review(db, history_job_id)
     )
 
 

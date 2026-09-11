@@ -182,6 +182,85 @@ def record_evaluation_and_route(
     }
 
 
+def request_manual_greeting_review(db: Database, job_id: str) -> dict[str, object]:
+    """把没有关联聊天的已采集岗位放入打招呼待确认池。"""
+    with db.connect() as connection:
+        job = connection.execute(
+            "SELECT * FROM fj_boss_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if job is None:
+            raise AppError(404, "NOT_FOUND", "岗位不存在。")
+
+        # 岗位 ID 与平台加密岗位 ID 都参与匹配，避免已有聊天的岗位重复进入待确认。
+        chat = connection.execute(
+            """
+            SELECT id FROM fj_chat_sessions
+            WHERE job_id = ?
+               OR (? <> '' AND encrypt_job_id = ?)
+            LIMIT 1
+            """,
+            (job_id, str(job["encrypt_job_id"] or ""), str(job["encrypt_job_id"] or "")),
+        ).fetchone()
+        if chat is not None:
+            raise AppError(409, "JOB_ALREADY_HAS_CHAT", "该岗位已有相关聊天，不能再次创建打招呼待确认事项。")
+
+        existing = connection.execute(
+            """
+            SELECT id FROM fj_review_items
+            WHERE job_id = ? AND action_type = 'start_conversation'
+              AND status IN ('pending', 'approved')
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+    if existing is not None:
+        return _serialize_review(_get_review_row(db, str(existing["id"])))
+
+    now = utc_now()
+    evaluation_id = new_id()
+    review_id = new_id()
+    draft_message = _generic_greeting(dict(job))
+    evaluation = {
+        "decision": "review",
+        "confidence": 1,
+        "summary": "用户从岗位记录手动推入待确认。",
+        "reasons": ["岗位尚无相关聊天，等待用户确认是否打招呼。"],
+        "strengths": [],
+        "gaps": [],
+        "risks": [],
+        "hard_requirements": [],
+    }
+    with db.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO fj_job_evaluations (
+              id, job_id, evaluation_version, source, decision, confidence,
+              evaluation_json, created_at
+            ) VALUES (?, ?, 'manual-greeting', 'rules', 'review', 1, ?, ?)
+            """,
+            (evaluation_id, job_id, _json(evaluation), now),
+        )
+        connection.execute(
+            """
+            INSERT INTO fj_review_items (
+              id, job_id, evaluation_id, action_type, status, ai_decision,
+              draft_message, final_message, resolution_note, auto_approved,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, 'start_conversation', 'pending', 'review', ?, '',
+                      '从岗位记录手动推入待确认', 0, ?, ?)
+            """,
+            (review_id, job_id, evaluation_id, draft_message, now, now),
+        )
+    _log(
+        db,
+        "manual_greeting_review_requested",
+        f"已将岗位“{job['title']}”推入打招呼待确认。",
+        detail={"job_id": job_id, "review_item_id": review_id},
+    )
+    return _serialize_review(_get_review_row(db, review_id))
+
+
 def list_review_items(
     db: Database,
     *,

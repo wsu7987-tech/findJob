@@ -21,6 +21,7 @@ const selectedJourney = ref<FineJobJobJourney | null>(null);
 const journeyLoading = ref(false);
 const journeyAnalysisRunning = ref(false);
 const rejectionMessageRunning = ref(false);
+const greetingJobId = ref<string | null>(null);
 const rejectionReasonNeedsDetail = computed(() => Boolean(
   selectedJourney.value?.progress?.outcome.status === "rejected"
   && (
@@ -237,6 +238,26 @@ const openDetail = (job: FineJobBossHistoryJob) => {
 const viewJobChat = async (job: FineJobBossHistoryJob) => {
   if (!job.session_id) return;
   await router.push({ name: "fine-job-chat", query: { session_id: job.session_id } });
+};
+
+const viewCompanyChat = async (job: FineJobBossHistoryJob) => {
+  await router.push({
+    name: "fine-job-chat",
+    query: { company_name: job.boss_name }
+  });
+};
+
+const requestGreetingReview = async (job: FineJobBossHistoryJob) => {
+  greetingJobId.value = job.id;
+  try {
+    await api.requestFineJobBossHistoryGreetingReview(job.id);
+    await loadHistory();
+    ElMessage.success("已推入待确认");
+  } catch (error) {
+    ElMessage.error((error as Error).message || "推入待确认失败");
+  } finally {
+    greetingJobId.value = null;
+  }
 };
 
 const deleteHistoryJob = async (job: FineJobBossHistoryJob) => {
@@ -671,6 +692,13 @@ watch(
             <span>{{ row.boss_name }}</span>
             <el-tag v-if="row.is_outsourcing_company" type="warning" size="small">外包</el-tag>
             <el-tag v-if="row.is_blacklisted" type="danger" size="small">黑名单</el-tag>
+            <el-tag
+              v-if="row.company_has_communication"
+              class="company-chat-tag"
+              type="primary"
+              size="small"
+              @click.stop="viewCompanyChat(row)"
+            >有过沟通</el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="salary" label="薪资" width="110" />
@@ -708,12 +736,20 @@ watch(
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="190" fixed="right">
+        <el-table-column label="操作" width="235" fixed="right">
           <template #default="{ row }">
             <el-button
               v-if="row.session_id"
               link type="primary" @click.stop="viewJobChat(row)"
             >聊天</el-button>
+            <el-button
+              v-else-if="row.detail_status === 'completed'"
+              link
+              type="primary"
+              :loading="greetingJobId === row.id"
+              :disabled="historyActionRunning"
+              @click.stop="requestGreetingReview(row)"
+            >打招呼</el-button>
             <el-button
               v-if="row.detail_status === 'completed' && !row.delivery_evaluation"
               link
@@ -764,6 +800,14 @@ watch(
         <div class="history-detail-heading">
           <h2>{{ selectedJob.title }}</h2>
           <p>{{ selectedJob.boss_name }} · {{ selectedJob.company_scale || "规模未知" }} · {{ selectedJob.location }}</p>
+          <el-button
+            v-if="!selectedJob.session_id"
+            type="primary"
+            plain
+            :loading="greetingJobId === selectedJob.id"
+            :disabled="historyActionRunning"
+            @click="requestGreetingReview(selectedJob)"
+          >打招呼</el-button>
           <div class="history-detail-tags">
             <el-tag>{{ selectedJob.salary || "薪资未知" }}</el-tag>
             <el-tag type="info">已采集 {{ selectedJob.collect_count }} 次</el-tag>
@@ -1012,6 +1056,11 @@ watch(
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
   gap: 4px 16px;
+}
+
+.company-chat-tag {
+  margin-left: 6px;
+  cursor: pointer;
 }
 
 .history-filter-actions,

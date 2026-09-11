@@ -630,7 +630,16 @@ def get_capture_history_job(db: Database, history_job_id: str) -> dict[str, obje
                     ORDER BY a.updated_at DESC LIMIT 1) AS attention_status,
                    (SELECT id FROM fj_chat_sessions s
                     WHERE s.job_id = fj_boss_jobs.id
+                       OR (fj_boss_jobs.encrypt_job_id <> '' AND s.encrypt_job_id = fj_boss_jobs.encrypt_job_id)
                     ORDER BY s.updated_at DESC LIMIT 1) AS session_id,
+                   EXISTS(
+                     SELECT 1
+                     FROM fj_chat_sessions company_session
+                     JOIN fj_boss_jobs company_job
+                       ON company_job.id = company_session.job_id
+                       OR (company_job.encrypt_job_id <> '' AND company_job.encrypt_job_id = company_session.encrypt_job_id)
+                     WHERE company_job.company_id = fj_boss_jobs.company_id
+                   ) AS company_has_communication,
                    company_scale, company_stage, company_industry, welfare,
                    salary, location, experience, degree,
                    boss_active_status, job_link, tags, skills, job_labels, search_keyword, payload_json,
@@ -750,7 +759,16 @@ def list_capture_history(
                     ORDER BY a.updated_at DESC LIMIT 1) AS attention_status,
                    (SELECT id FROM fj_chat_sessions s
                     WHERE s.job_id = fj_boss_jobs.id
+                       OR (fj_boss_jobs.encrypt_job_id <> '' AND s.encrypt_job_id = fj_boss_jobs.encrypt_job_id)
                     ORDER BY s.updated_at DESC LIMIT 1) AS session_id,
+                   EXISTS(
+                     SELECT 1
+                     FROM fj_chat_sessions company_session
+                     JOIN fj_boss_jobs company_job
+                       ON company_job.id = company_session.job_id
+                       OR (company_job.encrypt_job_id <> '' AND company_job.encrypt_job_id = company_session.encrypt_job_id)
+                     WHERE company_job.company_id = fj_boss_jobs.company_id
+                   ) AS company_has_communication,
                    company_scale, salary,
                    company_stage, company_industry, welfare, location, experience,
                    degree, boss_active_status, job_link,
@@ -821,6 +839,7 @@ def _serialize_history_row(row) -> dict[str, object]:
         "contact_origin": row["contact_origin"] or "unknown",
         "attention_status": row["attention_status"] or "",
         "session_id": row["session_id"],
+        "company_has_communication": bool(row["company_has_communication"]),
         "company_scale": row["company_scale"],
         "company_stage": row["company_stage"],
         "company_industry": row["company_industry"],

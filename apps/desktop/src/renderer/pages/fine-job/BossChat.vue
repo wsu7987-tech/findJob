@@ -760,6 +760,8 @@ const emergencyStop = async () => {
 };
 
 onMounted(() => {
+  const companyName = typeof route.query.company_name === "string" ? route.query.company_name.trim() : "";
+  if (companyName) store.searchQuery = companyName;
   const attention = typeof route.query.attention === "string" ? route.query.attention : "";
   if (attention) store.attentionFilter = attention;
   const waitingOn = typeof route.query.waiting_on === "string" ? route.query.waiting_on : "";
