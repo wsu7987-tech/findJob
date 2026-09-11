@@ -168,6 +168,16 @@ const submitDeepJobSearchTask = async () => {
     const submitted = await bridge.submitCodexPrompt(
       `使用 $finejob 继续处理 deep_job_search Workflow，workflow_run_id=${task.workflowRunId}。严格根据后端 Workflow Run 状态、Completion Contract 和 FineJob Skill 执行。后续批次读取同一 Run 的 Shared Base、analysis_guidance 和已保存 Item 结果；只保存结构化判断依据，不保存或展示内部思维链。external_action_policy=analysis_only，任何 recommend 只能进入正式待确认，不得发送或请求真实外部动作。`
     );
+    if (submitted) {
+      await router.replace({
+        name: "fine-job-codex",
+        query: {
+          task: "deep-job-search",
+          workflow_run_id: task.workflowRunId,
+          workflow_action: "view"
+        }
+      });
+    }
     const recoveryNotice = session.workflowSessionMode === "new_from_workflow_state" && run?.codex_session_ref
       ? "原 Codex 会话不可恢复，已基于 Workflow 状态建立新分析会话。"
       : "";

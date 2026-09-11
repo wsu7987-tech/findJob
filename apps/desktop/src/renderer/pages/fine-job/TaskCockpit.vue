@@ -323,8 +323,8 @@ watch(workflowRun, (run) => {
       <el-button v-if="workflowRun && workflowRun.status !== 'paused' && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)" @click="pauseRun">暂停</el-button>
       <el-button v-if="workflowRun?.status === 'paused' || (workflowRun?.status === 'waiting_for_user' && ['capture_interrupted', 'browser_not_running'].includes(workflowRun.stop_reason))" :loading="workflowStore.advancing" @click="resumeRun">继续</el-button>
       <el-button v-if="workflowRun && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)" type="danger" plain @click="cancelRun">停止任务</el-button>
-      <el-button v-if="workflowRun?.status === 'waiting_codex'" type="primary" @click="openWorkflowCodex('submit')">交给 Codex 分析</el-button>
-      <el-button v-else-if="hasCurrentWorkflowCodexSession" type="primary" @click="openWorkflowCodex('view')">查看 Codex 分析</el-button>
+      <el-button v-if="hasCurrentWorkflowCodexSession" type="primary" @click="openWorkflowCodex('view')">查看 Codex 分析</el-button>
+      <el-button v-else-if="workflowRun?.status === 'waiting_codex'" type="primary" @click="openWorkflowCodex('submit')">交给 Codex 分析</el-button>
     </div>
     <el-alert v-if="error" :title="error" type="error" :closable="false" />
     <el-alert

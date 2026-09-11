@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   attachWorkflowSession: vi.fn(),
   refreshWorkflow: vi.fn(),
   push: vi.fn(),
+  replace: vi.fn(),
   routeQuery: {} as Record<string, string>,
   codexState: {
     status: "idle",
@@ -64,7 +65,7 @@ vi.mock("@/services/desktop-bridge", () => ({
 
 vi.mock("vue-router", () => ({
   useRoute: () => ({ query: mocks.routeQuery }),
-  useRouter: () => ({ push: mocks.push })
+  useRouter: () => ({ push: mocks.push, replace: mocks.replace })
 }));
 
 import CodexWorkspace from "./CodexWorkspace.vue";
@@ -104,6 +105,9 @@ describe("CodexWorkspace", () => {
     mocks.attachWorkflowSession.mockReset().mockResolvedValue(undefined);
     mocks.refreshWorkflow.mockReset().mockResolvedValue(undefined);
     mocks.push.mockReset().mockResolvedValue(undefined);
+    mocks.replace.mockReset().mockImplementation(async (target: { query: Record<string, string> }) => {
+      mocks.routeQuery = target.query;
+    });
     mocks.routeQuery = {};
     mocks.codexState.status = "idle";
     mocks.codexState.runtimeId = "runtime-1";
@@ -237,7 +241,24 @@ describe("CodexWorkspace", () => {
       codex_session_ref: "runtime:runtime-2",
       codex_runtime_id: "runtime-2"
     });
+    expect(mocks.replace).toHaveBeenCalledWith({
+      name: "fine-job-codex",
+      query: {
+        task: "deep-job-search",
+        workflow_run_id: "workflow-run-1",
+        workflow_action: "view"
+      }
+    });
     expect(wrapper.html()).toContain("原 Codex 会话不可恢复，已基于 Workflow 状态建立新分析会话");
+
+    wrapper.unmount();
+    mount(CodexWorkspace, { global: { stubs: {
+      CodexTerminal: CodexTerminalStub, ElAlert: GenericStub, ElButton: ElButtonStub,
+      ElEmpty: GenericStub, ElInputNumber: GenericStub, ElOption: GenericStub,
+      ElSelect: GenericStub, ElTag: GenericStub, ElSwitch: GenericStub
+    } } });
+    await flushPromises();
+    expect(mocks.submitPrompt).toHaveBeenCalledTimes(1);
   });
 
   it("live_reused + view 只进入现有 Workflow 会话，不重复提交 Prompt", async () => {
@@ -303,5 +324,31 @@ describe("CodexWorkspace", () => {
     await flushPromises();
 
     expect(mocks.submitPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("submit 失败时保留 submit action，不 replace 为 view", async () => {
+    mocks.routeQuery = {
+      task: "deep-job-search",
+      workflow_run_id: "workflow-run-1",
+      workflow_action: "submit"
+    };
+    mocks.refreshWorkflow.mockResolvedValue({
+      codex_session_ref: null,
+      completion_contract: {
+        codex_execution_config: { model: "gpt-5.6-luna", reasoning_effort: "high" }
+      }
+    });
+    mocks.submitPrompt.mockResolvedValue(false);
+
+    mount(CodexWorkspace, { global: { stubs: {
+      CodexTerminal: CodexTerminalStub, ElAlert: GenericStub, ElButton: ElButtonStub,
+      ElEmpty: GenericStub, ElInputNumber: GenericStub, ElOption: GenericStub,
+      ElSelect: GenericStub, ElTag: GenericStub, ElSwitch: GenericStub
+    } } });
+    await flushPromises();
+
+    expect(mocks.submitPrompt).toHaveBeenCalledTimes(1);
+    expect(mocks.replace).not.toHaveBeenCalled();
+    expect(mocks.routeQuery.workflow_action).toBe("submit");
   });
 });

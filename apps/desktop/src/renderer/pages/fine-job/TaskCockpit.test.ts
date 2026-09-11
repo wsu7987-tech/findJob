@@ -194,6 +194,7 @@ describe("TaskCockpit", () => {
 
     const handoff = wrapper.findAll("button").find((item) => item.text() === "交给 Codex 分析");
     expect(handoff).toBeDefined();
+    expect(wrapper.findAll("button").some((item) => item.text() === "查看 Codex 分析")).toBe(false);
     await handoff!.trigger("click");
     expect(mocks.push).toHaveBeenCalledWith({
       name: "fine-job-codex",
@@ -216,9 +217,9 @@ describe("TaskCockpit", () => {
     expect(wrapper.findAll("button").some((item) => item.text() === "交给 Codex 分析")).toBe(false);
   });
 
-  it("当前存活 sessionRef 匹配时显示查看 Codex 分析，并使用 view action", async () => {
+  it("waiting_codex 的存活 sessionRef 匹配时优先显示查看 Codex 分析", async () => {
     mocks.getRun.mockResolvedValue({
-      ...run("running"),
+      ...run("waiting_codex"),
       codex_session_ref: "runtime:workflow-runtime-1"
     });
     mocks.codexState.status = "running";
@@ -231,6 +232,7 @@ describe("TaskCockpit", () => {
 
     const view = wrapper.findAll("button").find((item) => item.text() === "查看 Codex 分析");
     expect(view).toBeDefined();
+    expect(wrapper.findAll("button").some((item) => item.text() === "交给 Codex 分析")).toBe(false);
     await view!.trigger("click");
     expect(mocks.push).toHaveBeenCalledWith({
       name: "fine-job-codex",
