@@ -19,7 +19,7 @@ const mocks = vi.hoisted(() => ({
   messageSuccess: vi.fn(),
   messageError: vi.fn(),
   messageWarning: vi.fn(),
-  codexState: { status: "running", runId: "codex-session-1" as string | null }
+  codexState: { status: "running", sessionRef: "runtime:codex-session-1" as string | null }
 }));
 
 const { createdRun } = vi.hoisted(() => ({ createdRun: {
@@ -103,7 +103,7 @@ vi.mock("@/stores/fineJobJobHuntRefresh", () => ({
 vi.mock("@/stores/fineJobCodex", () => ({
   useFineJobCodexStore: () => ({
     get status() { return mocks.codexState.status; },
-    get runId() { return mocks.codexState.runId; },
+    get sessionRef() { return mocks.codexState.sessionRef; },
     load: mocks.codexLoad,
     start: mocks.startCodex
   })
@@ -157,7 +157,7 @@ describe("JobHuntRefresh", () => {
     mocks.markSubmitted.mockResolvedValue({ ...createdRun, current_step: "waiting_chat_messages" });
     mocks.submitPrompt.mockResolvedValue(true);
     mocks.codexState.status = "running";
-    mocks.codexState.runId = "codex-session-1";
+    mocks.codexState.sessionRef = "runtime:codex-session-1";
   });
 
   it("创建持久化 Run 后向 Codex 提交只含 run_id 的结构化任务", async () => {
@@ -182,7 +182,7 @@ describe("JobHuntRefresh", () => {
     await flushPromises();
 
     expect(mocks.createRun).toHaveBeenCalledTimes(1);
-    expect(mocks.attach).toHaveBeenCalledWith("refresh-run-1", "codex-session-1");
+    expect(mocks.attach).toHaveBeenCalledWith("refresh-run-1", "runtime:codex-session-1");
     expect(mocks.markSubmitted).toHaveBeenCalledWith("refresh-run-1");
     expect(mocks.startCodex).not.toHaveBeenCalled();
     expect(mocks.submitPrompt).toHaveBeenCalledTimes(1);
@@ -199,7 +199,7 @@ describe("JobHuntRefresh", () => {
 
   it("Codex 未就绪时不会创建 Refresh Run", async () => {
     mocks.codexState.status = "idle";
-    mocks.codexState.runId = null;
+    mocks.codexState.sessionRef = null;
     const wrapper = mount(JobHuntRefresh, {
       global: {
         stubs: {

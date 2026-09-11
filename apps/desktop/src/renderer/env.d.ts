@@ -71,22 +71,45 @@ declare global {
       }>;
       startCodex: (size?: { cols?: number; rows?: number }) => Promise<{
         status: string;
-        runId: string | null;
+        runtimeId: string | null;
+        sessionRef: string | null;
       }>;
       resumeCodex: (size?: { cols?: number; rows?: number }) => Promise<{
         status: string;
-        runId: string | null;
+        runtimeId: string | null;
+        sessionRef: string | null;
       }>;
-      getCodexState: () => Promise<{ status: string; runId: string | null }>;
+      startWorkflowCodex: (launch: {
+        cols?: number;
+        rows?: number;
+        model: string;
+        reasoningEffort: string;
+        sessionRef?: string;
+      }) => Promise<{
+        status: string;
+        runtimeId: string | null;
+        sessionRef: string | null;
+        workflowSessionMode?: "live_reused" | "resumed_explicit" | "new_from_workflow_state";
+      }>;
+      getCodexState: () => Promise<{
+        status: string;
+        runtimeId: string | null;
+        sessionRef: string | null;
+      }>;
       writeCodex: (data: string) => void;
       resizeCodex: (cols: number, rows: number) => void;
       interruptCodex: () => void;
       stopCodex: () => void;
       onCodexOutput: (
-        callback: (payload: { runId: string | null; data: string }) => void
+        callback: (payload: { runtimeId: string | null; sessionRef: string | null; data: string }) => void
       ) => () => void;
       onCodexStatus: (
-        callback: (payload: { status: string; runId: string | null; message: string }) => void
+        callback: (payload: {
+          status: string;
+          runtimeId: string | null;
+          sessionRef: string | null;
+          message: string;
+        }) => void
       ) => () => void;
     };
   }

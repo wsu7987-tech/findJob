@@ -126,16 +126,13 @@ const submitDeepJobSearchTask = async () => {
   const task = deepJobSearchTask();
   const bridge = getCodexBridge();
   if (!task || !bridge?.submitCodexPrompt) return;
-  if (isRunning.value) {
-    const sameSession = workflowStore.currentRun?.codex_session_ref === store.runId;
-    if (!sameSession) {
-      workflowAnalysisMessage.value = "当前 Codex 会话属于其他任务；请先结束它，再进入此 Workflow。";
-      return;
-    }
-  }
   workflowAnalysisMessage.value = "正在连接该 Workflow 的 Codex 分析会话……";
   try {
     const run = await workflowStore.refresh(task.workflowRunId);
+    if (isRunning.value && run?.codex_session_ref !== store.sessionRef) {
+      workflowAnalysisMessage.value = "当前 Codex 会话属于其他任务；请先结束它，再进入此 Workflow。";
+      return;
+    }
     const execution = run?.completion_contract?.codex_execution_config;
     if (!execution?.model || !execution.reasoning_effort) {
       throw new Error("本 Run 缺少已保存的 Codex 模型或推理强度。");
@@ -150,14 +147,17 @@ const submitDeepJobSearchTask = async () => {
     if (session.sessionRef) {
       await api.attachFineJobWorkflowCodexSession(task.workflowRunId, {
         codex_session_ref: session.sessionRef,
-        codex_runtime_id: session.runId || undefined
+        codex_runtime_id: session.runtimeId || undefined
       });
     }
     const submitted = await bridge.submitCodexPrompt(
-      `使用 $finejob 继续处理 deep_job_search Workflow，workflow_run_id=${task.workflowRunId}。严格根据 Workflow Run 状态、Completion Contract 和 FineJob Skill 执行。后续批次读取同一 Run 的 Shared Base、Item Context 和 analysis_guidance；只保存结构化判断依据，不保存或展示内部思维链。external_action_policy=analysis_only，任何 recommend 只能进入正式待确认，不得发送或请求真实外部动作。`
+      `使用 $finejob 继续处理 deep_job_search Workflow，workflow_run_id=${task.workflowRunId}。严格根据后端 Workflow Run 状态、Completion Contract 和 FineJob Skill 执行。后续批次读取同一 Run 的 Shared Base、analysis_guidance 和已保存 Item 结果；只保存结构化判断依据，不保存或展示内部思维链。external_action_policy=analysis_only，任何 recommend 只能进入正式待确认，不得发送或请求真实外部动作。`
     );
+    const recoveryNotice = session.workflowSessionMode === "new_from_workflow_state" && run?.codex_session_ref
+      ? "原 Codex 会话不可恢复，已基于 Workflow 状态建立新分析会话。"
+      : "";
     workflowAnalysisMessage.value = submitted
-      ? "Workflow 分析任务已提交，Codex 会通过 MCP 按需读取上下文并保存结果。"
+      ? `${recoveryNotice}Workflow 分析任务已提交，Codex 会通过 MCP 按需读取上下文并保存结果。`
       : "Codex 会话当前不可接收任务，请重新启动新会话后再试。";
   } catch (error) {
     workflowAnalysisMessage.value = `Workflow 分析任务提交失败：${error instanceof Error ? error.message : String(error)}`;
@@ -265,7 +265,7 @@ onMounted(async () => {
       <div class="card-actions">
         <el-tag :type="isRunning ? 'success' : 'info'">{{ store.status }}</el-tag>
         <el-button :disabled="isRunning" type="primary" @click="start(false)">新建会话</el-button>
-        <el-button :disabled="isRunning" @click="start(true)">恢复最近会话</el-button>
+        <el-button v-if="!deepJobSearchTask()" :disabled="isRunning" @click="start(true)">恢复最近会话</el-button>
         <el-button :disabled="!isRunning" @click="interrupt">中断</el-button>
         <el-button :disabled="!isRunning" @click="stop">结束</el-button>
       </div>

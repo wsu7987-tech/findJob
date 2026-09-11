@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   focus: vi.fn(),
   load: vi.fn(),
   start: vi.fn(),
+  startWorkflow: vi.fn(),
   strategiesLoad: vi.fn(),
   submitPrompt: vi.fn(),
   attachWorkflowSession: vi.fn(),
@@ -20,7 +21,8 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/stores/fineJobCodex", () => ({
   useFineJobCodexStore: () => ({
     status: "idle",
-    runId: "codex-session-1",
+    runtimeId: "runtime-1",
+    sessionRef: "runtime:runtime-1",
     statusMessage: "",
     permissions: null,
     pending: { greetings: [], chat_replies: [] },
@@ -29,6 +31,7 @@ vi.mock("@/stores/fineJobCodex", () => ({
     error: null,
     load: mocks.load,
     start: mocks.start,
+    startWorkflow: mocks.startWorkflow,
     savePermissions: vi.fn(),
     decide: vi.fn()
   })
@@ -85,6 +88,12 @@ describe("CodexWorkspace", () => {
     mocks.focus.mockReset();
     mocks.load.mockReset();
     mocks.start.mockReset().mockResolvedValue(undefined);
+    mocks.startWorkflow.mockReset().mockResolvedValue({
+      status: "running",
+      runtimeId: "runtime-2",
+      sessionRef: "runtime:runtime-2",
+      workflowSessionMode: "new_from_workflow_state"
+    });
     mocks.strategiesLoad.mockReset().mockResolvedValue(undefined);
     mocks.submitPrompt.mockReset().mockResolvedValue(true);
     mocks.attachWorkflowSession.mockReset().mockResolvedValue(undefined);
@@ -176,10 +185,16 @@ describe("CodexWorkspace", () => {
     );
   });
 
-  it("deep_job_search 通过新会话提交最小 Workflow 身份提示词", async () => {
+  it("deep_job_search 使用独立 sessionRef 并在不可恢复时提示从 Workflow 状态新建", async () => {
     mocks.routeQuery = { task: "deep-job-search", workflow_run_id: "workflow-run-1" };
+    mocks.refreshWorkflow.mockResolvedValue({
+      codex_session_ref: "runtime:closed-runtime-1",
+      completion_contract: {
+        codex_execution_config: { model: "gpt-5.6-luna", reasoning_effort: "high" }
+      }
+    });
 
-    mount(CodexWorkspace, {
+    const wrapper = mount(CodexWorkspace, {
       global: {
         stubs: {
           CodexTerminal: CodexTerminalStub,
@@ -196,12 +211,20 @@ describe("CodexWorkspace", () => {
     });
     await flushPromises();
 
-    expect(mocks.start).toHaveBeenCalledWith(120, 36, false);
-    expect(mocks.submitPrompt).toHaveBeenCalledWith(
-      "使用 $finejob 继续处理 deep_job_search Workflow，workflow_run_id=workflow-run-1。严格根据 Workflow Run 状态、Completion Contract 和 FineJob Skill 执行，直到 completed 或 waiting_for_user。"
-    );
-    expect(mocks.attachWorkflowSession).toHaveBeenCalledWith("workflow-run-1", {
-      codex_session_ref: "codex-session-1"
+    expect(mocks.startWorkflow).toHaveBeenCalledWith({
+      cols: 120,
+      rows: 36,
+      model: "gpt-5.6-luna",
+      reasoningEffort: "high",
+      sessionRef: "runtime:closed-runtime-1"
     });
+    expect(mocks.submitPrompt).toHaveBeenCalledWith(expect.stringContaining(
+      "后续批次读取同一 Run 的 Shared Base、analysis_guidance 和已保存 Item 结果"
+    ));
+    expect(mocks.attachWorkflowSession).toHaveBeenCalledWith("workflow-run-1", {
+      codex_session_ref: "runtime:runtime-2",
+      codex_runtime_id: "runtime-2"
+    });
+    expect(wrapper.html()).toContain("原 Codex 会话不可恢复，已基于 Workflow 状态建立新分析会话");
   });
 });

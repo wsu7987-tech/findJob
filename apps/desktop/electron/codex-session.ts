@@ -52,6 +52,8 @@ export interface CodexWorkflowLaunchOptions {
   sessionRef?: string;
 }
 
+export type WorkflowSessionMode = "live_reused" | "resumed_explicit" | "new_from_workflow_state";
+
 export const buildCodexInteractiveArgs = (options: {
   tuiWorkspace: string;
   resumeSessionRef?: string;
@@ -67,8 +69,9 @@ export const buildCodexInteractiveArgs = (options: {
   return args;
 };
 
-export const isExplicitCodexSessionId = (sessionRef: string | undefined) =>
-  Boolean(sessionRef && !sessionRef.startsWith("runtime:"));
+// 只有 Codex CLI 接受的明确 UUID 才能跨终端恢复；runtime: 仅绑定当前本地终端。
+export const isResumableCodexSessionId = (sessionRef: string | undefined) =>
+  Boolean(sessionRef && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionRef));
 
 const MANAGED_SKILLS = ["finejob", "finejob-profile"] as const;
 
@@ -145,7 +148,7 @@ export const writeManagedWorkspace = (
 export const createCodexSessionController = (options: CodexSessionOptions) => {
   let terminal: IPty | null = null;
   let status: SessionStatus = "idle";
-  let runId: string | null = null;
+  let runtimeId: string | null = null;
   let runtimeToken: string | null = null;
   let sessionRef: string | null = null;
   let recentOutput = "";
@@ -154,7 +157,7 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
 
   const setStatus = (next: SessionStatus, message = "") => {
     status = next;
-    options.emit("codex:status", { status, runId, message });
+    options.emit("codex:status", { status, runtimeId, sessionRef, message });
   };
 
   const start = async (
@@ -164,26 +167,37 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
     workflow?: Pick<CodexWorkflowLaunchOptions, "model" | "reasoningEffort" | "sessionRef">
   ) => {
     if (terminal) {
-      if (!workflow || workflow.sessionRef === sessionRef) return { status, runId, sessionRef };
+      if (!workflow || workflow.sessionRef === sessionRef) {
+        return {
+          status,
+          runtimeId,
+          sessionRef,
+          workflowSessionMode: workflow ? "live_reused" satisfies WorkflowSessionMode : undefined
+        };
+      }
       throw new Error("当前 Codex 会话属于其他 Workflow，结束后再切换。");
+    }
+    if (workflow && resume) {
+      throw new Error("Workflow 只能按明确 Session ID 恢复，不能恢复最近会话。");
     }
     setStatus("starting");
     recentOutput = "";
     try {
       const runtime = await options.createRuntime();
       const codexPath = await options.getCodexPath();
-      runId = runtime.run_id;
+      runtimeId = runtime.run_id;
       runtimeToken = runtime.token;
       // runtime: 前缀只表示本地 Workflow 绑定，无法证明它是可由 CLI 恢复的线程 ID。
-      sessionRef = isExplicitCodexSessionId(workflow?.sessionRef)
+      const resumableSessionId = isResumableCodexSessionId(workflow?.sessionRef)
         ? workflow!.sessionRef!
-        : `runtime:${runtime.run_id}`;
+        : undefined;
+      sessionRef = resumableSessionId ?? `runtime:${runtime.run_id}`;
       const tuiWorkspace = writeManagedWorkspace(options);
-      // Workflow 仅传入已经绑定的明确 Session Ref；通用恢复最近会话不会进入该分支。
+      // Workflow 只恢复已验证的明确 UUID，通用恢复最近会话不会进入该分支。
       const args = buildCodexInteractiveArgs({
         tuiWorkspace,
         resumeSessionRef: resume ? "--last" : (
-          isExplicitCodexSessionId(workflow?.sessionRef) ? workflow?.sessionRef : undefined
+          resumableSessionId
         ),
         model: workflow?.model,
         reasoningEffort: workflow?.reasoningEffort,
@@ -217,14 +231,14 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
         resolveFirstOutput?.();
         resolveFirstOutput = null;
         firstOutputPromise = null;
-        options.emit("codex:output", { runId, data });
+        options.emit("codex:output", { runtimeId, sessionRef, data });
       });
       terminal.onExit(({ exitCode }) => {
         resolveFirstOutput?.();
         resolveFirstOutput = null;
         firstOutputPromise = null;
         terminal = null;
-        const completedRunId = runId;
+        const completedRunId = runtimeId;
         const completedToken = runtimeToken;
         if (completedRunId && completedToken) {
           void options.completeRuntime(
@@ -241,16 +255,23 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
         );
       });
       setStatus("running");
-      return { status, runId, sessionRef };
+      return {
+        status,
+        runtimeId,
+        sessionRef,
+        workflowSessionMode: workflow
+          ? (resumableSessionId ? "resumed_explicit" : "new_from_workflow_state") satisfies WorkflowSessionMode
+          : undefined
+      };
     } catch (error) {
       terminal = null;
       sessionRef = null;
       resolveFirstOutput?.();
       resolveFirstOutput = null;
       firstOutputPromise = null;
-      if (runId && runtimeToken) {
+      if (runtimeId && runtimeToken) {
         void options.completeRuntime(
-          runId,
+          runtimeId,
           runtimeToken,
           "failed",
           error instanceof Error ? error.message : String(error)
@@ -300,6 +321,6 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
       sessionRef = null;
       setStatus("idle");
     },
-    state: () => ({ status, runId, sessionRef })
+    state: () => ({ status, runtimeId, sessionRef })
   };
 };

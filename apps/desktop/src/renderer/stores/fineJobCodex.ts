@@ -18,7 +18,9 @@ const emptyPending = (): FineJobCodexPendingWork => ({
 
 export const useFineJobCodexStore = defineStore("fine-job-codex", () => {
   const status = ref<FineJobCodexSessionStatus>("idle");
-  const runId = ref<string | null>(null);
+  // runtimeId 标识本地运行时，sessionRef 标识 Workflow 绑定的 Codex 会话引用。
+  const runtimeId = ref<string | null>(null);
+  const sessionRef = ref<string | null>(null);
   const statusMessage = ref("");
   const permissions = ref<FineJobCodexPermissions | null>(null);
   const pending = ref<FineJobCodexPendingWork>(emptyPending());
@@ -39,7 +41,8 @@ export const useFineJobCodexStore = defineStore("fine-job-codex", () => {
     const bridge = getCodexBridge();
     removeStatusListener = bridge?.onCodexStatus?.((payload) => {
       status.value = payload.status as FineJobCodexSessionStatus;
-      runId.value = payload.runId;
+      runtimeId.value = payload.runtimeId;
+      sessionRef.value = payload.sessionRef;
       statusMessage.value = payload.message;
     }) ?? null;
   };
@@ -56,7 +59,8 @@ export const useFineJobCodexStore = defineStore("fine-job-codex", () => {
       const state = await getCodexBridge()?.getCodexState?.();
       if (state) {
         status.value = state.status as FineJobCodexSessionStatus;
-        runId.value = state.runId;
+        runtimeId.value = state.runtimeId;
+        sessionRef.value = state.sessionRef;
       }
     } catch (value) {
       error.value = (value as Error).message;
@@ -73,7 +77,8 @@ export const useFineJobCodexStore = defineStore("fine-job-codex", () => {
       : await bridge.startCodex?.({ cols, rows });
     if (state) {
       status.value = state.status as FineJobCodexSessionStatus;
-      runId.value = state.runId;
+      runtimeId.value = state.runtimeId;
+      sessionRef.value = state.sessionRef;
     }
   };
 
@@ -90,7 +95,8 @@ export const useFineJobCodexStore = defineStore("fine-job-codex", () => {
     }
     const state = await bridge.startWorkflowCodex(launch);
     status.value = state.status as FineJobCodexSessionStatus;
-    runId.value = state.runId;
+    runtimeId.value = state.runtimeId;
+    sessionRef.value = state.sessionRef;
     return state;
   };
 
@@ -116,7 +122,8 @@ export const useFineJobCodexStore = defineStore("fine-job-codex", () => {
 
   return {
     status,
-    runId,
+    runtimeId,
+    sessionRef,
     statusMessage,
     permissions,
     pending,

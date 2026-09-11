@@ -90,9 +90,17 @@ const desktopBridge = {
       skills: Array<{ installed: boolean; name: "finejob" | "finejob-profile"; path: string }>;
     }>,
   startCodex: (size?: { cols?: number; rows?: number }) =>
-    ipcRenderer.invoke("codex:start", size) as Promise<{ status: string; runId: string | null }>,
+    ipcRenderer.invoke("codex:start", size) as Promise<{
+      status: string;
+      runtimeId: string | null;
+      sessionRef: string | null;
+    }>,
   resumeCodex: (size?: { cols?: number; rows?: number }) =>
-    ipcRenderer.invoke("codex:resume", size) as Promise<{ status: string; runId: string | null }>,
+    ipcRenderer.invoke("codex:resume", size) as Promise<{
+      status: string;
+      runtimeId: string | null;
+      sessionRef: string | null;
+    }>,
   startWorkflowCodex: (launch: {
     cols?: number;
     rows?: number;
@@ -101,11 +109,16 @@ const desktopBridge = {
     sessionRef?: string;
   }) => ipcRenderer.invoke("codex:start-workflow", launch) as Promise<{
     status: string;
-    runId: string | null;
+    runtimeId: string | null;
     sessionRef: string | null;
+    workflowSessionMode?: "live_reused" | "resumed_explicit" | "new_from_workflow_state";
   }>,
   getCodexState: () =>
-    ipcRenderer.invoke("codex:state") as Promise<{ status: string; runId: string | null }>,
+    ipcRenderer.invoke("codex:state") as Promise<{
+      status: string;
+      runtimeId: string | null;
+      sessionRef: string | null;
+    }>,
   writeCodex: (data: string) => ipcRenderer.send("codex:input", data),
   submitCodexPrompt: (prompt: string) =>
     ipcRenderer.invoke("codex:submit-prompt", prompt) as Promise<boolean>,
@@ -113,13 +126,31 @@ const desktopBridge = {
     ipcRenderer.send("codex:resize", { cols, rows }),
   interruptCodex: () => ipcRenderer.send("codex:interrupt"),
   stopCodex: () => ipcRenderer.send("codex:stop"),
-  onCodexOutput: (callback: (payload: { runId: string | null; data: string }) => void) => {
-    const listener = (_event: unknown, payload: { runId: string | null; data: string }) => callback(payload);
+  onCodexOutput: (callback: (payload: {
+    runtimeId: string | null;
+    sessionRef: string | null;
+    data: string;
+  }) => void) => {
+    const listener = (_event: unknown, payload: {
+      runtimeId: string | null;
+      sessionRef: string | null;
+      data: string;
+    }) => callback(payload);
     ipcRenderer.on("codex:output", listener);
     return () => ipcRenderer.removeListener("codex:output", listener);
   },
-  onCodexStatus: (callback: (payload: { status: string; runId: string | null; message: string }) => void) => {
-    const listener = (_event: unknown, payload: { status: string; runId: string | null; message: string }) => callback(payload);
+  onCodexStatus: (callback: (payload: {
+    status: string;
+    runtimeId: string | null;
+    sessionRef: string | null;
+    message: string;
+  }) => void) => {
+    const listener = (_event: unknown, payload: {
+      status: string;
+      runtimeId: string | null;
+      sessionRef: string | null;
+      message: string;
+    }) => callback(payload);
     ipcRenderer.on("codex:status", listener);
     return () => ipcRenderer.removeListener("codex:status", listener);
   }

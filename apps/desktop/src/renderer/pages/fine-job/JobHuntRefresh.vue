@@ -21,7 +21,7 @@ const runIsActive = computed(() => run.value?.status === "pending" || run.value?
 const codexReady = computed(() => {
   const bridge = getCodexBridge();
   return codexStore.status === "running"
-    && Boolean(codexStore.runId)
+    && Boolean(codexStore.sessionRef)
     && typeof bridge?.submitCodexPrompt === "function";
 });
 const codexStatusLabel = computed(() => ({
@@ -236,10 +236,10 @@ const refreshPrompt = (target: FineJobJobHuntRefreshRun) => {
 
 const submitRunToCodex = async (target: FineJobJobHuntRefreshRun) => {
   const bridge = getCodexBridge();
-  if (!codexReady.value || !bridge?.submitCodexPrompt || !codexStore.runId) {
+  if (!codexReady.value || !bridge?.submitCodexPrompt || !codexStore.sessionRef) {
     throw new Error("Codex 未就绪，请先在 Codex 工作台选择模型并启动会话。");
   }
-  await store.attachCodexSession(target.id, codexStore.runId);
+  await store.attachCodexSession(target.id, codexStore.sessionRef);
   const submitted = await bridge.submitCodexPrompt(refreshPrompt(target));
   if (!submitted) throw new Error("Codex 未接收任务，可在就绪后使用原 run_id 重新提交。");
   await store.markPromptSubmitted(target.id);
@@ -437,7 +437,7 @@ onBeforeUnmount(() => store.stopProgressReading());
         <div>
           <strong>Codex 执行器</strong>
           <span>状态：{{ codexStatusLabel }}</span>
-          <span>会话：{{ codexStore.runId || "无" }}</span>
+          <span>会话：{{ codexStore.sessionRef || "无" }}</span>
         </div>
         <p v-if="!codexReady" class="secondary-text">
           Codex 未就绪，请先选择模型并启动 Codex 会话。

@@ -11,14 +11,14 @@ describe("registerCodexIpc", () => {
       on: vi.fn((channel: string, handler: (...args: any[]) => unknown) => listeners.set(channel, handler))
     };
     const controller = {
-      start: vi.fn(async () => ({ status: "running", runId: "run-1" })),
-      resume: vi.fn(async () => ({ status: "running", runId: "run-1" })),
-      startWorkflow: vi.fn(async () => ({ status: "running", runId: "run-1", sessionRef: "session-1" })),
+      start: vi.fn(async () => ({ status: "running", runtimeId: "run-1", sessionRef: "runtime:run-1" })),
+      resume: vi.fn(async () => ({ status: "running", runtimeId: "run-1", sessionRef: "runtime:run-1" })),
+      startWorkflow: vi.fn(async () => ({ status: "running", runtimeId: "run-1", sessionRef: "runtime:run-1" })),
       write: vi.fn(),
       resize: vi.fn(),
       interrupt: vi.fn(),
       stop: vi.fn(),
-      state: vi.fn(() => ({ status: "idle", runId: null }))
+      state: vi.fn(() => ({ status: "idle", runtimeId: null, sessionRef: null }))
     };
 
     registerCodexIpc(ipcMain as never, controller, () => null);
@@ -34,6 +34,11 @@ describe("registerCodexIpc", () => {
     });
     expect(controller.startWorkflow).toHaveBeenCalledWith({
       model: "gpt-5.6-luna", reasoningEffort: "high", sessionRef: "session-1"
+    });
+    expect(handlers.get("codex:state")?.({})).toEqual({
+      status: "idle",
+      runtimeId: null,
+      sessionRef: null
     });
   });
 
