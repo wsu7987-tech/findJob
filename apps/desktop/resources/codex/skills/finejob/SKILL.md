@@ -88,10 +88,10 @@ description: 通过 FineJob MCP 编排可组合的求职业务节点，完成岗
 
 1. 读取 `finejob.get_workflow_run(workflow_run_id)`，确认 `status`、`completed_count`、`remaining_count` 和 `next_action_reason`。
 2. Run 进入 `waiting_codex` 后，先读取一次 `finejob.get_workflow_context_snapshot(workflow_run_id, channel="candidate_analysis")`。这是 Shared Base，只读取一次并在同一 Codex 会话复用。
-3. 调用 `finejob.list_workflow_analysis_items(workflow_run_id)`，只处理状态为 `pending` 或 `running` 的 Item。
+3. 从 Run 的 `analysis_handoff.analysis_batch_id` 读取已 claim 的正式分析批次，再调用 `finejob.list_workflow_analysis_items(workflow_run_id, analysis_batch_id)`，只处理该批次状态为 `pending` 或 `running` 的 Item，绝不重新分析 `succeeded` Item。
 4. 对每个 Item 调用 `finejob.get_workflow_analysis_item_context`。上下文只包含该岗位的 JD、必要岗位事实、策略引用和 Shared Base 引用；不得混用其他岗位的材料。
 5. 生成 `recommend`、`review` 或 `reject` 后，必须调用 `finejob.save_workflow_analysis_item` 保存。该工具会复用正式岗位评估保存能力，并由后端更新 Workflow 计数。
-6. 每次保存后重新读取 `finejob.get_workflow_run`。若仍要求 `codex_analysis`，继续处理待分析 Item；若后端转入 JD 补充或搜索，等待后端状态再次到达 `waiting_codex`；Run 为 `completed` 或 `waiting_for_user` 时结束。
+6. 每次保存后重新读取 `finejob.get_workflow_run` 与当前批次 Item。当前已 claim 批次完成后停止等待后端下一步；若后端转入 JD 补充或搜索，等待新的 `waiting_codex` 批次；Run 为 `completed` 或 `waiting_for_user` 时结束。
 
 约束：
 

@@ -1502,6 +1502,37 @@ export const api = {
       { method: "PATCH", body: JSON.stringify(payload) }
     );
   },
+  async claimFineJobWorkflowAnalysisHandoff(
+    workflowRunId: string,
+    payload: {
+      codex_session_ref: string;
+      codex_runtime_id?: string;
+      handoff_kind: "initial" | "next";
+    }
+  ) {
+    return request<FineJobWorkflowRun>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/analysis-handoff/claim`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
+  async confirmFineJobWorkflowAnalysisHandoff(
+    workflowRunId: string,
+    payload: { analysis_batch_id: string; codex_session_ref: string }
+  ) {
+    return request<FineJobWorkflowRun>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/analysis-handoff/confirm`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
+  async releaseFineJobWorkflowAnalysisHandoff(
+    workflowRunId: string,
+    payload: { analysis_batch_id: string; codex_session_ref: string }
+  ) {
+    return request<FineJobWorkflowRun>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/analysis-handoff/release`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
   async listFineJobWorkflowAnalysisItems(workflowRunId: string) {
     return request<{ workflow_run_id: string; items: FineJobWorkflowAnalysisItem[] }>(
       `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/analysis-items`

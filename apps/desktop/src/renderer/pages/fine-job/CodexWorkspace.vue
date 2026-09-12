@@ -120,7 +120,7 @@ const deepJobSearchTask = () => {
   if (query.task !== "deep-job-search") return null;
   const workflowRunId = String(query.workflow_run_id || "").trim();
   const action = String(query.workflow_action || "").trim();
-  if (!workflowRunId || (action !== "submit" && action !== "view")) return null;
+  if (!workflowRunId || (action !== "submit" && action !== "continue" && action !== "view")) return null;
   return { workflowRunId, action };
 };
 
@@ -129,6 +129,9 @@ const submitDeepJobSearchTask = async () => {
   const bridge = getCodexBridge();
   if (!task || !bridge?.submitCodexPrompt) return;
   workflowAnalysisMessage.value = "正在连接该 Workflow 的 Codex 分析会话……";
+  let claimedBatchId = "";
+  let claimedSessionRef = "";
+  let promptAccepted = false;
   try {
     const run = await workflowStore.refresh(task.workflowRunId);
     const sameLiveSession = isRunning.value && run?.codex_session_ref === store.sessionRef;
@@ -136,6 +139,10 @@ const submitDeepJobSearchTask = async () => {
       workflowAnalysisMessage.value = run?.codex_session_ref?.startsWith("runtime:")
         ? "原 Codex 会话不可恢复，请在下一批 waiting_codex 时重新交给 Codex 分析。"
         : "当前 Workflow 没有可查看的存活 Codex 会话。";
+      return;
+    }
+    if (task.action === "continue" && !sameLiveSession) {
+      workflowAnalysisMessage.value = "继续下一批需要当前 Workflow 的 Codex 会话仍在运行。";
       return;
     }
     if (task.action === "submit" && isRunning.value && !sameLiveSession) {
@@ -159,32 +166,58 @@ const submitDeepJobSearchTask = async () => {
         : "当前 Workflow 没有可查看的存活 Codex 会话。";
       return;
     }
-    if (session.sessionRef) {
-      await api.attachFineJobWorkflowCodexSession(task.workflowRunId, {
+    if (!session.sessionRef) throw new Error("Codex 会话未返回可绑定的 Session Ref。");
+    const claimedRun = await api.claimFineJobWorkflowAnalysisHandoff(task.workflowRunId, {
         codex_session_ref: session.sessionRef,
-        codex_runtime_id: session.runtimeId || undefined
-      });
-    }
+        codex_runtime_id: session.runtimeId || undefined,
+        handoff_kind: task.action === "continue" || run?.analysis_handoff?.needs_next_batch_handoff
+          ? "next"
+          : "initial"
+    });
+    claimedBatchId = claimedRun.analysis_handoff?.analysis_batch_id || "";
+    claimedSessionRef = session.sessionRef;
+    if (!claimedBatchId) throw new Error("后端没有返回已占用的分析批次。");
     const submitted = await bridge.submitCodexPrompt(
-      `使用 $finejob 继续处理 deep_job_search Workflow，workflow_run_id=${task.workflowRunId}。严格根据后端 Workflow Run 状态、Completion Contract 和 FineJob Skill 执行。后续批次读取同一 Run 的 Shared Base、analysis_guidance 和已保存 Item 结果；只保存结构化判断依据，不保存或展示内部思维链。external_action_policy=analysis_only，任何 recommend 只能进入正式待确认，不得发送或请求真实外部动作。`
+      task.action === "submit"
+        ? `使用 $finejob 处理 deep_job_search Workflow，workflow_run_id=${task.workflowRunId}，analysis_batch_id=${claimedBatchId}。读取 Workflow 状态和待分析 Item，按照 FineJob Skill 执行，直到当前待分析批次处理完成或 Run 进入边界状态。`
+        : `继续处理 workflow_run_id=${task.workflowRunId}，analysis_batch_id=${claimedBatchId} 当前新产生的 pending Analysis Items。`
     );
-    if (submitted) {
-      await router.replace({
-        name: "fine-job-codex",
-        query: {
-          task: "deep-job-search",
-          workflow_run_id: task.workflowRunId,
-          workflow_action: "view"
-        }
+    if (!submitted) {
+      await api.releaseFineJobWorkflowAnalysisHandoff(task.workflowRunId, {
+        analysis_batch_id: claimedBatchId,
+        codex_session_ref: claimedSessionRef
       });
+      workflowAnalysisMessage.value = "Codex 会话当前不可接收任务，当前分析批次已释放，可重新交接。";
+      return;
     }
+    promptAccepted = true;
+    await api.confirmFineJobWorkflowAnalysisHandoff(task.workflowRunId, {
+      analysis_batch_id: claimedBatchId,
+      codex_session_ref: claimedSessionRef
+    });
+    await router.replace({
+      name: "fine-job-codex",
+      query: {
+        task: "deep-job-search",
+        workflow_run_id: task.workflowRunId,
+        workflow_action: "view"
+      }
+    });
     const recoveryNotice = session.workflowSessionMode === "new_from_workflow_state" && run?.codex_session_ref
       ? "原 Codex 会话不可恢复，已基于 Workflow 状态建立新分析会话。"
       : "";
-    workflowAnalysisMessage.value = submitted
-      ? `${recoveryNotice}Workflow 分析任务已提交，Codex 会通过 MCP 按需读取上下文并保存结果。`
-      : "Codex 会话当前不可接收任务，请重新启动新会话后再试。";
+    workflowAnalysisMessage.value = `${recoveryNotice}${task.action === "submit" ? "Workflow 分析任务已提交" : "下一批 Workflow 分析任务已提交"}，Codex 会通过 MCP 按需读取上下文并保存结果。`;
   } catch (error) {
+    if (claimedBatchId && claimedSessionRef && !promptAccepted) {
+      try {
+        await api.releaseFineJobWorkflowAnalysisHandoff(task.workflowRunId, {
+          analysis_batch_id: claimedBatchId,
+          codex_session_ref: claimedSessionRef
+        });
+      } catch {
+        // 已提交或已被其他流程恢复的 claim 保持后端权威状态，避免错误覆盖。
+      }
+    }
     workflowAnalysisMessage.value = `Workflow 分析任务提交失败：${error instanceof Error ? error.message : String(error)}`;
   }
 };

@@ -2454,6 +2454,21 @@ export interface FineJobWorkflowRun {
   };
   codex_session_ref?: string | null;
   codex_runtime_id?: string | null;
+  analysis_handoff?: {
+    analysis_batch_id: string;
+    pending_item_count: number;
+    running_item_count: number;
+    succeeded_item_count: number;
+    handoff_status: "none" | "claimed" | "submitted" | "released" | "completed";
+    claimed_at?: string | null;
+    submitted_at?: string | null;
+    codex_session_ref?: string | null;
+    needs_initial_codex_handoff: boolean;
+    needs_next_batch_handoff: boolean;
+    codex_processing: boolean;
+    analysis_batch_complete: boolean;
+    recovery_available: boolean;
+  };
   completion_contract?: {
     target_count?: number;
     external_action_policy?: string;

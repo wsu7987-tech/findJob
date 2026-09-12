@@ -13,6 +13,9 @@ const mocks = vi.hoisted(() => ({
   strategiesLoad: vi.fn(),
   submitPrompt: vi.fn(),
   attachWorkflowSession: vi.fn(),
+  claimWorkflowHandoff: vi.fn(),
+  confirmWorkflowHandoff: vi.fn(),
+  releaseWorkflowHandoff: vi.fn(),
   refreshWorkflow: vi.fn(),
   push: vi.fn(),
   replace: vi.fn(),
@@ -48,7 +51,12 @@ vi.mock("@/stores/fineJobWorkflowRun", () => ({
 }));
 
 vi.mock("@/services/api", () => ({
-  api: { attachFineJobWorkflowCodexSession: mocks.attachWorkflowSession }
+  api: {
+    attachFineJobWorkflowCodexSession: mocks.attachWorkflowSession,
+    claimFineJobWorkflowAnalysisHandoff: mocks.claimWorkflowHandoff,
+    confirmFineJobWorkflowAnalysisHandoff: mocks.confirmWorkflowHandoff,
+    releaseFineJobWorkflowAnalysisHandoff: mocks.releaseWorkflowHandoff
+  }
 }));
 
 vi.mock("@/stores/fineJobStrategies", () => ({
@@ -103,6 +111,11 @@ describe("CodexWorkspace", () => {
     mocks.strategiesLoad.mockReset().mockResolvedValue(undefined);
     mocks.submitPrompt.mockReset().mockResolvedValue(true);
     mocks.attachWorkflowSession.mockReset().mockResolvedValue(undefined);
+    mocks.claimWorkflowHandoff.mockReset().mockResolvedValue({
+      analysis_handoff: { analysis_batch_id: "analysis-batch-1" }
+    });
+    mocks.confirmWorkflowHandoff.mockReset().mockResolvedValue(undefined);
+    mocks.releaseWorkflowHandoff.mockReset().mockResolvedValue(undefined);
     mocks.refreshWorkflow.mockReset().mockResolvedValue(undefined);
     mocks.push.mockReset().mockResolvedValue(undefined);
     mocks.replace.mockReset().mockImplementation(async (target: { query: Record<string, string> }) => {
@@ -234,12 +247,17 @@ describe("CodexWorkspace", () => {
       reasoningEffort: "high",
       sessionRef: "runtime:closed-runtime-1"
     });
-    expect(mocks.submitPrompt).toHaveBeenCalledWith(expect.stringContaining(
-      "后续批次读取同一 Run 的 Shared Base、analysis_guidance 和已保存 Item 结果"
-    ));
-    expect(mocks.attachWorkflowSession).toHaveBeenCalledWith("workflow-run-1", {
+    expect(mocks.claimWorkflowHandoff).toHaveBeenCalledWith("workflow-run-1", {
       codex_session_ref: "runtime:runtime-2",
-      codex_runtime_id: "runtime-2"
+      codex_runtime_id: "runtime-2",
+      handoff_kind: "initial"
+    });
+    expect(mocks.submitPrompt).toHaveBeenCalledWith(expect.stringContaining(
+      "workflow_run_id=workflow-run-1，analysis_batch_id=analysis-batch-1"
+    ));
+    expect(mocks.confirmWorkflowHandoff).toHaveBeenCalledWith("workflow-run-1", {
+      analysis_batch_id: "analysis-batch-1",
+      codex_session_ref: "runtime:runtime-2"
     });
     expect(mocks.replace).toHaveBeenCalledWith({
       name: "fine-job-codex",
@@ -291,7 +309,7 @@ describe("CodexWorkspace", () => {
 
     expect(mocks.startWorkflow).toHaveBeenCalledTimes(1);
     expect(mocks.submitPrompt).not.toHaveBeenCalled();
-    expect(mocks.attachWorkflowSession).not.toHaveBeenCalled();
+    expect(mocks.claimWorkflowHandoff).not.toHaveBeenCalled();
     expect(wrapper.html()).toContain("已进入当前 Workflow 的 Codex 分析会话");
   });
 
@@ -349,6 +367,47 @@ describe("CodexWorkspace", () => {
 
     expect(mocks.submitPrompt).toHaveBeenCalledTimes(1);
     expect(mocks.replace).not.toHaveBeenCalled();
+    expect(mocks.releaseWorkflowHandoff).toHaveBeenCalledWith("workflow-run-1", {
+      analysis_batch_id: "analysis-batch-1",
+      codex_session_ref: "runtime:runtime-2"
+    });
     expect(mocks.routeQuery.workflow_action).toBe("submit");
+  });
+
+  it("continue 自动提交短的下一批 Prompt", async () => {
+    mocks.routeQuery = {
+      task: "deep-job-search",
+      workflow_run_id: "workflow-run-1",
+      workflow_action: "continue"
+    };
+    mocks.codexState.status = "running";
+    mocks.codexState.sessionRef = "runtime:workflow-runtime-1";
+    mocks.refreshWorkflow.mockResolvedValue({
+      codex_session_ref: "runtime:workflow-runtime-1",
+      analysis_handoff: { needs_next_batch_handoff: true },
+      completion_contract: {
+        codex_execution_config: { model: "gpt-5.6-luna", reasoning_effort: "high" }
+      }
+    });
+    mocks.startWorkflow.mockResolvedValue({
+      status: "running",
+      runtimeId: "runtime-1",
+      sessionRef: "runtime:workflow-runtime-1",
+      workflowSessionMode: "live_reused"
+    });
+
+    mount(CodexWorkspace, { global: { stubs: {
+      CodexTerminal: CodexTerminalStub, ElAlert: GenericStub, ElButton: ElButtonStub,
+      ElEmpty: GenericStub, ElInputNumber: GenericStub, ElOption: GenericStub,
+      ElSelect: GenericStub, ElTag: GenericStub, ElSwitch: GenericStub
+    } } });
+    await flushPromises();
+
+    expect(mocks.claimWorkflowHandoff).toHaveBeenCalledWith("workflow-run-1", expect.objectContaining({
+      handoff_kind: "next"
+    }));
+    expect(mocks.submitPrompt).toHaveBeenCalledWith(
+      "继续处理 workflow_run_id=workflow-run-1，analysis_batch_id=analysis-batch-1 当前新产生的 pending Analysis Items。"
+    );
   });
 });

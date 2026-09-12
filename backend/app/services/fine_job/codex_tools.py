@@ -445,7 +445,10 @@ class CodexToolService:
 
     def list_workflow_analysis_items(self, arguments: dict[str, Any]) -> dict[str, object]:
         workflow_run_id = str(arguments.get("workflow_run_id") or "").strip()
-        data = workflow_runs.list_workflow_analysis_items(self.db, workflow_run_id)
+        analysis_batch_id = str(arguments.get("analysis_batch_id") or "").strip() or None
+        data = workflow_runs.list_workflow_analysis_items(
+            self.db, workflow_run_id, analysis_batch_id
+        )
         return _result(
             result_type="data",
             status="succeeded",

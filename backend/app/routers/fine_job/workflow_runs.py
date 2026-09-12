@@ -7,6 +7,8 @@ from backend.app.dependencies import get_config, get_database
 from backend.app.db import Database
 from backend.app.schemas.fine_job.workflow_runs import (
     WorkflowAnalysisSaveRequest,
+    WorkflowAnalysisHandoffClaimRequest,
+    WorkflowAnalysisHandoffRequest,
     WorkflowAnalysisFeedbackRequest,
     WorkflowAnalysisGuidanceUpdateRequest,
     WorkflowRunCodexSessionRequest,
@@ -98,6 +100,43 @@ def save_analysis_item(
 @router.patch("/{workflow_run_id}/codex-session")
 def attach_codex_session(workflow_run_id: str, payload: WorkflowRunCodexSessionRequest, db: Database = Depends(get_database)):
     return workflow_runs.attach_codex_session(db, workflow_run_id, payload.codex_session_ref, payload.codex_runtime_id)
+
+
+@router.post("/{workflow_run_id}/analysis-handoff/claim")
+def claim_analysis_handoff(
+    workflow_run_id: str,
+    payload: WorkflowAnalysisHandoffClaimRequest,
+    db: Database = Depends(get_database),
+):
+    return workflow_runs.claim_workflow_analysis_handoff(
+        db,
+        workflow_run_id,
+        codex_session_ref=payload.codex_session_ref,
+        codex_runtime_id=payload.codex_runtime_id,
+        handoff_kind=payload.handoff_kind,
+    )
+
+
+@router.post("/{workflow_run_id}/analysis-handoff/confirm")
+def confirm_analysis_handoff(
+    workflow_run_id: str,
+    payload: WorkflowAnalysisHandoffRequest,
+    db: Database = Depends(get_database),
+):
+    return workflow_runs.confirm_workflow_analysis_handoff(
+        db, workflow_run_id, payload.analysis_batch_id, payload.codex_session_ref
+    )
+
+
+@router.post("/{workflow_run_id}/analysis-handoff/release")
+def release_analysis_handoff(
+    workflow_run_id: str,
+    payload: WorkflowAnalysisHandoffRequest,
+    db: Database = Depends(get_database),
+):
+    return workflow_runs.release_workflow_analysis_handoff(
+        db, workflow_run_id, payload.analysis_batch_id, payload.codex_session_ref
+    )
 
 
 @router.patch("/{workflow_run_id}/analysis-guidance")

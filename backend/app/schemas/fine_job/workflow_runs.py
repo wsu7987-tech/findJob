@@ -38,6 +38,15 @@ class WorkflowRunCodexSessionRequest(BaseModel):
     codex_runtime_id: str | None = Field(default=None, max_length=200)
 
 
+class WorkflowAnalysisHandoffClaimRequest(WorkflowRunCodexSessionRequest):
+    handoff_kind: Literal["initial", "next"]
+
+
+class WorkflowAnalysisHandoffRequest(BaseModel):
+    analysis_batch_id: str = Field(min_length=1, max_length=100)
+    codex_session_ref: str = Field(min_length=1, max_length=200)
+
+
 class WorkflowAnalysisGuidanceUpdateRequest(BaseModel):
     analysis_guidance: str = Field(max_length=4000)
 

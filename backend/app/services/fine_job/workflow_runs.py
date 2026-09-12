@@ -184,6 +184,7 @@ def get_workflow_run(db: Database, workflow_run_id: str) -> dict[str, object]:
     return {
         **_serialize_run(run),
         "progress": _get_run_progress(db, workflow_run_id),
+        "analysis_handoff": _get_analysis_handoff_summary(db, workflow_run_id),
         "tasks": [_serialize_task(row) for row in tasks],
         "context_snapshots": [_serialize_snapshot(row) for row in snapshots],
     }
@@ -211,7 +212,9 @@ def get_context_snapshot(db: Database, workflow_run_id: str, channel: str = "dee
     return _serialize_snapshot(row)
 
 
-def list_workflow_analysis_items(db: Database, workflow_run_id: str) -> dict[str, object]:
+def list_workflow_analysis_items(
+    db: Database, workflow_run_id: str, analysis_batch_id: str | None = None
+) -> dict[str, object]:
     _require_run(db, workflow_run_id)
     with db.connect() as connection:
         rows = connection.execute(
@@ -244,8 +247,12 @@ def list_workflow_analysis_items(db: Database, workflow_run_id: str) -> dict[str
     feedback_by_task: dict[str, list[dict[str, object]]] = {}
     for row in feedback_rows:
         feedback_by_task.setdefault(str(row["workflow_task_id"]), []).append(_serialize_feedback(row))
+    if analysis_batch_id:
+        rows = [row for row in rows if _analysis_batch_id(row, workflow_run_id) == analysis_batch_id]
     return {
         "workflow_run_id": workflow_run_id,
+        "analysis_batch_id": analysis_batch_id or str(_get_analysis_handoff_summary(db, workflow_run_id).get("analysis_batch_id") or ""),
+        "analysis_handoff": _get_analysis_handoff_summary(db, workflow_run_id),
         "items": [
             _serialize_analysis_item(
                 row,
@@ -407,6 +414,9 @@ def record_workflow_analysis_result(
         payload,
         {"job_id": job_id, "decision": decision, "evaluation_id": evaluation_id, **evaluation},
     )
+    _complete_analysis_handoff_if_finished(
+        db, workflow_run_id, _analysis_batch_id_from_payload(payload, workflow_run_id)
+    )
     _refresh_counts(db, workflow_run_id)
     refreshed = _require_run(db, workflow_run_id)
     contract = _load(refreshed["completion_contract_json"], {})
@@ -430,6 +440,144 @@ def attach_codex_session(db: Database, workflow_run_id: str, codex_session_ref: 
     if snapshot["status"] != "ready":
         raise AppError(409, "CONTEXT_SNAPSHOT_BLOCKED", "分析上下文尚未通过预算检查。")
     _update_run(db, workflow_run_id, codex_session_ref=codex_session_ref, codex_runtime_id=codex_runtime_id or "", current_step="waiting_codex", next_action="codex_analysis", next_action_reason="候选池与 JD 准备完成后可提交 Codex 分析。")
+    return get_workflow_run(db, workflow_run_id)
+
+
+def claim_workflow_analysis_handoff(
+    db: Database,
+    workflow_run_id: str,
+    *,
+    codex_session_ref: str,
+    codex_runtime_id: str | None,
+    handoff_kind: str,
+) -> dict[str, object]:
+    """原子占用当前分析批次；占用本身不改变岗位分析 Item 的业务状态。"""
+    run = _require_run(db, workflow_run_id)
+    if run["status"] != "waiting_codex":
+        raise AppError(409, "WORKFLOW_NOT_READY_FOR_CODEX", "当前 Workflow 不在等待 Codex 分析状态。")
+    snapshot = get_context_snapshot(db, workflow_run_id, "candidate_analysis")
+    if snapshot["status"] != "ready":
+        raise AppError(409, "CONTEXT_SNAPSHOT_BLOCKED", "分析上下文尚未通过预算检查。")
+    summary = _get_analysis_handoff_summary(db, workflow_run_id)
+    batch_id = str(summary.get("analysis_batch_id") or "")
+    if not batch_id or int(summary.get("pending_item_count") or 0) <= 0:
+        raise AppError(409, "WORKFLOW_ANALYSIS_BATCH_NOT_READY", "当前没有可交接的 pending 分析批次。")
+    if handoff_kind == "initial" and not bool(summary.get("needs_initial_codex_handoff")) and not bool(summary.get("recovery_available")):
+        raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_NOT_INITIAL", "当前批次不是首次 Codex 交接。")
+    if handoff_kind == "next" and not bool(summary.get("needs_next_batch_handoff")):
+        raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_NOT_NEXT", "当前没有可继续的后续分析批次。")
+
+    now = utc_now()
+    recovered = False
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute(
+            "SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis' ORDER BY created_at",
+            (workflow_run_id,),
+        ).fetchall()
+        pending = [
+            row for row in rows
+            if row["status"] == "pending" and _analysis_batch_id(row, workflow_run_id) == batch_id
+        ]
+        if not pending:
+            raise AppError(409, "WORKFLOW_ANALYSIS_BATCH_NOT_READY", "当前分析批次已被处理或交接。")
+        existing = connection.execute(
+            "SELECT * FROM fj_workflow_analysis_handoffs WHERE workflow_run_id = ? AND analysis_batch_id = ?",
+            (workflow_run_id, batch_id),
+        ).fetchone()
+        if existing is not None and existing["status"] in {"claimed", "submitted"}:
+            previous_ref = str(existing["codex_session_ref"] or "")
+            if not previous_ref.startswith("runtime:") or previous_ref == codex_session_ref:
+                raise AppError(409, "WORKFLOW_ANALYSIS_BATCH_IN_PROGRESS", "当前分析批次已交给 Codex 处理。")
+            recovered = True
+        if existing is None:
+            connection.execute(
+                """
+                INSERT INTO fj_workflow_analysis_handoffs (
+                  workflow_run_id, analysis_batch_id, status, codex_session_ref, codex_runtime_id, claimed_at
+                ) VALUES (?, ?, 'claimed', ?, ?, ?)
+                """,
+                (workflow_run_id, batch_id, codex_session_ref, codex_runtime_id or "", now),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE fj_workflow_analysis_handoffs
+                SET status = 'claimed', codex_session_ref = ?, codex_runtime_id = ?, claimed_at = ?,
+                    submitted_at = NULL, released_at = NULL, completed_at = NULL,
+                    recovered_at = ?, recovery_reason = ?
+                WHERE workflow_run_id = ? AND analysis_batch_id = ?
+                """,
+                (
+                    codex_session_ref,
+                    codex_runtime_id or "",
+                    now,
+                    now if recovered else None,
+                    "previous_runtime_session_not_live" if recovered else "",
+                    workflow_run_id,
+                    batch_id,
+                ),
+            )
+    _update_run(
+        db,
+        workflow_run_id,
+        codex_session_ref=codex_session_ref,
+        codex_runtime_id=codex_runtime_id or "",
+        current_step="waiting_codex",
+        next_action="codex_analysis",
+        next_action_reason="Codex 已占用当前岗位分析批次，等待 Prompt 提交。",
+    )
+    return get_workflow_run(db, workflow_run_id)
+
+
+def confirm_workflow_analysis_handoff(
+    db: Database, workflow_run_id: str, analysis_batch_id: str, codex_session_ref: str
+) -> dict[str, object]:
+    """Prompt 被终端接受后确认批次已提交，后续点击只能查看。"""
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        handoff = connection.execute(
+            "SELECT * FROM fj_workflow_analysis_handoffs WHERE workflow_run_id = ? AND analysis_batch_id = ?",
+            (workflow_run_id, analysis_batch_id),
+        ).fetchone()
+        if handoff is None or str(handoff["codex_session_ref"] or "") != codex_session_ref:
+            raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_NOT_CLAIMED", "当前批次没有可确认的 Codex 交接。")
+        if handoff["status"] == "claimed":
+            connection.execute(
+                """
+                UPDATE fj_workflow_analysis_handoffs
+                SET status = 'submitted', submitted_at = ?
+                WHERE workflow_run_id = ? AND analysis_batch_id = ?
+                """,
+                (utc_now(), workflow_run_id, analysis_batch_id),
+            )
+        elif handoff["status"] != "submitted":
+            raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_NOT_CLAIMED", "当前批次已释放或完成，不能确认提交。")
+    return get_workflow_run(db, workflow_run_id)
+
+
+def release_workflow_analysis_handoff(
+    db: Database, workflow_run_id: str, analysis_batch_id: str, codex_session_ref: str
+) -> dict[str, object]:
+    """Prompt 未被终端接受时释放 claim，使同一批次可以安全重试。"""
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        handoff = connection.execute(
+            "SELECT * FROM fj_workflow_analysis_handoffs WHERE workflow_run_id = ? AND analysis_batch_id = ?",
+            (workflow_run_id, analysis_batch_id),
+        ).fetchone()
+        if handoff is None or str(handoff["codex_session_ref"] or "") != codex_session_ref:
+            raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_NOT_CLAIMED", "当前批次没有可释放的 Codex 交接。")
+        if handoff["status"] != "claimed":
+            raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_ALREADY_SUBMITTED", "当前批次已提交给 Codex，不能按失败释放。")
+        connection.execute(
+            """
+            UPDATE fj_workflow_analysis_handoffs
+            SET status = 'released', released_at = ?
+            WHERE workflow_run_id = ? AND analysis_batch_id = ?
+            """,
+            (utc_now(), workflow_run_id, analysis_batch_id),
+        )
     return get_workflow_run(db, workflow_run_id)
 
 
@@ -732,6 +880,7 @@ def _create_analysis_tasks(
         _wait_for_user(db, workflow_run_id, "context_budget_exceeded", str(snapshot["blocker_reason"]))
         return
     now = utc_now()
+    analysis_batch_id = new_id()
     with db.connect() as connection:
         for jd_row, job_id in zip(jd_rows, job_ids, strict=True):
             if not job_id:
@@ -742,7 +891,17 @@ def _create_analysis_tasks(
                   id, workflow_run_id, task_type, payload_json, result_json, created_at, updated_at
                 ) VALUES (?, ?, 'deep_job_search_analysis', ?, '{}', ?, ?)
                 """,
-                (new_id(), workflow_run_id, _dump({"job_id": job_id, "jd_task_id": jd_row["id"]}), now, now),
+                (
+                    new_id(),
+                    workflow_run_id,
+                    _dump({
+                        "job_id": job_id,
+                        "jd_task_id": jd_row["id"],
+                        "analysis_batch_id": analysis_batch_id,
+                    }),
+                    now,
+                    now,
+                ),
             )
     _update_run(
         db,
@@ -1037,6 +1196,96 @@ def _require_run(db: Database, workflow_run_id: str):
 
 def _serialize_run(row: Any) -> dict[str, object]:
     return {"workflow_run_id": row["id"], "workflow_type": row["workflow_type"], "completion_contract": _load(row["completion_contract_json"], {}), "status": "paused" if bool(row["paused"]) else row["status"], "completed_count": row["completed_count"], "remaining_count": row["remaining_count"], "current_step": row["current_step"], "next_action": row["next_action"], "next_action_reason": row["next_action_reason"], "waiting_for_user": bool(row["waiting_for_user"]), "stop_reason": row["stop_reason"], "codex_session_ref": row["codex_session_ref"], "codex_runtime_id": row["codex_runtime_id"], "telemetry": _load(row["telemetry_json"], {}), "created_at": row["created_at"], "updated_at": row["updated_at"], "completed_at": row["completed_at"]}
+
+
+def _analysis_batch_id_from_payload(payload: dict[str, Any], workflow_run_id: str) -> str:
+    """旧 Run 没有 batch 标记时作为一个兼容批次处理。"""
+    return str(payload.get("analysis_batch_id") or f"legacy:{workflow_run_id}")
+
+
+def _analysis_batch_id(row: Any, workflow_run_id: str) -> str:
+    return _analysis_batch_id_from_payload(_load(row["payload_json"], {}), workflow_run_id)
+
+
+def _get_analysis_handoff_summary(db: Database, workflow_run_id: str) -> dict[str, object]:
+    with db.connect() as connection:
+        rows = connection.execute(
+            "SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis' ORDER BY created_at",
+            (workflow_run_id,),
+        ).fetchall()
+    batches: dict[str, list[Any]] = {}
+    for row in rows:
+        batches.setdefault(_analysis_batch_id(row, workflow_run_id), []).append(row)
+    active_batch_id = next(
+        (
+            batch_id for batch_id, batch_rows in batches.items()
+            if any(row["status"] in {"pending", "running"} for row in batch_rows)
+        ),
+        next(reversed(batches), ""),
+    )
+    if not active_batch_id:
+        return {
+            "analysis_batch_id": "",
+            "pending_item_count": 0,
+            "running_item_count": 0,
+            "succeeded_item_count": 0,
+            "handoff_status": "none",
+            "needs_initial_codex_handoff": False,
+            "needs_next_batch_handoff": False,
+            "codex_processing": False,
+            "analysis_batch_complete": True,
+            "recovery_available": False,
+        }
+    batch_rows = batches[active_batch_id]
+    counts = {status: sum(row["status"] == status for row in batch_rows) for status in ("pending", "running", "succeeded")}
+    with db.connect() as connection:
+        handoff = connection.execute(
+            "SELECT * FROM fj_workflow_analysis_handoffs WHERE workflow_run_id = ? AND analysis_batch_id = ?",
+            (workflow_run_id, active_batch_id),
+        ).fetchone()
+    handoff_status = str(handoff["status"]) if handoff is not None else "none"
+    batch_index = list(batches).index(active_batch_id)
+    ready_for_handoff = counts["pending"] > 0 and handoff_status in {"none", "released"}
+    return {
+        "analysis_batch_id": active_batch_id,
+        "pending_item_count": counts["pending"],
+        "running_item_count": counts["running"],
+        "succeeded_item_count": counts["succeeded"],
+        "handoff_status": handoff_status,
+        "claimed_at": handoff["claimed_at"] if handoff is not None else None,
+        "submitted_at": handoff["submitted_at"] if handoff is not None else None,
+        "codex_session_ref": handoff["codex_session_ref"] if handoff is not None else None,
+        "needs_initial_codex_handoff": ready_for_handoff and batch_index == 0,
+        "needs_next_batch_handoff": ready_for_handoff and batch_index > 0,
+        "codex_processing": handoff_status in {"claimed", "submitted"} and (counts["pending"] + counts["running"]) > 0,
+        "analysis_batch_complete": counts["pending"] + counts["running"] == 0,
+        "recovery_available": handoff_status in {"claimed", "submitted"}
+        and str(handoff["codex_session_ref"] or "").startswith("runtime:"),
+    }
+
+
+def _complete_analysis_handoff_if_finished(
+    db: Database, workflow_run_id: str, analysis_batch_id: str
+) -> None:
+    with db.connect() as connection:
+        rows = connection.execute(
+            "SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis'",
+            (workflow_run_id,),
+        ).fetchall()
+        unfinished = any(
+            _analysis_batch_id(row, workflow_run_id) == analysis_batch_id
+            and row["status"] in {"pending", "running"}
+            for row in rows
+        )
+        if not unfinished:
+            connection.execute(
+                """
+                UPDATE fj_workflow_analysis_handoffs
+                SET status = 'completed', completed_at = ?
+                WHERE workflow_run_id = ? AND analysis_batch_id = ? AND status IN ('claimed', 'submitted')
+                """,
+                (utc_now(), workflow_run_id, analysis_batch_id),
+            )
 
 
 def _get_run_progress(db: Database, workflow_run_id: str) -> dict[str, object]:

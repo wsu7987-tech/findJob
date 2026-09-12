@@ -1882,6 +1882,24 @@ CREATE TABLE IF NOT EXISTS fj_workflow_tasks (
 CREATE INDEX IF NOT EXISTS idx_fj_workflow_tasks_run_status
   ON fj_workflow_tasks(workflow_run_id, status, created_at);
 
+-- Codex 分析批次独立记录交接状态，避免把 Prompt 提交状态混入岗位分析结果。
+CREATE TABLE IF NOT EXISTS fj_workflow_analysis_handoffs (
+  workflow_run_id TEXT NOT NULL,
+  analysis_batch_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'claimed',
+  codex_session_ref TEXT NOT NULL,
+  codex_runtime_id TEXT NOT NULL DEFAULT '',
+  claimed_at TEXT NOT NULL,
+  submitted_at TEXT,
+  released_at TEXT,
+  completed_at TEXT,
+  recovered_at TEXT,
+  recovery_reason TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (workflow_run_id, analysis_batch_id),
+  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE CASCADE,
+  CHECK (status IN ('claimed', 'submitted', 'released', 'completed'))
+);
+
 CREATE TABLE IF NOT EXISTS fj_workflow_context_snapshots (
   id TEXT PRIMARY KEY,
   workflow_run_id TEXT NOT NULL,

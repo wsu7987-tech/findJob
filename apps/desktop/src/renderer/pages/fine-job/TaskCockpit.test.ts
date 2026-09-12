@@ -138,7 +138,19 @@ const run = (status: string) => ({
     review_count: 0,
     reject_count: 0
   },
-  completion_contract: { target_count: 2 }
+  completion_contract: { target_count: 2 },
+  analysis_handoff: {
+    analysis_batch_id: "analysis-batch-1",
+    pending_item_count: 2,
+    running_item_count: 0,
+    succeeded_item_count: 0,
+    handoff_status: "none",
+    needs_initial_codex_handoff: true,
+    needs_next_batch_handoff: false,
+    codex_processing: false,
+    analysis_batch_complete: false,
+    recovery_available: false
+  }
 });
 
 const mountCockpit = () => mount(TaskCockpit, {
@@ -256,5 +268,61 @@ describe("TaskCockpit", () => {
     await flushPromises();
 
     expect(wrapper.findAll("button").some((item) => item.text() === "查看 Codex 分析")).toBe(false);
+  });
+
+  it("第一批完成后新 pending 批次在同一存活会话显示继续分析下一批", async () => {
+    mocks.getRun.mockResolvedValue({
+      ...run("waiting_codex"),
+      codex_session_ref: "runtime:workflow-runtime-1",
+      analysis_handoff: {
+        ...run("waiting_codex").analysis_handoff,
+        analysis_batch_id: "analysis-batch-2",
+        pending_item_count: 1,
+        succeeded_item_count: 0,
+        needs_initial_codex_handoff: false,
+        needs_next_batch_handoff: true
+      }
+    });
+    mocks.codexState.status = "running";
+    mocks.codexState.sessionRef = "runtime:workflow-runtime-1";
+    const wrapper = mountCockpit();
+    await flushPromises();
+    await wrapper.find('[placeholder="输入 Workflow Run ID 查看本轮上下文"]').setValue("workflow-run-1");
+    await wrapper.findAll("button").find((item) => item.text() === "查看本轮上下文")!.trigger("click");
+    await flushPromises();
+
+    const next = wrapper.findAll("button").find((item) => item.text() === "继续分析下一批");
+    expect(next).toBeDefined();
+    await next!.trigger("click");
+    expect(mocks.push).toHaveBeenCalledWith({
+      name: "fine-job-codex",
+      query: {
+        task: "deep-job-search",
+        workflow_run_id: "workflow-run-1",
+        workflow_action: "continue"
+      }
+    });
+  });
+
+  it("Codex 正在处理批次时只显示查看入口，不显示继续分析", async () => {
+    mocks.getRun.mockResolvedValue({
+      ...run("waiting_codex"),
+      codex_session_ref: "runtime:workflow-runtime-1",
+      analysis_handoff: {
+        ...run("waiting_codex").analysis_handoff,
+        handoff_status: "submitted",
+        codex_processing: true
+      }
+    });
+    mocks.codexState.status = "running";
+    mocks.codexState.sessionRef = "runtime:workflow-runtime-1";
+    const wrapper = mountCockpit();
+    await flushPromises();
+    await wrapper.find('[placeholder="输入 Workflow Run ID 查看本轮上下文"]').setValue("workflow-run-1");
+    await wrapper.findAll("button").find((item) => item.text() === "查看本轮上下文")!.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.findAll("button").some((item) => item.text() === "Codex 分析中")).toBe(true);
+    expect(wrapper.findAll("button").some((item) => item.text() === "继续分析下一批")).toBe(false);
   });
 });

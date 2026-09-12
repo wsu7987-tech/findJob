@@ -172,8 +172,10 @@ async def get_workflow_run(workflow_run_id: str) -> dict[str, Any]:
 
 
 @server.tool(name="finejob.list_workflow_analysis_items", structured_output=True)
-async def list_workflow_analysis_items(workflow_run_id: str) -> dict[str, Any]:
-    """读取当前批次待由 Codex 分析并正式保存的 Workflow Item。"""
+async def list_workflow_analysis_items(
+    workflow_run_id: str, analysis_batch_id: str | None = None
+) -> dict[str, Any]:
+    """读取当前已 claim 批次待由 Codex 分析并正式保存的 Workflow Item。"""
     return await _invoke("list_workflow_analysis_items", locals())
 
 

@@ -49,6 +49,24 @@ const hasEndedRuntimeWorkflowSession = computed(() => Boolean(
   workflowRun.value?.codex_session_ref?.startsWith("runtime:")
     && !hasCurrentWorkflowCodexSession.value
 ));
+const workflowCodexEntry = computed(() => {
+  const run = workflowRun.value;
+  const handoff = run?.analysis_handoff;
+  if (!run || run.status !== "waiting_codex" || !handoff) return null;
+  if (hasCurrentWorkflowCodexSession.value && handoff.codex_processing) {
+    return { action: "view" as const, label: "Codex 分析中" };
+  }
+  if (hasCurrentWorkflowCodexSession.value && handoff.needs_next_batch_handoff) {
+    return { action: "continue" as const, label: "继续分析下一批" };
+  }
+  if (hasCurrentWorkflowCodexSession.value) {
+    return { action: "view" as const, label: "查看 Codex 分析" };
+  }
+  if (handoff.needs_initial_codex_handoff || handoff.needs_next_batch_handoff || handoff.recovery_available) {
+    return { action: "submit" as const, label: "交给 Codex 分析" };
+  }
+  return null;
+});
 
 const selectedStrategy = computed(
   () => strategies.value.find((item) => item.id === selectedStrategyId.value) ?? null
@@ -193,11 +211,11 @@ const cancelRun = async () => {
   }
 };
 
-const openWorkflowCodex = async (action: "submit" | "view") => {
+const openWorkflowCodex = async (action: "submit" | "continue" | "view") => {
   const currentRun = workflowRun.value;
   if (!currentRun) return;
   if (action === "submit" && currentRun.status !== "waiting_codex") return;
-  if (action === "view" && !hasCurrentWorkflowCodexSession.value) return;
+  if ((action === "continue" || action === "view") && !hasCurrentWorkflowCodexSession.value) return;
   await router.push({
     name: "fine-job-codex",
     query: {
@@ -323,8 +341,7 @@ watch(workflowRun, (run) => {
       <el-button v-if="workflowRun && workflowRun.status !== 'paused' && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)" @click="pauseRun">暂停</el-button>
       <el-button v-if="workflowRun?.status === 'paused' || (workflowRun?.status === 'waiting_for_user' && ['capture_interrupted', 'browser_not_running'].includes(workflowRun.stop_reason))" :loading="workflowStore.advancing" @click="resumeRun">继续</el-button>
       <el-button v-if="workflowRun && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)" type="danger" plain @click="cancelRun">停止任务</el-button>
-      <el-button v-if="hasCurrentWorkflowCodexSession" type="primary" @click="openWorkflowCodex('view')">查看 Codex 分析</el-button>
-      <el-button v-else-if="workflowRun?.status === 'waiting_codex'" type="primary" @click="openWorkflowCodex('submit')">交给 Codex 分析</el-button>
+      <el-button v-if="workflowCodexEntry" type="primary" @click="openWorkflowCodex(workflowCodexEntry.action)">{{ workflowCodexEntry.label }}</el-button>
     </div>
     <el-alert v-if="error" :title="error" type="error" :closable="false" />
     <el-alert
