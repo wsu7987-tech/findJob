@@ -2471,6 +2471,17 @@ export interface FineJobWorkflowRun {
   };
   completion_contract?: {
     target_count?: number;
+    recommend_target?: number;
+    review_target?: number | null;
+    target_mode?: "any" | "all";
+    analysis_policy?: {
+      analyze_all_candidates?: boolean;
+      stop_after_current_batch?: boolean;
+      analysis_batch_size?: number;
+      stop_after_current_batch_consumed?: boolean;
+    };
+    execution_policy?: { after_analysis_batch?: "auto_continue" | "wait_for_user" };
+    frozen_candidate_pool?: { job_ids?: string[]; frozen_at?: string; reason?: string };
     external_action_policy?: string;
     selected_strategy_ids?: { filter_strategy_id?: string; recommendation_strategy_id?: string };
     selected_strategy_versions?: Record<string, number>;

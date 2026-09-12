@@ -1450,7 +1450,13 @@ export const api = {
     codex_model: string;
     codex_reasoning_effort: "minimal" | "low" | "medium" | "high" | "xhigh";
     analysis_guidance?: string;
-    target_count: number;
+    recommend_target: number;
+    review_target?: number;
+    target_mode?: "any" | "all";
+    analyze_all_candidates?: boolean;
+    stop_after_current_batch?: boolean;
+    analysis_batch_size?: number;
+    execution_policy_after_analysis_batch?: "auto_continue" | "wait_for_user";
     candidate_target_count?: number;
     allowed_search_keywords: string[];
     allowed_cities: string[];

@@ -31,7 +31,14 @@ const showAnalysisDetail = ref(false);
 const feedbackReason = ref("technical_direction");
 const selectedKeywords = ref<string[]>([]);
 const selectedCities = ref<string[]>([]);
-const targetCount = ref(5);
+const recommendTarget = ref(5);
+const enableReviewTarget = ref(false);
+const reviewTarget = ref(1);
+const targetMode = ref<"any" | "all">("all");
+const analyzeAllCandidates = ref(false);
+const stopAfterCurrentBatch = ref(false);
+const analysisBatchSize = ref(5);
+const afterAnalysisBatch = ref<"auto_continue" | "wait_for_user">("auto_continue");
 const candidateTargetCount = ref(15);
 const contextSoftBudgetCharacters = ref(12000);
 const router = useRouter();
@@ -150,7 +157,13 @@ const createRun = async () => {
       codex_model: codexModel.value,
       codex_reasoning_effort: codexReasoningEffort.value,
       analysis_guidance: analysisGuidance.value,
-      target_count: targetCount.value,
+      recommend_target: recommendTarget.value,
+      review_target: enableReviewTarget.value ? reviewTarget.value : undefined,
+      target_mode: targetMode.value,
+      analyze_all_candidates: analyzeAllCandidates.value,
+      stop_after_current_batch: stopAfterCurrentBatch.value,
+      analysis_batch_size: analysisBatchSize.value,
+      execution_policy_after_analysis_batch: afterAnalysisBatch.value,
       candidate_target_count: candidateTargetCount.value,
       allowed_search_keywords: selectedKeywords.value,
       allowed_cities: selectedCities.value,
@@ -306,11 +319,36 @@ watch(workflowRun, (run) => {
         <el-form-item label="本 Run 临时分析指导（可选）">
           <el-input v-model="analysisGuidance" type="textarea" :rows="3" placeholder="只影响本 Run 的后续分析，不修改长期正式策略" />
         </el-form-item>
-        <el-form-item label="本轮要完成的推荐岗位数">
-          <el-input-number v-model="targetCount" :min="1" :max="100" />
+        <el-form-item label="Recommend 完成目标">
+          <el-input-number v-model="recommendTarget" :min="1" :max="100" />
+        </el-form-item>
+        <el-form-item label="Review 完成目标（可选）">
+          <el-switch v-model="enableReviewTarget" active-text="计入目标" inactive-text="不计入目标" />
+          <el-input-number v-if="enableReviewTarget" v-model="reviewTarget" :min="1" :max="100" />
+        </el-form-item>
+        <el-form-item label="目标达成模式">
+          <el-select v-model="targetMode">
+            <el-option label="全部已配置目标达到（all）" value="all" />
+            <el-option label="任一已配置目标达到（any）" value="any" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="Analysis Batch">
+          <el-input-number v-model="analysisBatchSize" :min="1" :max="20" />
+          <p class="secondary-text">每个 Analysis Batch 的岗位数，可在 1 到 20 之间选择。</p>
+        </el-form-item>
+        <el-form-item label="达标后的候选池处理">
+          <el-switch v-model="analyzeAllCandidates" active-text="分析已形成候选池" inactive-text="达标即结束" />
+          <p class="secondary-text">开启后会冻结达标时已形成的候选池，只继续分析其中岗位，不再采集新岗位。</p>
+        </el-form-item>
+        <el-form-item label="批次衔接">
+          <el-switch v-model="stopAfterCurrentBatch" active-text="当前批后等待继续" inactive-text="不额外停止" />
+          <el-select v-model="afterAnalysisBatch" :disabled="stopAfterCurrentBatch">
+            <el-option label="自动继续下一批" value="auto_continue" />
+            <el-option label="每批等待用户继续" value="wait_for_user" />
+          </el-select>
         </el-form-item>
         <el-form-item label="候选池目标">
-          <el-input-number v-model="candidateTargetCount" :min="targetCount" :max="500" />
+          <el-input-number v-model="candidateTargetCount" :min="recommendTarget" :max="500" />
           <p class="secondary-text">候选池达到阶段目标后，系统按确定性发现顺序以小批次获取 JD；recommend 不足时继续补下一批。</p>
         </el-form-item>
         <el-form-item label="本轮 Context 软预算（字符）">
@@ -339,7 +377,7 @@ watch(workflowRun, (run) => {
       <el-button type="primary" :loading="workflowStore.loading" @click="loadSnapshot">查看本轮上下文</el-button>
       <el-button :loading="workflowStore.advancing" :disabled="!workflowRunId" @click="advanceRun">立即推进</el-button>
       <el-button v-if="workflowRun && workflowRun.status !== 'paused' && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)" @click="pauseRun">暂停</el-button>
-      <el-button v-if="workflowRun?.status === 'paused' || (workflowRun?.status === 'waiting_for_user' && ['capture_interrupted', 'browser_not_running'].includes(workflowRun.stop_reason))" :loading="workflowStore.advancing" @click="resumeRun">继续</el-button>
+      <el-button v-if="workflowRun?.status === 'paused' || (workflowRun?.status === 'waiting_for_user' && ['capture_interrupted', 'browser_not_running', 'analysis_batch_completed_waiting_user', 'analysis_batch_waiting_user'].includes(workflowRun.stop_reason))" :loading="workflowStore.advancing" @click="resumeRun">继续</el-button>
       <el-button v-if="workflowRun && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)" type="danger" plain @click="cancelRun">停止任务</el-button>
       <el-button v-if="workflowCodexEntry" type="primary" @click="openWorkflowCodex(workflowCodexEntry.action)">{{ workflowCodexEntry.label }}</el-button>
     </div>
@@ -361,7 +399,9 @@ watch(workflowRun, (run) => {
     />
     <el-descriptions v-if="workflowRun" :column="3" border>
       <el-descriptions-item label="Workflow Run ID"><code>{{ workflowRun.workflow_run_id }}</code></el-descriptions-item>
-      <el-descriptions-item label="目标推荐数">{{ workflowRun.completion_contract?.target_count ?? targetCount }}</el-descriptions-item>
+      <el-descriptions-item label="Recommend 目标">{{ workflowRun.completion_contract?.recommend_target ?? workflowRun.completion_contract?.target_count ?? recommendTarget }}</el-descriptions-item>
+      <el-descriptions-item label="Review 目标">{{ workflowRun.completion_contract?.review_target ?? '未配置' }}</el-descriptions-item>
+      <el-descriptions-item label="目标模式">{{ workflowRun.completion_contract?.target_mode ?? 'all' }}</el-descriptions-item>
       <el-descriptions-item label="正式 recommend">{{ workflowRun.completed_count }}</el-descriptions-item>
       <el-descriptions-item label="剩余目标">{{ workflowRun.remaining_count }}</el-descriptions-item>
       <el-descriptions-item label="当前搜索">{{ workflowRun.progress.current_keyword || '等待开始' }} / {{ workflowRun.progress.current_city || '—' }}</el-descriptions-item>
@@ -376,6 +416,8 @@ watch(workflowRun, (run) => {
       <el-descriptions-item label="建议投递策略">{{ workflowRun.completion_contract?.selected_strategy_ids?.recommendation_strategy_id || '—' }}</el-descriptions-item>
       <el-descriptions-item label="本 Run 模型">{{ workflowRun.completion_contract?.codex_execution_config?.model || '—' }}</el-descriptions-item>
       <el-descriptions-item label="推理强度">{{ workflowRun.completion_contract?.codex_execution_config?.reasoning_effort || '—' }}</el-descriptions-item>
+      <el-descriptions-item label="Analysis Batch">{{ workflowRun.completion_contract?.analysis_policy?.analysis_batch_size ?? '—' }}</el-descriptions-item>
+      <el-descriptions-item label="批次衔接">{{ workflowRun.completion_contract?.execution_policy?.after_analysis_batch ?? 'auto_continue' }}</el-descriptions-item>
     </el-descriptions>
     <section v-if="workflowRun" class="surface-card analysis-guidance-card">
       <div class="card-actions">

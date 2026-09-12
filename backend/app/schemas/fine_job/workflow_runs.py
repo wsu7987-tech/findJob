@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class DeepJobSearchConfig(BaseModel):
@@ -11,7 +11,15 @@ class DeepJobSearchConfig(BaseModel):
     codex_model: str = Field(min_length=1, max_length=128)
     codex_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"]
     analysis_guidance: str = Field(default="", max_length=4000)
-    target_count: int = Field(ge=1, le=100)
+    recommend_target: int | None = Field(default=None, ge=1, le=100)
+    review_target: int | None = Field(default=None, ge=1, le=100)
+    target_mode: Literal["any", "all"] = "all"
+    # 兼容已有调用方；创建后统一归一为 recommend_target。
+    target_count: int | None = Field(default=None, ge=1, le=100)
+    analyze_all_candidates: bool = False
+    stop_after_current_batch: bool = False
+    analysis_batch_size: int = Field(default=5, ge=1, le=20)
+    execution_policy_after_analysis_batch: Literal["auto_continue", "wait_for_user"] = "auto_continue"
     candidate_target_count: int | None = Field(default=None, ge=1, le=500)
     allowed_search_keywords: list[str] = Field(min_length=1, max_length=50)
     allowed_cities: list[str] = Field(min_length=1, max_length=20)
@@ -21,10 +29,23 @@ class DeepJobSearchConfig(BaseModel):
     scroll_batch_size: int = Field(default=3, ge=1, le=10)
     max_depth: int = Field(default=20, ge=1, le=200)
     low_yield_streak_limit: int = Field(default=3, ge=1, le=20)
-    jd_batch_size: int = Field(default=3, ge=1, le=5)
+    jd_batch_size: int | None = Field(default=None, ge=1, le=20)
     context_soft_budget_characters: int = Field(default=12000, ge=1000, le=200000)
     applied_feedback_ids: list[str] = Field(default_factory=list, max_length=100)
     applied_preference_ids: list[str] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="after")
+    def normalize_recommend_target(self) -> "DeepJobSearchConfig":
+        if self.recommend_target is None and self.target_count is None:
+            raise ValueError("recommend_target 为必填字段。")
+        if (
+            self.recommend_target is not None
+            and self.target_count is not None
+            and self.recommend_target != self.target_count
+        ):
+            raise ValueError("recommend_target 与 target_count 必须一致。")
+        self.recommend_target = self.recommend_target or self.target_count
+        return self
 
 
 class WorkflowRunCreateRequest(BaseModel):

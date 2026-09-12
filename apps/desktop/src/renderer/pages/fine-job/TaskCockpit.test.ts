@@ -92,6 +92,10 @@ const InputStub = defineComponent({
 });
 
 const GenericStub = defineComponent({ template: "<div><slot /></div>" });
+const FormItemStub = defineComponent({
+  props: { label: { type: String, default: "" } },
+  template: "<div><span>{{ label }}</span><slot /></div>"
+});
 const TableColumnStub = defineComponent({
   template: "<div><slot :row=\"{ job: { title: '', company: '', salary: '', city: '', discovery_keyword: '', discovery_depth: 0, filter_result: '', filter_reasons: [], jd_status: '' }, status: '', analysis_result: {} }\" /></div>"
 });
@@ -168,11 +172,12 @@ const mountCockpit = () => mount(TaskCockpit, {
       ElDialog: GenericStub,
       ElEmpty: GenericStub,
       ElForm: GenericStub,
-      ElFormItem: GenericStub,
+      ElFormItem: FormItemStub,
       ElInput: InputStub,
       ElInputNumber: GenericStub,
       ElOption: GenericStub,
       ElSelect: GenericStub,
+      ElSwitch: GenericStub,
       ElTable: GenericStub,
       ElTableColumn: TableColumnStub,
       ElTag: GenericStub
@@ -227,6 +232,32 @@ describe("TaskCockpit", () => {
     await flushPromises();
 
     expect(wrapper.findAll("button").some((item) => item.text() === "交给 Codex 分析")).toBe(false);
+  });
+
+  it("展示 Completion Contract 与批次衔接的最小配置", async () => {
+    const wrapper = mountCockpit();
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("Recommend 完成目标");
+    expect(wrapper.text()).toContain("Review 完成目标（可选）");
+    expect(wrapper.text()).toContain("目标达成模式");
+    expect(wrapper.text()).toContain("Analysis Batch");
+    expect(wrapper.text()).toContain("达标后的候选池处理");
+    expect(wrapper.text()).toContain("批次衔接");
+  });
+
+  it("批次等待用户时显示继续入口", async () => {
+    mocks.getRun.mockResolvedValue({
+      ...run("waiting_for_user"),
+      stop_reason: "analysis_batch_completed_waiting_user"
+    });
+    const wrapper = mountCockpit();
+    await flushPromises();
+    await wrapper.find('[placeholder="输入 Workflow Run ID 查看本轮上下文"]').setValue("workflow-run-1");
+    await wrapper.findAll("button").find((item) => item.text() === "查看本轮上下文")!.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.findAll("button").some((item) => item.text() === "继续")).toBe(true);
   });
 
   it("waiting_codex 的存活 sessionRef 匹配时优先显示查看 Codex 分析", async () => {

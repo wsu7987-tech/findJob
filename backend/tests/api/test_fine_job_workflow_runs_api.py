@@ -62,6 +62,8 @@ def _create_run(configured_client, **updates):
         "applied_preference_ids": ["preference-1"],
     }
     deep_job_search.update(updates)
+    if "recommend_target" in updates and "target_count" not in updates:
+        deep_job_search.pop("target_count")
     response = configured_client.post(
         "/api/fine-job/workflow-runs",
         json={
@@ -79,7 +81,16 @@ def test_create_workflow_run_exposes_real_search_context_snapshot(configured_cli
 
     assert run["status"] == "pending"
     assert run["completion_contract"]["source_policy"] == "fresh_only"
-    assert run["completion_contract"]["counting_rule"] == "saved_unique_recommend"
+    assert run["completion_contract"]["recommend_target"] == 2
+    assert run["completion_contract"]["review_target"] is None
+    assert run["completion_contract"]["target_mode"] == "all"
+    assert run["completion_contract"]["counting_rule"] == "saved_unique_recommend_and_optional_review"
+    assert run["completion_contract"]["analysis_policy"] == {
+        "analyze_all_candidates": False,
+        "stop_after_current_batch": False,
+        "analysis_batch_size": 5,
+    }
+    assert run["completion_contract"]["execution_policy"] == {"after_analysis_batch": "auto_continue"}
     assert run["completion_contract"]["allow_historical_jobs"] is False
     assert run["completion_contract"]["applied_feedback_ids"] == ["feedback-1"]
     assert run["completion_contract"]["selected_strategy_ids"]["recommendation_strategy_id"]
@@ -488,12 +499,18 @@ def test_interrupted_capture_waits_for_user_and_requires_explicit_resume(
     assert resumed.json()["tasks"][0]["operation_ref_id"] is None
 
 
-def _prepare_analysis_batch(configured_client, test_db, *, candidate_count: int, target_count: int = 2):
+def _prepare_analysis_batch(configured_client, test_db, *, candidate_count: int, target_count: int = 2, **updates):
+    run_updates = {
+        "target_count": target_count,
+        "candidate_target_count": candidate_count,
+        "analysis_batch_size": min(2, candidate_count),
+        **updates,
+    }
+    if "recommend_target" in updates:
+        run_updates.pop("target_count")
     run = _create_run(
         configured_client,
-        target_count=target_count,
-        candidate_target_count=candidate_count,
-        jd_batch_size=min(2, candidate_count),
+        **run_updates,
     )
     capture_id = new_id()
     now = utc_now()
@@ -806,6 +823,184 @@ def test_candidate_pool_exhausted_after_reject_waits_for_new_jobs(configured_cli
 
     assert result["status"] == "waiting_for_user"
     assert result["stop_reason"] == "new_jobs_insufficient"
+
+
+def test_review_target_participates_only_when_configured_and_respects_all_mode(
+    configured_client, test_db
+) -> None:
+    run, _jobs = _prepare_analysis_batch(
+        configured_client,
+        test_db,
+        candidate_count=2,
+        recommend_target=1,
+        review_target=1,
+        target_mode="all",
+    )
+    items = workflow_runs.list_workflow_analysis_items(test_db, run["workflow_run_id"])["items"]
+    service = CodexToolService(test_db, configured_client.app.state.config)
+
+    after_recommend = service.call(
+        "finejob.save_workflow_analysis_item",
+        {
+            "workflow_run_id": run["workflow_run_id"],
+            "workflow_task_id": items[0]["workflow_task_id"],
+            "decision": "recommend",
+            "summary": "达到 recommend 目标",
+        },
+    )["data"]
+    after_review = service.call(
+        "finejob.save_workflow_analysis_item",
+        {
+            "workflow_run_id": run["workflow_run_id"],
+            "workflow_task_id": items[1]["workflow_task_id"],
+            "decision": "review",
+            "summary": "达到 review 目标",
+        },
+    )["data"]
+
+    assert after_recommend["status"] == "waiting_codex"
+    assert after_review["status"] == "completed"
+    assert after_review["stop_reason"] == "completion_target_reached"
+
+
+def test_stop_after_current_batch_waits_for_user_then_prepares_next_batch(
+    configured_client, test_db
+) -> None:
+    run, _jobs = _prepare_analysis_batch(
+        configured_client,
+        test_db,
+        candidate_count=3,
+        target_count=2,
+        stop_after_current_batch=True,
+    )
+    items = workflow_runs.list_workflow_analysis_items(test_db, run["workflow_run_id"])["items"]
+    service = CodexToolService(test_db, configured_client.app.state.config)
+    for item in items:
+        result = service.call(
+            "finejob.save_workflow_analysis_item",
+            {
+                "workflow_run_id": run["workflow_run_id"],
+                "workflow_task_id": item["workflow_task_id"],
+                "decision": "reject",
+                "summary": "当前批不匹配",
+            },
+        )["data"]
+
+    resumed = configured_client.post(f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/resume")
+
+    assert result["status"] == "waiting_for_user"
+    assert result["stop_reason"] == "analysis_batch_completed_waiting_user"
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "running"
+    assert resumed.json()["current_step"] == "collecting_jd"
+
+
+def test_any_target_mode_can_complete_on_configured_review_target(configured_client, test_db) -> None:
+    run, _jobs = _prepare_analysis_batch(
+        configured_client,
+        test_db,
+        candidate_count=2,
+        recommend_target=2,
+        review_target=1,
+        target_mode="any",
+    )
+    item = workflow_runs.list_workflow_analysis_items(test_db, run["workflow_run_id"])["items"][0]
+
+    result = CodexToolService(test_db, configured_client.app.state.config).call(
+        "finejob.save_workflow_analysis_item",
+        {
+            "workflow_run_id": run["workflow_run_id"],
+            "workflow_task_id": item["workflow_task_id"],
+            "decision": "review",
+            "summary": "review 目标已达到",
+        },
+    )["data"]
+
+    assert result["status"] == "completed"
+    assert result["completed_count"] == 0
+    assert result["stop_reason"] == "completion_target_reached"
+
+
+def test_analyze_all_candidates_freezes_pool_and_never_resumes_search(
+    configured_client, test_db
+) -> None:
+    run, _jobs = _prepare_analysis_batch(
+        configured_client,
+        test_db,
+        candidate_count=3,
+        target_count=1,
+        analyze_all_candidates=True,
+    )
+    service = CodexToolService(test_db, configured_client.app.state.config)
+    first_batch = workflow_runs.list_workflow_analysis_items(test_db, run["workflow_run_id"])["items"]
+    first = service.call(
+        "finejob.save_workflow_analysis_item",
+        {
+            "workflow_run_id": run["workflow_run_id"],
+            "workflow_task_id": first_batch[0]["workflow_task_id"],
+            "decision": "recommend",
+            "summary": "达到目标",
+        },
+    )["data"]
+    second = service.call(
+        "finejob.save_workflow_analysis_item",
+        {
+            "workflow_run_id": run["workflow_run_id"],
+            "workflow_task_id": first_batch[1]["workflow_task_id"],
+            "decision": "reject",
+            "summary": "继续完成冻结候选池",
+        },
+    )["data"]
+    pending = [
+        item for item in workflow_runs.list_workflow_analysis_items(test_db, run["workflow_run_id"])["items"]
+        if item["status"] == "pending"
+    ]
+    final = service.call(
+        "finejob.save_workflow_analysis_item",
+        {
+            "workflow_run_id": run["workflow_run_id"],
+            "workflow_task_id": pending[0]["workflow_task_id"],
+            "decision": "reject",
+            "summary": "冻结池最后一项",
+        },
+    )["data"]
+
+    assert len(first["completion_contract"]["frozen_candidate_pool"]["job_ids"]) == 3
+    assert second["status"] == "waiting_codex"
+    assert len([task for task in second["tasks"] if task["task_type"] == "deep_job_search"]) == 1
+    assert final["status"] == "completed"
+    assert final["stop_reason"] == "frozen_candidate_pool_analyzed"
+
+
+def test_wait_for_user_execution_policy_waits_after_each_analysis_batch(
+    configured_client, test_db
+) -> None:
+    run, _jobs = _prepare_analysis_batch(
+        configured_client,
+        test_db,
+        candidate_count=3,
+        target_count=2,
+        execution_policy_after_analysis_batch="wait_for_user",
+    )
+    items = workflow_runs.list_workflow_analysis_items(test_db, run["workflow_run_id"])["items"]
+    service = CodexToolService(test_db, configured_client.app.state.config)
+    for item in items:
+        result = service.call(
+            "finejob.save_workflow_analysis_item",
+            {
+                "workflow_run_id": run["workflow_run_id"],
+                "workflow_task_id": item["workflow_task_id"],
+                "decision": "reject",
+                "summary": "等待用户继续",
+            },
+        )["data"]
+
+    resumed = configured_client.post(f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/resume")
+
+    assert result["status"] == "waiting_for_user"
+    assert result["stop_reason"] == "analysis_batch_waiting_user"
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "running"
 
 
 def test_non_resumable_stop_reason_is_not_resumed(configured_client, test_db) -> None:
