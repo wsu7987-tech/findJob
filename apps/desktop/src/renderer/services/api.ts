@@ -1534,7 +1534,12 @@ export const api = {
   },
   async releaseFineJobWorkflowAnalysisHandoff(
     workflowRunId: string,
-    payload: { analysis_batch_id: string; handoff_attempt_id: string; codex_session_ref: string }
+    payload: {
+      analysis_batch_id: string;
+      handoff_attempt_id: string;
+      codex_session_ref: string;
+      release_reason?: "transport_failure" | "full_retry";
+    }
   ) {
     return request<FineJobWorkflowRun>(
       `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/analysis-handoff/release`,

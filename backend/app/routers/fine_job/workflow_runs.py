@@ -148,7 +148,12 @@ def release_analysis_handoff(
     db: Database = Depends(get_database),
 ):
     return workflow_runs.release_workflow_analysis_handoff(
-        db, workflow_run_id, payload.analysis_batch_id, payload.handoff_attempt_id, payload.codex_session_ref
+        db,
+        workflow_run_id,
+        payload.analysis_batch_id,
+        payload.handoff_attempt_id,
+        payload.codex_session_ref,
+        payload.release_reason,
     )
 
 

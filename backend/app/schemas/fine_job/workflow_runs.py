@@ -69,6 +69,7 @@ class WorkflowAnalysisHandoffRequest(BaseModel):
     analysis_batch_id: str = Field(min_length=1, max_length=100)
     handoff_attempt_id: str = Field(min_length=1, max_length=100)
     codex_session_ref: str = Field(min_length=1, max_length=200)
+    release_reason: Literal["transport_failure", "full_retry"] | None = None
 
 
 class WorkflowAnalysisHandoffStartAckRequest(BaseModel):

@@ -3,7 +3,11 @@ import { computed, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
 import { api } from "@/services/api";
-import { triggerWorkflowCodexHandoff } from "@/services/workflowCodexHandoff";
+import {
+  resubmitWorkflowCodexEnter,
+  retryWorkflowCodexHandoff,
+  triggerWorkflowCodexHandoff
+} from "@/services/workflowCodexHandoff";
 import { useFineJobCodexStore } from "@/stores/fineJobCodex";
 import { useFineJobWorkflowRunStore } from "@/stores/fineJobWorkflowRun";
 import type {
@@ -58,13 +62,30 @@ const hasEndedRuntimeWorkflowSession = computed(() => Boolean(
   workflowRun.value?.codex_session_ref?.startsWith("runtime:")
     && !hasCurrentWorkflowCodexSession.value
 ));
+const canResubmitWorkflowCodexEnter = computed(() => {
+  const run = workflowRun.value;
+  const handoff = run?.analysis_handoff;
+  return Boolean(
+    handoff?.attempt_status === "prompt_written"
+      && handoff.codex_session_ref === codexStore.sessionRef
+      && run?.codex_session_ref === codexStore.sessionRef
+      && codexStore.status === "running"
+  );
+});
+const canRetryWorkflowCodexHandoff = computed(() => Boolean(
+  workflowRun.value?.analysis_handoff?.attempt_status === "prompt_written"
+    && workflowRun.value.analysis_handoff.retry_available
+));
 const workflowCodexEntry = computed(() => {
   const run = workflowRun.value;
   const handoff = run?.analysis_handoff;
   if (!run || run.status !== "waiting_codex" || !handoff) return null;
   const handoffMode = run.completion_contract?.execution_policy?.codex_handoff ?? "auto";
   if (handoffMode === "auto") {
-    return hasCurrentWorkflowCodexSession.value ? { action: "view" as const, label: "查看 Codex" } : null;
+    if (["prompt_written", "started"].includes(handoff.attempt_status) || run.codex_session_ref) {
+      return { action: "view" as const, label: "查看 Codex" };
+    }
+    return null;
   }
   if (handoff.attempt_status === "prompt_written") {
     return { action: "view" as const, label: "等待 Codex 开始" };
@@ -256,7 +277,6 @@ const openWorkflowCodex = async (action: "submit" | "continue" | "view") => {
     workflowStore.setRun(result.run);
     return;
   }
-  if (!hasCurrentWorkflowCodexSession.value) return;
   await router.push({
     name: "fine-job-codex",
     query: {
@@ -265,6 +285,22 @@ const openWorkflowCodex = async (action: "submit" | "continue" | "view") => {
       workflow_action: action
     }
   });
+};
+
+const resubmitWorkflowCodex = async () => {
+  const currentRun = workflowRun.value;
+  if (!currentRun) return;
+  const result = await resubmitWorkflowCodexEnter(currentRun, codexStore);
+  workflowStore.setRun(result.run);
+  error.value = result.status === "enter_submitted" ? "" : result.message;
+};
+
+const retryWorkflowCodex = async () => {
+  const currentRun = workflowRun.value;
+  if (!currentRun) return;
+  const result = await retryWorkflowCodexHandoff(currentRun, codexStore);
+  workflowStore.setRun(result.run);
+  error.value = result.status === "submitted" ? "" : result.message;
 };
 
 onMounted(async () => {
@@ -416,6 +452,17 @@ watch(workflowRun, (run) => {
       <el-button v-if="workflowRun?.status === 'paused' || (workflowRun?.status === 'waiting_for_user' && ['capture_interrupted', 'browser_not_running', 'analysis_batch_completed_waiting_user', 'analysis_batch_waiting_user'].includes(workflowRun.stop_reason))" :loading="workflowStore.advancing" @click="resumeRun">继续</el-button>
       <el-button v-if="workflowRun && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)" type="danger" plain @click="cancelRun">停止任务</el-button>
       <el-button v-if="workflowCodexEntry" type="primary" @click="openWorkflowCodex(workflowCodexEntry.action)">{{ workflowCodexEntry.label }}</el-button>
+      <el-button
+        v-if="canResubmitWorkflowCodexEnter"
+        data-testid="resubmit-workflow-codex-enter"
+        @click="resubmitWorkflowCodex"
+      >再次提交</el-button>
+      <el-button
+        v-if="canRetryWorkflowCodexHandoff"
+        type="warning"
+        data-testid="retry-workflow-codex-handoff"
+        @click="retryWorkflowCodex"
+      >重新交接</el-button>
       <el-tag v-if="workflowHandoffStatus" type="info">{{ workflowHandoffStatus }}</el-tag>
     </div>
     <el-alert v-if="error" :title="error" type="error" :closable="false" />

@@ -12,11 +12,14 @@ const mocks = vi.hoisted(() => ({
   startWorkflow: vi.fn(),
   strategiesLoad: vi.fn(),
   submitPrompt: vi.fn(),
+  submitEnter: vi.fn(),
   attachWorkflowSession: vi.fn(),
   claimWorkflowHandoff: vi.fn(),
   markPromptWritten: vi.fn(),
   releaseWorkflowHandoff: vi.fn(),
   triggerWorkflowHandoff: vi.fn(),
+  resubmitWorkflowEnter: vi.fn(),
+  retryWorkflowHandoff: vi.fn(),
   refreshWorkflow: vi.fn(),
   push: vi.fn(),
   replace: vi.fn(),
@@ -69,11 +72,13 @@ vi.mock("@/stores/fineJobStrategies", () => ({
 }));
 
 vi.mock("@/services/desktop-bridge", () => ({
-  getCodexBridge: () => ({ submitCodexPrompt: mocks.submitPrompt })
+  getCodexBridge: () => ({ submitCodexPrompt: mocks.submitPrompt, submitCodexEnter: mocks.submitEnter })
 }));
 
 vi.mock("@/services/workflowCodexHandoff", () => ({
-  triggerWorkflowCodexHandoff: mocks.triggerWorkflowHandoff
+  triggerWorkflowCodexHandoff: mocks.triggerWorkflowHandoff,
+  resubmitWorkflowCodexEnter: mocks.resubmitWorkflowEnter,
+  retryWorkflowCodexHandoff: mocks.retryWorkflowHandoff
 }));
 
 vi.mock("vue-router", () => ({
@@ -115,6 +120,7 @@ describe("CodexWorkspace", () => {
     });
     mocks.strategiesLoad.mockReset().mockResolvedValue(undefined);
     mocks.submitPrompt.mockReset().mockResolvedValue(true);
+    mocks.submitEnter.mockReset().mockResolvedValue(true);
     mocks.attachWorkflowSession.mockReset().mockResolvedValue(undefined);
     mocks.claimWorkflowHandoff.mockReset().mockResolvedValue({
       analysis_handoff: { analysis_batch_id: "analysis-batch-1", handoff_attempt_id: "attempt-1" }
@@ -125,6 +131,12 @@ describe("CodexWorkspace", () => {
       status: value.analysis_handoff?.attempt_status === "prompt_written" ? "skipped" : "submitted",
       run: value,
       message: "共享 handoff 已处理"
+    }));
+    mocks.resubmitWorkflowEnter.mockReset().mockImplementation(async (value) => ({
+      status: "enter_submitted", run: value, message: "已再次发送 Enter"
+    }));
+    mocks.retryWorkflowHandoff.mockReset().mockImplementation(async (value) => ({
+      status: "submitted", run: value, message: "已重新交接"
     }));
     mocks.refreshWorkflow.mockReset().mockResolvedValue(undefined);
     mocks.push.mockReset().mockResolvedValue(undefined);
@@ -362,6 +374,38 @@ describe("CodexWorkspace", () => {
     expect(mocks.startWorkflow).not.toHaveBeenCalled();
     expect(mocks.triggerWorkflowHandoff).toHaveBeenCalledTimes(1);
     expect(mocks.replace).not.toHaveBeenCalled();
+  });
+
+  it("prompt_written 的再次提交只调用 Enter 交接，不重写完整 Prompt", async () => {
+    mocks.routeQuery = {
+      task: "deep-job-search",
+      workflow_run_id: "workflow-run-1",
+      workflow_action: "view"
+    };
+    mocks.codexState.status = "running";
+    mocks.codexState.sessionRef = "runtime:workflow-runtime-1";
+    mocks.refreshWorkflow.mockResolvedValue({
+      codex_session_ref: "runtime:workflow-runtime-1",
+      analysis_handoff: {
+        attempt_status: "prompt_written",
+        handoff_attempt_id: "attempt-1",
+        codex_session_ref: "runtime:workflow-runtime-1"
+      },
+      completion_contract: { codex_execution_config: { model: "gpt-5.6-luna", reasoning_effort: "high" } }
+    });
+
+    const wrapper = mount(CodexWorkspace, { global: { stubs: {
+      CodexTerminal: CodexTerminalStub, ElAlert: GenericStub, ElButton: ElButtonStub,
+      ElEmpty: GenericStub, ElInputNumber: GenericStub, ElOption: GenericStub,
+      ElSelect: GenericStub, ElTag: GenericStub, ElSwitch: GenericStub
+    } } });
+    await flushPromises();
+    await wrapper.get('[data-testid="resubmit-workflow-analysis"]').trigger("click");
+    await flushPromises();
+
+    expect(mocks.resubmitWorkflowEnter).toHaveBeenCalledTimes(1);
+    expect(mocks.triggerWorkflowHandoff).not.toHaveBeenCalled();
+    expect(mocks.submitPrompt).not.toHaveBeenCalled();
   });
 
   it("submit 失败时保留 submit action，不 replace 为 view", async () => {

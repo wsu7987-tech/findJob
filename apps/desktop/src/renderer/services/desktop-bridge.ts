@@ -83,6 +83,7 @@ type DesktopBridgeShape = {
   }>;
   writeCodex?: (data: string) => void;
   submitCodexPrompt?: (prompt: string) => Promise<boolean>;
+  submitCodexEnter?: () => Promise<boolean>;
   resizeCodex?: (cols: number, rows: number) => void;
   interruptCodex?: () => void;
   stopCodex?: () => void;

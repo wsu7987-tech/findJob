@@ -9,6 +9,8 @@ type SessionStatus = "idle" | "starting" | "running" | "exited" | "failed";
 
 const RECENT_OUTPUT_LIMIT = 4_096;
 const EXIT_SUMMARY_LIMIT = 500;
+const INITIAL_TUI_OUTPUT_TIMEOUT_MS = 2_000;
+const PROMPT_SUBMIT_FALLBACK_MS = 750;
 
 const stripTerminalControlSequences = (value: string) =>
   value
@@ -154,6 +156,27 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
   let recentOutput = "";
   let firstOutputPromise: Promise<void> | null = null;
   let resolveFirstOutput: (() => void) | null = null;
+  let outputSequence = 0;
+  const outputWaiters = new Set<() => void>();
+
+  const waitForOutputAfter = (sequence: number) => new Promise<void>((resolve) => {
+    if (outputSequence > sequence) {
+      resolve();
+      return;
+    }
+    const complete = () => {
+      clearTimeout(fallback);
+      outputWaiters.delete(complete);
+      resolve();
+    };
+    // PTY 输出只用于安排 Enter 的发送时机，业务开始仍由 MCP ACK 确认。
+    const fallback = setTimeout(complete, PROMPT_SUBMIT_FALLBACK_MS);
+    outputWaiters.add(complete);
+  });
+
+  const resolveOutputWaiters = () => {
+    for (const resolve of [...outputWaiters]) resolve();
+  };
 
   const setStatus = (next: SessionStatus, message = "") => {
     status = next;
@@ -231,12 +254,15 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
         resolveFirstOutput?.();
         resolveFirstOutput = null;
         firstOutputPromise = null;
+        outputSequence += 1;
+        resolveOutputWaiters();
         options.emit("codex:output", { runtimeId, sessionRef, data });
       });
       terminal.onExit(({ exitCode }) => {
         resolveFirstOutput?.();
         resolveFirstOutput = null;
         firstOutputPromise = null;
+        resolveOutputWaiters();
         terminal = null;
         const completedRunId = runtimeId;
         const completedToken = runtimeToken;
@@ -269,6 +295,7 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
       resolveFirstOutput?.();
       resolveFirstOutput = null;
       firstOutputPromise = null;
+      resolveOutputWaiters();
       if (runtimeId && runtimeToken) {
         void options.completeRuntime(
           runtimeId,
@@ -302,15 +329,21 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
         // 没有首屏时最多等待两秒，避免任务入口被终端初始化卡住。
         await Promise.race([
           pendingFirstOutput,
-          new Promise<void>((resolve) => setTimeout(resolve, 2_000))
+          new Promise<void>((resolve) => setTimeout(resolve, INITIAL_TUI_OUTPUT_TIMEOUT_MS))
         ]);
       }
       if (terminal !== currentTerminal) return false;
-      // Prompt 与 Enter 分开发送，给 Codex TUI 留出接收输入的短暂窗口。
+      // Prompt 与 Enter 分开发送，等待写入后的新输出或保守回退后再提交。
+      const outputBeforePrompt = outputSequence;
       currentTerminal.write(text);
-      await new Promise<void>((resolve) => setTimeout(resolve, 80));
+      await waitForOutputAfter(outputBeforePrompt);
       if (terminal !== currentTerminal) return false;
       currentTerminal.write("\r");
+      return true;
+    },
+    async submitEnter() {
+      if (!terminal || status !== "running") return false;
+      terminal.write("\r");
       return true;
     },
     resize(cols: number, rows: number) {

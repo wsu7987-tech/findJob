@@ -122,6 +122,7 @@ const desktopBridge = {
   writeCodex: (data: string) => ipcRenderer.send("codex:input", data),
   submitCodexPrompt: (prompt: string) =>
     ipcRenderer.invoke("codex:submit-prompt", prompt) as Promise<boolean>,
+  submitCodexEnter: () => ipcRenderer.invoke("codex:submit-enter") as Promise<boolean>,
   resizeCodex: (cols: number, rows: number) =>
     ipcRenderer.send("codex:resize", { cols, rows }),
   interruptCodex: () => ipcRenderer.send("codex:interrupt"),

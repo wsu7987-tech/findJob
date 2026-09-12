@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { FineJobWorkflowRun } from "@/types";
 
-import { triggerWorkflowCodexHandoff } from "./workflowCodexHandoff";
+import {
+  resubmitWorkflowCodexEnter,
+  retryWorkflowCodexHandoff,
+  triggerWorkflowCodexHandoff
+} from "./workflowCodexHandoff";
 
 const run = (updates: Partial<FineJobWorkflowRun> = {}): FineJobWorkflowRun => ({
   workflow_run_id: "workflow-run-1",
@@ -54,7 +58,10 @@ const dependencies = (returnedRun: FineJobWorkflowRun) => {
     releaseFineJobWorkflowAnalysisHandoff: vi.fn().mockResolvedValue(returnedRun),
     getFineJobWorkflowRun: vi.fn().mockResolvedValue(returnedRun)
   };
-  const transport = { submitCodexPrompt: vi.fn().mockResolvedValue(true) };
+  const transport = {
+    submitCodexPrompt: vi.fn().mockResolvedValue(true),
+    submitCodexEnter: vi.fn().mockResolvedValue(true)
+  };
   return { client, transport };
 };
 
@@ -144,5 +151,69 @@ describe("workflowCodexHandoff", () => {
     expect(codex.startWorkflow).toHaveBeenCalledTimes(1);
     expect(handoffDependencies.client.claimFineJobWorkflowAnalysisHandoff).toHaveBeenCalledTimes(1);
     expect(handoffDependencies.transport.submitCodexPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("prompt_written 只再次发送 Enter，不写 Prompt、claim 或创建 attempt", async () => {
+    const source = run({
+      codex_session_ref: "runtime:workflow-runtime-1",
+      analysis_handoff: {
+        ...run().analysis_handoff!,
+        attempt_status: "prompt_written",
+        codex_session_ref: "runtime:workflow-runtime-1"
+      }
+    });
+    const handoffDependencies = dependencies(source);
+    const codex = { ...codexStore(), status: "running", sessionRef: "runtime:workflow-runtime-1" };
+
+    const result = await resubmitWorkflowCodexEnter(source, codex, handoffDependencies.transport);
+
+    expect(result.status).toBe("enter_submitted");
+    expect(handoffDependencies.transport.submitCodexEnter).toHaveBeenCalledTimes(1);
+    expect(handoffDependencies.transport.submitCodexPrompt).not.toHaveBeenCalled();
+    expect(handoffDependencies.client.claimFineJobWorkflowAnalysisHandoff).not.toHaveBeenCalled();
+  });
+
+  it("超时后的重新交接先释放旧 attempt，再创建并写入新 Prompt", async () => {
+    const source = run({
+      codex_session_ref: "runtime:closed-runtime-1",
+      analysis_handoff: {
+        ...run().analysis_handoff!,
+        attempt_status: "prompt_written",
+        codex_session_ref: "runtime:closed-runtime-1",
+        retry_available: true
+      }
+    });
+    const released = run({
+      analysis_handoff: { ...source.analysis_handoff!, attempt_status: "released" }
+    });
+    const claimed = run({
+      codex_session_ref: "runtime:workflow-runtime-2",
+      analysis_handoff: {
+        ...source.analysis_handoff!,
+        handoff_attempt_id: "attempt-2",
+        attempt_status: "claimed",
+        codex_session_ref: "runtime:workflow-runtime-2"
+      }
+    });
+    const promptWritten = run({
+      codex_session_ref: "runtime:workflow-runtime-2",
+      analysis_handoff: { ...claimed.analysis_handoff!, attempt_status: "prompt_written" }
+    });
+    const handoffDependencies = dependencies(promptWritten);
+    handoffDependencies.client.releaseFineJobWorkflowAnalysisHandoff.mockResolvedValue(released);
+    handoffDependencies.client.claimFineJobWorkflowAnalysisHandoff.mockResolvedValue(claimed);
+    const codex = codexStore("runtime:workflow-runtime-2");
+
+    const result = await retryWorkflowCodexHandoff(source, codex, handoffDependencies);
+
+    expect(result.status).toBe("submitted");
+    expect(handoffDependencies.client.releaseFineJobWorkflowAnalysisHandoff).toHaveBeenCalledWith("workflow-run-1", {
+      analysis_batch_id: "analysis-batch-1",
+      handoff_attempt_id: "attempt-1",
+      codex_session_ref: "runtime:closed-runtime-1",
+      release_reason: "full_retry"
+    });
+    expect(handoffDependencies.client.claimFineJobWorkflowAnalysisHandoff).toHaveBeenCalledTimes(1);
+    expect(handoffDependencies.transport.submitCodexPrompt).toHaveBeenCalledWith(expect.stringContaining("handoff_attempt_id=attempt-2"));
   });
 });

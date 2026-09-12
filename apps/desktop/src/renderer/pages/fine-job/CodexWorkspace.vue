@@ -5,7 +5,11 @@ import { useRoute, useRouter } from "vue-router";
 import CodexTerminal from "@/components/CodexTerminal.vue";
 import { api } from "@/services/api";
 import { getCodexBridge } from "@/services/desktop-bridge";
-import { triggerWorkflowCodexHandoff } from "@/services/workflowCodexHandoff";
+import {
+  resubmitWorkflowCodexEnter,
+  retryWorkflowCodexHandoff,
+  triggerWorkflowCodexHandoff
+} from "@/services/workflowCodexHandoff";
 import { useFineJobCodexStore } from "@/stores/fineJobCodex";
 import { useFineJobStrategiesStore } from "@/stores/fineJobStrategies";
 import { useFineJobWorkflowRunStore } from "@/stores/fineJobWorkflowRun";
@@ -29,6 +33,7 @@ const copyMessage = ref("");
 const profileAnalysisMessage = ref("");
 const workflowAnalysisMessage = ref("");
 const workflowRetryAvailable = ref(false);
+const workflowResubmitAvailable = ref(false);
 const quickTaskMessage = ref("");
 const quickTaskSubmitting = ref<"filter" | "recommendation" | null>(null);
 const filterTaskStrategyId = ref<string | null>(null);
@@ -126,14 +131,24 @@ const deepJobSearchTask = () => {
   return { workflowRunId, action };
 };
 
-const submitDeepJobSearchTask = async (requestedAction?: "submit" | "continue" | "retry") => {
+const updateWorkflowHandoffControls = (run: Awaited<ReturnType<typeof workflowStore.refresh>> | null | undefined) => {
+  const handoff = run?.analysis_handoff;
+  workflowRetryAvailable.value = Boolean(handoff?.attempt_status === "prompt_written" && handoff.retry_available);
+  workflowResubmitAvailable.value = Boolean(
+    handoff?.attempt_status === "prompt_written"
+      && handoff.codex_session_ref === store.sessionRef
+      && run?.codex_session_ref === store.sessionRef
+      && isRunning.value
+  );
+};
+
+const submitDeepJobSearchTask = async (requestedAction?: "submit" | "continue") => {
   const task = deepJobSearchTask();
   if (!task) return;
   const action = requestedAction ?? task.action;
   try {
     const run = await workflowStore.refresh(task.workflowRunId);
-    const existingHandoff = run?.analysis_handoff;
-    workflowRetryAvailable.value = Boolean(existingHandoff?.retry_available);
+    updateWorkflowHandoffControls(run);
     if (action === "view") {
       workflowAnalysisMessage.value = isRunning.value && run?.codex_session_ref === store.sessionRef
         ? "已进入当前 Workflow 的 Codex 分析会话。"
@@ -142,9 +157,9 @@ const submitDeepJobSearchTask = async (requestedAction?: "submit" | "continue" |
     }
     if (!run) return;
     workflowAnalysisMessage.value = "正在交接当前 Workflow Analysis Batch……";
-    const result = await triggerWorkflowCodexHandoff(run, store, action === "retry" ? "retry" : "manual");
+    const result = await triggerWorkflowCodexHandoff(run, store, "manual");
     workflowStore.setRun(result.run);
-    workflowRetryAvailable.value = Boolean(result.run.analysis_handoff?.retry_available);
+    updateWorkflowHandoffControls(result.run);
     workflowAnalysisMessage.value = result.message;
     if (result.status === "submitted") {
       await router.replace({
@@ -157,8 +172,36 @@ const submitDeepJobSearchTask = async (requestedAction?: "submit" | "continue" |
   }
 };
 
+const resubmitWorkflowAnalysis = async () => {
+  const task = deepJobSearchTask();
+  if (!task) return;
+  try {
+    const run = await workflowStore.refresh(task.workflowRunId);
+    updateWorkflowHandoffControls(run);
+    if (!run) return;
+    const result = await resubmitWorkflowCodexEnter(run, store);
+    workflowStore.setRun(result.run);
+    updateWorkflowHandoffControls(result.run);
+    workflowAnalysisMessage.value = result.message;
+  } catch (error) {
+    workflowAnalysisMessage.value = `Workflow 再次提交失败：${error instanceof Error ? error.message : String(error)}`;
+  }
+};
+
 const retryWorkflowAnalysis = async () => {
-  await submitDeepJobSearchTask("retry");
+  const task = deepJobSearchTask();
+  if (!task) return;
+  try {
+    const run = await workflowStore.refresh(task.workflowRunId);
+    updateWorkflowHandoffControls(run);
+    if (!run) return;
+    const result = await retryWorkflowCodexHandoff(run, store);
+    workflowStore.setRun(result.run);
+    updateWorkflowHandoffControls(result.run);
+    workflowAnalysisMessage.value = result.message;
+  } catch (error) {
+    workflowAnalysisMessage.value = `Workflow 重新交接失败：${error instanceof Error ? error.message : String(error)}`;
+  }
 };
 
 const returnToTaskCockpit = async () => {
@@ -283,12 +326,19 @@ onMounted(async () => {
       :closable="false"
       show-icon
     />
-    <el-button
-      v-if="deepJobSearchTask() && workflowRetryAvailable"
+    <div v-if="deepJobSearchTask() && (workflowResubmitAvailable || workflowRetryAvailable)" class="card-actions">
+      <el-button
+        v-if="workflowResubmitAvailable"
+        data-testid="resubmit-workflow-analysis"
+        @click="resubmitWorkflowAnalysis"
+      >再次提交</el-button>
+      <el-button
+        v-if="workflowRetryAvailable"
       type="warning"
       data-testid="retry-workflow-analysis"
       @click="retryWorkflowAnalysis"
-    >重新写入当前分析 Prompt</el-button>
+      >重新交接</el-button>
+    </div>
     <el-alert
       v-if="deepJobSearchTask()"
       :title="`当前 Workflow Run：${deepJobSearchTask()?.workflowRunId}`"

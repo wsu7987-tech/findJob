@@ -17,6 +17,8 @@ const mocks = vi.hoisted(() => ({
   listItems: vi.fn(),
   getItemContext: vi.fn(),
   triggerWorkflowHandoff: vi.fn(),
+  resubmitWorkflowEnter: vi.fn(),
+  retryWorkflowHandoff: vi.fn(),
   codexState: { status: "idle", sessionRef: null as string | null }
 }));
 
@@ -77,7 +79,9 @@ vi.mock("@/stores/fineJobCodex", () => ({
 }));
 
 vi.mock("@/services/workflowCodexHandoff", () => ({
-  triggerWorkflowCodexHandoff: mocks.triggerWorkflowHandoff
+  triggerWorkflowCodexHandoff: mocks.triggerWorkflowHandoff,
+  resubmitWorkflowCodexEnter: mocks.resubmitWorkflowEnter,
+  retryWorkflowCodexHandoff: mocks.retryWorkflowHandoff
 }));
 
 vi.mock("vue-router", () => ({
@@ -219,6 +223,12 @@ describe("TaskCockpit", () => {
     mocks.triggerWorkflowHandoff.mockReset().mockImplementation(async (value) => ({
       status: "submitted", run: value, message: "已交接"
     }));
+    mocks.resubmitWorkflowEnter.mockReset().mockImplementation(async (value) => ({
+      status: "enter_submitted", run: value, message: "已再次发送 Enter"
+    }));
+    mocks.retryWorkflowHandoff.mockReset().mockImplementation(async (value) => ({
+      status: "submitted", run: value, message: "已重新交接"
+    }));
     mocks.codexState.status = "idle";
     mocks.codexState.sessionRef = null;
   });
@@ -336,6 +346,59 @@ describe("TaskCockpit", () => {
         workflow_action: "view"
       }
     });
+  });
+
+  it("auto 的 prompt_written 保留查看与再次提交入口，不显示手动完整交接", async () => {
+    mocks.getRun.mockResolvedValue({
+      ...run("waiting_codex"),
+      codex_session_ref: "runtime:workflow-runtime-1",
+      completion_contract: { target_count: 2, execution_policy: { codex_handoff: "auto" as const } },
+      analysis_handoff: {
+        ...run("waiting_codex").analysis_handoff,
+        attempt_status: "prompt_written",
+        codex_session_ref: "runtime:workflow-runtime-1"
+      }
+    });
+    mocks.codexState.status = "running";
+    mocks.codexState.sessionRef = "runtime:workflow-runtime-1";
+    const wrapper = mountCockpit();
+    await flushPromises();
+    await wrapper.find('[placeholder="输入 Workflow Run ID 查看本轮上下文"]').setValue("workflow-run-1");
+    await wrapper.findAll("button").find((item) => item.text() === "查看本轮上下文")!.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("等待 Codex 开始");
+    expect(wrapper.findAll("button").some((item) => item.text() === "查看 Codex")).toBe(true);
+    expect(wrapper.find('[data-testid="resubmit-workflow-codex-enter"]').exists()).toBe(true);
+    expect(wrapper.findAll("button").some((item) => item.text() === "交给 Codex 分析")).toBe(false);
+    await wrapper.find('[data-testid="resubmit-workflow-codex-enter"]').trigger("click");
+    expect(mocks.resubmitWorkflowEnter).toHaveBeenCalledTimes(1);
+    expect(mocks.triggerWorkflowHandoff).not.toHaveBeenCalled();
+  });
+
+  it("prompt_written 超时后提供重新交接，并保留原 attempt 的查看入口", async () => {
+    mocks.getRun.mockResolvedValue({
+      ...run("waiting_codex"),
+      codex_session_ref: "runtime:closed-runtime-1",
+      completion_contract: { target_count: 2, execution_policy: { codex_handoff: "auto" as const } },
+      analysis_handoff: {
+        ...run("waiting_codex").analysis_handoff,
+        attempt_status: "prompt_written",
+        handoff_attempt_id: "attempt-1",
+        codex_session_ref: "runtime:closed-runtime-1",
+        retry_available: true
+      }
+    });
+    const wrapper = mountCockpit();
+    await flushPromises();
+    await wrapper.find('[placeholder="输入 Workflow Run ID 查看本轮上下文"]').setValue("workflow-run-1");
+    await wrapper.findAll("button").find((item) => item.text() === "查看本轮上下文")!.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.findAll("button").some((item) => item.text() === "查看 Codex")).toBe(true);
+    expect(wrapper.find('[data-testid="retry-workflow-codex-handoff"]').exists()).toBe(true);
+    await wrapper.find('[data-testid="retry-workflow-codex-handoff"]').trigger("click");
+    expect(mocks.retryWorkflowHandoff).toHaveBeenCalledTimes(1);
   });
 
   it("已结束的 runtime session 不显示无效果的查看按钮", async () => {

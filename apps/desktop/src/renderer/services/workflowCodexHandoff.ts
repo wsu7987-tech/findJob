@@ -3,9 +3,9 @@ import type { FineJobWorkflowRun } from "@/types";
 import { ApiError, api } from "./api";
 import { getCodexBridge } from "./desktop-bridge";
 
-type HandoffTrigger = "auto" | "manual" | "retry";
+type HandoffTrigger = "auto" | "manual";
 
-type WorkflowCodexStore = {
+export type WorkflowCodexStore = {
   status: string;
   runtimeId: string | null;
   sessionRef: string | null;
@@ -32,10 +32,11 @@ type WorkflowHandoffApi = Pick<
 
 type PromptTransport = {
   submitCodexPrompt?: (prompt: string) => Promise<boolean>;
+  submitCodexEnter?: () => Promise<boolean>;
 };
 
 export type WorkflowCodexHandoffResult = {
-  status: "submitted" | "skipped" | "transport_failed" | "transport_unconfirmed" | "busy";
+  status: "submitted" | "enter_submitted" | "skipped" | "transport_failed" | "transport_unconfirmed" | "busy";
   run: FineJobWorkflowRun;
   message: string;
 };
@@ -56,7 +57,6 @@ const canStartHandoff = (run: FineJobWorkflowRun, trigger: HandoffTrigger) => {
   if (trigger === "auto") {
     return executionPolicy(run).codex_handoff !== "manual" && hasReadyBatch(run);
   }
-  if (trigger === "retry") return Boolean(run.analysis_handoff?.retry_available);
   return hasReadyBatch(run);
 };
 
@@ -116,7 +116,6 @@ const runHandoff = async (
       codex_session_ref: session.sessionRef,
       codex_runtime_id: session.runtimeId || undefined,
       handoff_kind: handoff.needs_next_batch_handoff ? "next" : "initial",
-      ...(trigger === "retry" ? { retry_handoff_attempt_id: handoff.handoff_attempt_id || undefined } : {})
     });
   } catch (error) {
     if (error instanceof ApiError && error.statusCode === 409) {
@@ -184,6 +183,66 @@ export const triggerWorkflowCodexHandoff = (
     dependencies.client ?? api,
     dependencies.transport ?? getCodexBridge()
   ).finally(() => activeHandoffs.delete(run.workflow_run_id));
+  activeHandoffs.set(run.workflow_run_id, task);
+  return task;
+};
+
+const hasLivePromptWrittenAttempt = (run: FineJobWorkflowRun, codexStore: WorkflowCodexStore) => {
+  const handoff = run.analysis_handoff;
+  return Boolean(
+    run.status === "waiting_codex"
+      && handoff?.attempt_status === "prompt_written"
+      && handoff.codex_session_ref
+      && handoff.codex_session_ref === codexStore.sessionRef
+      && run.codex_session_ref === codexStore.sessionRef
+      && codexStore.status === "running"
+  );
+};
+
+export const resubmitWorkflowCodexEnter = async (
+  run: FineJobWorkflowRun,
+  codexStore: WorkflowCodexStore,
+  transport: PromptTransport = getCodexBridge() ?? {}
+): Promise<WorkflowCodexHandoffResult> => {
+  if (!hasLivePromptWrittenAttempt(run, codexStore) || !transport.submitCodexEnter) {
+    return { status: "skipped", run, message: "当前交接不能再次提交；请查看 Codex 或在超时后重新交接。" };
+  }
+  // 仅提交当前 composer 中已有的 Prompt，attempt 与业务状态均保持不变。
+  const submitted = await transport.submitCodexEnter();
+  return submitted
+    ? { status: "enter_submitted", run, message: "已再次发送 Enter，等待当前 attempt 的开始 ACK。" }
+    : { status: "transport_failed", run, message: "当前 Codex 会话不可提交 Enter，请查看会话或重新交接。" };
+};
+
+export const retryWorkflowCodexHandoff = (
+  run: FineJobWorkflowRun,
+  codexStore: WorkflowCodexStore,
+  dependencies: { client?: WorkflowHandoffApi; transport?: PromptTransport } = {}
+) => {
+  const existing = activeHandoffs.get(run.workflow_run_id);
+  if (existing) return existing;
+  const client = dependencies.client ?? api;
+  const transport = dependencies.transport ?? getCodexBridge() ?? {};
+  const task = (async (): Promise<WorkflowCodexHandoffResult> => {
+    const handoff = run.analysis_handoff;
+    if (
+      run.status !== "waiting_codex"
+      || handoff?.attempt_status !== "prompt_written"
+      || !handoff.retry_available
+      || !handoff.analysis_batch_id
+      || !handoff.handoff_attempt_id
+      || !handoff.codex_session_ref
+    ) {
+      return { status: "skipped", run, message: "当前交接尚未进入可重新交接状态。" };
+    }
+    const released = await client.releaseFineJobWorkflowAnalysisHandoff(run.workflow_run_id, {
+      analysis_batch_id: handoff.analysis_batch_id,
+      handoff_attempt_id: handoff.handoff_attempt_id,
+      codex_session_ref: handoff.codex_session_ref,
+      release_reason: "full_retry"
+    });
+    return runHandoff(released, codexStore, "manual", client, transport);
+  })().finally(() => activeHandoffs.delete(run.workflow_run_id));
   activeHandoffs.set(run.workflow_run_id, task);
   return task;
 };

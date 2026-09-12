@@ -12,6 +12,7 @@ interface CodexController {
   }) => Promise<unknown>;
   write: (data: string) => void;
   submitPrompt?: (prompt: string) => Promise<boolean>;
+  submitEnter?: () => Promise<boolean>;
   resize: (cols: number, rows: number) => void;
   interrupt: () => void;
   stop: () => void;
@@ -44,6 +45,7 @@ export const registerCodexIpc = (
     if (typeof prompt !== "string" || !controller.submitPrompt) return false;
     return controller.submitPrompt(prompt);
   });
+  ipcMain.handle("codex:submit-enter", () => controller.submitEnter?.() ?? false);
   ipcMain.on("codex:resize", (_event, size: { cols: number; rows: number }) => {
     if (Number.isInteger(size?.cols) && Number.isInteger(size?.rows)) {
       controller.resize(size.cols, size.rows);

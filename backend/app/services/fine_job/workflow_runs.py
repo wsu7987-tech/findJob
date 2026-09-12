@@ -635,8 +635,9 @@ def release_workflow_analysis_handoff(
     analysis_batch_id: str,
     handoff_attempt_id: str,
     codex_session_ref: str,
+    release_reason: str | None = None,
 ) -> dict[str, object]:
-    """Prompt 未被终端接受时释放 claim，使同一批次可以安全重试。"""
+    """按 transport 失败或用户完整重试释放当前交接尝试。"""
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         handoff = connection.execute(
@@ -649,15 +650,16 @@ def release_workflow_analysis_handoff(
             or str(handoff["handoff_attempt_id"] or "") != handoff_attempt_id
         ):
             raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_STALE", "当前批次没有可释放的有效 Codex 交接。")
-        if handoff["attempt_status"] != "claimed":
+        can_full_retry = handoff["attempt_status"] == "prompt_written" and release_reason == "full_retry"
+        if handoff["attempt_status"] != "claimed" and not can_full_retry:
             raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_ALREADY_SUBMITTED", "当前批次已提交给 Codex，不能按失败释放。")
         connection.execute(
             """
             UPDATE fj_workflow_analysis_handoffs
-            SET status = 'released', attempt_status = 'released', released_at = ?
+            SET status = 'released', attempt_status = 'released', released_at = ?, recovery_reason = ?
             WHERE workflow_run_id = ? AND analysis_batch_id = ?
             """,
-            (utc_now(), workflow_run_id, analysis_batch_id),
+            (utc_now(), release_reason or "transport_failure", workflow_run_id, analysis_batch_id),
         )
     return get_workflow_run(db, workflow_run_id)
 

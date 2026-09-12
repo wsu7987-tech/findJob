@@ -757,7 +757,7 @@ def test_next_analysis_batch_only_handoffs_new_pending_items(configured_client, 
     assert claimed.json()["analysis_handoff"]["handoff_status"] == "claimed"
 
 
-def test_start_ack_timeout_waits_for_explicit_retry_and_replaces_old_attempt(
+def test_start_ack_timeout_full_retry_releases_old_attempt_before_replacing_it(
     configured_client, test_db
 ) -> None:
     run, _jobs = _prepare_analysis_batch(configured_client, test_db, candidate_count=1, target_count=1)
@@ -786,13 +786,24 @@ def test_start_ack_timeout_waits_for_explicit_retry_and_replaces_old_attempt(
     assert waiting["attempt_status"] == "prompt_written"
     assert waiting["retry_available"] is True
 
+    released = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/release",
+        json={
+            "analysis_batch_id": batch_id,
+            "handoff_attempt_id": first_attempt_id,
+            "codex_session_ref": "runtime:session-a",
+            "release_reason": "full_retry",
+        },
+    )
+    assert released.status_code == 200
+    assert released.json()["analysis_handoff"]["attempt_status"] == "released"
+
     retried = configured_client.post(
         f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/claim",
         json={
             "codex_session_ref": "runtime:session-b",
             "codex_runtime_id": "runtime-b",
             "handoff_kind": "initial",
-            "retry_handoff_attempt_id": first_attempt_id,
         },
     )
     assert retried.status_code == 200

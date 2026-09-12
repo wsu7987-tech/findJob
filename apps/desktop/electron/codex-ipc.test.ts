@@ -15,6 +15,7 @@ describe("registerCodexIpc", () => {
       resume: vi.fn(async () => ({ status: "running", runtimeId: "run-1", sessionRef: "runtime:run-1" })),
       startWorkflow: vi.fn(async () => ({ status: "running", runtimeId: "run-1", sessionRef: "runtime:run-1" })),
       write: vi.fn(),
+      submitEnter: vi.fn(async () => true),
       resize: vi.fn(),
       interrupt: vi.fn(),
       stop: vi.fn(),
@@ -40,6 +41,8 @@ describe("registerCodexIpc", () => {
       runtimeId: null,
       sessionRef: null
     });
+    await expect(handlers.get("codex:submit-enter")?.({})).resolves.toBe(true);
+    expect(controller.submitEnter).toHaveBeenCalledTimes(1);
   });
 
   it("限制超出边界的 IPC 输入", () => {
@@ -49,7 +52,7 @@ describe("registerCodexIpc", () => {
       on: vi.fn((channel: string, handler: (...args: any[]) => unknown) => listeners.set(channel, handler))
     };
     const controller = {
-      start: vi.fn(), resume: vi.fn(), startWorkflow: vi.fn(), write: vi.fn(), resize: vi.fn(),
+      start: vi.fn(), resume: vi.fn(), startWorkflow: vi.fn(), write: vi.fn(), submitEnter: vi.fn(), resize: vi.fn(),
       interrupt: vi.fn(), stop: vi.fn(), state: vi.fn()
     };
     registerCodexIpc(ipcMain as never, controller, () => null);
