@@ -2,8 +2,8 @@
 import { computed, nextTick, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
-import CodexTerminal from "@/components/CodexTerminal.vue";
 import { api } from "@/services/api";
+import { useCodexTerminalState } from "@/services/codex-terminal-state";
 import { getCodexBridge } from "@/services/desktop-bridge";
 import {
   resubmitWorkflowCodexSubmit,
@@ -20,16 +20,8 @@ const workflowStore = useFineJobWorkflowRunStore();
 const strategiesStore = useFineJobStrategiesStore();
 const route = useRoute();
 const router = useRouter();
-const terminal = ref<{
-  clear: () => void;
-  copyAll: () => Promise<boolean>;
-  copySelection: () => Promise<boolean>;
-  focus: () => void;
-  paste: () => Promise<boolean>;
-} | null>(null);
-const terminalSize = ref({ cols: 120, rows: 36 });
+const { terminal, terminalSize } = useCodexTerminalState();
 const savingPermissions = ref(false);
-const copyMessage = ref("");
 const profileAnalysisMessage = ref("");
 const workflowAnalysisMessage = ref("");
 const workflowRetryAvailable = ref(false);
@@ -312,15 +304,6 @@ const retryWorkflowAnalysis = async () => {
   }
 };
 
-const returnToTaskCockpit = async () => {
-  const task = deepJobSearchTask();
-  if (!task) return;
-  await router.push({
-    name: "fine-job-task-cockpit",
-    query: { workflow_run_id: task.workflowRunId }
-  });
-};
-
 const submitQuickTask = async (taskType: "filter" | "recommendation") => {
   const bridge = getCodexBridge();
   if (!bridge?.submitCodexPrompt) {
@@ -358,27 +341,6 @@ const submitQuickTask = async (taskType: "filter" | "recommendation") => {
 
 const stop = () => getCodexBridge()?.stopCodex?.();
 const interrupt = () => getCodexBridge()?.interruptCodex?.();
-
-const showClipboardMessage = (successMessage: string, failureMessage: string, success: boolean) => {
-  copyMessage.value = success ? successMessage : failureMessage;
-  globalThis.setTimeout(() => {
-    copyMessage.value = "";
-  }, 1800);
-};
-
-const copySelection = async () => {
-  showClipboardMessage("已复制", "请先选择要复制的内容", Boolean(await terminal.value?.copySelection()));
-};
-
-const copyAll = async () => {
-  showClipboardMessage("已复制", "当前没有可复制的会话内容", Boolean(await terminal.value?.copyAll()));
-};
-
-const paste = async () => {
-  showClipboardMessage("已粘贴", "剪贴板没有可粘贴的文本", Boolean(await terminal.value?.paste()));
-};
-
-const clearTerminal = () => terminal.value?.clear();
 
 const savePermissions = async () => {
   if (!store.permissions) return;
@@ -596,21 +558,6 @@ onMounted(async () => {
       />
     </section>
 
-    <div class="surface-card terminal-card">
-      <div class="terminal-toolbar">
-        <span class="secondary-text">拖动选择文本后可按 Ctrl/Cmd+C 复制</span>
-        <div class="card-actions">
-          <el-button v-if="deepJobSearchTask()" @click="returnToTaskCockpit">返回任务驾驶舱</el-button>
-          <span v-if="copyMessage" class="secondary-text">{{ copyMessage }}</span>
-          <el-button :disabled="!terminal" @click="paste">粘贴</el-button>
-          <el-button :disabled="!terminal" @click="clearTerminal">Clear</el-button>
-          <el-button :disabled="!terminal" @click="copySelection">复制选中内容</el-button>
-          <el-button :disabled="!terminal" @click="copyAll">复制全部会话</el-button>
-        </div>
-      </div>
-      <CodexTerminal ref="terminal" @ready="terminalSize = $event" />
-    </div>
-
     <div class="codex-columns">
       <section class="surface-card">
         <div class="page-heading">
@@ -680,10 +627,6 @@ onMounted(async () => {
   gap: 14px;
 }
 
-.terminal-card {
-  padding: 10px;
-}
-
 .quick-task-card,
 .quick-task-grid {
   display: grid;
@@ -731,14 +674,6 @@ onMounted(async () => {
 
 .quick-task-item p {
   margin: 4px 0 0;
-}
-
-.terminal-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 0 2px 10px;
 }
 
 .codex-columns {

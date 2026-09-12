@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watchEffect } from "vue";
-import { RouterView } from "vue-router";
+import { RouterView, useRoute } from "vue-router";
 
 import AppShell from "@/components/AppShell.vue";
+import CodexTerminalPanel from "@/components/CodexTerminalPanel.vue";
 import SettingsDrawer from "@/components/SettingsDrawer.vue";
 import { useConfigStore } from "@/stores/config";
 import { useFineJobBossExecutorStore } from "@/stores/fineJobBossExecutor";
@@ -19,6 +20,8 @@ const workflowRunStore = useFineJobWorkflowRunStore();
 const settingsOpen = ref(false);
 const notices = computed(() => noticesStore.items);
 const isShelllessRoute = computed(() => false);
+const route = useRoute();
+const showCodexTerminal = computed(() => route.name === "fine-job-codex");
 const workflowCodexController = startFineJobWorkflowCodexController({
   workflowStore: workflowRunStore,
   codexStore
@@ -71,6 +74,8 @@ onMounted(() => {
   <RouterView v-if="isShelllessRoute" />
 
   <AppShell v-else @open-settings="settingsOpen = true">
+    <!-- 终端全局挂载，页面切换时继续接收 Codex 输出并保留原有画面。 -->
+    <CodexTerminalPanel :visible="showCodexTerminal" />
     <RouterView @open-settings="settingsOpen = true" />
   </AppShell>
 

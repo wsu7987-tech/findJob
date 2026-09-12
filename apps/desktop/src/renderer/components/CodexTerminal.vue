@@ -98,10 +98,12 @@ const handleCustomKey = (event: KeyboardEvent) => {
 
 // 对外提供终端聚焦能力，供新建会话完成后把输入焦点交给终端。
 const focus = () => terminal?.focus();
+// 全局终端从隐藏状态恢复显示时重新计算列数和行数。
+const fit = () => fitAddon?.fit();
 // 只清空终端当前显示内容，不结束 Codex 进程或删除会话数据。
 const clear = () => terminal?.clear();
 
-defineExpose({ clear, copyAll, copySelection, focus, paste: pasteFromClipboard });
+defineExpose({ clear, copyAll, copySelection, fit, focus, paste: pasteFromClipboard });
 
 onMounted(() => {
   if (!host.value) return;

@@ -69,6 +69,7 @@ describe("App", () => {
       global: {
         stubs: {
           AppShell: AppShellStub,
+          CodexTerminalPanel: defineComponent({ template: "<div />" }),
           SettingsDrawer: SettingsDrawerStub,
           ElAlert: ElAlertStub
         }
@@ -96,6 +97,7 @@ describe("App", () => {
       global: {
         stubs: {
           AppShell: AppShellStub,
+          CodexTerminalPanel: defineComponent({ template: "<div />" }),
           SettingsDrawer: SettingsDrawerStub,
           ElAlert: ElAlertStub
         }

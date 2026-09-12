@@ -68,6 +68,22 @@ vi.mock("@/services/api", () => ({
   }
 }));
 
+vi.mock("@/services/codex-terminal-state", () => ({
+  useCodexTerminalState: () => ({
+    terminal: {
+      value: {
+        clear: mocks.clear,
+        copyAll: vi.fn().mockResolvedValue(true),
+        copySelection: vi.fn().mockResolvedValue(true),
+        fit: vi.fn(),
+        focus: mocks.focus,
+        paste: vi.fn().mockResolvedValue(true)
+      }
+    },
+    terminalSize: { value: { cols: 120, rows: 36 } }
+  })
+}));
+
 vi.mock("@/stores/fineJobStrategies", () => ({
   useFineJobStrategiesStore: () => ({
     filters: [{ id: "filter-1", name: "Agent 筛选", enabled: true }],
