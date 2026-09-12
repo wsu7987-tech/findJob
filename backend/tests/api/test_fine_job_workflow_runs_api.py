@@ -91,6 +91,12 @@ def test_create_workflow_run_exposes_real_search_context_snapshot(configured_cli
         "analysis_batch_size": 5,
     }
     assert run["completion_contract"]["execution_policy"] == {"after_analysis_batch": "auto_continue"}
+    assert run["completion_progress"] == {
+        "recommend": {"current": 0, "target": 2, "remaining": 2, "reached": False},
+        "review": {"current": 0, "target": None, "remaining": None, "reached": None},
+        "target_mode": "all",
+        "target_reached": False,
+    }
     assert run["completion_contract"]["allow_historical_jobs"] is False
     assert run["completion_contract"]["applied_feedback_ids"] == ["feedback-1"]
     assert run["completion_contract"]["selected_strategy_ids"]["recommendation_strategy_id"]
@@ -859,8 +865,17 @@ def test_review_target_participates_only_when_configured_and_respects_all_mode(
     )["data"]
 
     assert after_recommend["status"] == "waiting_codex"
+    assert after_recommend["completion_progress"] == {
+        "recommend": {"current": 1, "target": 1, "remaining": 0, "reached": True},
+        "review": {"current": 0, "target": 1, "remaining": 1, "reached": False},
+        "target_mode": "all",
+        "target_reached": False,
+    }
     assert after_review["status"] == "completed"
     assert after_review["stop_reason"] == "completion_target_reached"
+    assert after_review["completion_progress"]["target_reached"] is True
+    saved_items = workflow_runs.list_workflow_analysis_items(test_db, run["workflow_run_id"])["items"]
+    assert sum(item["analysis_result"].get("review_status") == "pending" for item in saved_items) == 2
 
 
 def test_stop_after_current_batch_waits_for_user_then_prepares_next_batch(
@@ -918,7 +933,14 @@ def test_any_target_mode_can_complete_on_configured_review_target(configured_cli
 
     assert result["status"] == "completed"
     assert result["completed_count"] == 0
+    assert result["remaining_count"] == 2
     assert result["stop_reason"] == "completion_target_reached"
+    assert result["completion_progress"] == {
+        "recommend": {"current": 0, "target": 2, "remaining": 2, "reached": False},
+        "review": {"current": 1, "target": 1, "remaining": 0, "reached": True},
+        "target_mode": "any",
+        "target_reached": True,
+    }
 
 
 def test_analyze_all_candidates_freezes_pool_and_never_resumes_search(

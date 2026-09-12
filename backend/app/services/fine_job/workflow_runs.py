@@ -194,7 +194,7 @@ def get_workflow_run(db: Database, workflow_run_id: str) -> dict[str, object]:
         tasks = connection.execute("SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? ORDER BY created_at", (workflow_run_id,)).fetchall()
         snapshots = connection.execute("SELECT * FROM fj_workflow_context_snapshots WHERE workflow_run_id = ? ORDER BY created_at", (workflow_run_id,)).fetchall()
     return {
-        **_serialize_run(run),
+        **_serialize_run(db, run),
         "progress": _get_run_progress(db, workflow_run_id),
         "analysis_handoff": _get_analysis_handoff_summary(db, workflow_run_id),
         "tasks": [_serialize_task(row) for row in tasks],
@@ -1244,12 +1244,37 @@ def _completion_counts(db: Database, workflow_run_id: str) -> dict[str, int]:
 
 
 def _business_target_reached(db: Database, workflow_run_id: str, contract: dict[str, Any]) -> bool:
+    return bool(_completion_progress(db, workflow_run_id, contract)["target_reached"])
+
+
+def _completion_progress(
+    db: Database, workflow_run_id: str, contract: dict[str, Any]
+) -> dict[str, object]:
     counts = _completion_counts(db, workflow_run_id)
-    targets = [counts["recommend"] >= int(contract.get("recommend_target") or contract.get("target_count") or 0)]
+    recommend_target = int(contract.get("recommend_target") or contract.get("target_count") or 0)
     review_target = contract.get("review_target")
-    if review_target is not None:
-        targets.append(counts["review"] >= int(review_target))
-    return any(targets) if contract.get("target_mode") == "any" else all(targets)
+    recommend_reached = counts["recommend"] >= recommend_target
+    review_reached = counts["review"] >= int(review_target) if review_target is not None else None
+    configured_reached = [recommend_reached]
+    if review_reached is not None:
+        configured_reached.append(review_reached)
+    target_mode = "any" if contract.get("target_mode") == "any" else "all"
+    return {
+        "recommend": {
+            "current": counts["recommend"],
+            "target": recommend_target,
+            "remaining": max(0, recommend_target - counts["recommend"]),
+            "reached": recommend_reached,
+        },
+        "review": {
+            "current": counts["review"],
+            "target": int(review_target) if review_target is not None else None,
+            "remaining": max(0, int(review_target) - counts["review"]) if review_target is not None else None,
+            "reached": review_reached,
+        },
+        "target_mode": target_mode,
+        "target_reached": any(configured_reached) if target_mode == "any" else all(configured_reached),
+    }
 
 
 def _is_analysis_batch_complete(db: Database, workflow_run_id: str, analysis_batch_id: str) -> bool:
@@ -1389,7 +1414,7 @@ def _continue_after_analysis_batch(db: Database, workflow_run_id: str) -> dict[s
 def _resume_search_or_wait(db: Database, config: AppConfig, workflow_run_id: str) -> None:
     _update_run(db, workflow_run_id, status="pending", current_step="searching", next_action="continue_search", next_action_reason="当前候选池已处理完，继续寻找 fresh_only 候选。", waiting_for_user=0, stop_reason="")
     if _next_task(db, workflow_run_id) is None:
-        _wait_for_user(db, workflow_run_id, "new_jobs_insufficient", "已批准搜索组合与候选池均已处理完，仍未达到正式 recommend 目标。")
+        _wait_for_user(db, workflow_run_id, "new_jobs_insufficient", "已批准搜索组合与候选池均已处理完，尚未达到本轮配置的完成目标。")
         return
     advance_deep_job_search(db, config, workflow_run_id)
 
@@ -1452,8 +1477,9 @@ def _require_run(db: Database, workflow_run_id: str):
     return row
 
 
-def _serialize_run(row: Any) -> dict[str, object]:
-    return {"workflow_run_id": row["id"], "workflow_type": row["workflow_type"], "completion_contract": _load(row["completion_contract_json"], {}), "status": "paused" if bool(row["paused"]) else row["status"], "completed_count": row["completed_count"], "remaining_count": row["remaining_count"], "current_step": row["current_step"], "next_action": row["next_action"], "next_action_reason": row["next_action_reason"], "waiting_for_user": bool(row["waiting_for_user"]), "stop_reason": row["stop_reason"], "codex_session_ref": row["codex_session_ref"], "codex_runtime_id": row["codex_runtime_id"], "telemetry": _load(row["telemetry_json"], {}), "created_at": row["created_at"], "updated_at": row["updated_at"], "completed_at": row["completed_at"]}
+def _serialize_run(db: Database, row: Any) -> dict[str, object]:
+    contract = _load(row["completion_contract_json"], {})
+    return {"workflow_run_id": row["id"], "workflow_type": row["workflow_type"], "completion_contract": contract, "completion_progress": _completion_progress(db, str(row["id"]), contract), "status": "paused" if bool(row["paused"]) else row["status"], "completed_count": row["completed_count"], "remaining_count": row["remaining_count"], "current_step": row["current_step"], "next_action": row["next_action"], "next_action_reason": row["next_action_reason"], "waiting_for_user": bool(row["waiting_for_user"]), "stop_reason": row["stop_reason"], "codex_session_ref": row["codex_session_ref"], "codex_runtime_id": row["codex_runtime_id"], "telemetry": _load(row["telemetry_json"], {}), "created_at": row["created_at"], "updated_at": row["updated_at"], "completed_at": row["completed_at"]}
 
 
 def _analysis_batch_id_from_payload(payload: dict[str, Any], workflow_run_id: str) -> str:

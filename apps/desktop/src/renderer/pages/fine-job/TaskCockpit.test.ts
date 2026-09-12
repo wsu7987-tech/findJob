@@ -96,6 +96,10 @@ const FormItemStub = defineComponent({
   props: { label: { type: String, default: "" } },
   template: "<div><span>{{ label }}</span><slot /></div>"
 });
+const DescriptionsItemStub = defineComponent({
+  props: { label: { type: String, default: "" } },
+  template: "<div><span>{{ label }}</span><slot /></div>"
+});
 const TableColumnStub = defineComponent({
   template: "<div><slot :row=\"{ job: { title: '', company: '', salary: '', city: '', discovery_keyword: '', discovery_depth: 0, filter_result: '', filter_reasons: [], jd_status: '' }, status: '', analysis_result: {} }\" /></div>"
 });
@@ -168,7 +172,7 @@ const mountCockpit = () => mount(TaskCockpit, {
       ElCollapse: GenericStub,
       ElCollapseItem: GenericStub,
       ElDescriptions: GenericStub,
-      ElDescriptionsItem: GenericStub,
+      ElDescriptionsItem: DescriptionsItemStub,
       ElDialog: GenericStub,
       ElEmpty: GenericStub,
       ElForm: GenericStub,
@@ -258,6 +262,42 @@ describe("TaskCockpit", () => {
     await flushPromises();
 
     expect(wrapper.findAll("button").some((item) => item.text() === "继续")).toBe(true);
+  });
+
+  it("使用 completion_progress 与实际 pending review 展示完成结果", async () => {
+    const completedRun = {
+      ...run("completed"),
+      completion_progress: {
+        recommend: { current: 0, target: 2, remaining: 2, reached: false },
+        review: { current: 1, target: 1, remaining: 0, reached: true },
+        target_mode: "any",
+        target_reached: true
+      }
+    };
+    mocks.getRun.mockResolvedValue(completedRun);
+    mocks.getLatestRun.mockResolvedValue({ workflow_run: completedRun });
+    mocks.listItems.mockResolvedValue({
+      items: [
+        {
+          workflow_task_id: "recommend-item", status: "succeeded",
+          analysis_result: { decision: "recommend", review_status: "pending" },
+          job: { title: "推荐岗位", company: "公司 A" }
+        },
+        {
+          workflow_task_id: "review-item", status: "succeeded",
+          analysis_result: { decision: "review", review_status: "pending" },
+          job: { title: "复核岗位", company: "公司 B" }
+        }
+      ]
+    });
+    const wrapper = mountCockpit();
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("业务完成状态");
+    expect(wrapper.text()).toContain("已达到配置目标");
+    expect(wrapper.text()).toContain("Recommend 完成");
+    expect(wrapper.text()).toContain("Review 完成");
+    expect(wrapper.text()).toContain("进入待确认 2");
   });
 
   it("waiting_codex 的存活 sessionRef 匹配时优先显示查看 Codex 分析", async () => {

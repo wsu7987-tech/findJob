@@ -2429,6 +2429,12 @@ export interface FineJobWorkflowRun {
   status: string;
   completed_count: number;
   remaining_count: number;
+  completion_progress?: {
+    recommend: { current: number; target: number; remaining: number; reached: boolean };
+    review: { current: number; target: number | null; remaining: number | null; reached: boolean | null };
+    target_mode: "any" | "all";
+    target_reached: boolean;
+  };
   current_step: string;
   next_action: string;
   next_action_reason: string;

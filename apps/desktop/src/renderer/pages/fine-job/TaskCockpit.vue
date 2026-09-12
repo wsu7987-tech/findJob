@@ -85,6 +85,10 @@ const compatibleRecommendationStrategies = computed(() => recommendationStrategi
   (item) => item.filter_strategy_id === selectedStrategyId.value
 ));
 const activeAnalysisItem = computed(() => analysisItems.value.find((item) => item.status === "running") ?? null);
+const completionProgress = computed(() => workflowRun.value?.completion_progress);
+const pendingReviewItems = computed(() => analysisItems.value.filter(
+  (item) => item.status === "succeeded" && item.analysis_result.review_status === "pending"
+));
 
 const syncStrategyScope = () => {
   selectedKeywords.value = [...(selectedStrategy.value?.search_keywords ?? [])];
@@ -402,8 +406,11 @@ watch(workflowRun, (run) => {
       <el-descriptions-item label="Recommend 目标">{{ workflowRun.completion_contract?.recommend_target ?? workflowRun.completion_contract?.target_count ?? recommendTarget }}</el-descriptions-item>
       <el-descriptions-item label="Review 目标">{{ workflowRun.completion_contract?.review_target ?? '未配置' }}</el-descriptions-item>
       <el-descriptions-item label="目标模式">{{ workflowRun.completion_contract?.target_mode ?? 'all' }}</el-descriptions-item>
-      <el-descriptions-item label="正式 recommend">{{ workflowRun.completed_count }}</el-descriptions-item>
-      <el-descriptions-item label="剩余目标">{{ workflowRun.remaining_count }}</el-descriptions-item>
+      <el-descriptions-item label="业务完成状态">{{ completionProgress?.target_reached ? '已达到配置目标' : '尚未达到配置目标' }}</el-descriptions-item>
+      <el-descriptions-item label="Recommend 完成">{{ completionProgress ? `${completionProgress.recommend.current} / ${completionProgress.recommend.target}（剩余 ${completionProgress.recommend.remaining}）` : '—' }}</el-descriptions-item>
+      <el-descriptions-item label="Review 完成">{{ completionProgress?.review.target === null ? `${completionProgress?.review.current ?? 0}（未计入目标）` : `${completionProgress?.review.current ?? 0} / ${completionProgress?.review.target ?? 0}（剩余 ${completionProgress?.review.remaining ?? 0}）` }}</el-descriptions-item>
+      <el-descriptions-item label="正式 Recommend（兼容计数）">{{ workflowRun.completed_count }}</el-descriptions-item>
+      <el-descriptions-item label="Recommend 剩余（兼容计数）">{{ workflowRun.remaining_count }}</el-descriptions-item>
       <el-descriptions-item label="当前搜索">{{ workflowRun.progress.current_keyword || '等待开始' }} / {{ workflowRun.progress.current_city || '—' }}</el-descriptions-item>
       <el-descriptions-item label="搜索深度 / 批次">{{ workflowRun.progress.search_depth }} / {{ workflowRun.progress.search_batch_count }}</el-descriptions-item>
       <el-descriptions-item label="岗位：已见 / Fresh / 重复">{{ workflowRun.progress.jobs_seen }} / {{ workflowRun.progress.fresh_jobs }} / {{ workflowRun.progress.duplicate_jobs }}</el-descriptions-item>
@@ -469,8 +476,8 @@ watch(workflowRun, (run) => {
     </el-dialog>
     <section v-if="workflowRun?.status === 'completed'" class="surface-card">
       <h3>本轮完成结果</h3>
-      <p>本轮共分析 {{ workflowRun.progress.recommend_count + workflowRun.progress.review_count + workflowRun.progress.reject_count }}；Recommend {{ workflowRun.progress.recommend_count }}；Review {{ workflowRun.progress.review_count }}；Reject {{ workflowRun.progress.reject_count }}；进入待确认 {{ workflowRun.progress.recommend_count }}。</p>
-      <div v-for="item in analysisItems.filter((entry) => entry.analysis_result.decision === 'recommend')" :key="`completed-${item.workflow_task_id}`" class="analysis-result-card"><strong>{{ item.job.title }} · {{ item.job.company }}</strong><p>{{ listText(item.analysis_result.reasons) }}</p><p>风险：{{ listText(item.analysis_result.risks) || '无' }}</p><el-button link @click="router.push({ name: 'fine-job-review' })">去待确认</el-button></div>
+      <p>本轮共分析 {{ workflowRun.progress.recommend_count + workflowRun.progress.review_count + workflowRun.progress.reject_count }}；Recommend {{ workflowRun.progress.recommend_count }}；Review {{ workflowRun.progress.review_count }}；Reject {{ workflowRun.progress.reject_count }}；进入待确认 {{ pendingReviewItems.length }}。</p>
+      <div v-for="item in pendingReviewItems" :key="`completed-${item.workflow_task_id}`" class="analysis-result-card"><strong>{{ item.job.title }} · {{ item.job.company }}</strong><p>{{ listText(item.analysis_result.reasons) }}</p><p>风险：{{ listText(item.analysis_result.risks) || '无' }}</p><el-button link @click="router.push({ name: 'fine-job-review' })">去待确认</el-button></div>
     </section>
     <template v-if="snapshot">
       <el-alert
