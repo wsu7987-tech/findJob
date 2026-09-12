@@ -2494,7 +2494,10 @@ export interface FineJobWorkflowRun {
       analysis_batch_size?: number;
       stop_after_current_batch_consumed?: boolean;
     };
-    execution_policy?: { after_analysis_batch?: "auto_continue" | "wait_for_user" };
+    execution_policy?: {
+      after_analysis_batch?: "auto_continue" | "wait_for_user";
+      codex_handoff?: "auto" | "manual";
+    };
     frozen_candidate_pool?: { job_ids?: string[]; frozen_at?: string; reason?: string };
     external_action_policy?: string;
     selected_strategy_ids?: { filter_strategy_id?: string; recommendation_strategy_id?: string };

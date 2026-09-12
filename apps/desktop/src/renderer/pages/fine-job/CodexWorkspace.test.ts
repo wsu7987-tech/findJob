@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   claimWorkflowHandoff: vi.fn(),
   markPromptWritten: vi.fn(),
   releaseWorkflowHandoff: vi.fn(),
+  triggerWorkflowHandoff: vi.fn(),
   refreshWorkflow: vi.fn(),
   push: vi.fn(),
   replace: vi.fn(),
@@ -47,7 +48,7 @@ vi.mock("@/stores/fineJobCodex", () => ({
 }));
 
 vi.mock("@/stores/fineJobWorkflowRun", () => ({
-  useFineJobWorkflowRunStore: () => ({ refresh: mocks.refreshWorkflow })
+  useFineJobWorkflowRunStore: () => ({ refresh: mocks.refreshWorkflow, setRun: vi.fn() })
 }));
 
 vi.mock("@/services/api", () => ({
@@ -69,6 +70,10 @@ vi.mock("@/stores/fineJobStrategies", () => ({
 
 vi.mock("@/services/desktop-bridge", () => ({
   getCodexBridge: () => ({ submitCodexPrompt: mocks.submitPrompt })
+}));
+
+vi.mock("@/services/workflowCodexHandoff", () => ({
+  triggerWorkflowCodexHandoff: mocks.triggerWorkflowHandoff
 }));
 
 vi.mock("vue-router", () => ({
@@ -116,6 +121,11 @@ describe("CodexWorkspace", () => {
     });
     mocks.markPromptWritten.mockReset().mockResolvedValue(undefined);
     mocks.releaseWorkflowHandoff.mockReset().mockResolvedValue(undefined);
+    mocks.triggerWorkflowHandoff.mockReset().mockImplementation(async (value) => ({
+      status: value.analysis_handoff?.attempt_status === "prompt_written" ? "skipped" : "submitted",
+      run: value,
+      message: "共享 handoff 已处理"
+    }));
     mocks.refreshWorkflow.mockReset().mockResolvedValue(undefined);
     mocks.push.mockReset().mockResolvedValue(undefined);
     mocks.replace.mockReset().mockImplementation(async (target: { query: Record<string, string> }) => {
@@ -210,7 +220,7 @@ describe("CodexWorkspace", () => {
     );
   });
 
-  it("首次 handoff 只提交一次 Workflow Prompt，并在不可恢复时提示从 Workflow 状态新建", async () => {
+  it("首次 handoff 复用共享 orchestration，不依赖页面内 transport", async () => {
     mocks.routeQuery = {
       task: "deep-job-search",
       workflow_run_id: "workflow-run-1",
@@ -240,26 +250,9 @@ describe("CodexWorkspace", () => {
     });
     await flushPromises();
 
-    expect(mocks.startWorkflow).toHaveBeenCalledWith({
-      cols: 120,
-      rows: 36,
-      model: "gpt-5.6-luna",
-      reasoningEffort: "high",
-      sessionRef: "runtime:closed-runtime-1"
-    });
-    expect(mocks.claimWorkflowHandoff).toHaveBeenCalledWith("workflow-run-1", {
-      codex_session_ref: "runtime:runtime-2",
-      codex_runtime_id: "runtime-2",
-      handoff_kind: "initial"
-    });
-    expect(mocks.submitPrompt).toHaveBeenCalledWith(expect.stringContaining(
-      "workflow_run_id=workflow-run-1，analysis_batch_id=analysis-batch-1，handoff_attempt_id=attempt-1"
-    ));
-    expect(mocks.markPromptWritten).toHaveBeenCalledWith("workflow-run-1", {
-      analysis_batch_id: "analysis-batch-1",
-      handoff_attempt_id: "attempt-1",
-      codex_session_ref: "runtime:runtime-2"
-    });
+    expect(mocks.triggerWorkflowHandoff).toHaveBeenCalledWith(expect.anything(), expect.anything(), "manual");
+    expect(mocks.startWorkflow).not.toHaveBeenCalled();
+    expect(mocks.submitPrompt).not.toHaveBeenCalled();
     expect(mocks.replace).toHaveBeenCalledWith({
       name: "fine-job-codex",
       query: {
@@ -268,7 +261,7 @@ describe("CodexWorkspace", () => {
         workflow_action: "view"
       }
     });
-    expect(wrapper.html()).toContain("原 Codex 会话不可恢复，已基于 Workflow 状态建立新分析会话");
+    expect(wrapper.html()).toContain("共享 handoff 已处理");
 
     wrapper.unmount();
     mount(CodexWorkspace, { global: { stubs: {
@@ -277,7 +270,7 @@ describe("CodexWorkspace", () => {
       ElSelect: GenericStub, ElTag: GenericStub, ElSwitch: GenericStub
     } } });
     await flushPromises();
-    expect(mocks.submitPrompt).toHaveBeenCalledTimes(1);
+    expect(mocks.triggerWorkflowHandoff).toHaveBeenCalledTimes(1);
   });
 
   it("live_reused + view 只进入现有 Workflow 会话，不重复提交 Prompt", async () => {
@@ -308,7 +301,7 @@ describe("CodexWorkspace", () => {
     } } });
     await flushPromises();
 
-    expect(mocks.startWorkflow).toHaveBeenCalledTimes(1);
+    expect(mocks.startWorkflow).not.toHaveBeenCalled();
     expect(mocks.submitPrompt).not.toHaveBeenCalled();
     expect(mocks.claimWorkflowHandoff).not.toHaveBeenCalled();
     expect(wrapper.html()).toContain("已进入当前 Workflow 的 Codex 分析会话");
@@ -335,14 +328,14 @@ describe("CodexWorkspace", () => {
       workflowSessionMode: "live_reused"
     });
 
-    mount(CodexWorkspace, { global: { stubs: {
+    const wrapper = mount(CodexWorkspace, { global: { stubs: {
       CodexTerminal: CodexTerminalStub, ElAlert: GenericStub, ElButton: ElButtonStub,
       ElEmpty: GenericStub, ElInputNumber: GenericStub, ElOption: GenericStub,
       ElSelect: GenericStub, ElTag: GenericStub, ElSwitch: GenericStub
     } } });
     await flushPromises();
 
-    expect(mocks.submitPrompt).toHaveBeenCalledTimes(1);
+    expect(mocks.triggerWorkflowHandoff).toHaveBeenCalledTimes(1);
   });
 
   it("重载时已有 prompt_written attempt 不重复写入 Prompt", async () => {
@@ -367,16 +360,8 @@ describe("CodexWorkspace", () => {
     await flushPromises();
 
     expect(mocks.startWorkflow).not.toHaveBeenCalled();
-    expect(mocks.claimWorkflowHandoff).not.toHaveBeenCalled();
-    expect(mocks.submitPrompt).not.toHaveBeenCalled();
-    expect(mocks.replace).toHaveBeenCalledWith({
-      name: "fine-job-codex",
-      query: {
-        task: "deep-job-search",
-        workflow_run_id: "workflow-run-1",
-        workflow_action: "view"
-      }
-    });
+    expect(mocks.triggerWorkflowHandoff).toHaveBeenCalledTimes(1);
+    expect(mocks.replace).not.toHaveBeenCalled();
   });
 
   it("submit 失败时保留 submit action，不 replace 为 view", async () => {
@@ -391,22 +376,20 @@ describe("CodexWorkspace", () => {
         codex_execution_config: { model: "gpt-5.6-luna", reasoning_effort: "high" }
       }
     });
-    mocks.submitPrompt.mockResolvedValue(false);
+    mocks.triggerWorkflowHandoff.mockImplementationOnce(async (value) => ({
+      status: "transport_failed", run: value, message: "终端不可接收"
+    }));
 
-    mount(CodexWorkspace, { global: { stubs: {
+    const wrapper = mount(CodexWorkspace, { global: { stubs: {
       CodexTerminal: CodexTerminalStub, ElAlert: GenericStub, ElButton: ElButtonStub,
       ElEmpty: GenericStub, ElInputNumber: GenericStub, ElOption: GenericStub,
       ElSelect: GenericStub, ElTag: GenericStub, ElSwitch: GenericStub
     } } });
     await flushPromises();
 
-    expect(mocks.submitPrompt).toHaveBeenCalledTimes(1);
+    expect(mocks.triggerWorkflowHandoff).toHaveBeenCalledTimes(1);
     expect(mocks.replace).not.toHaveBeenCalled();
-    expect(mocks.releaseWorkflowHandoff).toHaveBeenCalledWith("workflow-run-1", {
-      analysis_batch_id: "analysis-batch-1",
-      handoff_attempt_id: "attempt-1",
-      codex_session_ref: "runtime:runtime-2"
-    });
+    expect(wrapper.html()).toContain("终端不可接收");
     expect(mocks.routeQuery.workflow_action).toBe("submit");
   });
 
@@ -439,11 +422,6 @@ describe("CodexWorkspace", () => {
     } } });
     await flushPromises();
 
-    expect(mocks.claimWorkflowHandoff).toHaveBeenCalledWith("workflow-run-1", expect.objectContaining({
-      handoff_kind: "next"
-    }));
-    expect(mocks.submitPrompt).toHaveBeenCalledWith(
-      expect.stringContaining("handoff_attempt_id=attempt-1")
-    );
+    expect(mocks.triggerWorkflowHandoff).toHaveBeenCalledWith(expect.anything(), expect.anything(), "manual");
   });
 });

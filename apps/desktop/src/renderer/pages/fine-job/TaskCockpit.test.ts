@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   listModels: vi.fn(),
   listItems: vi.fn(),
   getItemContext: vi.fn(),
+  triggerWorkflowHandoff: vi.fn(),
   codexState: { status: "idle", sessionRef: null as string | null }
 }));
 
@@ -47,6 +48,10 @@ vi.mock("@/stores/fineJobWorkflowRun", async () => {
       get currentRun() {
         return currentRun.value;
       },
+      setRun: (run: ReturnType<typeof run> | null) => {
+        currentRun.value = run;
+        return run;
+      },
       loading: false,
       advancing: false,
       refresh,
@@ -69,6 +74,10 @@ vi.mock("@/stores/fineJobCodex", () => ({
     get status() { return mocks.codexState.status; },
     get sessionRef() { return mocks.codexState.sessionRef; }
   })
+}));
+
+vi.mock("@/services/workflowCodexHandoff", () => ({
+  triggerWorkflowCodexHandoff: mocks.triggerWorkflowHandoff
 }));
 
 vi.mock("vue-router", () => ({
@@ -146,7 +155,7 @@ const run = (status: string) => ({
     review_count: 0,
     reject_count: 0
   },
-  completion_contract: { target_count: 2 },
+  completion_contract: { target_count: 2, execution_policy: { codex_handoff: "manual" as const } },
   analysis_handoff: {
     analysis_batch_id: "analysis-batch-1",
     pending_item_count: 2,
@@ -207,11 +216,14 @@ describe("TaskCockpit", () => {
     mocks.listModels.mockReset().mockResolvedValue({ models: [] });
     mocks.listItems.mockReset().mockResolvedValue({ items: [] });
     mocks.getItemContext.mockReset().mockResolvedValue({});
+    mocks.triggerWorkflowHandoff.mockReset().mockImplementation(async (value) => ({
+      status: "submitted", run: value, message: "已交接"
+    }));
     mocks.codexState.status = "idle";
     mocks.codexState.sessionRef = null;
   });
 
-  it("waiting_codex 显示交给 Codex 分析，并明确提交待分析批次", async () => {
+  it("manual 模式显示交给 Codex 分析，并调用共享 orchestration", async () => {
     const wrapper = mountCockpit();
     await flushPromises();
     await wrapper.find('[placeholder="输入 Workflow Run ID 查看本轮上下文"]').setValue("workflow-run-1");
@@ -222,14 +234,7 @@ describe("TaskCockpit", () => {
     expect(handoff).toBeDefined();
     expect(wrapper.findAll("button").some((item) => item.text() === "查看 Codex 分析")).toBe(false);
     await handoff!.trigger("click");
-    expect(mocks.push).toHaveBeenCalledWith({
-      name: "fine-job-codex",
-      query: {
-        task: "deep-job-search",
-        workflow_run_id: "workflow-run-1",
-        workflow_action: "submit"
-      }
-    });
+    expect(mocks.triggerWorkflowHandoff).toHaveBeenCalledWith(expect.objectContaining({ workflow_run_id: "workflow-run-1" }), expect.anything(), "manual");
   });
 
   it("非 waiting_codex 状态不显示分析入口", async () => {
@@ -253,6 +258,7 @@ describe("TaskCockpit", () => {
     expect(wrapper.text()).toContain("Analysis Batch");
     expect(wrapper.text()).toContain("达标后的候选池处理");
     expect(wrapper.text()).toContain("批次衔接");
+    expect(wrapper.text()).toContain("Codex 交接");
   });
 
   it("批次等待用户时显示继续入口", async () => {
@@ -370,14 +376,7 @@ describe("TaskCockpit", () => {
     const next = wrapper.findAll("button").find((item) => item.text() === "继续分析下一批");
     expect(next).toBeDefined();
     await next!.trigger("click");
-    expect(mocks.push).toHaveBeenCalledWith({
-      name: "fine-job-codex",
-      query: {
-        task: "deep-job-search",
-        workflow_run_id: "workflow-run-1",
-        workflow_action: "continue"
-      }
-    });
+    expect(mocks.triggerWorkflowHandoff).toHaveBeenCalledWith(expect.anything(), expect.anything(), "manual");
   });
 
   it("Codex 正在处理批次时只显示查看入口，不显示继续分析", async () => {
@@ -400,6 +399,22 @@ describe("TaskCockpit", () => {
     await flushPromises();
 
     expect(wrapper.findAll("button").some((item) => item.text() === "Codex 分析中")).toBe(true);
+    expect(wrapper.findAll("button").some((item) => item.text() === "继续分析下一批")).toBe(false);
+  });
+
+  it("auto 模式只展示准备状态，不显示人工交接按钮", async () => {
+    mocks.getRun.mockResolvedValue({
+      ...run("waiting_codex"),
+      completion_contract: { target_count: 2, execution_policy: { codex_handoff: "auto" } }
+    });
+    const wrapper = mountCockpit();
+    await flushPromises();
+    await wrapper.find('[placeholder="输入 Workflow Run ID 查看本轮上下文"]').setValue("workflow-run-1");
+    await wrapper.findAll("button").find((item) => item.text() === "查看本轮上下文")!.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("准备 Codex");
+    expect(wrapper.findAll("button").some((item) => item.text() === "交给 Codex 分析")).toBe(false);
     expect(wrapper.findAll("button").some((item) => item.text() === "继续分析下一批")).toBe(false);
   });
 });

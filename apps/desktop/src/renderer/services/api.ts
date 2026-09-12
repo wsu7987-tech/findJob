@@ -1457,6 +1457,7 @@ export const api = {
     stop_after_current_batch?: boolean;
     analysis_batch_size?: number;
     execution_policy_after_analysis_batch?: "auto_continue" | "wait_for_user";
+    execution_policy_codex_handoff?: "auto" | "manual";
     candidate_target_count?: number;
     allowed_search_keywords: string[];
     allowed_cities: string[];

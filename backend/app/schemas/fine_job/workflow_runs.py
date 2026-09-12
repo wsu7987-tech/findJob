@@ -20,6 +20,7 @@ class DeepJobSearchConfig(BaseModel):
     stop_after_current_batch: bool = False
     analysis_batch_size: int = Field(default=5, ge=1, le=20)
     execution_policy_after_analysis_batch: Literal["auto_continue", "wait_for_user"] = "auto_continue"
+    execution_policy_codex_handoff: Literal["auto", "manual"] = "auto"
     candidate_target_count: int | None = Field(default=None, ge=1, le=500)
     allowed_search_keywords: list[str] = Field(min_length=1, max_length=50)
     allowed_cities: list[str] = Field(min_length=1, max_length=20)

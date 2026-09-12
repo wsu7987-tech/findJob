@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
 import { api } from "@/services/api";
+import { triggerWorkflowCodexHandoff } from "@/services/workflowCodexHandoff";
 import { useFineJobCodexStore } from "@/stores/fineJobCodex";
 import { useFineJobWorkflowRunStore } from "@/stores/fineJobWorkflowRun";
 import type {
@@ -39,6 +40,7 @@ const analyzeAllCandidates = ref(false);
 const stopAfterCurrentBatch = ref(false);
 const analysisBatchSize = ref(5);
 const afterAnalysisBatch = ref<"auto_continue" | "wait_for_user">("auto_continue");
+const codexHandoff = ref<"auto" | "manual">("auto");
 const candidateTargetCount = ref(15);
 const contextSoftBudgetCharacters = ref(12000);
 const router = useRouter();
@@ -60,6 +62,10 @@ const workflowCodexEntry = computed(() => {
   const run = workflowRun.value;
   const handoff = run?.analysis_handoff;
   if (!run || run.status !== "waiting_codex" || !handoff) return null;
+  const handoffMode = run.completion_contract?.execution_policy?.codex_handoff ?? "auto";
+  if (handoffMode === "auto") {
+    return hasCurrentWorkflowCodexSession.value ? { action: "view" as const, label: "查看 Codex" } : null;
+  }
   if (handoff.attempt_status === "prompt_written") {
     return { action: "view" as const, label: "等待 Codex 开始" };
   }
@@ -76,6 +82,16 @@ const workflowCodexEntry = computed(() => {
     return { action: "submit" as const, label: "交给 Codex 分析" };
   }
   return null;
+});
+const workflowHandoffStatus = computed(() => {
+  const run = workflowRun.value;
+  const handoff = run?.analysis_handoff;
+  if (!run || run.status !== "waiting_codex" || !handoff) return "";
+  if ((run.completion_contract?.execution_policy?.codex_handoff ?? "auto") !== "auto") return "";
+  if (handoff.attempt_status === "prompt_written") return "等待 Codex 开始";
+  if (handoff.attempt_status === "started") return "Codex 分析中";
+  if (handoff.needs_initial_codex_handoff || handoff.needs_next_batch_handoff) return "准备 Codex";
+  return "";
 });
 
 const selectedStrategy = computed(
@@ -171,6 +187,7 @@ const createRun = async () => {
       stop_after_current_batch: stopAfterCurrentBatch.value,
       analysis_batch_size: analysisBatchSize.value,
       execution_policy_after_analysis_batch: afterAnalysisBatch.value,
+      execution_policy_codex_handoff: codexHandoff.value,
       candidate_target_count: candidateTargetCount.value,
       allowed_search_keywords: selectedKeywords.value,
       allowed_cities: selectedCities.value,
@@ -234,8 +251,12 @@ const cancelRun = async () => {
 const openWorkflowCodex = async (action: "submit" | "continue" | "view") => {
   const currentRun = workflowRun.value;
   if (!currentRun) return;
-  if (action === "submit" && currentRun.status !== "waiting_codex") return;
-  if ((action === "continue" || action === "view") && !hasCurrentWorkflowCodexSession.value) return;
+  if (action !== "view") {
+    const result = await triggerWorkflowCodexHandoff(currentRun, codexStore, "manual");
+    workflowStore.setRun(result.run);
+    return;
+  }
+  if (!hasCurrentWorkflowCodexSession.value) return;
   await router.push({
     name: "fine-job-codex",
     query: {
@@ -281,6 +302,7 @@ watch(workflowRun, (run) => {
   if (run) {
     workflowRunId.value = run.workflow_run_id;
     analysisGuidance.value = run.completion_contract?.analysis_guidance?.text || analysisGuidance.value;
+    codexHandoff.value = run.completion_contract?.execution_policy?.codex_handoff ?? "auto";
   }
 });
 </script>
@@ -354,6 +376,13 @@ watch(workflowRun, (run) => {
             <el-option label="每批等待用户继续" value="wait_for_user" />
           </el-select>
         </el-form-item>
+        <el-form-item label="Codex 交接">
+          <el-select v-model="codexHandoff">
+            <el-option label="自动交接（auto）" value="auto" />
+            <el-option label="等待手动交接（manual）" value="manual" />
+          </el-select>
+          <p class="secondary-text">自动模式由桌面应用持续发现 ready Analysis Batch 并交接给 Codex；手动模式保留驾驶舱按钮。</p>
+        </el-form-item>
         <el-form-item label="候选池目标">
           <el-input-number v-model="candidateTargetCount" :min="recommendTarget" :max="500" />
           <p class="secondary-text">候选池达到阶段目标后，系统按确定性发现顺序以小批次获取 JD；recommend 不足时继续补下一批。</p>
@@ -387,6 +416,7 @@ watch(workflowRun, (run) => {
       <el-button v-if="workflowRun?.status === 'paused' || (workflowRun?.status === 'waiting_for_user' && ['capture_interrupted', 'browser_not_running', 'analysis_batch_completed_waiting_user', 'analysis_batch_waiting_user'].includes(workflowRun.stop_reason))" :loading="workflowStore.advancing" @click="resumeRun">继续</el-button>
       <el-button v-if="workflowRun && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)" type="danger" plain @click="cancelRun">停止任务</el-button>
       <el-button v-if="workflowCodexEntry" type="primary" @click="openWorkflowCodex(workflowCodexEntry.action)">{{ workflowCodexEntry.label }}</el-button>
+      <el-tag v-if="workflowHandoffStatus" type="info">{{ workflowHandoffStatus }}</el-tag>
     </div>
     <el-alert v-if="error" :title="error" type="error" :closable="false" />
     <el-alert
@@ -428,6 +458,7 @@ watch(workflowRun, (run) => {
       <el-descriptions-item label="推理强度">{{ workflowRun.completion_contract?.codex_execution_config?.reasoning_effort || '—' }}</el-descriptions-item>
       <el-descriptions-item label="Analysis Batch">{{ workflowRun.completion_contract?.analysis_policy?.analysis_batch_size ?? '—' }}</el-descriptions-item>
       <el-descriptions-item label="批次衔接">{{ workflowRun.completion_contract?.execution_policy?.after_analysis_batch ?? 'auto_continue' }}</el-descriptions-item>
+      <el-descriptions-item label="Codex 交接">{{ workflowRun.completion_contract?.execution_policy?.codex_handoff ?? 'auto' }}</el-descriptions-item>
     </el-descriptions>
     <section v-if="workflowRun" class="surface-card analysis-guidance-card">
       <div class="card-actions">

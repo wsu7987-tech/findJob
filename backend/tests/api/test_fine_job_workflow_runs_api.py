@@ -90,7 +90,10 @@ def test_create_workflow_run_exposes_real_search_context_snapshot(configured_cli
         "stop_after_current_batch": False,
         "analysis_batch_size": 5,
     }
-    assert run["completion_contract"]["execution_policy"] == {"after_analysis_batch": "auto_continue"}
+    assert run["completion_contract"]["execution_policy"] == {
+        "after_analysis_batch": "auto_continue",
+        "codex_handoff": "auto",
+    }
     assert run["completion_progress"] == {
         "recommend": {"current": 0, "target": 2, "remaining": 2, "reached": False},
         "review": {"current": 0, "target": None, "remaining": None, "reached": None},
@@ -118,6 +121,15 @@ def test_create_workflow_run_exposes_real_search_context_snapshot(configured_cli
         item["section_id"] == "complete_resume" and not item["included"]
         for item in snapshot["sections"]
     )
+
+
+def test_workflow_run_can_require_manual_codex_handoff(configured_client) -> None:
+    run = _create_run(configured_client, execution_policy_codex_handoff="manual")
+
+    assert run["completion_contract"]["execution_policy"] == {
+        "after_analysis_batch": "auto_continue",
+        "codex_handoff": "manual",
+    }
 
 
 def test_workflow_rejects_recommendation_strategy_from_another_filter(configured_client) -> None:

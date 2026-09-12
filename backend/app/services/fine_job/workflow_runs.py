@@ -104,6 +104,7 @@ def create_deep_job_search_run(
         },
         "execution_policy": {
             "after_analysis_batch": str(payload.get("execution_policy_after_analysis_batch") or "auto_continue"),
+            "codex_handoff": str(payload.get("execution_policy_codex_handoff") or "auto"),
         },
         "created_from": created_from,
         "version": 1,
