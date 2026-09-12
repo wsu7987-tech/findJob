@@ -6,7 +6,7 @@ import CodexTerminal from "@/components/CodexTerminal.vue";
 import { api } from "@/services/api";
 import { getCodexBridge } from "@/services/desktop-bridge";
 import {
-  resubmitWorkflowCodexEnter,
+  resubmitWorkflowCodexSubmit,
   retryWorkflowCodexHandoff,
   triggerWorkflowCodexHandoff
 } from "@/services/workflowCodexHandoff";
@@ -40,6 +40,19 @@ const filterTaskStrategyId = ref<string | null>(null);
 const recommendationTaskStrategyId = ref<string | null>(null);
 const filterTaskCount = ref(20);
 const recommendationTaskCount = ref(10);
+const transportDebugPromptWritten = ref(false);
+const transportDebugPromptWrittenAt = ref("");
+const transportDebugSubmitAt = ref("");
+const transportDebugResult = ref("尚未发送专用提交键。");
+const transportDebugMessage = ref("");
+const transportDebugBinding = ref("读取中");
+const transportDebugKeySequence = ref("读取中");
+const transportDebugCandidateId = ref("enter");
+const transportDebugCandidates = ref<Array<{ id: string; binding: string; keySequence: string }>>([]);
+
+const TRANSPORT_DEBUG_PROMPT = "请只回复：FINEJOB_SUBMIT_OK";
+// 保留 Transport Debug 代码供后续排查，仅在需要时通过此开关显示测试界面。
+const SHOW_TRANSPORT_DEBUG = false;
 
 const labels: Record<string, string> = {
   send_greeting: "发送打招呼",
@@ -65,6 +78,101 @@ const start = async (resume = false) => {
   await store.start(terminalSize.value.cols, terminalSize.value.rows, resume);
   await nextTick();
   terminal.value?.focus();
+};
+
+const applyTransportDebugInfo = (info: {
+  binding: string;
+  keySequence: string;
+  sessionMode: "workflow" | "transport_debug" | null;
+  candidates: Array<{ id: string; binding: string; keySequence: string }>;
+}) => {
+  transportDebugBinding.value = info.binding;
+  transportDebugKeySequence.value = info.keySequence;
+  transportDebugCandidates.value = info.candidates;
+  if (info.sessionMode === "transport_debug") {
+    const currentCandidate = info.candidates.find((item) => item.binding === info.binding);
+    if (currentCandidate) transportDebugCandidateId.value = currentCandidate.id;
+  }
+};
+
+const loadTransportDebugInfo = async () => {
+  const info = await getCodexBridge()?.getCodexTransportDebugInfo?.();
+  if (!info) return;
+  applyTransportDebugInfo(info);
+};
+
+const ensureTransportDebugSession = async () => {
+  const bridge = getCodexBridge();
+  if (!bridge?.writeTransportDebugPrompt || !bridge.submitTransportDebugKey) {
+    throw new Error("当前桌面端不支持 Codex Transport Debug。");
+  }
+  const info = await bridge.getCodexTransportDebugInfo?.();
+  if (info) applyTransportDebugInfo(info);
+  if (store.status !== "running") {
+    await store.startTransportDebug(
+      terminalSize.value.cols,
+      terminalSize.value.rows,
+      transportDebugCandidateId.value
+    );
+    await loadTransportDebugInfo();
+    await nextTick();
+    terminal.value?.focus();
+  } else if (info?.sessionMode !== "transport_debug") {
+    throw new Error("请先结束当前 Codex 会话，再启动独立的 Transport Debug 会话。");
+  }
+  return bridge;
+};
+
+const submitTransportDebugPromptDirect = async () => {
+  try {
+    const bridge = await ensureTransportDebugSession();
+    if (!bridge.submitTransportDebugPrompt) {
+      throw new Error("当前桌面端不支持一次性提交测试 Prompt。");
+    }
+    transportDebugSubmitAt.value = new Date().toLocaleTimeString();
+    const submitted = await bridge.submitTransportDebugPrompt(TRANSPORT_DEBUG_PROMPT);
+    transportDebugPromptWritten.value = false;
+    transportDebugPromptWrittenAt.value = "";
+    transportDebugResult.value = submitted
+      ? "测试 Prompt 已写入并执行，请观察终端中的 Codex 输出。"
+      : "测试 Prompt 未能直接执行。";
+    transportDebugMessage.value = submitted
+      ? "已完成一次写入与提交。"
+      : "当前 Codex composer 未能接收测试 Prompt。";
+  } catch (error) {
+    transportDebugResult.value = "直接执行失败。";
+    transportDebugMessage.value = `测试 Prompt 直接执行失败：${error instanceof Error ? error.message : String(error)}`;
+  }
+};
+
+const writeTransportDebugPrompt = async () => {
+  try {
+    const bridge = await ensureTransportDebugSession();
+    const written = await bridge.writeTransportDebugPrompt?.(TRANSPORT_DEBUG_PROMPT);
+    transportDebugPromptWritten.value = Boolean(written);
+    transportDebugPromptWrittenAt.value = written ? new Date().toLocaleTimeString() : "";
+    transportDebugResult.value = "尚未发送专用提交键。";
+    transportDebugMessage.value = written
+      ? "测试 Prompt 已写入 composer；请确认终端输入框中的文本后点击“测试自动提交”。"
+      : "测试 Prompt 未能写入当前 Codex composer。";
+  } catch (error) {
+    transportDebugPromptWritten.value = false;
+    transportDebugMessage.value = `写入测试 Prompt 失败：${error instanceof Error ? error.message : String(error)}`;
+  }
+};
+
+const submitTransportDebugKey = async () => {
+  const bridge = getCodexBridge();
+  if (!transportDebugPromptWritten.value || !bridge?.submitTransportDebugKey) return;
+  transportDebugSubmitAt.value = new Date().toLocaleTimeString();
+  try {
+    const submitted = await bridge.submitTransportDebugKey();
+    transportDebugResult.value = submitted
+      ? "PTY 已写入专用提交键；等待在终端中观察 Codex 是否执行。"
+      : "PTY 未能写入专用提交键。";
+  } catch (error) {
+    transportDebugResult.value = `发送专用提交键失败：${error instanceof Error ? error.message : String(error)}`;
+  }
 };
 
 const profileAnalysisTask = () => {
@@ -179,7 +287,7 @@ const resubmitWorkflowAnalysis = async () => {
     const run = await workflowStore.refresh(task.workflowRunId);
     updateWorkflowHandoffControls(run);
     if (!run) return;
-    const result = await resubmitWorkflowCodexEnter(run, store);
+    const result = await resubmitWorkflowCodexSubmit(run, store);
     workflowStore.setRun(result.run);
     updateWorkflowHandoffControls(result.run);
     workflowAnalysisMessage.value = result.message;
@@ -291,6 +399,7 @@ onMounted(async () => {
   recommendationTaskStrategyId.value = enabledRecommendationStrategies.value[0]?.id ?? null;
   await submitProfileAnalysisTask();
   await submitDeepJobSearchTask();
+  if (SHOW_TRANSPORT_DEBUG) await loadTransportDebugInfo();
 });
 </script>
 
@@ -353,6 +462,52 @@ onMounted(async () => {
       :type="store.status === 'failed' ? 'error' : 'info'"
       show-icon
     />
+
+    <section v-show="SHOW_TRANSPORT_DEBUG" class="surface-card transport-debug-card">
+      <div class="page-heading">
+        <div>
+          <p class="app-shell__eyebrow">开发 / 调试</p>
+          <h3>Codex Transport Debug</h3>
+          <p class="secondary-text">只验证 composer 的 Prompt 写入与专用提交键，不创建 Workflow Run 或调用 MCP。</p>
+        </div>
+        <div class="card-actions">
+          <el-button data-testid="write-transport-debug-prompt" @click="writeTransportDebugPrompt">写入测试 Prompt</el-button>
+          <el-button
+            type="success"
+            data-testid="submit-transport-debug-prompt"
+            @click="submitTransportDebugPromptDirect"
+          >输入测试 Prompt 并直接执行</el-button>
+          <el-button
+            type="primary"
+            :disabled="!transportDebugPromptWritten"
+            data-testid="submit-transport-debug-key"
+            @click="submitTransportDebugKey"
+          >测试自动提交</el-button>
+        </div>
+      </div>
+      <p class="secondary-text">测试 Prompt：{{ TRANSPORT_DEBUG_PROMPT }}</p>
+      <div class="transport-debug-selector">
+        <span>提交键候选：</span>
+        <el-select v-model="transportDebugCandidateId" :disabled="isRunning" style="width: 220px">
+          <el-option
+            v-for="candidate in transportDebugCandidates"
+            :key="candidate.id"
+            :label="`${candidate.binding}（${candidate.keySequence}）`"
+            :value="candidate.id"
+          />
+        </el-select>
+        <span class="secondary-text">启动调试会话后固定；需切换时先结束当前会话。</span>
+      </div>
+      <div class="transport-debug-meta">
+        <span>runtime id：{{ store.runtimeId || "未启动" }}</span>
+        <span>Prompt：{{ transportDebugPromptWritten ? `已写入（${transportDebugPromptWrittenAt}）` : "未写入" }}</span>
+        <span>submit binding：{{ transportDebugBinding }}</span>
+        <span>PTY key sequence：{{ transportDebugKeySequence }}</span>
+        <span>提交时间：{{ transportDebugSubmitAt || "未发送" }}</span>
+        <span>transport：{{ transportDebugResult }}</span>
+      </div>
+      <el-alert v-if="transportDebugMessage" :title="transportDebugMessage" type="info" :closable="false" show-icon />
+    </section>
 
     <section class="surface-card quick-task-card">
       <div class="page-heading">
@@ -535,6 +690,27 @@ onMounted(async () => {
   gap: 14px;
 }
 
+.transport-debug-card,
+.transport-debug-meta {
+  display: grid;
+  gap: 10px;
+}
+
+.transport-debug-selector {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.transport-debug-meta {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
 .quick-task-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
@@ -593,7 +769,8 @@ onMounted(async () => {
 
 @media (max-width: 1100px) {
   .codex-columns,
-  .quick-task-grid { grid-template-columns: 1fr; }
+  .quick-task-grid,
+  .transport-debug-meta { grid-template-columns: 1fr; }
 
 }
 

@@ -100,6 +100,19 @@ export const useFineJobCodexStore = defineStore("fine-job-codex", () => {
     return state;
   };
 
+  const startTransportDebug = async (cols: number, rows: number, candidateId: string) => {
+    const bridge = getCodexBridge();
+    if (!bridge?.startTransportDebugCodex) {
+      throw new Error("当前桌面端不支持 Codex Transport Debug 会话。");
+    }
+    const state = await bridge.startTransportDebugCodex({ cols, rows, candidateId });
+    if (!state) throw new Error("Codex Transport Debug 会话未能启动。");
+    status.value = state.status as FineJobCodexSessionStatus;
+    runtimeId.value = state.runtimeId;
+    sessionRef.value = state.sessionRef;
+    return state;
+  };
+
   const savePermissions = async (next: FineJobCodexPermissions) => {
     permissions.value = await api.updateFineJobCodexPermissions({
       enabled: next.enabled,
@@ -133,6 +146,7 @@ export const useFineJobCodexStore = defineStore("fine-job-codex", () => {
     load,
     start,
     startWorkflow,
+    startTransportDebug,
     savePermissions,
     decide
   };

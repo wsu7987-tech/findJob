@@ -80,7 +80,7 @@ vi.mock("@/stores/fineJobCodex", () => ({
 
 vi.mock("@/services/workflowCodexHandoff", () => ({
   triggerWorkflowCodexHandoff: mocks.triggerWorkflowHandoff,
-  resubmitWorkflowCodexEnter: mocks.resubmitWorkflowEnter,
+  resubmitWorkflowCodexSubmit: mocks.resubmitWorkflowEnter,
   retryWorkflowCodexHandoff: mocks.retryWorkflowHandoff
 }));
 

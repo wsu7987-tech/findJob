@@ -11,6 +11,34 @@ const RECENT_OUTPUT_LIMIT = 4_096;
 const EXIT_SUMMARY_LIMIT = 500;
 const INITIAL_TUI_OUTPUT_TIMEOUT_MS = 2_000;
 const PROMPT_SUBMIT_FALLBACK_MS = 750;
+const PROMPT_SUBMIT_SETTLE_MS = 300;
+export const FINEJOB_WORKFLOW_COMPOSER_SUBMIT_BINDING = "enter";
+export const FINEJOB_WORKFLOW_COMPOSER_SUBMIT_SEQUENCE = "\r";
+export const FINEJOB_WORKFLOW_COMPOSER_SUBMIT_SEQUENCE_DISPLAY = "\\r";
+
+export interface CodexTransportDebugSubmitCandidate {
+  id: string;
+  binding: string;
+  keySequence: string;
+  keySequenceDisplay: string;
+}
+
+// 默认调试键与物理 Enter 保持一致；候选通过启动参数写入当前会话。
+export const FINEJOB_TRANSPORT_DEBUG_SUBMIT_CANDIDATES: readonly CodexTransportDebugSubmitCandidate[] = [
+  { id: "enter", binding: "enter", keySequence: "\r", keySequenceDisplay: "\\r" },
+  { id: "ctrl-y", binding: "ctrl-y", keySequence: "\x19", keySequenceDisplay: "\\x19" },
+  { id: "ctrl-q", binding: "ctrl-q", keySequence: "\x11", keySequenceDisplay: "\\x11" },
+  { id: "ctrl-o", binding: "ctrl-o", keySequence: "\x0f", keySequenceDisplay: "\\x0f" },
+  { id: "ctrl-t", binding: "ctrl-t", keySequence: "\x14", keySequenceDisplay: "\\x14" }
+];
+
+const FINEJOB_WORKFLOW_COMPOSER_SUBMIT = {
+  binding: FINEJOB_WORKFLOW_COMPOSER_SUBMIT_BINDING,
+  keySequence: FINEJOB_WORKFLOW_COMPOSER_SUBMIT_SEQUENCE,
+  keySequenceDisplay: FINEJOB_WORKFLOW_COMPOSER_SUBMIT_SEQUENCE_DISPLAY
+};
+
+type DedicatedComposerMode = "workflow" | "transport_debug" | null;
 
 const stripTerminalControlSequences = (value: string) =>
   value
@@ -56,11 +84,22 @@ export interface CodexWorkflowLaunchOptions {
 
 export type WorkflowSessionMode = "live_reused" | "resumed_explicit" | "new_from_workflow_state";
 
+type KeymapConfigValue = string | string[];
+
+const serializeKeymapConfigValue = (value: KeymapConfigValue) =>
+  Array.isArray(value)
+    ? `[${value.map((item) => JSON.stringify(item)).join(", ")}]`
+    : JSON.stringify(value);
+
 export const buildCodexInteractiveArgs = (options: {
   tuiWorkspace: string;
   resumeSessionRef?: string;
   model?: string;
   reasoningEffort?: string;
+  workflowComposerSubmitBinding?: string;
+  managedComposerSubmitBinding?: string;
+  keymapOverrides?: Record<string, KeymapConfigValue>;
+  unbindKeymapActions?: string[];
 }) => {
   const args = [
     ...(options.resumeSessionRef ? ["resume", options.resumeSessionRef] : []),
@@ -68,6 +107,20 @@ export const buildCodexInteractiveArgs = (options: {
   ];
   if (options.model) args.push("--model", options.model);
   if (options.reasoningEffort) args.push("--config", `model_reasoning_effort=\"${options.reasoningEffort}\"`);
+  if (options.workflowComposerSubmitBinding) {
+    args.push("--config", `tui.keymap.composer.submit=\"${options.workflowComposerSubmitBinding}\"`);
+  }
+  if (options.managedComposerSubmitBinding) {
+    args.push("--config", `tui.keymap.composer.submit=\"${options.managedComposerSubmitBinding}\"`);
+  }
+  for (const [action, binding] of Object.entries(options.keymapOverrides ?? {})) {
+    // 普通会话固定提交与换行职责，避免用户配置改变自动任务的输入含义。
+    args.push("--config", `tui.keymap.${action}=${serializeKeymapConfigValue(binding)}`);
+  }
+  for (const action of options.unbindKeymapActions ?? []) {
+    // 调试会话使用应用托管按键，先解除 Codex 默认动作占用，避免启动时 keymap 冲突。
+    args.push("--config", `tui.keymap.${action}=[]`);
+  }
   return args;
 };
 
@@ -153,11 +206,18 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
   let runtimeId: string | null = null;
   let runtimeToken: string | null = null;
   let sessionRef: string | null = null;
+  let dedicatedComposerSubmit: {
+    binding: string;
+    keySequence: string;
+    keySequenceDisplay: string;
+  } | null = null;
+  let dedicatedComposerMode: DedicatedComposerMode = null;
   let recentOutput = "";
   let firstOutputPromise: Promise<void> | null = null;
   let resolveFirstOutput: (() => void) | null = null;
   let outputSequence = 0;
   const outputWaiters = new Set<() => void>();
+  let transportDebugPromptOutputSequence: number | null = null;
 
   const waitForOutputAfter = (sequence: number) => new Promise<void>((resolve) => {
     if (outputSequence > sequence) {
@@ -187,10 +247,25 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
     resume: boolean,
     cols = 120,
     rows = 36,
-    workflow?: Pick<CodexWorkflowLaunchOptions, "model" | "reasoningEffort" | "sessionRef">
+    workflow?: Pick<CodexWorkflowLaunchOptions, "model" | "reasoningEffort" | "sessionRef">,
+    requestedComposerMode: DedicatedComposerMode = null,
+    requestedComposerSubmit: {
+      binding: string;
+      keySequence: string;
+      keySequenceDisplay: string;
+    } | null = null
   ) => {
     if (terminal) {
+      if (requestedComposerMode === "transport_debug") {
+        if (dedicatedComposerMode !== "transport_debug") {
+          throw new Error("当前 Codex 会话不是 Transport Debug 会话，请先结束后再启动测试会话。");
+        }
+        return { status, runtimeId, sessionRef };
+      }
       if (!workflow || workflow.sessionRef === sessionRef) {
+        if (workflow && dedicatedComposerMode !== "workflow") {
+          throw new Error("当前 Codex 会话不是 Workflow 会话，结束后再切换。");
+        }
         return {
           status,
           runtimeId,
@@ -224,6 +299,14 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
         ),
         model: workflow?.model,
         reasoningEffort: workflow?.reasoningEffort,
+        workflowComposerSubmitBinding: requestedComposerSubmit?.binding,
+        managedComposerSubmitBinding: requestedComposerMode === null ? "enter" : undefined,
+        keymapOverrides: requestedComposerMode === "transport_debug"
+          ? undefined
+          : { "editor.insert_newline": ["shift-enter"] },
+        unbindKeymapActions: requestedComposerMode === "transport_debug"
+          ? ["editor.insert_newline", "editor.yank"]
+          : undefined
       });
       const resolvedLaunch = resolveCodexLaunch(codexPath, []);
       const launch =
@@ -264,6 +347,9 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
         firstOutputPromise = null;
         resolveOutputWaiters();
         terminal = null;
+        dedicatedComposerSubmit = null;
+        dedicatedComposerMode = null;
+        transportDebugPromptOutputSequence = null;
         const completedRunId = runtimeId;
         const completedToken = runtimeToken;
         if (completedRunId && completedToken) {
@@ -280,6 +366,9 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
           buildCodexExitMessage(exitCode, recentOutput)
         );
       });
+      dedicatedComposerSubmit = requestedComposerSubmit;
+      dedicatedComposerMode = requestedComposerMode;
+      transportDebugPromptOutputSequence = null;
       setStatus("running");
       return {
         status,
@@ -292,6 +381,9 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
     } catch (error) {
       terminal = null;
       sessionRef = null;
+      dedicatedComposerSubmit = null;
+      dedicatedComposerMode = null;
+      transportDebugPromptOutputSequence = null;
       resolveFirstOutput?.();
       resolveFirstOutput = null;
       firstOutputPromise = null;
@@ -314,31 +406,54 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
     start: (cols?: number, rows?: number) => start(false, cols, rows),
     resume: (cols?: number, rows?: number) => start(true, cols, rows),
     startWorkflow: (launch: CodexWorkflowLaunchOptions) =>
-      start(false, launch.cols, launch.rows, launch),
+      start(false, launch.cols, launch.rows, launch, "workflow", FINEJOB_WORKFLOW_COMPOSER_SUBMIT),
+    startTransportDebug: (cols?: number, rows?: number, candidateId?: string) => {
+      const candidate = FINEJOB_TRANSPORT_DEBUG_SUBMIT_CANDIDATES.find((item) => item.id === candidateId)
+        ?? FINEJOB_TRANSPORT_DEBUG_SUBMIT_CANDIDATES[0];
+      return start(false, cols, rows, undefined, "transport_debug", candidate);
+    },
     write(data: string) {
       if (terminal && data.length <= 16_384) {
         terminal.write(data);
       }
     },
     async submitPrompt(prompt: string) {
-      const currentTerminal = terminal;
+      return submitPromptWithKey(prompt, "\r");
+    },
+    async submitWorkflowPrompt(prompt: string) {
+      if (!dedicatedComposerSubmit || dedicatedComposerMode !== "workflow") return false;
+      return submitPromptWithKey(prompt, dedicatedComposerSubmit.keySequence);
+    },
+    async submitWorkflowKey() {
+      if (!terminal || status !== "running" || dedicatedComposerMode !== "workflow" || !dedicatedComposerSubmit) return false;
+      terminal.write(dedicatedComposerSubmit.keySequence);
+      return true;
+    },
+    async writeTransportDebugPrompt(prompt: string) {
       const text = prompt.trim();
-      if (!currentTerminal || !text || text.length > 16_380) return false;
-      const pendingFirstOutput = firstOutputPromise;
-      if (pendingFirstOutput) {
-        // 没有首屏时最多等待两秒，避免任务入口被终端初始化卡住。
-        await Promise.race([
-          pendingFirstOutput,
-          new Promise<void>((resolve) => setTimeout(resolve, INITIAL_TUI_OUTPUT_TIMEOUT_MS))
-        ]);
+      if (!terminal || status !== "running" || dedicatedComposerMode !== "transport_debug" || !text || text.length > 16_380) {
+        return false;
+      }
+      // 记录写入前的输出序号，提交动作会等待后续回显，避免输入和提交键同时进入 PTY。
+      transportDebugPromptOutputSequence = outputSequence;
+      terminal.write(text);
+      return true;
+    },
+    async submitTransportDebugPrompt(prompt: string) {
+      if (!dedicatedComposerSubmit || dedicatedComposerMode !== "transport_debug") return false;
+      // 一次完成 Prompt 写入、回显等待和提交，确保按钮行为与人工输入后按提交键一致。
+      return submitPromptWithKey(prompt, dedicatedComposerSubmit.keySequence);
+    },
+    async submitTransportDebugKey() {
+      if (!terminal || status !== "running" || dedicatedComposerMode !== "transport_debug" || !dedicatedComposerSubmit) return false;
+      const currentTerminal = terminal;
+      const promptOutputSequence = transportDebugPromptOutputSequence;
+      if (promptOutputSequence !== null) {
+        await waitForOutputAfter(promptOutputSequence);
       }
       if (terminal !== currentTerminal) return false;
-      // Prompt 与 Enter 分开发送，等待写入后的新输出或保守回退后再提交。
-      const outputBeforePrompt = outputSequence;
-      currentTerminal.write(text);
-      await waitForOutputAfter(outputBeforePrompt);
-      if (terminal !== currentTerminal) return false;
-      currentTerminal.write("\r");
+      currentTerminal.write(dedicatedComposerSubmit.keySequence);
+      transportDebugPromptOutputSequence = null;
       return true;
     },
     async submitEnter() {
@@ -356,8 +471,44 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
       terminal?.kill();
       terminal = null;
       sessionRef = null;
+      dedicatedComposerSubmit = null;
+      dedicatedComposerMode = null;
       setStatus("idle");
     },
-    state: () => ({ status, runtimeId, sessionRef })
+    state: () => ({ status, runtimeId, sessionRef }),
+    transportDebugInfo: () => ({
+      binding: dedicatedComposerSubmit?.binding ?? FINEJOB_TRANSPORT_DEBUG_SUBMIT_CANDIDATES[0].binding,
+      keySequence: dedicatedComposerSubmit?.keySequenceDisplay ?? FINEJOB_TRANSPORT_DEBUG_SUBMIT_CANDIDATES[0].keySequenceDisplay,
+      sessionMode: dedicatedComposerMode,
+      candidates: FINEJOB_TRANSPORT_DEBUG_SUBMIT_CANDIDATES.map(({ id, binding, keySequenceDisplay }) => ({
+        id,
+        binding,
+        keySequence: keySequenceDisplay
+      }))
+    })
   };
+
+  async function submitPromptWithKey(prompt: string, submitKey: string) {
+    const currentTerminal = terminal;
+    const text = prompt.trim();
+    if (!currentTerminal || !text || text.length > 16_380) return false;
+    const pendingFirstOutput = firstOutputPromise;
+    if (pendingFirstOutput) {
+      // 没有首屏时最多等待两秒，避免任务入口被终端初始化卡住。
+      await Promise.race([
+        pendingFirstOutput,
+        new Promise<void>((resolve) => setTimeout(resolve, INITIAL_TUI_OUTPUT_TIMEOUT_MS))
+      ]);
+    }
+    if (terminal !== currentTerminal) return false;
+    // Prompt 与提交键分开发送，等待写入后的新输出或保守回退后再提交。
+    const outputBeforePrompt = outputSequence;
+    currentTerminal.write(text);
+    await waitForOutputAfter(outputBeforePrompt);
+    // 即使首屏输出恰好晚到，也给 composer 一个独立的处理窗口，避免提交键和文本进入同一批输入。
+    await new Promise<void>((resolve) => setTimeout(resolve, PROMPT_SUBMIT_SETTLE_MS));
+    if (terminal !== currentTerminal) return false;
+    currentTerminal.write(submitKey);
+    return true;
+  }
 };

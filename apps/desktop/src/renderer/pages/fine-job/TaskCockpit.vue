@@ -4,7 +4,7 @@ import { useRoute, useRouter } from "vue-router";
 
 import { api } from "@/services/api";
 import {
-  resubmitWorkflowCodexEnter,
+  resubmitWorkflowCodexSubmit,
   retryWorkflowCodexHandoff,
   triggerWorkflowCodexHandoff
 } from "@/services/workflowCodexHandoff";
@@ -62,7 +62,7 @@ const hasEndedRuntimeWorkflowSession = computed(() => Boolean(
   workflowRun.value?.codex_session_ref?.startsWith("runtime:")
     && !hasCurrentWorkflowCodexSession.value
 ));
-const canResubmitWorkflowCodexEnter = computed(() => {
+const canResubmitWorkflowCodexSubmit = computed(() => {
   const run = workflowRun.value;
   const handoff = run?.analysis_handoff;
   return Boolean(
@@ -275,6 +275,7 @@ const openWorkflowCodex = async (action: "submit" | "continue" | "view") => {
   if (action !== "view") {
     const result = await triggerWorkflowCodexHandoff(currentRun, codexStore, "manual");
     workflowStore.setRun(result.run);
+    error.value = result.status === "submitted" ? "" : result.message;
     return;
   }
   await router.push({
@@ -290,7 +291,7 @@ const openWorkflowCodex = async (action: "submit" | "continue" | "view") => {
 const resubmitWorkflowCodex = async () => {
   const currentRun = workflowRun.value;
   if (!currentRun) return;
-  const result = await resubmitWorkflowCodexEnter(currentRun, codexStore);
+  const result = await resubmitWorkflowCodexSubmit(currentRun, codexStore);
   workflowStore.setRun(result.run);
   error.value = result.status === "enter_submitted" ? "" : result.message;
 };
@@ -453,7 +454,7 @@ watch(workflowRun, (run) => {
       <el-button v-if="workflowRun && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)" type="danger" plain @click="cancelRun">停止任务</el-button>
       <el-button v-if="workflowCodexEntry" type="primary" @click="openWorkflowCodex(workflowCodexEntry.action)">{{ workflowCodexEntry.label }}</el-button>
       <el-button
-        v-if="canResubmitWorkflowCodexEnter"
+        v-if="canResubmitWorkflowCodexSubmit"
         data-testid="resubmit-workflow-codex-enter"
         @click="resubmitWorkflowCodex"
       >再次提交</el-button>

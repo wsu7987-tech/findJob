@@ -14,12 +14,18 @@ describe("registerCodexIpc", () => {
       start: vi.fn(async () => ({ status: "running", runtimeId: "run-1", sessionRef: "runtime:run-1" })),
       resume: vi.fn(async () => ({ status: "running", runtimeId: "run-1", sessionRef: "runtime:run-1" })),
       startWorkflow: vi.fn(async () => ({ status: "running", runtimeId: "run-1", sessionRef: "runtime:run-1" })),
+      startTransportDebug: vi.fn(async () => ({ status: "running", runtimeId: "debug-1", sessionRef: "runtime:debug-1" })),
       write: vi.fn(),
+      submitWorkflowPrompt: vi.fn(async () => true),
+      submitWorkflowKey: vi.fn(async () => true),
+      writeTransportDebugPrompt: vi.fn(async () => true),
+      submitTransportDebugKey: vi.fn(async () => true),
       submitEnter: vi.fn(async () => true),
       resize: vi.fn(),
       interrupt: vi.fn(),
       stop: vi.fn(),
-      state: vi.fn(() => ({ status: "idle", runtimeId: null, sessionRef: null }))
+      state: vi.fn(() => ({ status: "idle", runtimeId: null, sessionRef: null })),
+      transportDebugInfo: vi.fn(() => ({ binding: "ctrl-y", keySequence: "\\x19", sessionMode: null, candidates: [] }))
     };
 
     registerCodexIpc(ipcMain as never, controller, () => null);
@@ -43,6 +49,18 @@ describe("registerCodexIpc", () => {
     });
     await expect(handlers.get("codex:submit-enter")?.({})).resolves.toBe(true);
     expect(controller.submitEnter).toHaveBeenCalledTimes(1);
+    await expect(handlers.get("codex:submit-workflow-prompt")?.({}, "workflow prompt")).resolves.toBe(true);
+    await expect(handlers.get("codex:submit-workflow-key")?.({})).resolves.toBe(true);
+    expect(controller.submitWorkflowPrompt).toHaveBeenCalledWith("workflow prompt");
+    expect(controller.submitWorkflowKey).toHaveBeenCalledTimes(1);
+    await expect(handlers.get("codex:start-transport-debug")?.({}, { cols: 100, rows: 30, candidateId: "ctrl-y" })).resolves.toEqual({
+      status: "running", runtimeId: "debug-1", sessionRef: "runtime:debug-1"
+    });
+    await expect(handlers.get("codex:write-transport-debug-prompt")?.({}, "debug prompt")).resolves.toBe(true);
+    await expect(handlers.get("codex:submit-transport-debug-key")?.({})).resolves.toBe(true);
+    expect(controller.startTransportDebug).toHaveBeenCalledWith(100, 30, "ctrl-y");
+    expect(controller.writeTransportDebugPrompt).toHaveBeenCalledWith("debug prompt");
+    expect(controller.submitTransportDebugKey).toHaveBeenCalledTimes(1);
   });
 
   it("限制超出边界的 IPC 输入", () => {
@@ -52,8 +70,9 @@ describe("registerCodexIpc", () => {
       on: vi.fn((channel: string, handler: (...args: any[]) => unknown) => listeners.set(channel, handler))
     };
     const controller = {
-      start: vi.fn(), resume: vi.fn(), startWorkflow: vi.fn(), write: vi.fn(), submitEnter: vi.fn(), resize: vi.fn(),
-      interrupt: vi.fn(), stop: vi.fn(), state: vi.fn()
+      start: vi.fn(), resume: vi.fn(), startWorkflow: vi.fn(), startTransportDebug: vi.fn(), write: vi.fn(), submitWorkflowPrompt: vi.fn(),
+      submitWorkflowKey: vi.fn(), writeTransportDebugPrompt: vi.fn(), submitTransportDebugKey: vi.fn(), submitEnter: vi.fn(), resize: vi.fn(),
+      interrupt: vi.fn(), stop: vi.fn(), state: vi.fn(), transportDebugInfo: vi.fn()
     };
     registerCodexIpc(ipcMain as never, controller, () => null);
     listeners.get("codex:input")?.({}, { unexpected: true });

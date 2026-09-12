@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { FineJobWorkflowRun } from "@/types";
 
 import {
-  resubmitWorkflowCodexEnter,
+  resubmitWorkflowCodexSubmit,
   retryWorkflowCodexHandoff,
   triggerWorkflowCodexHandoff
 } from "./workflowCodexHandoff";
@@ -59,8 +59,8 @@ const dependencies = (returnedRun: FineJobWorkflowRun) => {
     getFineJobWorkflowRun: vi.fn().mockResolvedValue(returnedRun)
   };
   const transport = {
-    submitCodexPrompt: vi.fn().mockResolvedValue(true),
-    submitCodexEnter: vi.fn().mockResolvedValue(true)
+    submitWorkflowCodexPrompt: vi.fn().mockResolvedValue(true),
+    submitWorkflowCodexKey: vi.fn().mockResolvedValue(true)
   };
   return { client, transport };
 };
@@ -87,7 +87,7 @@ describe("workflowCodexHandoff", () => {
     expect(result.status).toBe("submitted");
     expect(codex.startWorkflow).toHaveBeenCalledWith(expect.objectContaining({ model: "gpt-5.6-luna" }));
     expect(handoffDependencies.client.claimFineJobWorkflowAnalysisHandoff).toHaveBeenCalledWith("workflow-run-1", expect.objectContaining({ handoff_kind: "initial" }));
-    expect(handoffDependencies.transport.submitCodexPrompt).toHaveBeenCalledWith(expect.stringContaining("handoff_attempt_id=attempt-1"));
+    expect(handoffDependencies.transport.submitWorkflowCodexPrompt).toHaveBeenCalledWith(expect.stringContaining("handoff_attempt_id=attempt-1"));
     expect(handoffDependencies.client.markFineJobWorkflowAnalysisHandoffPromptWritten).toHaveBeenCalledTimes(1);
   });
 
@@ -118,7 +118,7 @@ describe("workflowCodexHandoff", () => {
 
     expect(automatic.status).toBe("skipped");
     expect(manual.status).toBe("submitted");
-    expect(handoffDependencies.transport.submitCodexPrompt).toHaveBeenCalledTimes(1);
+    expect(handoffDependencies.transport.submitWorkflowCodexPrompt).toHaveBeenCalledTimes(1);
   });
 
   it("已有有效 attempt、暂停或等待用户边界均不重复 transport", async () => {
@@ -135,7 +135,7 @@ describe("workflowCodexHandoff", () => {
     await triggerWorkflowCodexHandoff(waiting, codex, "auto", handoffDependencies);
 
     expect(codex.startWorkflow).not.toHaveBeenCalled();
-    expect(handoffDependencies.transport.submitCodexPrompt).not.toHaveBeenCalled();
+    expect(handoffDependencies.transport.submitWorkflowCodexPrompt).not.toHaveBeenCalled();
   });
 
   it("同一 renderer 的并发触发共享一次 handoff，后端 claim 保持最终防线", async () => {
@@ -150,7 +150,7 @@ describe("workflowCodexHandoff", () => {
 
     expect(codex.startWorkflow).toHaveBeenCalledTimes(1);
     expect(handoffDependencies.client.claimFineJobWorkflowAnalysisHandoff).toHaveBeenCalledTimes(1);
-    expect(handoffDependencies.transport.submitCodexPrompt).toHaveBeenCalledTimes(1);
+    expect(handoffDependencies.transport.submitWorkflowCodexPrompt).toHaveBeenCalledTimes(1);
   });
 
   it("prompt_written 只再次发送 Enter，不写 Prompt、claim 或创建 attempt", async () => {
@@ -165,11 +165,11 @@ describe("workflowCodexHandoff", () => {
     const handoffDependencies = dependencies(source);
     const codex = { ...codexStore(), status: "running", sessionRef: "runtime:workflow-runtime-1" };
 
-    const result = await resubmitWorkflowCodexEnter(source, codex, handoffDependencies.transport);
+    const result = await resubmitWorkflowCodexSubmit(source, codex, handoffDependencies.transport);
 
     expect(result.status).toBe("enter_submitted");
-    expect(handoffDependencies.transport.submitCodexEnter).toHaveBeenCalledTimes(1);
-    expect(handoffDependencies.transport.submitCodexPrompt).not.toHaveBeenCalled();
+    expect(handoffDependencies.transport.submitWorkflowCodexKey).toHaveBeenCalledTimes(1);
+    expect(handoffDependencies.transport.submitWorkflowCodexPrompt).not.toHaveBeenCalled();
     expect(handoffDependencies.client.claimFineJobWorkflowAnalysisHandoff).not.toHaveBeenCalled();
   });
 
@@ -214,6 +214,6 @@ describe("workflowCodexHandoff", () => {
       release_reason: "full_retry"
     });
     expect(handoffDependencies.client.claimFineJobWorkflowAnalysisHandoff).toHaveBeenCalledTimes(1);
-    expect(handoffDependencies.transport.submitCodexPrompt).toHaveBeenCalledWith(expect.stringContaining("handoff_attempt_id=attempt-2"));
+    expect(handoffDependencies.transport.submitWorkflowCodexPrompt).toHaveBeenCalledWith(expect.stringContaining("handoff_attempt_id=attempt-2"));
   });
 });

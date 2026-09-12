@@ -113,6 +113,12 @@ const desktopBridge = {
     sessionRef: string | null;
     workflowSessionMode?: "live_reused" | "resumed_explicit" | "new_from_workflow_state";
   }>,
+  startTransportDebugCodex: (options?: { cols?: number; rows?: number; candidateId?: string }) =>
+    ipcRenderer.invoke("codex:start-transport-debug", options) as Promise<{
+      status: string;
+      runtimeId: string | null;
+      sessionRef: string | null;
+    } | false>,
   getCodexState: () =>
     ipcRenderer.invoke("codex:state") as Promise<{
       status: string;
@@ -122,6 +128,22 @@ const desktopBridge = {
   writeCodex: (data: string) => ipcRenderer.send("codex:input", data),
   submitCodexPrompt: (prompt: string) =>
     ipcRenderer.invoke("codex:submit-prompt", prompt) as Promise<boolean>,
+  submitWorkflowCodexPrompt: (prompt: string) =>
+    ipcRenderer.invoke("codex:submit-workflow-prompt", prompt) as Promise<boolean>,
+  submitWorkflowCodexKey: () => ipcRenderer.invoke("codex:submit-workflow-key") as Promise<boolean>,
+  writeTransportDebugPrompt: (prompt: string) =>
+    ipcRenderer.invoke("codex:write-transport-debug-prompt", prompt) as Promise<boolean>,
+  submitTransportDebugPrompt: (prompt: string) =>
+    ipcRenderer.invoke("codex:submit-transport-debug-prompt", prompt) as Promise<boolean>,
+  submitTransportDebugKey: () =>
+    ipcRenderer.invoke("codex:submit-transport-debug-key") as Promise<boolean>,
+  getCodexTransportDebugInfo: () =>
+    ipcRenderer.invoke("codex:transport-debug-info") as Promise<{
+      binding: string;
+      keySequence: string;
+      sessionMode: "workflow" | "transport_debug" | null;
+      candidates: Array<{ id: string; binding: string; keySequence: string }>;
+    } | null>,
   submitCodexEnter: () => ipcRenderer.invoke("codex:submit-enter") as Promise<boolean>,
   resizeCodex: (cols: number, rows: number) =>
     ipcRenderer.send("codex:resize", { cols, rows }),

@@ -35,7 +35,7 @@ describe("fineJobWorkflowCodexController", () => {
           releaseFineJobWorkflowAnalysisHandoff: vi.fn().mockResolvedValue(run),
           getFineJobWorkflowRun: vi.fn().mockResolvedValue(run)
         },
-        transport: { submitCodexPrompt: vi.fn().mockResolvedValue(true) }
+        transport: { submitWorkflowCodexPrompt: vi.fn().mockResolvedValue(true) }
       }
     });
 

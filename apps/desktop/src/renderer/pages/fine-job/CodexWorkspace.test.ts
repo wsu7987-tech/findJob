@@ -13,6 +13,10 @@ const mocks = vi.hoisted(() => ({
   strategiesLoad: vi.fn(),
   submitPrompt: vi.fn(),
   submitEnter: vi.fn(),
+  startTransportDebug: vi.fn(),
+  writeTransportDebugPrompt: vi.fn(),
+  submitTransportDebugKey: vi.fn(),
+  getTransportDebugInfo: vi.fn(),
   attachWorkflowSession: vi.fn(),
   claimWorkflowHandoff: vi.fn(),
   markPromptWritten: vi.fn(),
@@ -45,6 +49,7 @@ vi.mock("@/stores/fineJobCodex", () => ({
     load: mocks.load,
     start: mocks.start,
     startWorkflow: mocks.startWorkflow,
+    startTransportDebug: mocks.startTransportDebug,
     savePermissions: vi.fn(),
     decide: vi.fn()
   })
@@ -72,12 +77,18 @@ vi.mock("@/stores/fineJobStrategies", () => ({
 }));
 
 vi.mock("@/services/desktop-bridge", () => ({
-  getCodexBridge: () => ({ submitCodexPrompt: mocks.submitPrompt, submitCodexEnter: mocks.submitEnter })
+  getCodexBridge: () => ({
+    submitCodexPrompt: mocks.submitPrompt,
+    submitCodexEnter: mocks.submitEnter,
+    writeTransportDebugPrompt: mocks.writeTransportDebugPrompt,
+    submitTransportDebugKey: mocks.submitTransportDebugKey,
+    getCodexTransportDebugInfo: mocks.getTransportDebugInfo
+  })
 }));
 
 vi.mock("@/services/workflowCodexHandoff", () => ({
   triggerWorkflowCodexHandoff: mocks.triggerWorkflowHandoff,
-  resubmitWorkflowCodexEnter: mocks.resubmitWorkflowEnter,
+  resubmitWorkflowCodexSubmit: mocks.resubmitWorkflowEnter,
   retryWorkflowCodexHandoff: mocks.retryWorkflowHandoff
 }));
 
@@ -121,6 +132,21 @@ describe("CodexWorkspace", () => {
     mocks.strategiesLoad.mockReset().mockResolvedValue(undefined);
     mocks.submitPrompt.mockReset().mockResolvedValue(true);
     mocks.submitEnter.mockReset().mockResolvedValue(true);
+    mocks.startTransportDebug.mockReset().mockImplementation(async () => {
+      mocks.codexState.status = "running";
+      mocks.codexState.runtimeId = "transport-debug-runtime";
+      mocks.codexState.sessionRef = "runtime:transport-debug-runtime";
+      return { status: "running", runtimeId: mocks.codexState.runtimeId, sessionRef: mocks.codexState.sessionRef };
+    });
+    mocks.writeTransportDebugPrompt.mockReset().mockResolvedValue(true);
+    mocks.submitTransportDebugKey.mockReset().mockResolvedValue(true);
+    mocks.getTransportDebugInfo.mockReset().mockResolvedValue({
+      binding: "ctrl-y", keySequence: "\\x19", sessionMode: null,
+      candidates: [
+        { id: "ctrl-y", binding: "ctrl-y", keySequence: "\\x19" },
+        { id: "ctrl-q", binding: "ctrl-q", keySequence: "\\x11" }
+      ]
+    });
     mocks.attachWorkflowSession.mockReset().mockResolvedValue(undefined);
     mocks.claimWorkflowHandoff.mockReset().mockResolvedValue({
       analysis_handoff: { analysis_batch_id: "analysis-batch-1", handoff_attempt_id: "attempt-1" }
@@ -230,6 +256,28 @@ describe("CodexWorkspace", () => {
       2,
       "使用 $finejob，按建议投递策略“Agent 建议”（recommendation_strategy_id=recommendation-1）从新采集开始获取 10 条推荐投递岗位。开始前提醒当前自动招呼状态；本任务只生成建议并放入待确认，不执行真实招呼。"
     );
+  });
+
+  it("Transport Debug 仅写入固定 Prompt，再单独发送专用提交键", async () => {
+    const wrapper = mount(CodexWorkspace, {
+      global: { stubs: {
+        CodexTerminal: CodexTerminalStub, ElAlert: GenericStub, ElButton: ElButtonStub,
+        ElEmpty: GenericStub, ElInputNumber: GenericStub, ElOption: GenericStub,
+        ElSelect: GenericStub, ElTag: GenericStub, ElSwitch: GenericStub
+      } }
+    });
+    await flushPromises();
+
+    await wrapper.get('[data-testid="write-transport-debug-prompt"]').trigger("click");
+    await flushPromises();
+    expect(mocks.startTransportDebug).toHaveBeenCalledWith(120, 36, "enter");
+    expect(mocks.writeTransportDebugPrompt).toHaveBeenCalledWith("请只回复：FINEJOB_SUBMIT_OK");
+    expect(mocks.submitTransportDebugKey).not.toHaveBeenCalled();
+    expect(mocks.triggerWorkflowHandoff).not.toHaveBeenCalled();
+
+    await wrapper.get('[data-testid="submit-transport-debug-key"]').trigger("click");
+    expect(mocks.submitTransportDebugKey).toHaveBeenCalledTimes(1);
+    expect(mocks.submitPrompt).not.toHaveBeenCalled();
   });
 
   it("首次 handoff 复用共享 orchestration，不依赖页面内 transport", async () => {

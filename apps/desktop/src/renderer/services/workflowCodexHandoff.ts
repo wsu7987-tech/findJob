@@ -31,8 +31,8 @@ type WorkflowHandoffApi = Pick<
 >;
 
 type PromptTransport = {
-  submitCodexPrompt?: (prompt: string) => Promise<boolean>;
-  submitCodexEnter?: () => Promise<boolean>;
+  submitWorkflowCodexPrompt?: (prompt: string) => Promise<boolean>;
+  submitWorkflowCodexKey?: () => Promise<boolean>;
 };
 
 export type WorkflowCodexHandoffResult = {
@@ -91,7 +91,7 @@ const runHandoff = async (
     return { status: "skipped", run, message: "当前 Run 没有可交接的 Analysis Batch。" };
   }
   const execution = run.completion_contract?.codex_execution_config;
-  if (!execution?.model || !execution.reasoning_effort || !transport.submitCodexPrompt) {
+  if (!execution?.model || !execution.reasoning_effort || !transport.submitWorkflowCodexPrompt) {
     return { status: "skipped", run, message: "当前桌面端缺少可用的 Codex handoff 条件。" };
   }
   if (codexStore.status === "running" && codexStore.sessionRef !== run.codex_session_ref) {
@@ -131,10 +131,11 @@ const runHandoff = async (
     return { status: "transport_unconfirmed", run: claimed, message: "后端没有返回有效的分析交接尝试。" };
   }
 
-  const written = await transport.submitCodexPrompt(
+  // 直接调用工作流提交通道，由会话层完成 Prompt 写入、等待和提交键发送。
+  const submitted = await transport.submitWorkflowCodexPrompt(
     buildWorkflowPrompt(run.workflow_run_id, analysisBatchId, handoffAttemptId)
   );
-  if (!written) {
+  if (!submitted) {
     try {
       const released = await client.releaseFineJobWorkflowAnalysisHandoff(run.workflow_run_id, {
         analysis_batch_id: analysisBatchId,
@@ -157,12 +158,12 @@ const runHandoff = async (
       handoff_attempt_id: handoffAttemptId,
       codex_session_ref: session.sessionRef
     });
-    return { status: "submitted", run: promptWritten, message: "Prompt 已写入 Codex，等待当前 attempt 的开始 ACK。" };
+    return { status: "submitted", run: promptWritten, message: "Prompt 已写入并提交给 Codex，等待当前 attempt 的开始 ACK。" };
   } catch {
     return {
       status: "transport_unconfirmed",
       run: await currentRun(client, run.workflow_run_id, claimed),
-      message: "Prompt 已写入终端，等待服务端确认 transport 状态。"
+      message: "Prompt 已写入并提交终端，等待服务端确认 transport 状态。"
     };
   }
 };
@@ -199,19 +200,19 @@ const hasLivePromptWrittenAttempt = (run: FineJobWorkflowRun, codexStore: Workfl
   );
 };
 
-export const resubmitWorkflowCodexEnter = async (
+export const resubmitWorkflowCodexSubmit = async (
   run: FineJobWorkflowRun,
   codexStore: WorkflowCodexStore,
   transport: PromptTransport = getCodexBridge() ?? {}
 ): Promise<WorkflowCodexHandoffResult> => {
-  if (!hasLivePromptWrittenAttempt(run, codexStore) || !transport.submitCodexEnter) {
+  if (!hasLivePromptWrittenAttempt(run, codexStore) || !transport.submitWorkflowCodexKey) {
     return { status: "skipped", run, message: "当前交接不能再次提交；请查看 Codex 或在超时后重新交接。" };
   }
-  // 仅提交当前 composer 中已有的 Prompt，attempt 与业务状态均保持不变。
-  const submitted = await transport.submitCodexEnter();
+  // 仅发送当前 Workflow 会话的专用提交键，attempt 与业务状态均保持不变。
+  const submitted = await transport.submitWorkflowCodexKey();
   return submitted
-    ? { status: "enter_submitted", run, message: "已再次发送 Enter，等待当前 attempt 的开始 ACK。" }
-    : { status: "transport_failed", run, message: "当前 Codex 会话不可提交 Enter，请查看会话或重新交接。" };
+    ? { status: "enter_submitted", run, message: "已再次发送 Workflow 提交键，等待当前 attempt 的开始 ACK。" }
+    : { status: "transport_failed", run, message: "当前 Codex 会话不可发送 Workflow 提交键，请查看会话或重新交接。" };
 };
 
 export const retryWorkflowCodexHandoff = (

@@ -76,6 +76,11 @@ type DesktopBridgeShape = {
     sessionRef: string | null;
     workflowSessionMode?: "live_reused" | "resumed_explicit" | "new_from_workflow_state";
   }>;
+  startTransportDebugCodex?: (options?: { cols?: number; rows?: number; candidateId?: string }) => Promise<{
+    status: string;
+    runtimeId: string | null;
+    sessionRef: string | null;
+  } | false>;
   getCodexState?: () => Promise<{
     status: string;
     runtimeId: string | null;
@@ -83,6 +88,17 @@ type DesktopBridgeShape = {
   }>;
   writeCodex?: (data: string) => void;
   submitCodexPrompt?: (prompt: string) => Promise<boolean>;
+  submitWorkflowCodexPrompt?: (prompt: string) => Promise<boolean>;
+  submitWorkflowCodexKey?: () => Promise<boolean>;
+  writeTransportDebugPrompt?: (prompt: string) => Promise<boolean>;
+  submitTransportDebugPrompt?: (prompt: string) => Promise<boolean>;
+  submitTransportDebugKey?: () => Promise<boolean>;
+  getCodexTransportDebugInfo?: () => Promise<{
+    binding: string;
+    keySequence: string;
+    sessionMode: "workflow" | "transport_debug" | null;
+    candidates: Array<{ id: string; binding: string; keySequence: string }>;
+  } | null>;
   submitCodexEnter?: () => Promise<boolean>;
   resizeCodex?: (cols: number, rows: number) => void;
   interruptCodex?: () => void;

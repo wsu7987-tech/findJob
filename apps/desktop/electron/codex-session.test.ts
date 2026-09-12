@@ -12,6 +12,9 @@ import {
   buildCodexExitMessage,
   buildCodexInteractiveArgs,
   createCodexSessionController,
+  FINEJOB_TRANSPORT_DEBUG_SUBMIT_CANDIDATES,
+  FINEJOB_WORKFLOW_COMPOSER_SUBMIT_BINDING,
+  FINEJOB_WORKFLOW_COMPOSER_SUBMIT_SEQUENCE,
   isResumableCodexSessionId,
   writeManagedWorkspace
 } from "./codex-session";
@@ -124,37 +127,109 @@ describe("buildCodexInteractiveArgs", () => {
     expect(isResumableCodexSessionId("6bbf9b35-d4d4-45a5-bfb4-8f8f1ed544 f0")).toBe(false);
     expect(isResumableCodexSessionId("6bbf9b35-d4d4-45a5-bfb4-8f8f1ed544f0")).toBe(true);
   });
+
+  it("只有 Workflow 启动参数注入专用 composer submit 绑定", () => {
+    const workflowArgs = buildCodexInteractiveArgs({
+      tuiWorkspace: "D:/workflow-workspace",
+      workflowComposerSubmitBinding: FINEJOB_WORKFLOW_COMPOSER_SUBMIT_BINDING
+    });
+    const standardArgs = buildCodexInteractiveArgs({ tuiWorkspace: "D:/standard-workspace" });
+
+    expect(workflowArgs).toContain(`tui.keymap.composer.submit=\"${FINEJOB_WORKFLOW_COMPOSER_SUBMIT_BINDING}\"`);
+    expect(standardArgs.join(" ")).not.toContain("tui.keymap.composer.submit");
+  });
 });
 
 describe("Workflow Prompt transport", () => {
-  it("Prompt 写入后的新 PTY 输出触发单独 Enter", async () => {
+  it("Prompt 写入后的新 PTY 输出触发 Workflow 专用提交键", async () => {
     const { controller, handlers, terminal } = createSessionController();
     await controller.startWorkflow({ model: "gpt-5.6-luna", reasoningEffort: "high" });
+    expect(ptyMocks.spawn.mock.calls[0]?.[1]).toContain(
+      `tui.keymap.composer.submit=\"${FINEJOB_WORKFLOW_COMPOSER_SUBMIT_BINDING}\"`
+    );
     handlers.data?.("Codex ready");
 
-    const submitted = controller.submitPrompt("workflow prompt");
+    const submitted = controller.submitWorkflowPrompt("workflow prompt");
     expect(terminal.write).toHaveBeenCalledWith("workflow prompt");
-    expect(terminal.write).not.toHaveBeenCalledWith("\r");
+    expect(terminal.write).toHaveBeenCalledTimes(1);
     handlers.data?.("workflow prompt echo");
 
     await expect(submitted).resolves.toBe(true);
     expect(terminal.write).toHaveBeenNthCalledWith(1, "workflow prompt");
-    expect(terminal.write).toHaveBeenNthCalledWith(2, "\r");
+    expect(terminal.write).toHaveBeenNthCalledWith(2, FINEJOB_WORKFLOW_COMPOSER_SUBMIT_SEQUENCE);
+    expect(terminal.write).toHaveBeenCalledWith("\r");
   });
 
-  it("没有新输出时在 750ms 回退后单独发送 Enter", async () => {
+  it("没有新输出时在 750ms 回退后发送 Workflow 专用提交键", async () => {
     vi.useFakeTimers();
     const { controller, handlers, terminal } = createSessionController();
     await controller.startWorkflow({ model: "gpt-5.6-luna", reasoningEffort: "high" });
     handlers.data?.("Codex ready");
 
-    const submitted = controller.submitPrompt("workflow prompt");
+    const submitted = controller.submitWorkflowPrompt("workflow prompt");
     expect(terminal.write).toHaveBeenCalledWith("workflow prompt");
     await vi.advanceTimersByTimeAsync(749);
-    expect(terminal.write).not.toHaveBeenCalledWith("\r");
+    expect(terminal.write).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(300);
 
     await expect(submitted).resolves.toBe(true);
-    expect(terminal.write).toHaveBeenNthCalledWith(2, "\r");
+    expect(terminal.write).toHaveBeenNthCalledWith(2, FINEJOB_WORKFLOW_COMPOSER_SUBMIT_SEQUENCE);
+    expect(terminal.write).toHaveBeenCalledWith("\r");
+  });
+
+  it("再次提交只发送 Workflow 专用提交键", async () => {
+    const { controller, terminal } = createSessionController();
+    await controller.startWorkflow({ model: "gpt-5.6-luna", reasoningEffort: "high" });
+    await controller.startWorkflow({
+      model: "gpt-5.6-luna",
+      reasoningEffort: "high",
+      sessionRef: "runtime:runtime-1"
+    });
+
+    await expect(controller.submitWorkflowKey()).resolves.toBe(true);
+
+    expect(ptyMocks.spawn).toHaveBeenCalledTimes(1);
+    expect(terminal.write).toHaveBeenCalledTimes(1);
+    expect(terminal.write).toHaveBeenCalledWith(FINEJOB_WORKFLOW_COMPOSER_SUBMIT_SEQUENCE);
+  });
+
+  it("普通 Codex 会话固定 Enter 提交并保留 Shift+Enter 换行", async () => {
+    const { controller, terminal } = createSessionController();
+    await controller.start();
+
+    expect(ptyMocks.spawn.mock.calls[0]?.[1]).toContain('tui.keymap.composer.submit="enter"');
+    expect(ptyMocks.spawn.mock.calls[0]?.[1]).toContain('tui.keymap.editor.insert_newline=["shift-enter"]');
+    await expect(controller.submitWorkflowKey()).resolves.toBe(false);
+    expect(terminal.write).not.toHaveBeenCalled();
+  });
+
+  it("Transport Debug 会话按选定候选注入 keymap，写入 Prompt 与提交键保持分离", async () => {
+    const { controller, terminal } = createSessionController();
+    const candidate = FINEJOB_TRANSPORT_DEBUG_SUBMIT_CANDIDATES[1];
+    await controller.startTransportDebug(undefined, undefined, candidate.id);
+
+    expect(ptyMocks.spawn.mock.calls[0]?.[1]).toContain(
+      `tui.keymap.composer.submit=\"${candidate.binding}\"`
+    );
+    await expect(controller.writeTransportDebugPrompt("请只回复：FINEJOB_SUBMIT_OK")).resolves.toBe(true);
+    expect(terminal.write).toHaveBeenCalledWith("请只回复：FINEJOB_SUBMIT_OK");
+    expect(terminal.write).not.toHaveBeenCalledWith(candidate.keySequence);
+
+    await expect(controller.submitTransportDebugKey()).resolves.toBe(true);
+    expect(terminal.write).toHaveBeenNthCalledWith(2, candidate.keySequence);
+    expect(terminal.write).not.toHaveBeenCalledWith("\r");
+  });
+
+  it("Transport Debug 信息提供可比较的候选键", () => {
+    const { controller } = createSessionController();
+
+    expect(controller.transportDebugInfo().candidates).toEqual(
+      FINEJOB_TRANSPORT_DEBUG_SUBMIT_CANDIDATES.map(({ id, binding, keySequenceDisplay }) => ({
+        id,
+        binding,
+        keySequence: keySequenceDisplay
+      }))
+    );
   });
 });
