@@ -1887,10 +1887,14 @@ CREATE TABLE IF NOT EXISTS fj_workflow_analysis_handoffs (
   workflow_run_id TEXT NOT NULL,
   analysis_batch_id TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'claimed',
+  handoff_attempt_id TEXT NOT NULL DEFAULT '',
+  attempt_status TEXT NOT NULL DEFAULT 'claimed',
   codex_session_ref TEXT NOT NULL,
   codex_runtime_id TEXT NOT NULL DEFAULT '',
   claimed_at TEXT NOT NULL,
   submitted_at TEXT,
+  prompt_written_at TEXT,
+  started_at TEXT,
   released_at TEXT,
   completed_at TEXT,
   recovered_at TEXT,
@@ -2238,6 +2242,49 @@ class Database:
         for column, statement in run_migrations.items():
             if column not in run_columns:
                 connection.execute(statement)
+        handoff_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fj_workflow_analysis_handoffs'"
+        ).fetchone()
+        if handoff_table is not None:
+            handoff_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(fj_workflow_analysis_handoffs)")
+            }
+            handoff_attempt_was_missing = "handoff_attempt_id" not in handoff_columns
+            handoff_migrations = {
+                "handoff_attempt_id": (
+                    "ALTER TABLE fj_workflow_analysis_handoffs "
+                    "ADD COLUMN handoff_attempt_id TEXT NOT NULL DEFAULT ''"
+                ),
+                "attempt_status": (
+                    "ALTER TABLE fj_workflow_analysis_handoffs "
+                    "ADD COLUMN attempt_status TEXT NOT NULL DEFAULT 'claimed'"
+                ),
+                "prompt_written_at": (
+                    "ALTER TABLE fj_workflow_analysis_handoffs ADD COLUMN prompt_written_at TEXT"
+                ),
+                "started_at": (
+                    "ALTER TABLE fj_workflow_analysis_handoffs ADD COLUMN started_at TEXT"
+                ),
+            }
+            for column, statement in handoff_migrations.items():
+                if column not in handoff_columns:
+                    connection.execute(statement)
+            if handoff_attempt_was_missing:
+                # 旧 submitted 记录没有携带 attempt 标识，升级后先等待超时并由用户显式重试。
+                connection.execute(
+                    """
+                    UPDATE fj_workflow_analysis_handoffs
+                    SET handoff_attempt_id = 'legacy:' || workflow_run_id || ':' || analysis_batch_id,
+                        attempt_status = CASE status
+                          WHEN 'submitted' THEN 'prompt_written'
+                          WHEN 'released' THEN 'released'
+                          WHEN 'completed' THEN 'completed'
+                          ELSE 'claimed'
+                        END,
+                        prompt_written_at = CASE WHEN status = 'submitted' THEN submitted_at ELSE NULL END
+                    """
+                )
         table = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fj_workflow_job_discoveries'"
         ).fetchone()

@@ -60,7 +60,10 @@ const workflowCodexEntry = computed(() => {
   const run = workflowRun.value;
   const handoff = run?.analysis_handoff;
   if (!run || run.status !== "waiting_codex" || !handoff) return null;
-  if (hasCurrentWorkflowCodexSession.value && handoff.codex_processing) {
+  if (handoff.attempt_status === "prompt_written") {
+    return { action: "view" as const, label: "等待 Codex 开始" };
+  }
+  if (hasCurrentWorkflowCodexSession.value && handoff.attempt_status === "started" && handoff.codex_processing) {
     return { action: "view" as const, label: "Codex 分析中" };
   }
   if (hasCurrentWorkflowCodexSession.value && handoff.needs_next_batch_handoff) {

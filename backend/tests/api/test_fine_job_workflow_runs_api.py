@@ -599,7 +599,7 @@ def test_candidate_pool_to_jd_to_waiting_codex_uses_compact_shared_and_item_cont
     assert sum(job["history_record_id"] == material["job_id"] for job in jobs) == 1
 
 
-def test_analysis_batch_handoff_claim_confirm_release_and_runtime_recovery(
+def test_analysis_batch_handoff_attempt_ack_is_idempotent_and_rejects_stale_attempts(
     configured_client, test_db
 ) -> None:
     run, _jobs = _prepare_analysis_batch(configured_client, test_db, candidate_count=2)
@@ -617,6 +617,7 @@ def test_analysis_batch_handoff_claim_confirm_release_and_runtime_recovery(
     )
     assert claimed.status_code == 200
     assert claimed.json()["analysis_handoff"]["handoff_status"] == "claimed"
+    first_attempt_id = claimed.json()["analysis_handoff"]["handoff_attempt_id"]
     assert claimed.json()["analysis_handoff"]["pending_item_count"] == 2
 
     duplicate = configured_client.post(
@@ -631,7 +632,11 @@ def test_analysis_batch_handoff_claim_confirm_release_and_runtime_recovery(
 
     released = configured_client.post(
         f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/release",
-        json={"analysis_batch_id": batch_id, "codex_session_ref": "runtime:session-a"},
+        json={
+            "analysis_batch_id": batch_id,
+            "handoff_attempt_id": first_attempt_id,
+            "codex_session_ref": "runtime:session-a",
+        },
     )
     assert released.status_code == 200
     assert released.json()["analysis_handoff"]["needs_initial_codex_handoff"] is True
@@ -645,36 +650,70 @@ def test_analysis_batch_handoff_claim_confirm_release_and_runtime_recovery(
         },
     )
     assert reclaimed.status_code == 200
-    confirmed = configured_client.post(
-        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/confirm",
-        json={"analysis_batch_id": batch_id, "codex_session_ref": "runtime:session-b"},
-    )
-    assert confirmed.status_code == 200
-    assert confirmed.json()["analysis_handoff"]["handoff_status"] == "submitted"
-
-    recovered = configured_client.post(
-        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/claim",
+    second_attempt_id = reclaimed.json()["analysis_handoff"]["handoff_attempt_id"]
+    prompt_written = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/prompt-written",
         json={
-            "codex_session_ref": "runtime:session-c",
-            "codex_runtime_id": "runtime-c",
-            "handoff_kind": "initial",
+            "analysis_batch_id": batch_id,
+            "handoff_attempt_id": second_attempt_id,
+            "codex_session_ref": "runtime:session-b",
         },
     )
-    assert recovered.status_code == 200
-    assert recovered.json()["analysis_handoff"]["handoff_status"] == "claimed"
+    assert prompt_written.status_code == 200
+    assert prompt_written.json()["analysis_handoff"]["attempt_status"] == "prompt_written"
+    assert prompt_written.json()["analysis_handoff"]["codex_processing"] is False
+    pending_item = workflow_runs.list_workflow_analysis_items(test_db, run_id, batch_id)["items"][0]
+    blocked_save = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run_id}/analysis-items/{pending_item['workflow_task_id']}/save",
+        json={"decision": "reject", "summary": "尚未确认开始"},
+    )
+    assert blocked_save.status_code == 409
+    assert blocked_save.json()["error_category"] == "WORKFLOW_ANALYSIS_NOT_STARTED"
+
+    stale_ack = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/ack-started",
+        json={"analysis_batch_id": batch_id, "handoff_attempt_id": first_attempt_id},
+    )
+    assert stale_ack.status_code == 409
+
+    started = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/ack-started",
+        json={"analysis_batch_id": batch_id, "handoff_attempt_id": second_attempt_id},
+    )
+    assert started.status_code == 200
+    assert started.json()["analysis_handoff"]["attempt_status"] == "started"
+    assert started.json()["analysis_handoff"]["codex_processing"] is True
+
+    repeated = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/ack-started",
+        json={"analysis_batch_id": batch_id, "handoff_attempt_id": second_attempt_id},
+    )
+    assert repeated.status_code == 200
+    assert repeated.json()["analysis_handoff"]["started_at"] == started.json()["analysis_handoff"]["started_at"]
 
 
 def test_next_analysis_batch_only_handoffs_new_pending_items(configured_client, test_db) -> None:
     run, _jobs = _prepare_analysis_batch(configured_client, test_db, candidate_count=3, target_count=2)
     run_id = run["workflow_run_id"]
     first_batch_id = run["analysis_handoff"]["analysis_batch_id"]
-    configured_client.post(
+    claimed = configured_client.post(
         f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/claim",
         json={"codex_session_ref": "runtime:session-a", "codex_runtime_id": "runtime-a", "handoff_kind": "initial"},
     )
     configured_client.post(
-        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/confirm",
-        json={"analysis_batch_id": first_batch_id, "codex_session_ref": "runtime:session-a"},
+        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/prompt-written",
+        json={
+            "analysis_batch_id": first_batch_id,
+            "handoff_attempt_id": claimed.json()["analysis_handoff"]["handoff_attempt_id"],
+            "codex_session_ref": "runtime:session-a",
+        },
+    )
+    configured_client.post(
+        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/ack-started",
+        json={
+            "analysis_batch_id": first_batch_id,
+            "handoff_attempt_id": claimed.json()["analysis_handoff"]["handoff_attempt_id"],
+        },
     )
     service = CodexToolService(test_db, configured_client.app.state.config)
     first_items = workflow_runs.list_workflow_analysis_items(test_db, run_id, first_batch_id)["items"]
@@ -689,7 +728,7 @@ def test_next_analysis_batch_only_handoffs_new_pending_items(configured_client, 
 
     refreshed = workflow_runs.get_workflow_run(test_db, run_id)
     next_summary = refreshed["analysis_handoff"]
-    assert next_summary["needs_next_batch_handoff"] is True
+    assert next_summary["needs_next_batch_handoff"] is True, next_summary
     assert next_summary["analysis_batch_id"] != first_batch_id
     assert all(item["status"] == "succeeded" for item in workflow_runs.list_workflow_analysis_items(test_db, run_id, first_batch_id)["items"])
     next_items = workflow_runs.list_workflow_analysis_items(
@@ -704,6 +743,56 @@ def test_next_analysis_batch_only_handoffs_new_pending_items(configured_client, 
     )
     assert claimed.status_code == 200
     assert claimed.json()["analysis_handoff"]["handoff_status"] == "claimed"
+
+
+def test_start_ack_timeout_waits_for_explicit_retry_and_replaces_old_attempt(
+    configured_client, test_db
+) -> None:
+    run, _jobs = _prepare_analysis_batch(configured_client, test_db, candidate_count=1, target_count=1)
+    run_id = run["workflow_run_id"]
+    batch_id = run["analysis_handoff"]["analysis_batch_id"]
+    claimed = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/claim",
+        json={"codex_session_ref": "runtime:session-a", "codex_runtime_id": "runtime-a", "handoff_kind": "initial"},
+    )
+    first_attempt_id = claimed.json()["analysis_handoff"]["handoff_attempt_id"]
+    configured_client.post(
+        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/prompt-written",
+        json={
+            "analysis_batch_id": batch_id,
+            "handoff_attempt_id": first_attempt_id,
+            "codex_session_ref": "runtime:session-a",
+        },
+    )
+    with test_db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_workflow_analysis_handoffs SET prompt_written_at = '2000-01-01T00:00:00Z' "
+            "WHERE workflow_run_id = ? AND analysis_batch_id = ?",
+            (run_id, batch_id),
+        )
+    waiting = configured_client.get(f"/api/fine-job/workflow-runs/{run_id}").json()["analysis_handoff"]
+    assert waiting["attempt_status"] == "prompt_written"
+    assert waiting["retry_available"] is True
+
+    retried = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/claim",
+        json={
+            "codex_session_ref": "runtime:session-b",
+            "codex_runtime_id": "runtime-b",
+            "handoff_kind": "initial",
+            "retry_handoff_attempt_id": first_attempt_id,
+        },
+    )
+    assert retried.status_code == 200
+    second_attempt_id = retried.json()["analysis_handoff"]["handoff_attempt_id"]
+    assert second_attempt_id != first_attempt_id
+    assert retried.json()["analysis_handoff"]["attempt_status"] == "claimed"
+
+    stale = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/ack-started",
+        json={"analysis_batch_id": batch_id, "handoff_attempt_id": first_attempt_id},
+    )
+    assert stale.status_code == 409
 
 
 def test_workflow_recommend_routes_to_pending_review_without_external_action(configured_client, test_db) -> None:

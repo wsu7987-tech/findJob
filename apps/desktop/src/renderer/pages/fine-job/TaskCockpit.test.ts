@@ -153,11 +153,16 @@ const run = (status: string) => ({
     running_item_count: 0,
     succeeded_item_count: 0,
     handoff_status: "none",
+    attempt_status: "none",
     needs_initial_codex_handoff: true,
     needs_next_batch_handoff: false,
     codex_processing: false,
     analysis_batch_complete: false,
-    recovery_available: false
+    recovery_available: false,
+    awaiting_start_ack: false,
+    start_ack_timed_out: false,
+    retry_available: false,
+    start_ack_timeout_seconds: 45
   }
 });
 
@@ -382,6 +387,7 @@ describe("TaskCockpit", () => {
       analysis_handoff: {
         ...run("waiting_codex").analysis_handoff,
         handoff_status: "submitted",
+        attempt_status: "started",
         codex_processing: true
       }
     });

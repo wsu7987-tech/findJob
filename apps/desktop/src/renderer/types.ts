@@ -2466,14 +2466,22 @@ export interface FineJobWorkflowRun {
     running_item_count: number;
     succeeded_item_count: number;
     handoff_status: "none" | "claimed" | "submitted" | "released" | "completed";
+    handoff_attempt_id?: string | null;
+    attempt_status: "none" | "claimed" | "prompt_written" | "started" | "released" | "completed";
     claimed_at?: string | null;
     submitted_at?: string | null;
+    prompt_written_at?: string | null;
+    started_at?: string | null;
     codex_session_ref?: string | null;
     needs_initial_codex_handoff: boolean;
     needs_next_batch_handoff: boolean;
     codex_processing: boolean;
     analysis_batch_complete: boolean;
     recovery_available: boolean;
+    awaiting_start_ack: boolean;
+    start_ack_timed_out: boolean;
+    retry_available: boolean;
+    start_ack_timeout_seconds: number;
   };
   completion_contract?: {
     target_count?: number;

@@ -171,6 +171,16 @@ async def get_workflow_run(workflow_run_id: str) -> dict[str, Any]:
     return await _invoke("get_workflow_run", locals())
 
 
+@server.tool(name="finejob.ack_workflow_analysis_batch_started", structured_output=True)
+async def ack_workflow_analysis_batch_started(
+    workflow_run_id: str,
+    analysis_batch_id: str,
+    handoff_attempt_id: str,
+) -> dict[str, Any]:
+    """确认当前有效交接尝试已由 Codex 开始处理，随后再读取并保存分析 Item。"""
+    return await _invoke("ack_workflow_analysis_batch_started", locals())
+
+
 @server.tool(name="finejob.list_workflow_analysis_items", structured_output=True)
 async def list_workflow_analysis_items(
     workflow_run_id: str, analysis_batch_id: str | None = None

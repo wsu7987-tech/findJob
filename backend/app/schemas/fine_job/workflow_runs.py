@@ -61,11 +61,18 @@ class WorkflowRunCodexSessionRequest(BaseModel):
 
 class WorkflowAnalysisHandoffClaimRequest(WorkflowRunCodexSessionRequest):
     handoff_kind: Literal["initial", "next"]
+    retry_handoff_attempt_id: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class WorkflowAnalysisHandoffRequest(BaseModel):
     analysis_batch_id: str = Field(min_length=1, max_length=100)
+    handoff_attempt_id: str = Field(min_length=1, max_length=100)
     codex_session_ref: str = Field(min_length=1, max_length=200)
+
+
+class WorkflowAnalysisHandoffStartAckRequest(BaseModel):
+    analysis_batch_id: str = Field(min_length=1, max_length=100)
+    handoff_attempt_id: str = Field(min_length=1, max_length=100)
 
 
 class WorkflowAnalysisGuidanceUpdateRequest(BaseModel):

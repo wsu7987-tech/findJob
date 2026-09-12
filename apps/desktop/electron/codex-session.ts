@@ -306,7 +306,11 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
         ]);
       }
       if (terminal !== currentTerminal) return false;
-      currentTerminal.write(`${text}\r`);
+      // Prompt 与 Enter 分开发送，给 Codex TUI 留出接收输入的短暂窗口。
+      currentTerminal.write(text);
+      await new Promise<void>((resolve) => setTimeout(resolve, 80));
+      if (terminal !== currentTerminal) return false;
+      currentTerminal.write("\r");
       return true;
     },
     resize(cols: number, rows: number) {

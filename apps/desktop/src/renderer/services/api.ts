@@ -1514,6 +1514,7 @@ export const api = {
       codex_session_ref: string;
       codex_runtime_id?: string;
       handoff_kind: "initial" | "next";
+      retry_handoff_attempt_id?: string;
     }
   ) {
     return request<FineJobWorkflowRun>(
@@ -1521,18 +1522,18 @@ export const api = {
       { method: "POST", body: JSON.stringify(payload) }
     );
   },
-  async confirmFineJobWorkflowAnalysisHandoff(
+  async markFineJobWorkflowAnalysisHandoffPromptWritten(
     workflowRunId: string,
-    payload: { analysis_batch_id: string; codex_session_ref: string }
+    payload: { analysis_batch_id: string; handoff_attempt_id: string; codex_session_ref: string }
   ) {
     return request<FineJobWorkflowRun>(
-      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/analysis-handoff/confirm`,
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/analysis-handoff/prompt-written`,
       { method: "POST", body: JSON.stringify(payload) }
     );
   },
   async releaseFineJobWorkflowAnalysisHandoff(
     workflowRunId: string,
-    payload: { analysis_batch_id: string; codex_session_ref: string }
+    payload: { analysis_batch_id: string; handoff_attempt_id: string; codex_session_ref: string }
   ) {
     return request<FineJobWorkflowRun>(
       `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/analysis-handoff/release`,

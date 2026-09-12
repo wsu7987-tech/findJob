@@ -9,6 +9,7 @@ from backend.app.schemas.fine_job.workflow_runs import (
     WorkflowAnalysisSaveRequest,
     WorkflowAnalysisHandoffClaimRequest,
     WorkflowAnalysisHandoffRequest,
+    WorkflowAnalysisHandoffStartAckRequest,
     WorkflowAnalysisFeedbackRequest,
     WorkflowAnalysisGuidanceUpdateRequest,
     WorkflowRunCodexSessionRequest,
@@ -114,17 +115,29 @@ def claim_analysis_handoff(
         codex_session_ref=payload.codex_session_ref,
         codex_runtime_id=payload.codex_runtime_id,
         handoff_kind=payload.handoff_kind,
+        retry_handoff_attempt_id=payload.retry_handoff_attempt_id,
     )
 
 
-@router.post("/{workflow_run_id}/analysis-handoff/confirm")
-def confirm_analysis_handoff(
+@router.post("/{workflow_run_id}/analysis-handoff/prompt-written")
+def mark_analysis_handoff_prompt_written(
     workflow_run_id: str,
     payload: WorkflowAnalysisHandoffRequest,
     db: Database = Depends(get_database),
 ):
-    return workflow_runs.confirm_workflow_analysis_handoff(
-        db, workflow_run_id, payload.analysis_batch_id, payload.codex_session_ref
+    return workflow_runs.mark_workflow_analysis_handoff_prompt_written(
+        db, workflow_run_id, payload.analysis_batch_id, payload.handoff_attempt_id, payload.codex_session_ref
+    )
+
+
+@router.post("/{workflow_run_id}/analysis-handoff/ack-started")
+def ack_analysis_handoff_started(
+    workflow_run_id: str,
+    payload: WorkflowAnalysisHandoffStartAckRequest,
+    db: Database = Depends(get_database),
+):
+    return workflow_runs.ack_workflow_analysis_batch_started(
+        db, workflow_run_id, payload.analysis_batch_id, payload.handoff_attempt_id
     )
 
 
@@ -135,7 +148,7 @@ def release_analysis_handoff(
     db: Database = Depends(get_database),
 ):
     return workflow_runs.release_workflow_analysis_handoff(
-        db, workflow_run_id, payload.analysis_batch_id, payload.codex_session_ref
+        db, workflow_run_id, payload.analysis_batch_id, payload.handoff_attempt_id, payload.codex_session_ref
     )
 
 

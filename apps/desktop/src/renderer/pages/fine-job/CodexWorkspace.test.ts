@@ -14,7 +14,7 @@ const mocks = vi.hoisted(() => ({
   submitPrompt: vi.fn(),
   attachWorkflowSession: vi.fn(),
   claimWorkflowHandoff: vi.fn(),
-  confirmWorkflowHandoff: vi.fn(),
+  markPromptWritten: vi.fn(),
   releaseWorkflowHandoff: vi.fn(),
   refreshWorkflow: vi.fn(),
   push: vi.fn(),
@@ -54,7 +54,7 @@ vi.mock("@/services/api", () => ({
   api: {
     attachFineJobWorkflowCodexSession: mocks.attachWorkflowSession,
     claimFineJobWorkflowAnalysisHandoff: mocks.claimWorkflowHandoff,
-    confirmFineJobWorkflowAnalysisHandoff: mocks.confirmWorkflowHandoff,
+    markFineJobWorkflowAnalysisHandoffPromptWritten: mocks.markPromptWritten,
     releaseFineJobWorkflowAnalysisHandoff: mocks.releaseWorkflowHandoff
   }
 }));
@@ -112,9 +112,9 @@ describe("CodexWorkspace", () => {
     mocks.submitPrompt.mockReset().mockResolvedValue(true);
     mocks.attachWorkflowSession.mockReset().mockResolvedValue(undefined);
     mocks.claimWorkflowHandoff.mockReset().mockResolvedValue({
-      analysis_handoff: { analysis_batch_id: "analysis-batch-1" }
+      analysis_handoff: { analysis_batch_id: "analysis-batch-1", handoff_attempt_id: "attempt-1" }
     });
-    mocks.confirmWorkflowHandoff.mockReset().mockResolvedValue(undefined);
+    mocks.markPromptWritten.mockReset().mockResolvedValue(undefined);
     mocks.releaseWorkflowHandoff.mockReset().mockResolvedValue(undefined);
     mocks.refreshWorkflow.mockReset().mockResolvedValue(undefined);
     mocks.push.mockReset().mockResolvedValue(undefined);
@@ -253,10 +253,11 @@ describe("CodexWorkspace", () => {
       handoff_kind: "initial"
     });
     expect(mocks.submitPrompt).toHaveBeenCalledWith(expect.stringContaining(
-      "workflow_run_id=workflow-run-1，analysis_batch_id=analysis-batch-1"
+      "workflow_run_id=workflow-run-1，analysis_batch_id=analysis-batch-1，handoff_attempt_id=attempt-1"
     ));
-    expect(mocks.confirmWorkflowHandoff).toHaveBeenCalledWith("workflow-run-1", {
+    expect(mocks.markPromptWritten).toHaveBeenCalledWith("workflow-run-1", {
       analysis_batch_id: "analysis-batch-1",
+      handoff_attempt_id: "attempt-1",
       codex_session_ref: "runtime:runtime-2"
     });
     expect(mocks.replace).toHaveBeenCalledWith({
@@ -344,6 +345,40 @@ describe("CodexWorkspace", () => {
     expect(mocks.submitPrompt).toHaveBeenCalledTimes(1);
   });
 
+  it("重载时已有 prompt_written attempt 不重复写入 Prompt", async () => {
+    mocks.routeQuery = {
+      task: "deep-job-search",
+      workflow_run_id: "workflow-run-1",
+      workflow_action: "submit"
+    };
+    mocks.refreshWorkflow.mockResolvedValue({
+      codex_session_ref: "runtime:workflow-runtime-1",
+      analysis_handoff: { attempt_status: "prompt_written", handoff_attempt_id: "attempt-1" },
+      completion_contract: {
+        codex_execution_config: { model: "gpt-5.6-luna", reasoning_effort: "high" }
+      }
+    });
+
+    mount(CodexWorkspace, { global: { stubs: {
+      CodexTerminal: CodexTerminalStub, ElAlert: GenericStub, ElButton: ElButtonStub,
+      ElEmpty: GenericStub, ElInputNumber: GenericStub, ElOption: GenericStub,
+      ElSelect: GenericStub, ElTag: GenericStub, ElSwitch: GenericStub
+    } } });
+    await flushPromises();
+
+    expect(mocks.startWorkflow).not.toHaveBeenCalled();
+    expect(mocks.claimWorkflowHandoff).not.toHaveBeenCalled();
+    expect(mocks.submitPrompt).not.toHaveBeenCalled();
+    expect(mocks.replace).toHaveBeenCalledWith({
+      name: "fine-job-codex",
+      query: {
+        task: "deep-job-search",
+        workflow_run_id: "workflow-run-1",
+        workflow_action: "view"
+      }
+    });
+  });
+
   it("submit 失败时保留 submit action，不 replace 为 view", async () => {
     mocks.routeQuery = {
       task: "deep-job-search",
@@ -369,6 +404,7 @@ describe("CodexWorkspace", () => {
     expect(mocks.replace).not.toHaveBeenCalled();
     expect(mocks.releaseWorkflowHandoff).toHaveBeenCalledWith("workflow-run-1", {
       analysis_batch_id: "analysis-batch-1",
+      handoff_attempt_id: "attempt-1",
       codex_session_ref: "runtime:runtime-2"
     });
     expect(mocks.routeQuery.workflow_action).toBe("submit");
@@ -407,7 +443,7 @@ describe("CodexWorkspace", () => {
       handoff_kind: "next"
     }));
     expect(mocks.submitPrompt).toHaveBeenCalledWith(
-      "继续处理 workflow_run_id=workflow-run-1，analysis_batch_id=analysis-batch-1 当前新产生的 pending Analysis Items。"
+      expect.stringContaining("handoff_attempt_id=attempt-1")
     );
   });
 });

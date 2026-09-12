@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from backend.app.config import AppConfig
@@ -22,6 +23,7 @@ from backend.app.utils import new_id, utc_now
 
 
 HARD_CONTEXT_BUDGET = 1_000_000
+START_ACK_TIMEOUT_SECONDS = 45
 
 
 def create_deep_job_search_run(
@@ -418,6 +420,9 @@ def record_workflow_analysis_result(
     if item["status"] == "succeeded":
         return get_workflow_run(db, workflow_run_id)
     payload = _load(item["payload_json"], {})
+    _require_analysis_batch_started(
+        db, workflow_run_id, _analysis_batch_id_from_payload(payload, workflow_run_id)
+    )
     job_id = str(payload.get("job_id") or "")
     _finish_task(
         db,
@@ -495,6 +500,7 @@ def claim_workflow_analysis_handoff(
     codex_session_ref: str,
     codex_runtime_id: str | None,
     handoff_kind: str,
+    retry_handoff_attempt_id: str | None = None,
 ) -> dict[str, object]:
     """原子占用当前分析批次；占用本身不改变岗位分析 Item 的业务状态。"""
     run = _require_run(db, workflow_run_id)
@@ -507,13 +513,14 @@ def claim_workflow_analysis_handoff(
     batch_id = str(summary.get("analysis_batch_id") or "")
     if not batch_id or int(summary.get("pending_item_count") or 0) <= 0:
         raise AppError(409, "WORKFLOW_ANALYSIS_BATCH_NOT_READY", "当前没有可交接的 pending 分析批次。")
-    if handoff_kind == "initial" and not bool(summary.get("needs_initial_codex_handoff")) and not bool(summary.get("recovery_available")):
+    is_retry = bool(retry_handoff_attempt_id)
+    if handoff_kind == "initial" and not bool(summary.get("needs_initial_codex_handoff")) and not is_retry:
         raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_NOT_INITIAL", "当前批次不是首次 Codex 交接。")
-    if handoff_kind == "next" and not bool(summary.get("needs_next_batch_handoff")):
+    if handoff_kind == "next" and not bool(summary.get("needs_next_batch_handoff")) and not is_retry:
         raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_NOT_NEXT", "当前没有可继续的后续分析批次。")
 
     now = utc_now()
-    recovered = False
+    attempt_id = new_id()
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         rows = connection.execute(
@@ -530,35 +537,42 @@ def claim_workflow_analysis_handoff(
             "SELECT * FROM fj_workflow_analysis_handoffs WHERE workflow_run_id = ? AND analysis_batch_id = ?",
             (workflow_run_id, batch_id),
         ).fetchone()
-        if existing is not None and existing["status"] in {"claimed", "submitted"}:
-            previous_ref = str(existing["codex_session_ref"] or "")
-            if not previous_ref.startswith("runtime:") or previous_ref == codex_session_ref:
-                raise AppError(409, "WORKFLOW_ANALYSIS_BATCH_IN_PROGRESS", "当前分析批次已交给 Codex 处理。")
-            recovered = True
+        if existing is not None:
+            existing_attempt_status = str(existing["attempt_status"] or "claimed")
+            can_retry = (
+                existing_attempt_status == "prompt_written"
+                and str(existing["handoff_attempt_id"] or "") == str(retry_handoff_attempt_id or "")
+                and _start_ack_timed_out(existing)
+            )
+            if not can_retry and existing_attempt_status in {"claimed", "prompt_written", "started"}:
+                raise AppError(409, "WORKFLOW_ANALYSIS_BATCH_IN_PROGRESS", "当前分析批次已有有效 Codex 交接。")
         if existing is None:
             connection.execute(
                 """
                 INSERT INTO fj_workflow_analysis_handoffs (
-                  workflow_run_id, analysis_batch_id, status, codex_session_ref, codex_runtime_id, claimed_at
-                ) VALUES (?, ?, 'claimed', ?, ?, ?)
+                  workflow_run_id, analysis_batch_id, status, handoff_attempt_id, attempt_status,
+                  codex_session_ref, codex_runtime_id, claimed_at
+                ) VALUES (?, ?, 'claimed', ?, 'claimed', ?, ?, ?)
                 """,
-                (workflow_run_id, batch_id, codex_session_ref, codex_runtime_id or "", now),
+                (workflow_run_id, batch_id, attempt_id, codex_session_ref, codex_runtime_id or "", now),
             )
         else:
             connection.execute(
                 """
                 UPDATE fj_workflow_analysis_handoffs
-                SET status = 'claimed', codex_session_ref = ?, codex_runtime_id = ?, claimed_at = ?,
-                    submitted_at = NULL, released_at = NULL, completed_at = NULL,
+                SET status = 'claimed', handoff_attempt_id = ?, attempt_status = 'claimed',
+                    codex_session_ref = ?, codex_runtime_id = ?, claimed_at = ?, submitted_at = NULL,
+                    prompt_written_at = NULL, started_at = NULL, released_at = NULL, completed_at = NULL,
                     recovered_at = ?, recovery_reason = ?
                 WHERE workflow_run_id = ? AND analysis_batch_id = ?
                 """,
                 (
+                    attempt_id,
                     codex_session_ref,
                     codex_runtime_id or "",
                     now,
-                    now if recovered else None,
-                    "previous_runtime_session_not_live" if recovered else "",
+                    now if is_retry else None,
+                    "start_ack_timeout_retry" if is_retry else "",
                     workflow_run_id,
                     batch_id,
                 ),
@@ -570,39 +584,56 @@ def claim_workflow_analysis_handoff(
         codex_runtime_id=codex_runtime_id or "",
         current_step="waiting_codex",
         next_action="codex_analysis",
-        next_action_reason="Codex 已占用当前岗位分析批次，等待 Prompt 提交。",
+        next_action_reason="Codex 已占用当前岗位分析批次，等待写入 Prompt。",
     )
     return get_workflow_run(db, workflow_run_id)
 
 
-def confirm_workflow_analysis_handoff(
-    db: Database, workflow_run_id: str, analysis_batch_id: str, codex_session_ref: str
+def mark_workflow_analysis_handoff_prompt_written(
+    db: Database,
+    workflow_run_id: str,
+    analysis_batch_id: str,
+    handoff_attempt_id: str,
+    codex_session_ref: str,
 ) -> dict[str, object]:
-    """Prompt 被终端接受后确认批次已提交，后续点击只能查看。"""
+    """记录 Prompt 已写入终端；业务开始仍由 Codex ACK 决定。"""
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         handoff = connection.execute(
             "SELECT * FROM fj_workflow_analysis_handoffs WHERE workflow_run_id = ? AND analysis_batch_id = ?",
             (workflow_run_id, analysis_batch_id),
         ).fetchone()
-        if handoff is None or str(handoff["codex_session_ref"] or "") != codex_session_ref:
-            raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_NOT_CLAIMED", "当前批次没有可确认的 Codex 交接。")
-        if handoff["status"] == "claimed":
+        if (
+            handoff is None
+            or str(handoff["codex_session_ref"] or "") != codex_session_ref
+            or str(handoff["handoff_attempt_id"] or "") != handoff_attempt_id
+        ):
+            raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_STALE", "当前 Codex 交接已失效，不能确认 Prompt 写入。")
+        if handoff["attempt_status"] == "claimed":
             connection.execute(
                 """
                 UPDATE fj_workflow_analysis_handoffs
-                SET status = 'submitted', submitted_at = ?
+                SET status = 'submitted', attempt_status = 'prompt_written', submitted_at = ?, prompt_written_at = ?
                 WHERE workflow_run_id = ? AND analysis_batch_id = ?
                 """,
-                (utc_now(), workflow_run_id, analysis_batch_id),
+                (utc_now(), utc_now(), workflow_run_id, analysis_batch_id),
             )
-        elif handoff["status"] != "submitted":
-            raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_NOT_CLAIMED", "当前批次已释放或完成，不能确认提交。")
+        elif handoff["attempt_status"] not in {"prompt_written", "started"}:
+            raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_STALE", "当前 Codex 交接已失效，不能确认 Prompt 写入。")
+    _update_run(
+        db,
+        workflow_run_id,
+        next_action_reason="Prompt 已写入 Codex 终端，等待当前交接尝试确认开始。",
+    )
     return get_workflow_run(db, workflow_run_id)
 
 
 def release_workflow_analysis_handoff(
-    db: Database, workflow_run_id: str, analysis_batch_id: str, codex_session_ref: str
+    db: Database,
+    workflow_run_id: str,
+    analysis_batch_id: str,
+    handoff_attempt_id: str,
+    codex_session_ref: str,
 ) -> dict[str, object]:
     """Prompt 未被终端接受时释放 claim，使同一批次可以安全重试。"""
     with db.connect() as connection:
@@ -611,18 +642,71 @@ def release_workflow_analysis_handoff(
             "SELECT * FROM fj_workflow_analysis_handoffs WHERE workflow_run_id = ? AND analysis_batch_id = ?",
             (workflow_run_id, analysis_batch_id),
         ).fetchone()
-        if handoff is None or str(handoff["codex_session_ref"] or "") != codex_session_ref:
-            raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_NOT_CLAIMED", "当前批次没有可释放的 Codex 交接。")
-        if handoff["status"] != "claimed":
+        if (
+            handoff is None
+            or str(handoff["codex_session_ref"] or "") != codex_session_ref
+            or str(handoff["handoff_attempt_id"] or "") != handoff_attempt_id
+        ):
+            raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_STALE", "当前批次没有可释放的有效 Codex 交接。")
+        if handoff["attempt_status"] != "claimed":
             raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_ALREADY_SUBMITTED", "当前批次已提交给 Codex，不能按失败释放。")
         connection.execute(
             """
             UPDATE fj_workflow_analysis_handoffs
-            SET status = 'released', released_at = ?
+            SET status = 'released', attempt_status = 'released', released_at = ?
             WHERE workflow_run_id = ? AND analysis_batch_id = ?
             """,
             (utc_now(), workflow_run_id, analysis_batch_id),
         )
+    return get_workflow_run(db, workflow_run_id)
+
+
+def ack_workflow_analysis_batch_started(
+    db: Database,
+    workflow_run_id: str,
+    analysis_batch_id: str,
+    handoff_attempt_id: str,
+) -> dict[str, object]:
+    """仅由当前有效交接尝试确认 Codex 已开始处理分析批次。"""
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        handoff = connection.execute(
+            "SELECT * FROM fj_workflow_analysis_handoffs WHERE workflow_run_id = ? AND analysis_batch_id = ?",
+            (workflow_run_id, analysis_batch_id),
+        ).fetchone()
+        if handoff is None or str(handoff["handoff_attempt_id"] or "") != handoff_attempt_id:
+            raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_STALE", "当前 Codex 交接尝试已失效，不能确认开始。")
+        attempt_status = str(handoff["attempt_status"] or "")
+        if attempt_status == "started":
+            return get_workflow_run(db, workflow_run_id)
+        if attempt_status != "prompt_written":
+            raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_NOT_READY", "Prompt 尚未写入或当前交接已结束，不能确认开始。")
+        rows = connection.execute(
+            "SELECT status, payload_json FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis'",
+            (workflow_run_id,),
+        ).fetchall()
+        has_active_item = any(
+            _analysis_batch_id_from_payload(_load(row["payload_json"], {}), workflow_run_id) == analysis_batch_id
+            and row["status"] in {"pending", "running"}
+            for row in rows
+        )
+        if not has_active_item:
+            raise AppError(409, "WORKFLOW_ANALYSIS_BATCH_FINISHED", "当前分析批次已完成，不能重新启动。")
+        connection.execute(
+            """
+            UPDATE fj_workflow_analysis_handoffs
+            SET status = 'submitted', attempt_status = 'started', started_at = ?
+            WHERE workflow_run_id = ? AND analysis_batch_id = ? AND handoff_attempt_id = ?
+            """,
+            (utc_now(), workflow_run_id, analysis_batch_id, handoff_attempt_id),
+        )
+    _update_run(
+        db,
+        workflow_run_id,
+        current_step="waiting_codex",
+        next_action="codex_analysis",
+        next_action_reason="Codex 已确认开始当前岗位分析批次。",
+    )
     return get_workflow_run(db, workflow_run_id)
 
 
@@ -1491,6 +1575,33 @@ def _analysis_batch_id(row: Any, workflow_run_id: str) -> str:
     return _analysis_batch_id_from_payload(_load(row["payload_json"], {}), workflow_run_id)
 
 
+def _start_ack_timed_out(handoff: Any) -> bool:
+    """Prompt 写入后只展示等待确认，超时由用户显式重试生成新尝试。"""
+    prompt_written_at = str(handoff["prompt_written_at"] or "")
+    if not prompt_written_at:
+        return False
+    try:
+        written_at = datetime.fromisoformat(prompt_written_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return datetime.now(timezone.utc) >= written_at + timedelta(seconds=START_ACK_TIMEOUT_SECONDS)
+
+
+def _require_analysis_batch_started(
+    db: Database, workflow_run_id: str, analysis_batch_id: str
+) -> None:
+    """正式保存分析结果前确认当前批次已收到 Codex 的开始 ACK。"""
+    with db.connect() as connection:
+        handoff = connection.execute(
+            "SELECT attempt_status FROM fj_workflow_analysis_handoffs WHERE workflow_run_id = ? AND analysis_batch_id = ?",
+            (workflow_run_id, analysis_batch_id),
+        ).fetchone()
+    # 旧的直接服务调用没有创建 handoff 记录，保持其既有兼容行为；
+    # 一旦存在交接记录，正式保存必须等待当前 attempt 的 ACK。
+    if handoff is not None and str(handoff["attempt_status"] or "") != "started":
+        raise AppError(409, "WORKFLOW_ANALYSIS_NOT_STARTED", "当前分析批次尚未确认由 Codex 开始处理。")
+
+
 def _get_analysis_handoff_summary(db: Database, workflow_run_id: str) -> dict[str, object]:
     with db.connect() as connection:
         rows = connection.execute(
@@ -1514,11 +1625,17 @@ def _get_analysis_handoff_summary(db: Database, workflow_run_id: str) -> dict[st
             "running_item_count": 0,
             "succeeded_item_count": 0,
             "handoff_status": "none",
+            "handoff_attempt_id": None,
+            "attempt_status": "none",
             "needs_initial_codex_handoff": False,
             "needs_next_batch_handoff": False,
             "codex_processing": False,
             "analysis_batch_complete": True,
             "recovery_available": False,
+            "awaiting_start_ack": False,
+            "start_ack_timed_out": False,
+            "retry_available": False,
+            "start_ack_timeout_seconds": START_ACK_TIMEOUT_SECONDS,
         }
     batch_rows = batches[active_batch_id]
     counts = {status: sum(row["status"] == status for row in batch_rows) for status in ("pending", "running", "succeeded")}
@@ -1528,23 +1645,32 @@ def _get_analysis_handoff_summary(db: Database, workflow_run_id: str) -> dict[st
             (workflow_run_id, active_batch_id),
         ).fetchone()
     handoff_status = str(handoff["status"]) if handoff is not None else "none"
+    attempt_status = str(handoff["attempt_status"] or "claimed") if handoff is not None else "none"
+    start_ack_timed_out = bool(handoff is not None and attempt_status == "prompt_written" and _start_ack_timed_out(handoff))
     batch_index = list(batches).index(active_batch_id)
-    ready_for_handoff = counts["pending"] > 0 and handoff_status in {"none", "released"}
+    ready_for_handoff = counts["pending"] > 0 and (handoff is None or attempt_status == "released")
     return {
         "analysis_batch_id": active_batch_id,
         "pending_item_count": counts["pending"],
         "running_item_count": counts["running"],
         "succeeded_item_count": counts["succeeded"],
         "handoff_status": handoff_status,
+        "handoff_attempt_id": handoff["handoff_attempt_id"] if handoff is not None else None,
+        "attempt_status": attempt_status,
         "claimed_at": handoff["claimed_at"] if handoff is not None else None,
         "submitted_at": handoff["submitted_at"] if handoff is not None else None,
+        "prompt_written_at": handoff["prompt_written_at"] if handoff is not None else None,
+        "started_at": handoff["started_at"] if handoff is not None else None,
         "codex_session_ref": handoff["codex_session_ref"] if handoff is not None else None,
         "needs_initial_codex_handoff": ready_for_handoff and batch_index == 0,
         "needs_next_batch_handoff": ready_for_handoff and batch_index > 0,
-        "codex_processing": handoff_status in {"claimed", "submitted"} and (counts["pending"] + counts["running"]) > 0,
+        "codex_processing": attempt_status == "started" and (counts["pending"] + counts["running"]) > 0,
         "analysis_batch_complete": counts["pending"] + counts["running"] == 0,
-        "recovery_available": handoff_status in {"claimed", "submitted"}
-        and str(handoff["codex_session_ref"] or "").startswith("runtime:"),
+        "recovery_available": False,
+        "awaiting_start_ack": attempt_status == "prompt_written",
+        "start_ack_timed_out": start_ack_timed_out,
+        "retry_available": start_ack_timed_out,
+        "start_ack_timeout_seconds": START_ACK_TIMEOUT_SECONDS,
     }
 
 
@@ -1565,8 +1691,8 @@ def _complete_analysis_handoff_if_finished(
             connection.execute(
                 """
                 UPDATE fj_workflow_analysis_handoffs
-                SET status = 'completed', completed_at = ?
-                WHERE workflow_run_id = ? AND analysis_batch_id = ? AND status IN ('claimed', 'submitted')
+                SET status = 'completed', attempt_status = 'completed', completed_at = ?
+                WHERE workflow_run_id = ? AND analysis_batch_id = ? AND attempt_status IN ('claimed', 'prompt_written', 'started')
                 """,
                 (utc_now(), workflow_run_id, analysis_batch_id),
             )
