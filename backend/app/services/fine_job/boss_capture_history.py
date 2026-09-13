@@ -218,6 +218,7 @@ def record_capture_jobs(
                         "strategy_filter_status",
                         "final_filter_status",
                         "filter_reasons",
+                        "filter_failure_codes",
                         "filter_missing_fields",
                         "filter_strategy_id",
                     ):
@@ -414,6 +415,7 @@ def update_capture_job_filter_result(
                     "final_filter_status", result.get("status")
                 ),
                 "filter_reasons": list(result.get("reasons") or []),
+                "filter_failure_codes": list(result.get("failure_codes") or []),
                 "filter_missing_fields": list(result.get("missing_fields") or []),
                 "filter_strategy_id": result.get("strategy_id"),
                 "cooldown_excluded": bool(result.get("cooldown_excluded")),
@@ -862,6 +864,7 @@ def _serialize_history_row(row) -> dict[str, object]:
             "final_filter_status", payload.get("filter_status")
         ),
         "filter_reasons": list(payload.get("filter_reasons") or []),
+        "filter_failure_codes": list(payload.get("filter_failure_codes") or []),
         "filter_missing_fields": list(payload.get("filter_missing_fields") or []),
         "filter_strategy_id": payload.get("filter_strategy_id"),
         "cooldown_excluded": bool(payload.get("cooldown_excluded")),

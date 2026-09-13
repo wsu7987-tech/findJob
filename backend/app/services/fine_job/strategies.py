@@ -31,7 +31,6 @@ FILTER_LIST_FIELDS = (
     "skill_include_any",
     "skill_include_all",
     "skill_exclude",
-    "boss_active_statuses",
 )
 RECOMMENDATION_LIST_FIELDS = (
     "desired_responsibilities",
@@ -39,6 +38,7 @@ RECOMMENDATION_LIST_FIELDS = (
     "preferred_skills",
     "excluded_terms",
     "preferred_industries",
+    "boss_active_statuses",
 )
 
 
@@ -545,10 +545,10 @@ def _migrate_legacy_intent(db: Database) -> None:
               company_industries_json, company_stages_json, degrees_json,
               experiences_json, job_types_json, monthly_salary_min,
               monthly_salary_max_at_least, daily_salary_min, skill_include_any_json,
-              skill_include_all_json, skill_exclude_json, boss_active_statuses_json,
+              skill_include_all_json, skill_exclude_json,
               unknown_value_policy, notes, created_at, updated_at
             ) VALUES (?, ?, 1, ?, ?, ?, '[]', ?, '[]', '[]', '[]', '[]', '[]',
-                      '[]', '[]', '[]', ?, ?, NULL, ?, '[]', '[]', '[]', 'review', ?, ?, ?)
+                      '[]', '[]', '[]', ?, ?, NULL, ?, '[]', '[]', 'review', ?, ?, ?)
             """,
             (
                 "legacy-intent-default",

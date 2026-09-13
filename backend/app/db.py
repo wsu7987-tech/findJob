@@ -887,7 +887,6 @@ CREATE TABLE IF NOT EXISTS fj_job_filter_strategies (
   skill_include_any_json TEXT NOT NULL DEFAULT '[]',
   skill_include_all_json TEXT NOT NULL DEFAULT '[]',
   skill_exclude_json TEXT NOT NULL DEFAULT '[]',
-  boss_active_statuses_json TEXT NOT NULL DEFAULT '[]',
   cooldown_rules_json TEXT NOT NULL DEFAULT '{}',
   unknown_value_policy TEXT NOT NULL DEFAULT 'review',
   notes TEXT NOT NULL DEFAULT '',
@@ -912,6 +911,7 @@ CREATE TABLE IF NOT EXISTS fj_job_recommendation_strategies (
   preferred_skills_json TEXT NOT NULL DEFAULT '[]',
   excluded_terms_json TEXT NOT NULL DEFAULT '[]',
   preferred_industries_json TEXT NOT NULL DEFAULT '[]',
+  boss_active_statuses_json TEXT NOT NULL DEFAULT '[]',
   work_preferences TEXT NOT NULL DEFAULT '',
   risk_notes TEXT NOT NULL DEFAULT '',
   minimum_confidence REAL NOT NULL DEFAULT 0.7,
@@ -1946,6 +1946,129 @@ CREATE TABLE IF NOT EXISTS fj_workflow_job_discoveries (
 CREATE INDEX IF NOT EXISTS idx_fj_workflow_job_discoveries_job
   ON fj_workflow_job_discoveries(job_id, discovered_at DESC);
 
+-- Search Combination 保存每个已执行组合的状态、来源与累计搜索质量指标。
+CREATE TABLE IF NOT EXISTS fj_workflow_search_combinations (
+  id TEXT PRIMARY KEY,
+  workflow_run_id TEXT NOT NULL,
+  keyword TEXT NOT NULL,
+  city TEXT NOT NULL,
+  platform_filters_json TEXT NOT NULL DEFAULT '{}',
+  identity_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  sequence INTEGER NOT NULL DEFAULT 0,
+  parent_combination_id TEXT,
+  transition_action TEXT NOT NULL DEFAULT 'SWITCH_COMBINATION',
+  transition_reason TEXT NOT NULL DEFAULT '',
+  selected_axis TEXT NOT NULL DEFAULT '',
+  evidence_json TEXT NOT NULL DEFAULT '{}',
+  batch_count INTEGER NOT NULL DEFAULT 0,
+  pages_seen INTEGER NOT NULL DEFAULT 0,
+  jobs_seen INTEGER NOT NULL DEFAULT 0,
+  run_fresh_jobs INTEGER NOT NULL DEFAULT 0,
+  historical_duplicates INTEGER NOT NULL DEFAULT 0,
+  cooldown_excluded INTEGER NOT NULL DEFAULT 0,
+  strategy_pass INTEGER NOT NULL DEFAULT 0,
+  strategy_review INTEGER NOT NULL DEFAULT 0,
+  strategy_reject INTEGER NOT NULL DEFAULT 0,
+  qualified_fresh_jobs INTEGER NOT NULL DEFAULT 0,
+  candidate_jobs INTEGER NOT NULL DEFAULT 0,
+  novelty_yield REAL NOT NULL DEFAULT 0,
+  qualified_novelty_yield REAL NOT NULL DEFAULT 0,
+  duplicate_rate REAL NOT NULL DEFAULT 0,
+  low_novelty_streak INTEGER NOT NULL DEFAULT 0,
+  low_qualified_yield_streak INTEGER NOT NULL DEFAULT 0,
+  started_at TEXT,
+  completed_at TEXT,
+  stop_reason TEXT NOT NULL DEFAULT '',
+  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE CASCADE,
+  FOREIGN KEY (parent_combination_id) REFERENCES fj_workflow_search_combinations(id) ON DELETE SET NULL,
+  UNIQUE (workflow_run_id, identity_json),
+  CHECK (status IN ('pending', 'running', 'exhausted', 'completed', 'skipped', 'failed')),
+  CHECK (transition_action IN ('ADD_FILTER', 'REMOVE_FILTER', 'REPLACE_FILTER', 'SWITCH_COMBINATION'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_workflow_search_combinations_run_sequence
+  ON fj_workflow_search_combinations(workflow_run_id, sequence);
+
+CREATE INDEX IF NOT EXISTS idx_fj_workflow_search_combinations_scope_status
+  ON fj_workflow_search_combinations(workflow_run_id, keyword, city, status);
+
+-- Prefetch 只保存下一批 JD 准备状态，不进入正式 Workflow JD/Analysis task 状态机。
+CREATE TABLE IF NOT EXISTS fj_workflow_prefetch_batches (
+  id TEXT PRIMARY KEY,
+  workflow_run_id TEXT NOT NULL,
+  source_analysis_batch_id TEXT NOT NULL,
+  target_count INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'preparing',
+  failure_reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT,
+  promoted_at TEXT,
+  abandoned_at TEXT,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE CASCADE,
+  UNIQUE (workflow_run_id, source_analysis_batch_id),
+  CHECK (status IN ('preparing', 'ready', 'promoted', 'abandoned', 'cancelled', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_workflow_prefetch_batches_run_status
+  ON fj_workflow_prefetch_batches(workflow_run_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS fj_workflow_prefetch_items (
+  id TEXT PRIMARY KEY,
+  workflow_run_id TEXT NOT NULL,
+  prefetch_batch_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  lifecycle_status TEXT NOT NULL DEFAULT 'preparing',
+  detail_status TEXT NOT NULL DEFAULT 'not_collected',
+  operation_ref_type TEXT,
+  operation_ref_id TEXT,
+  error_message TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT,
+  promoted_at TEXT,
+  abandoned_at TEXT,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE CASCADE,
+  FOREIGN KEY (prefetch_batch_id) REFERENCES fj_workflow_prefetch_batches(id) ON DELETE CASCADE,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+  UNIQUE (prefetch_batch_id, job_id),
+  CHECK (status IN ('pending', 'collecting', 'ready', 'failed')),
+  CHECK (lifecycle_status IN ('preparing', 'ready', 'promoted', 'abandoned', 'cancelled')),
+  CHECK (detail_status IN ('not_collected', 'queued', 'collecting', 'completed', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_workflow_prefetch_items_batch_status
+  ON fj_workflow_prefetch_items(prefetch_batch_id, status, created_at);
+
+-- 同一个岗位只允许一个活动 reservation；释放/终结后会留下历史记录但不再占用岗位。
+CREATE TABLE IF NOT EXISTS fj_workflow_candidate_reservations (
+  id TEXT PRIMARY KEY,
+  workflow_run_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  owner_type TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'reserved',
+  created_at TEXT NOT NULL,
+  released_at TEXT,
+  terminal_at TEXT,
+  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE CASCADE,
+  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+  UNIQUE (owner_type, owner_id, job_id),
+  CHECK (owner_type IN ('formal_jd', 'formal_analysis', 'prefetch')),
+  CHECK (status IN ('reserved', 'promoted', 'released', 'abandoned', 'cancelled', 'failed'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_candidate_reservations_active
+  ON fj_workflow_candidate_reservations(job_id)
+  WHERE status = 'reserved';
+
+CREATE INDEX IF NOT EXISTS idx_fj_workflow_candidate_reservations_run_status
+  ON fj_workflow_candidate_reservations(workflow_run_id, status, created_at);
+
 -- Workflow 分析反馈只记录本轮评估质量，不修改正式策略。
 CREATE TABLE IF NOT EXISTS fj_workflow_evaluation_feedback (
   id TEXT PRIMARY KEY,
@@ -2201,6 +2324,7 @@ class Database:
             self._ensure_fj_platform_session_columns(connection)
             self._ensure_fj_boss_job_columns(connection)
             self._ensure_fj_delivery_strategy_columns(connection)
+            self._ensure_fj_strategy_activity_schema(connection)
             self._ensure_fj_boss_executor_schema(connection)
             self._ensure_fj_company_governance_schema(connection)
             self._ensure_fj_execution_observability_schema(connection)
@@ -2221,6 +2345,47 @@ class Database:
 
             migrate_legacy_job_activity(connection)
             initialize_execution_observability(connection)
+
+    def _ensure_fj_strategy_activity_schema(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """将旧岗位筛选策略中的招聘者活跃状态迁移到建议投递策略。"""
+        recommendation_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(fj_job_recommendation_strategies)")
+        }
+        if "boss_active_statuses_json" not in recommendation_columns:
+            connection.execute(
+                "ALTER TABLE fj_job_recommendation_strategies "
+                "ADD COLUMN boss_active_statuses_json TEXT NOT NULL DEFAULT '[]'"
+            )
+
+        # 旧版本只把活跃状态存放在关联的岗位筛选策略中，首次升级时复制到建议策略。
+        filter_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(fj_job_filter_strategies)")
+        }
+        if "boss_active_statuses_json" not in filter_columns:
+            return
+        connection.execute(
+            """
+            UPDATE fj_job_recommendation_strategies
+            SET boss_active_statuses_json = (
+              SELECT s.boss_active_statuses_json
+              FROM fj_job_filter_strategies s
+              WHERE s.id = fj_job_recommendation_strategies.filter_strategy_id
+            )
+            WHERE filter_strategy_id IS NOT NULL
+              AND COALESCE(TRIM(boss_active_statuses_json), '') IN ('', '[]')
+              AND EXISTS (
+                SELECT 1
+                FROM fj_job_filter_strategies s
+                WHERE s.id = fj_job_recommendation_strategies.filter_strategy_id
+                  AND COALESCE(TRIM(s.boss_active_statuses_json), '') NOT IN ('', '[]')
+              )
+            """
+        )
 
     def _ensure_workflow_run_schema(self, connection: sqlite3.Connection) -> None:
         """为已创建的 Workflow Run 表补齐运行控制与候选标记。"""

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import json
+
 from backend.app.services.fine_job import workflow_runs
 from backend.app.services.fine_job.boss_capture_history import (
     create_capture_batch,
@@ -24,9 +27,11 @@ def _strategy_payload(**updates):
     return payload
 
 
-def _create_run(configured_client, **updates):
+def _create_run(configured_client, strategy_updates=None, **updates):
+    strategy_payload = _strategy_payload()
+    strategy_payload.update(strategy_updates or {})
     strategy = configured_client.post(
-        "/api/fine-job/strategies/filters", json=_strategy_payload()
+        "/api/fine-job/strategies/filters", json=strategy_payload
     ).json()["strategy"]
     profile = configured_client.get("/api/fine-job/profiles").json()["profiles"][0]
     resume = configured_client.post(
@@ -365,6 +370,9 @@ def test_fresh_only_count_excludes_historical_discoveries_and_records_source(
     assert discovery["city"] == "广州"
     assert discovery["scroll_depth"] == 5
     assert discovery["is_filter_candidate"] == 1
+    search_combination = json.loads(discovery["search_combination_json"])
+    assert search_combination["search_combination_id"] == search_task["payload"]["search_combination_id"]
+    assert search_combination["platform_filters"] == {}
     assert refreshed["telemetry"]["fresh_candidates"] == 1
     assert refreshed["progress"]["current_keyword"] == "AI Agent"
     assert refreshed["progress"]["current_city"] == "广州"
@@ -391,7 +399,7 @@ def test_exhausted_search_tasks_waits_for_new_jobs_not_history(configured_client
     assert response.status_code == 200
     advanced = response.json()
     assert advanced["status"] == "waiting_for_user"
-    assert advanced["stop_reason"] == "new_jobs_insufficient"
+    assert advanced["stop_reason"] == "approved_search_space_exhausted"
     assert advanced["completed_count"] == 0
 
 
@@ -426,6 +434,8 @@ def test_search_advance_is_idempotent_while_capture_is_running(
     assert first.status_code == 200
     assert second.status_code == 200
     assert len(started) == 1
+    assert started[0].filters == {}
+    assert started[0].force_search_navigation is False
     assert second.json()["tasks"][0]["operation_ref_id"] == "capture-running"
 
 
@@ -459,6 +469,104 @@ def test_search_continues_current_combination_before_pending_combinations(
 
     assert advanced["next_action"] == "continue_scroll"
     assert next(item for item in advanced["tasks"] if item["operation_ref_id"] == "capture-continuing")["status"] == "running"
+
+
+def test_search_planner_passes_dynamic_platform_filters_to_capture(
+    configured_client, test_db, monkeypatch
+) -> None:
+    run = _create_run(
+        configured_client,
+        strategy_updates={"experiences": ["1-3年", "3-5年"]},
+    )
+    first_task_id = run["tasks"][0]["workflow_task_id"]
+    with test_db.connect() as connection:
+        task = connection.execute(
+            "SELECT * FROM fj_workflow_tasks WHERE id = ?", (first_task_id,)
+        ).fetchone()
+        connection.execute(
+            "UPDATE fj_workflow_tasks SET status = 'succeeded' WHERE id = ?",
+            (first_task_id,),
+        )
+    started: list[object] = []
+    monkeypatch.setattr(
+        workflow_runs.boss_scraper_service,
+        "get_browser_status",
+        lambda: BossBrowserStatus(running=True, cdp_port=9222),
+    )
+    monkeypatch.setattr(
+        workflow_runs.boss_capture_task_manager,
+        "start_capture",
+        lambda request, **kwargs: (started.append(request) or {"id": "capture-next"}),
+    )
+
+    advanced = workflow_runs._decide_next_step(
+        test_db,
+        configured_client.app.state.config,
+        run["workflow_run_id"],
+        task,
+        {"id": "capture-initial", "continuation_available": False, "has_more": False},
+        run["completion_contract"],
+        {
+            "jobs_seen": 30,
+            "run_fresh_jobs": 30,
+            "strategy_reject": 15,
+            "qualified_fresh_jobs": 0,
+            "candidate_jobs": 0,
+            "failure_code_counts": {"experience": 15, "degree": 6},
+        },
+    )
+
+    assert len(started) == 1
+    assert started[0].keyword == "AI Agent"
+    assert started[0].city == "广州"
+    assert started[0].filters == {"experience": "104"}
+    assert started[0].force_search_navigation is True
+    assert advanced["telemetry"]["search_planner"]["current_combination"]["platform_filters"] == {
+        "experience": "104"
+    }
+
+
+def test_search_planner_switches_city_before_keyword(configured_client, test_db) -> None:
+    run = _create_run(
+        configured_client,
+        strategy_updates={
+            "search_keywords": ["AI Agent", "产品经理"],
+            "cities": ["广州", "上海"],
+        },
+        allowed_search_keywords=["AI Agent", "产品经理"],
+        allowed_cities=["广州", "上海"],
+    )
+    first_payload = run["tasks"][0]["payload"]
+    first_combination_id = first_payload["search_combination_id"]
+
+    assert workflow_runs._create_next_approved_scope(
+        test_db, run["workflow_run_id"], first_payload, first_combination_id
+    )
+    with test_db.connect() as connection:
+        tasks = connection.execute(
+            "SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? ORDER BY created_at",
+            (run["workflow_run_id"],),
+        ).fetchall()
+    payloads = [json.loads(item["payload_json"]) for item in tasks]
+    second_payload = next(payload for payload in payloads if payload["city"] == "上海")
+    assert (second_payload["keyword"], second_payload["city"]) == ("AI Agent", "上海")
+    assert second_payload["platform_filters"] == {}
+
+    assert workflow_runs._create_next_approved_scope(
+        test_db,
+        run["workflow_run_id"],
+        second_payload,
+        second_payload["search_combination_id"],
+    )
+    with test_db.connect() as connection:
+        tasks = connection.execute(
+            "SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? ORDER BY created_at",
+            (run["workflow_run_id"],),
+        ).fetchall()
+    payloads = [json.loads(item["payload_json"]) for item in tasks]
+    third_payload = next(payload for payload in payloads if payload["keyword"] == "产品经理")
+    assert (third_payload["keyword"], third_payload["city"]) == ("产品经理", "广州")
+    assert third_payload["platform_filters"] == {}
 
 
 def test_codex_reads_backend_context_snapshot_via_registered_tool(
@@ -582,6 +690,278 @@ def _prepare_analysis_batch(configured_client, test_db, *, candidate_count: int,
         test_db, configured_client.app.state.config, run["workflow_run_id"]
     )
     return advanced, jobs
+
+
+def _ack_started_batch(configured_client, run: dict[str, object]) -> dict[str, object]:
+    run_id = str(run["workflow_run_id"])
+    batch_id = str(run["analysis_handoff"]["analysis_batch_id"])
+    claimed = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/claim",
+        json={
+            "codex_session_ref": "runtime:prefetch-test",
+            "codex_runtime_id": "prefetch-test",
+            "handoff_kind": "initial",
+        },
+    )
+    assert claimed.status_code == 200
+    attempt_id = claimed.json()["analysis_handoff"]["handoff_attempt_id"]
+    prompt_written = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/prompt-written",
+        json={
+            "analysis_batch_id": batch_id,
+            "handoff_attempt_id": attempt_id,
+            "codex_session_ref": "runtime:prefetch-test",
+        },
+    )
+    assert prompt_written.status_code == 200
+    started = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run_id}/analysis-handoff/ack-started",
+        json={"analysis_batch_id": batch_id, "handoff_attempt_id": attempt_id},
+    )
+    assert started.status_code == 200
+    return started.json()
+
+
+def _save_analysis_results(
+    configured_client, test_db, run: dict[str, object], decisions: list[str]
+) -> dict[str, object]:
+    current = run
+    for decision in decisions:
+        item = next(
+            task for task in current["tasks"]
+            if task["task_type"] == "deep_job_search_analysis"
+            and task["status"] == "pending"
+        )
+        current = workflow_runs.record_workflow_analysis_result(
+            test_db,
+            configured_client.app.state.config,
+            str(current["workflow_run_id"]),
+            str(item["workflow_task_id"]),
+            decision=decision,
+            evaluation_id=f"evaluation-{item['workflow_task_id']}",
+            evaluation={"summary": "targeted test"},
+        )
+    return current
+
+
+def test_prefetch_stays_outside_current_run_state_and_reuses_completed_jd(
+    configured_client, test_db, monkeypatch
+) -> None:
+    run, _jobs = _prepare_analysis_batch(configured_client, test_db, candidate_count=4)
+    monkeypatch.setattr(
+        workflow_runs.boss_capture_task_manager,
+        "start_history_detail",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("不应重复抓取已有 JD")),
+    )
+
+    started = _ack_started_batch(configured_client, run)
+
+    assert started["status"] == "waiting_codex"
+    assert started["current_step"] == "waiting_codex"
+    assert started["analysis_handoff"]["attempt_status"] == "started"
+    assert started["prefetch"]["status"] == "ready"
+    assert started["prefetch"]["ready_count"] == 2
+    assert started["prefetch"]["target_count"] == 2
+    assert len([
+        task for task in started["tasks"]
+        if task["task_type"] == "deep_job_search_analysis"
+    ]) == 2
+
+
+def test_completion_contract_abandons_ready_prefetch_before_new_analysis_batch(
+    configured_client, test_db
+) -> None:
+    run, _jobs = _prepare_analysis_batch(configured_client, test_db, candidate_count=4)
+    _ack_started_batch(configured_client, run)
+
+    completed = _save_analysis_results(
+        configured_client, test_db, run, ["recommend", "recommend"]
+    )
+
+    assert completed["status"] == "completed"
+    assert completed["prefetch"]["status"] == "abandoned"
+    assert not any(
+        task["task_type"] == "deep_job_search_analysis"
+        and task["payload"].get("prefetch_item_id")
+        for task in completed["tasks"]
+    )
+    with test_db.connect() as connection:
+        reservation = connection.execute(
+            """
+            SELECT COUNT(*) FROM fj_workflow_candidate_reservations
+            WHERE workflow_run_id = ? AND owner_type = 'prefetch' AND status = 'reserved'
+            """,
+            (completed["workflow_run_id"],),
+        ).fetchone()[0]
+    assert reservation == 0
+
+
+def test_wait_for_user_keeps_ready_buffer_until_user_continue(
+    configured_client, test_db
+) -> None:
+    run, _jobs = _prepare_analysis_batch(
+        configured_client,
+        test_db,
+        candidate_count=4,
+        target_count=3,
+        execution_policy_after_analysis_batch="wait_for_user",
+    )
+    _ack_started_batch(configured_client, run)
+
+    waiting = _save_analysis_results(
+        configured_client, test_db, run, ["recommend", "recommend"]
+    )
+    assert waiting["status"] == "waiting_for_user"
+    assert waiting["stop_reason"] == "analysis_batch_waiting_user"
+    assert waiting["prefetch"]["status"] == "ready"
+    assert waiting["prefetch"]["ready_count"] == 2
+    assert len([
+        task for task in waiting["tasks"]
+        if task["task_type"] == "deep_job_search_analysis"
+    ]) == 2
+
+    resumed = configured_client.post(
+        f"/api/fine-job/workflow-runs/{waiting['workflow_run_id']}/resume"
+    )
+    assert resumed.status_code == 200
+    continued = resumed.json()
+    assert continued["status"] == "waiting_codex"
+    assert continued["prefetch"]["status"] == "promoted"
+    assert len([
+        task for task in continued["tasks"]
+        if task["task_type"] == "deep_job_search_analysis"
+    ]) == 4
+    with test_db.connect() as connection:
+        active_analysis_reservations = connection.execute(
+            """
+            SELECT COUNT(*) FROM fj_workflow_candidate_reservations
+            WHERE workflow_run_id = ? AND owner_type = 'formal_analysis'
+              AND status = 'reserved'
+            """,
+            (continued["workflow_run_id"],),
+        ).fetchone()[0]
+    assert active_analysis_reservations == 2
+
+
+def test_partial_ready_failed_prefetch_promotes_smaller_batch_without_stalling(
+    configured_client, test_db
+) -> None:
+    run, _jobs = _prepare_analysis_batch(
+        configured_client,
+        test_db,
+        candidate_count=10,
+        target_count=10,
+        analysis_batch_size=5,
+    )
+    started = _ack_started_batch(configured_client, run)
+    batch_id = started["prefetch"]["prefetch_batch_id"]
+    with test_db.connect() as connection:
+        items = connection.execute(
+            """
+            SELECT id, job_id FROM fj_workflow_prefetch_items
+            WHERE prefetch_batch_id = ? AND status = 'ready'
+            ORDER BY created_at, id
+            """,
+            (batch_id,),
+        ).fetchall()
+        for item in items[:2]:
+            connection.execute(
+                """
+                UPDATE fj_workflow_prefetch_items
+                SET status = 'failed', lifecycle_status = 'abandoned',
+                    detail_status = 'failed', error_message = 'targeted failure'
+                WHERE id = ?
+                """,
+                (item["id"],),
+            )
+            connection.execute(
+                """
+                UPDATE fj_workflow_candidate_reservations
+                SET status = 'failed', released_at = ?, terminal_at = ?
+                WHERE owner_type = 'prefetch' AND owner_id = ? AND status = 'reserved'
+                """,
+                (utc_now(), utc_now(), item["id"]),
+            )
+
+    completed = _save_analysis_results(
+        configured_client, test_db, run, ["recommend", "reject", "reject", "reject", "reject"]
+    )
+
+    assert completed["status"] == "waiting_codex"
+    assert completed["prefetch"]["status"] == "promoted"
+    assert len([
+        task for task in completed["tasks"]
+        if task["task_type"] == "deep_job_search_analysis"
+    ]) == 8
+
+
+def test_prefetch_reservation_is_atomic_and_competing_batch_cannot_select_candidate(
+    configured_client, test_db
+) -> None:
+    run, _jobs = _prepare_analysis_batch(configured_client, test_db, candidate_count=3)
+    config = configured_client.app.state.config
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(
+            lambda source: workflow_runs._ensure_prefetch_batch(
+                test_db, config, str(run["workflow_run_id"]), source
+            ),
+            ["prefetch-source-a", "prefetch-source-b"],
+        ))
+
+    assert all(results)
+    with test_db.connect() as connection:
+        active = connection.execute(
+            """
+            SELECT COUNT(*) FROM fj_workflow_candidate_reservations
+            WHERE job_id = (
+              SELECT job_id FROM fj_workflow_prefetch_items
+              ORDER BY created_at DESC LIMIT 1
+            ) AND status = 'reserved'
+            """
+        ).fetchone()[0]
+        batch_statuses = {
+            row[0] for row in connection.execute(
+                """
+                SELECT status FROM fj_workflow_prefetch_batches
+                WHERE workflow_run_id = ?
+                """,
+                (run["workflow_run_id"],),
+            ).fetchall()
+        }
+    assert active == 1
+    assert "failed" in batch_statuses
+
+
+def test_cancelled_prefetch_releases_reservation_for_later_selection(
+    configured_client, test_db
+) -> None:
+    run, _jobs = _prepare_analysis_batch(configured_client, test_db, candidate_count=3)
+    config = configured_client.app.state.config
+    first_batch = workflow_runs._ensure_prefetch_batch(
+        test_db, config, str(run["workflow_run_id"]), "cancel-source-a"
+    )
+    assert first_batch
+
+    workflow_runs._cancel_prefetch_batches(test_db, str(run["workflow_run_id"]))
+    second_batch = workflow_runs._ensure_prefetch_batch(
+        test_db, config, str(run["workflow_run_id"]), "cancel-source-b"
+    )
+
+    assert second_batch
+    with test_db.connect() as connection:
+        statuses = [
+            row[0] for row in connection.execute(
+                """
+                SELECT status FROM fj_workflow_candidate_reservations
+                WHERE workflow_run_id = ? AND owner_type = 'prefetch'
+                ORDER BY created_at
+                """,
+                (run["workflow_run_id"],),
+            ).fetchall()
+        ]
+    assert "cancelled" in statuses
+    assert statuses.count("reserved") == 1
 
 
 def test_candidate_pool_to_jd_to_waiting_codex_uses_compact_shared_and_item_context(
@@ -940,7 +1320,7 @@ def test_candidate_pool_exhausted_after_reject_waits_for_new_jobs(configured_cli
     )["data"]
 
     assert result["status"] == "waiting_for_user"
-    assert result["stop_reason"] == "new_jobs_insufficient"
+    assert result["stop_reason"] == "approved_search_space_exhausted"
 
 
 def test_review_target_participates_only_when_configured_and_respects_all_mode(

@@ -1465,6 +1465,9 @@ export const api = {
     scroll_batch_size?: number;
     max_depth?: number;
     low_yield_streak_limit?: number;
+    low_novelty_threshold?: number;
+    low_qualified_yield_threshold?: number;
+    search_combination_safety_limit?: number;
     context_soft_budget_characters?: number;
   }) {
     return request<FineJobWorkflowRun>("/api/fine-job/workflow-runs", {

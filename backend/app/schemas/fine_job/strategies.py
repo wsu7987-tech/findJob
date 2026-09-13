@@ -91,7 +91,6 @@ class FineJobFilterStrategyPayload(BaseModel):
     skill_include_any: list[str] = Field(default_factory=list)
     skill_include_all: list[str] = Field(default_factory=list)
     skill_exclude: list[str] = Field(default_factory=list)
-    boss_active_statuses: list[str] = Field(default_factory=list)
     cooldown_rules: FineJobCooldownRules = Field(default_factory=FineJobCooldownRules)
     unknown_value_policy: UnknownValuePolicy = "review"
     notes: str = ""
@@ -130,6 +129,7 @@ class FineJobRecommendationStrategyPayload(BaseModel):
     preferred_skills: list[str] = Field(default_factory=list)
     excluded_terms: list[str] = Field(default_factory=list)
     preferred_industries: list[str] = Field(default_factory=list)
+    boss_active_statuses: list[str] = Field(default_factory=list)
     work_preferences: str = ""
     risk_notes: str = ""
     minimum_confidence: float = Field(default=0.7, ge=0, le=1)

@@ -43,8 +43,12 @@ def advance(workflow_run_id: str, config: AppConfig = Depends(get_config), db: D
 
 
 @router.post("/{workflow_run_id}/resume")
-def resume(workflow_run_id: str, db: Database = Depends(get_database)):
-    return workflow_runs.resume_deep_job_search_run(db, workflow_run_id)
+def resume(
+    workflow_run_id: str,
+    config: AppConfig = Depends(get_config),
+    db: Database = Depends(get_database),
+):
+    return workflow_runs.resume_deep_job_search_run(db, config, workflow_run_id)
 
 
 @router.post("/{workflow_run_id}/pause")
@@ -134,10 +138,11 @@ def mark_analysis_handoff_prompt_written(
 def ack_analysis_handoff_started(
     workflow_run_id: str,
     payload: WorkflowAnalysisHandoffStartAckRequest,
+    config: AppConfig = Depends(get_config),
     db: Database = Depends(get_database),
 ):
     return workflow_runs.ack_workflow_analysis_batch_started(
-        db, workflow_run_id, payload.analysis_batch_id, payload.handoff_attempt_id
+        db, workflow_run_id, payload.analysis_batch_id, payload.handoff_attempt_id, config
     )
 
 

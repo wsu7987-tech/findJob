@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { FineJobWorkflowRun } from "@/types";
+import { api } from "./api";
 
 import { createFineJobWorkflowCodexController } from "./fineJobWorkflowCodexController";
 
@@ -44,5 +45,48 @@ describe("fineJobWorkflowCodexController", () => {
     expect(getLatestRun).toHaveBeenCalledTimes(1);
     expect(codexStore.startWorkflow).toHaveBeenCalledTimes(1);
     expect(setRun).toHaveBeenCalled();
+  });
+
+  it("Prefetch 准备期间由 App-level controller 轮询旁路进度", async () => {
+    const run = {
+      ...waitingRun(),
+      analysis_handoff: {
+        ...waitingRun().analysis_handoff,
+        pending_item_count: 0,
+        attempt_status: "started" as const,
+        needs_initial_codex_handoff: false,
+        needs_next_batch_handoff: false
+      },
+      telemetry: {
+        prefetch: {
+          prefetch_batch_id: "prefetch-1",
+          source_analysis_batch_id: "batch-away",
+          status: "preparing",
+          target_count: 5,
+          pending_count: 2,
+          collecting_count: 1,
+          ready_count: 2,
+          failed_count: 0
+        }
+      }
+    } satisfies FineJobWorkflowRun;
+    const advance = vi.spyOn(api, "advanceFineJobWorkflowRun").mockResolvedValue(run);
+    const controller = createFineJobWorkflowCodexController({
+      getLatestRun: vi.fn().mockResolvedValue(run),
+      workflowStore: { setRun: vi.fn() },
+      codexStore: {
+        load: vi.fn().mockResolvedValue(undefined), status: "idle", runtimeId: null, sessionRef: null,
+        startWorkflow: vi.fn()
+      },
+      intervalMs: 10_000,
+      handoffDependencies: {
+        transport: { submitWorkflowCodexPrompt: vi.fn().mockResolvedValue(true) }
+      }
+    });
+
+    await controller.tick();
+
+    expect(advance).toHaveBeenCalledWith(run.workflow_run_id);
+    advance.mockRestore();
   });
 });

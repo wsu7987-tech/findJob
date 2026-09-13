@@ -271,6 +271,50 @@ describe("TaskCockpit", () => {
     expect(wrapper.text()).toContain("Codex 交接");
   });
 
+  it("展示 Search Planner 的最小状态", async () => {
+    mocks.getRun.mockResolvedValue({
+      ...run("running"),
+      telemetry: {
+        fresh_candidates: 2,
+        search_planner: {
+          current_scope: { keyword: "AI Agent", city: "广州" },
+          current_combination: {
+            id: "combination-1",
+            sequence: 2,
+            status: "running",
+            platform_filters: { experience: "104" },
+            platform_filter_labels: ["1-3年"],
+            metrics: {
+              run_fresh_jobs: 4,
+              historical_duplicates: 23,
+              strategy_reject: 7,
+              qualified_fresh_jobs: 2
+            }
+          },
+          last_transition: {
+            action: "ADD_FILTER",
+            reason: "duplicate_pool_skew",
+            selected_axis: "experience",
+            evidence: {},
+            stop_reason: ""
+          },
+          pending_combination_count: 1
+        }
+      }
+    });
+    const wrapper = mountCockpit();
+    await flushPromises();
+    await wrapper.find('[placeholder="输入 Workflow Run ID 查看本轮上下文"]').setValue("workflow-run-1");
+    await wrapper.findAll("button").find((item) => item.text() === "查看本轮上下文")!.trigger("click");
+    await flushPromises();
+
+    const summary = wrapper.get('[data-testid="search-planner-summary"]');
+    expect(summary.text()).toContain("AI Agent / 广州");
+    expect(summary.text()).toContain("1-3年");
+    expect(summary.text()).toContain("历史重复 23");
+    expect(summary.text()).toContain("尝试其它平台筛选值");
+  });
+
   it("批次等待用户时显示继续入口", async () => {
     mocks.getRun.mockResolvedValue({
       ...run("waiting_for_user"),

@@ -126,9 +126,83 @@ const compatibleRecommendationStrategies = computed(() => recommendationStrategi
 ));
 const activeAnalysisItem = computed(() => analysisItems.value.find((item) => item.status === "running") ?? null);
 const completionProgress = computed(() => workflowRun.value?.completion_progress);
+const prefetchProgress = computed(() => workflowRun.value?.prefetch ?? workflowRun.value?.telemetry.prefetch);
 const pendingReviewItems = computed(() => analysisItems.value.filter(
   (item) => item.status === "succeeded" && item.analysis_result.review_status === "pending"
 ));
+const searchPlanner = computed(() => workflowRun.value?.telemetry.search_planner ?? null);
+const plannerMetric = (key: string) => Number(
+  searchPlanner.value?.current_combination?.metrics?.[key] ?? 0
+);
+const plannerFilterText = computed(() => {
+  const labels = searchPlanner.value?.current_combination?.platform_filter_labels ?? [];
+  return labels.length ? labels.join(" + ") : "Baseline {}";
+});
+const plannerReasonText = computed(() => {
+  const reason = searchPlanner.value?.last_transition?.reason ?? "";
+  const reasonLabels: Record<string, string> = {
+    duplicate_pool_skew: "历史重复池高度集中，尝试其它平台筛选值",
+    filter_quality_exhaustion: "Fresh 岗位主要被 FineJob 策略拒绝，收窄高频失败维度",
+    low_novelty_exhausted: "当前组合的低 novelty 窗口已达到切换条件",
+    low_qualified_yield: "当前组合的合格 Fresh 产出偏低，尝试新的平台筛选值",
+    approved_city_next: "当前关键词的城市 Scope 已耗尽，进入下一个批准城市",
+    approved_keyword_next: "当前关键词的批准城市均已耗尽，进入下一个批准关键词",
+    approved_platform_search_space_exhausted: "当前 Scope 的合理平台组合已耗尽",
+    baseline: "先执行当前 Scope 的 Baseline 搜索",
+  };
+  return reasonLabels[reason] || reason || "等待当前组合采集结果";
+});
+const plannerNextActionText = computed(() => {
+  const transition = searchPlanner.value?.last_transition;
+  if (!transition) return "开始 Baseline 搜索";
+  if (transition.reason === "baseline") {
+    const status = searchPlanner.value?.current_combination?.status;
+    if (status === "running") return "执行 Baseline 搜索";
+    if (status === "pending") return "开始 Baseline 搜索";
+    return "Baseline 搜索已完成";
+  }
+  if (transition.action === "ADD_FILTER") return `增加${transition.selected_axis}平台筛选`;
+  if (transition.action === "REMOVE_FILTER") return `移除${transition.selected_axis}平台筛选`;
+  if (transition.action === "REPLACE_FILTER") return `替换${transition.selected_axis}平台筛选值`;
+  if (transition.reason === "approved_city_next") return "切换下一个批准城市并从 Baseline 开始";
+  if (transition.reason === "approved_keyword_next") return "切换下一个批准关键词并从 Baseline 开始";
+  return transition.action === "SWITCH_COMBINATION" ? "切换下一个搜索组合" : "继续当前组合";
+});
+const activeCaptureStatus = computed(() => {
+  const tasks = workflowRun.value?.tasks ?? [];
+  return [...tasks]
+    .reverse()
+    .find((task) => task.task_type === "deep_job_search" && task.capture && ["pending", "running"].includes(task.status))
+    ?.capture ?? null;
+});
+const captureStatusText = computed(() => {
+  const capture = activeCaptureStatus.value;
+  if (!capture) return "";
+  // 将后台采集器的状态翻译为驾驶舱可直接判断的进度信息。
+  const statusLabels: Record<string, string> = {
+    queued: "已排队",
+    running: "运行中",
+    completed: "已完成",
+    failed: "失败",
+    unavailable: "状态暂不可用"
+  };
+  const stageLabels: Record<string, string> = {
+    queued: "等待采集器",
+    list_collecting: "采集岗位列表",
+    list_continuing: "继续采集岗位列表",
+    details_collecting: "采集岗位详情"
+  };
+  const progress = capture.progress_total > 0
+    ? `${capture.progress_current}/${capture.progress_total}`
+    : "";
+  return [
+    `采集任务：${statusLabels[capture.status] || capture.status}`,
+    stageLabels[capture.stage] ? `阶段：${stageLabels[capture.stage]}` : "",
+    progress ? `进度：${progress}` : "",
+    capture.message || "",
+    capture.error_message && capture.status === "failed" ? `错误：${capture.error_message}` : ""
+  ].filter(Boolean).join("；");
+});
 
 const syncStrategyScope = () => {
   selectedKeywords.value = [...(selectedStrategy.value?.search_keywords ?? [])];
@@ -482,6 +556,18 @@ watch(workflowRun, (run) => {
       :closable="false"
       show-icon
     />
+    <section v-if="searchPlanner" class="surface-card search-planner-summary" data-testid="search-planner-summary">
+      <h3>搜索策略状态</h3>
+      <p>搜索范围：{{ searchPlanner.current_scope.keyword || '—' }} / {{ searchPlanner.current_scope.city || '—' }}</p>
+      <p>当前组合：{{ plannerFilterText }}</p>
+      <p>
+        本组合：Fresh {{ plannerMetric('run_fresh_jobs') }}；历史重复 {{ plannerMetric('historical_duplicates') }}；
+        Filter Reject {{ plannerMetric('strategy_reject') }}；Qualified Fresh {{ plannerMetric('qualified_fresh_jobs') }}
+      </p>
+      <p>切换原因：{{ plannerReasonText }}</p>
+      <p>下一动作：{{ plannerNextActionText }}</p>
+      <p v-if="captureStatusText">实际采集状态：{{ captureStatusText }}</p>
+    </section>
     <el-descriptions v-if="workflowRun" :column="3" border>
       <el-descriptions-item label="Workflow Run ID"><code>{{ workflowRun.workflow_run_id }}</code></el-descriptions-item>
       <el-descriptions-item label="Recommend 目标">{{ workflowRun.completion_contract?.recommend_target ?? workflowRun.completion_contract?.target_count ?? recommendTarget }}</el-descriptions-item>
@@ -497,6 +583,9 @@ watch(workflowRun, (run) => {
       <el-descriptions-item label="岗位：已见 / Fresh / 重复">{{ workflowRun.progress.jobs_seen }} / {{ workflowRun.progress.fresh_jobs }} / {{ workflowRun.progress.duplicate_jobs }}</el-descriptions-item>
       <el-descriptions-item label="初筛候选">{{ workflowRun.progress.candidates }}</el-descriptions-item>
       <el-descriptions-item label="JD：完成 / 已建">{{ workflowRun.progress.jd_completed }} / {{ workflowRun.progress.jd_total }}</el-descriptions-item>
+      <el-descriptions-item v-if="prefetchProgress && prefetchProgress.status !== 'none'" label="下一批 JD">
+        {{ prefetchProgress.ready_count }} / {{ prefetchProgress.target_count }} 已准备（{{ prefetchProgress.status }}）
+      </el-descriptions-item>
       <el-descriptions-item label="分析：推荐 / 复核 / 拒绝">{{ workflowRun.progress.recommend_count }} / {{ workflowRun.progress.review_count }} / {{ workflowRun.progress.reject_count }}</el-descriptions-item>
       <el-descriptions-item label="当前状态">{{ workflowRun.status }} / {{ workflowRun.current_step }}</el-descriptions-item>
       <el-descriptions-item label="下一步">{{ workflowRun.next_action }}</el-descriptions-item>
@@ -602,5 +691,7 @@ watch(workflowRun, (run) => {
 .codex-config { grid-template-columns: minmax(220px, 1fr) 160px; }
 .analysis-guidance-card, .analysis-result-card { padding: 14px; border: 1px solid var(--line); border-radius: var(--radius-control); }
 .analysis-result-card p { margin: 0; white-space: pre-wrap; }
+.search-planner-summary { display: grid; gap: 8px; }
+.search-planner-summary h3, .search-planner-summary p { margin: 0; }
 .feedback-reason { width: 190px; }
 </style>

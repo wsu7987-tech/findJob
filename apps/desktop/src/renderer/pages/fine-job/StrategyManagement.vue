@@ -329,9 +329,6 @@ const cloneDelivery = (value: FineJobDeliveryStrategy): FineJobDeliveryStrategy 
                 <el-form-item label="经验要求">
                   <el-select v-model="filterForm.experiences" multiple clearable><el-option v-for="item in experienceOptions" :key="item" :label="item" :value="item" /></el-select>
                 </el-form-item>
-                <el-form-item label="招聘者活跃状态">
-                  <el-select v-model="filterForm.boss_active_statuses" multiple clearable><el-option v-for="item in activeOptions" :key="item" :label="item" :value="item" /></el-select>
-                </el-form-item>
                 <el-form-item label="月薪下限不低于（K）"><el-input-number v-model="filterForm.monthly_salary_min" :min="0" /></el-form-item>
                 <el-form-item label="月薪上限不低于（K）"><el-input-number v-model="filterForm.monthly_salary_max_at_least" :min="0" /></el-form-item>
                 <el-form-item label="日薪下限不低于（元）"><el-input-number v-model="filterForm.daily_salary_min" :min="0" /></el-form-item>
@@ -410,6 +407,7 @@ const cloneDelivery = (value: FineJobDeliveryStrategy): FineJobDeliveryStrategy 
                 <el-form-item label="加分技能"><el-select v-model="recommendationForm.preferred_skills" multiple filterable allow-create default-first-option clearable placeholder="LangGraph、MCP" /></el-form-item>
                 <el-form-item label="排除职责/风险词"><el-select v-model="recommendationForm.excluded_terms" multiple filterable allow-create default-first-option clearable placeholder="销售、驻场" /></el-form-item>
                 <el-form-item label="偏好行业"><el-select v-model="recommendationForm.preferred_industries" multiple filterable allow-create default-first-option clearable placeholder="人工智能" /></el-form-item>
+                <el-form-item label="招聘者活跃状态"><el-select v-model="recommendationForm.boss_active_statuses" multiple clearable><el-option v-for="item in activeOptions" :key="item" :label="item" :value="item" /></el-select></el-form-item>
                 <el-form-item label="信息不足时"><el-select v-model="recommendationForm.insufficient_info_action"><el-option label="待人工判断" value="review" /><el-option label="不建议" value="reject" /></el-select></el-form-item>
               </div>
               <el-form-item label="工作偏好"><el-input v-model="recommendationForm.work_preferences" type="textarea" :rows="2" placeholder="远程、通勤、团队阶段等软要求" /></el-form-item>

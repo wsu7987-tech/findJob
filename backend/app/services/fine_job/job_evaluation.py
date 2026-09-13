@@ -75,6 +75,7 @@ def _evaluate_filter_job(
     job_id = str(job.get("job_id") or "")
     reasons: list[str] = []
     failures: list[str] = []
+    failure_codes: list[str] = []
     missing: list[str] = []
     title = _text(job.get("title"))
     company = _text(job.get("boss_name") or job.get("company"))
@@ -88,16 +89,16 @@ def _evaluate_filter_job(
         if _text(value)
     )
 
-    _contains_any(title, strategy.get("title_include_any"), "岗位名称", reasons, failures)
-    _contains_all(title, strategy.get("title_include_all"), "岗位名称", reasons, failures)
-    _exclude_terms(title, strategy.get("title_exclude"), "岗位名称", failures)
-    _contains_any(company, strategy.get("company_include"), "公司", reasons, failures)
-    _exclude_terms(company, strategy.get("company_exclude"), "公司", failures)
-    _exact_allowed(job, "company_scale", strategy, "company_scales", "公司规模", reasons, failures, missing)
-    _exact_allowed(job, "company_industry", strategy, "company_industries", "公司行业", reasons, failures, missing)
-    _exact_allowed(job, "company_stage", strategy, "company_stages", "融资阶段", reasons, failures, missing)
-    _exact_allowed(job, "degree", strategy, "degrees", "学历", reasons, failures, missing)
-    _exact_allowed(job, "experience", strategy, "experiences", "经验", reasons, failures, missing)
+    _contains_any(title, strategy.get("title_include_any"), "岗位名称", reasons, failures, failure_codes, "title")
+    _contains_all(title, strategy.get("title_include_all"), "岗位名称", reasons, failures, failure_codes, "title")
+    _exclude_terms(title, strategy.get("title_exclude"), "岗位名称", failures, failure_codes, "title")
+    _contains_any(company, strategy.get("company_include"), "公司", reasons, failures, failure_codes, "company")
+    _exclude_terms(company, strategy.get("company_exclude"), "公司", failures, failure_codes, "company")
+    _exact_allowed(job, "company_scale", strategy, "company_scales", "公司规模", reasons, failures, missing, failure_codes, "company_scale")
+    _exact_allowed(job, "company_industry", strategy, "company_industries", "公司行业", reasons, failures, missing, failure_codes, "company_industry")
+    _exact_allowed(job, "company_stage", strategy, "company_stages", "融资阶段", reasons, failures, missing, failure_codes, "company_stage")
+    _exact_allowed(job, "degree", strategy, "degrees", "学历", reasons, failures, missing, failure_codes, "degree")
+    _exact_allowed(job, "experience", strategy, "experiences", "经验", reasons, failures, missing, failure_codes, "experience")
 
     cities = _strings(strategy.get("cities"))
     if cities:
@@ -107,6 +108,7 @@ def _evaluate_filter_job(
             missing.append("地点")
         else:
             failures.append("地点不在限定城市")
+            failure_codes.append("city")
 
     job_types = _strings(strategy.get("job_types"))
     if job_types:
@@ -115,21 +117,12 @@ def _evaluate_filter_job(
             reasons.append(f"工作性质符合：{_job_type_label(detected)}")
         else:
             failures.append(f"工作性质为{_job_type_label(detected)}")
+            failure_codes.append("job_type")
 
-    _evaluate_salary(job, strategy, reasons, failures, missing)
-    _contains_any(skill_text, strategy.get("skill_include_any"), "技能", reasons, failures)
-    _contains_all(skill_text, strategy.get("skill_include_all"), "技能", reasons, failures)
-    _exclude_terms(skill_text, strategy.get("skill_exclude"), "技能/JD", failures)
-
-    active_allowed = _strings(strategy.get("boss_active_statuses"))
-    if active_allowed:
-        active = _text(job.get("boss_active_status") or detail.get("boss_active_status"))
-        if not active:
-            missing.append("招聘者活跃状态")
-        elif any(value.lower() in active.lower() for value in active_allowed):
-            reasons.append(f"招聘者状态符合：{active}")
-        else:
-            failures.append(f"招聘者状态不符合：{active}")
+    _evaluate_salary(job, strategy, reasons, failures, missing, failure_codes)
+    _contains_any(skill_text, strategy.get("skill_include_any"), "技能", reasons, failures, failure_codes, "skill")
+    _contains_all(skill_text, strategy.get("skill_include_all"), "技能", reasons, failures, failure_codes, "skill")
+    _exclude_terms(skill_text, strategy.get("skill_exclude"), "技能/JD", failures, failure_codes, "skill")
 
     policy = str(strategy.get("unknown_value_policy") or "review")
     if failures:
@@ -137,6 +130,7 @@ def _evaluate_filter_job(
     elif missing and policy == "exclude":
         status = "reject"
         failures.append(f"缺少必要字段：{'、'.join(missing)}")
+        failure_codes.extend(_missing_field_codes(missing))
     elif missing and policy == "review":
         status = "review"
     else:
@@ -147,6 +141,7 @@ def _evaluate_filter_job(
         "job_id": job_id,
         "status": status,
         "reasons": [*reasons, *failures],
+        "failure_codes": _unique_strings(failure_codes),
         "missing_fields": missing,
         "strategy_id": strategy.get("id"),
     }
@@ -193,6 +188,17 @@ def _evaluate_delivery_rules(
         )
     if not jd:
         missing.append("完整JD")
+    active_allowed = _strings(strategy.get("boss_active_statuses"))
+    if active_allowed:
+        # 招聘者活跃状态属于建议投递阶段，缺失时沿用信息不足处理策略。
+        active = _text(job.get("boss_active_status") or detail.get("boss_active_status"))
+        if not active:
+            missing.append("招聘者活跃状态")
+        elif any(value.lower() in active.lower() for value in active_allowed):
+            reasons.append(f"招聘者状态符合：{active}")
+        else:
+            risks.append(f"招聘者状态不符合：{active}")
+
     required = _strings(strategy.get("required_skills"))
     missing_required = [value for value in required if value.lower() not in combined.lower()]
     if missing_required:
@@ -228,6 +234,18 @@ def _evaluate_delivery_rules(
         decision = "review"
     normalized_reasons = reasons or ["符合已配置的结构化条件"]
     hard_requirements = []
+    if active_allowed:
+        active = _text(job.get("boss_active_status") or detail.get("boss_active_status"))
+        hard_requirements.append(
+            {
+                "name": "招聘者活跃状态",
+                "status": "unknown" if not active else (
+                    "pass" if any(value.lower() in active.lower() for value in active_allowed) else "fail"
+                ),
+                "jd_evidence": f"建议投递策略允许：{'、'.join(active_allowed)}",
+                "resume_evidence": active,
+            }
+        )
     for value in required:
         hard_requirements.append(
             {
@@ -631,7 +649,7 @@ def _clamp_score(value: object) -> float:
     return max(0.0, min(1.0, score))
 
 
-def _evaluate_salary(job, strategy, reasons, failures, missing) -> None:
+def _evaluate_salary(job, strategy, reasons, failures, missing, failure_codes) -> None:
     salary = _text(job.get("salary"))
     monthly_min = strategy.get("monthly_salary_min")
     monthly_max = strategy.get("monthly_salary_max_at_least")
@@ -644,23 +662,27 @@ def _evaluate_salary(job, strategy, reasons, failures, missing) -> None:
         low, high = int(match.group(1)), int(match.group(2))
         if monthly_min is not None and low < int(monthly_min):
             failures.append(f"月薪下限 {low}K 低于要求")
+            failure_codes.append("salary")
         elif monthly_max is not None and high < int(monthly_max):
             failures.append(f"月薪上限 {high}K 低于要求")
+            failure_codes.append("salary")
         else:
             reasons.append("月薪范围符合")
     elif daily:
         low = int(daily.group(1))
         if daily_min is not None and low < int(daily_min):
             failures.append(f"日薪下限 {low} 元低于要求")
+            failure_codes.append("salary")
         elif daily_min is not None:
             reasons.append("日薪范围符合")
         elif monthly_min is not None or monthly_max is not None:
             failures.append("岗位为日薪，不能满足月薪条件")
+            failure_codes.append("salary")
     else:
         missing.append("薪资")
 
 
-def _exact_allowed(job, job_key, strategy, strategy_key, label, reasons, failures, missing):
+def _exact_allowed(job, job_key, strategy, strategy_key, label, reasons, failures, missing, failure_codes, failure_code):
     allowed = _strings(strategy.get(strategy_key))
     if not allowed:
         return
@@ -671,9 +693,10 @@ def _exact_allowed(job, job_key, strategy, strategy_key, label, reasons, failure
         reasons.append(f"{label}符合：{value}")
     else:
         failures.append(f"{label}不符合：{value}")
+        failure_codes.append(failure_code)
 
 
-def _contains_any(text, values, label, reasons, failures):
+def _contains_any(text, values, label, reasons, failures, failure_codes, failure_code):
     terms = _strings(values)
     if not terms:
         return
@@ -682,23 +705,26 @@ def _contains_any(text, values, label, reasons, failures):
         reasons.append(f"{label}命中：{'、'.join(hits[:5])}")
     else:
         failures.append(f"{label}未命中任一要求词")
+        failure_codes.append(failure_code)
 
 
-def _contains_all(text, values, label, reasons, failures):
+def _contains_all(text, values, label, reasons, failures, failure_codes, failure_code):
     terms = _strings(values)
     if not terms:
         return
     missing = [term for term in terms if term.lower() not in text.lower()]
     if missing:
         failures.append(f"{label}缺少：{'、'.join(missing[:5])}")
+        failure_codes.append(failure_code)
     else:
         reasons.append(f"{label}满足全部要求词")
 
 
-def _exclude_terms(text, values, label, failures):
+def _exclude_terms(text, values, label, failures, failure_codes, failure_code):
     hits = [term for term in _strings(values) if term.lower() in text.lower()]
     if hits:
         failures.append(f"{label}命中排除词：{'、'.join(hits[:5])}")
+        failure_codes.append(failure_code)
 
 
 def _detect_job_type(job: dict[str, object]) -> str:
@@ -720,3 +746,20 @@ def _strings(value: object) -> list[str]:
 
 def _text(value: object) -> str:
     return str(value or "").strip()
+
+
+def _missing_field_codes(fields: list[str]) -> list[str]:
+    mapping = {
+        "薪资": "salary",
+        "经验": "experience",
+        "学历": "degree",
+        "公司规模": "company_scale",
+        "融资阶段": "company_stage",
+        "公司行业": "company_industry",
+        "地点": "city",
+    }
+    return [mapping[field] for field in fields if field in mapping]
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(str(value) for value in values if str(value).strip()))

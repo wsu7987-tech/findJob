@@ -31,7 +31,6 @@ export const emptyFilterStrategy = (): FineJobFilterStrategy => ({
   skill_include_any: [],
   skill_include_all: [],
   skill_exclude: [],
-  boss_active_statuses: [],
   cooldown_rules: {
     applied_company: { period: "permanent", exclude_outsourcing: true },
     detailed_and_evaluated_company: { period: "days_3", exclude_outsourcing: true },
@@ -53,6 +52,7 @@ export const emptyRecommendationStrategy = (): FineJobRecommendationStrategy => 
   preferred_skills: [],
   excluded_terms: [],
   preferred_industries: [],
+  boss_active_statuses: [],
   work_preferences: "",
   risk_notes: "",
   minimum_confidence: 0.7,

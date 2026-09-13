@@ -24,7 +24,6 @@ def _filter_payload(**updates):
         "skill_include_any": ["Python"],
         "skill_include_all": [],
         "skill_exclude": ["驻场"],
-        "boss_active_statuses": ["刚刚活跃"],
         "unknown_value_policy": "review",
         "notes": "应用研发岗位",
     }
@@ -136,6 +135,7 @@ def test_recommendation_strategy_crud(configured_client) -> None:
         "preferred_skills": ["LangGraph"],
         "excluded_terms": ["销售"],
         "preferred_industries": ["人工智能"],
+        "boss_active_statuses": ["刚刚活跃"],
         "work_preferences": "优先产品研发",
         "risk_notes": "排除驻场",
         "minimum_confidence": 0.7,
@@ -151,6 +151,7 @@ def test_recommendation_strategy_crud(configured_client) -> None:
     strategy = created.json()["strategy"]
     assert strategy["evaluation_method"] == "hybrid"
     assert strategy["filter_strategy_id"] == filter_strategy["id"]
+    assert strategy["boss_active_statuses"] == ["刚刚活跃"]
     assert configured_client.get(
         "/api/fine-job/strategies/recommendations"
     ).json()["strategies"][0]["required_skills"] == ["Python"]

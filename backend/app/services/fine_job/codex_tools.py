@@ -452,7 +452,7 @@ class CodexToolService:
         if not workflow_run_id or not analysis_batch_id or not handoff_attempt_id:
             raise AppError(422, "VALIDATION_FAILED", "Workflow Run、分析批次和交接尝试标识均为必填。")
         run = workflow_runs.ack_workflow_analysis_batch_started(
-            self.db, workflow_run_id, analysis_batch_id, handoff_attempt_id
+            self.db, workflow_run_id, analysis_batch_id, handoff_attempt_id, self.config
         )
         return _result(
             result_type="data",

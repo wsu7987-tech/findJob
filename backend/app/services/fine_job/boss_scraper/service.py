@@ -29,6 +29,7 @@ class BossCaptureRequest:
     cdp_port: int = engine.DEFAULT_CDP_PORT
     output_format: str = "json"
     prefer_current_page: bool = False
+    force_search_navigation: bool = False
     filter_strategy_id: str | None = None
 
 
@@ -718,7 +719,12 @@ class BossScraperService:
             used_current_page = False
             if request.prefer_current_page:
                 capture_target = self._find_interactive_target(request.cdp_port)
-                if capture_target and self._is_search_url(str(capture_target.get("url") or "")):
+                current_url = str((capture_target or {}).get("url") or "")
+                if (
+                    capture_target
+                    and self._is_search_url(current_url)
+                    and not request.force_search_navigation
+                ):
                     source_url = str(capture_target["url"])
                     used_current_page = True
                 else:

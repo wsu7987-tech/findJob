@@ -324,6 +324,30 @@ class BossCaptureTaskManager:
             task = deepcopy(self._require_task(task_id))
         return {key: value for key, value in task.items() if not key.startswith("_")}
 
+    def get_task_status(self, task_id: str) -> dict[str, object]:
+        """返回采集任务的轻量状态，供 Workflow 状态查询使用。"""
+        with self._lock:
+            task = self._require_task(task_id)
+            # 只读取状态字段，避免状态轮询复制完整岗位列表。
+            return {
+                key: task.get(key)
+                for key in (
+                    "id",
+                    "status",
+                    "stage",
+                    "message",
+                    "progress_current",
+                    "progress_total",
+                    "jobs_collected",
+                    "details_completed",
+                    "details_failed",
+                    "current_job",
+                    "error_message",
+                    "updated_at",
+                    "finished_at",
+                )
+            }
+
     def apply_recommendations(
         self,
         task_id: str,
@@ -362,6 +386,7 @@ class BossCaptureTaskManager:
                     "final_filter_status", result.get("status")
                 )
                 job["filter_reasons"] = list(result.get("reasons") or [])
+                job["filter_failure_codes"] = list(result.get("failure_codes") or [])
                 job["filter_missing_fields"] = list(result.get("missing_fields") or [])
                 job["filter_strategy_id"] = result.get("strategy_id")
                 for field in (
@@ -780,6 +805,7 @@ class BossCaptureTaskManager:
                 continue
             job["filter_status"] = result.get("status")
             job["filter_reasons"] = list(result.get("reasons") or [])
+            job["filter_failure_codes"] = list(result.get("failure_codes") or [])
             job["filter_missing_fields"] = list(result.get("missing_fields") or [])
             job["filter_strategy_id"] = strategy_id
             for field in (
@@ -844,6 +870,7 @@ class BossCaptureTaskManager:
                     "strategy_filter_status": previous.get("strategy_filter_status"),
                     "final_filter_status": previous.get("final_filter_status"),
                     "filter_reasons": previous.get("filter_reasons", []),
+                    "filter_failure_codes": previous.get("filter_failure_codes", []),
                     "filter_missing_fields": previous.get("filter_missing_fields", []),
                     "filter_strategy_id": previous.get("filter_strategy_id"),
                     "delivery_evaluation": previous.get("delivery_evaluation"),

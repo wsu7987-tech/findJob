@@ -10,6 +10,14 @@ from backend.app.errors import AppError
 from backend.app.services.fine_job.boss_capture_tasks import boss_capture_task_manager
 from backend.app.services.fine_job.boss_capture_history import get_capture_history_job
 from backend.app.services.fine_job.boss_scraper.service import BossCaptureRequest, boss_scraper_service
+from backend.app.services.fine_job.adaptive_search_planner import (
+    SearchWindowMetrics,
+    build_metrics_for_window,
+    canonicalize_platform_filters,
+    combination_identity,
+    describe_platform_filters,
+    plan_next_combination,
+)
 from backend.app.services.fine_job.filter_exclusions import apply_filter_exclusions
 from backend.app.services.fine_job.job_evaluation import evaluate_filter_strategy
 from backend.app.services.fine_job import profile_store, profile_v3
@@ -97,6 +105,12 @@ def create_deep_job_search_run(
             "low_yield_streak_limit": int(payload.get("low_yield_streak_limit") or 3),
             "candidate_target_count": candidate_target,
         },
+        "planner_policy": {
+            "low_novelty_threshold": float(payload.get("low_novelty_threshold") or 0.25),
+            "low_qualified_yield_threshold": float(payload.get("low_qualified_yield_threshold") or 0.15),
+            "duplicate_skew_threshold": 0.6,
+            "combination_safety_limit": int(payload.get("search_combination_safety_limit") or 24),
+        },
         "analysis_policy": {
             "analyze_all_candidates": bool(payload.get("analyze_all_candidates")),
             "stop_after_current_batch": bool(payload.get("stop_after_current_batch")),
@@ -123,17 +137,52 @@ def create_deep_job_search_run(
             """,
             (workflow_run_id, _dump(contract), recommend_target, now, now),
         )
-        for keyword in requested_keywords:
-            for city in requested_cities:
-                task_id = new_id()
-                connection.execute(
-                    """
-                    INSERT INTO fj_workflow_tasks (
-                      id, workflow_run_id, task_type, payload_json, result_json, created_at, updated_at
-                    ) VALUES (?, ?, 'deep_job_search', ?, '{}', ?, ?)
-                    """,
-                    (task_id, workflow_run_id, _dump({"keyword": keyword, "city": city, "depth": 0, "low_yield_streak": 0}), now, now),
-                )
+        # 先只建立第一个 Scope 的 baseline 组合，后续组合由 Planner 按结果按需创建。
+        keyword = requested_keywords[0]
+        city = requested_cities[0]
+        combination_id = new_id()
+        filters: dict[str, str] = {}
+        connection.execute(
+            """
+            INSERT INTO fj_workflow_search_combinations (
+              id, workflow_run_id, keyword, city, platform_filters_json,
+              identity_json, status, sequence, transition_action, transition_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 1, 'SWITCH_COMBINATION', 'baseline')
+            """,
+            (
+                combination_id,
+                workflow_run_id,
+                keyword,
+                city,
+                _dump(filters),
+                combination_identity(keyword, city, filters),
+            ),
+        )
+        task_id = new_id()
+        connection.execute(
+            """
+            INSERT INTO fj_workflow_tasks (
+              id, workflow_run_id, task_type, payload_json, result_json, created_at, updated_at
+            ) VALUES (?, ?, 'deep_job_search', ?, '{}', ?, ?)
+            """,
+            (
+                task_id,
+                workflow_run_id,
+                _dump({
+                    "keyword": keyword,
+                    "city": city,
+                    "platform_filters": filters,
+                    "search_combination_id": combination_id,
+                    "is_baseline": True,
+                    "depth": 0,
+                    "low_yield_streak": 0,
+                    "low_novelty_streak": 0,
+                    "low_qualified_yield_streak": 0,
+                }),
+                now,
+                now,
+            ),
+        )
     snapshot = _create_search_context_snapshot(
         db, workflow_run_id, strategy, recommendation_strategy, contract,
         int(payload.get("context_soft_budget_characters") or 12000),
@@ -147,8 +196,20 @@ def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: st
     """推进一个采集批次；Codex 只在候选池准备完成后参与。"""
     run = _require_run(db, workflow_run_id)
     if bool(run["paused"]):
+        _advance_prefetch(db, config, workflow_run_id, allow_start=False)
+        return get_workflow_run(db, workflow_run_id)
+    if run["status"] in {"waiting_codex", "waiting_for_user"}:
+        # Prefetch 是旁路调度；这里只轮询/启动已获准的下一批 JD，不改变主 Run 状态机。
+        _advance_prefetch(db, config, workflow_run_id)
+        refreshed = _require_run(db, workflow_run_id)
+        if (
+            refreshed["status"] == "waiting_codex"
+            and str(refreshed["next_action"] or "") == "wait_prefetch"
+        ):
+            _continue_after_prefetch_wait(db, config, workflow_run_id)
         return get_workflow_run(db, workflow_run_id)
     if run["status"] in {"completed", "cancelled", "failed", "waiting_codex", "waiting_for_user"}:
+        _abandon_prefetch_batches(db, workflow_run_id)
         return get_workflow_run(db, workflow_run_id)
     contract = _load(run["completion_contract_json"], {})
     jd_task = _next_jd_task(db, workflow_run_id)
@@ -156,7 +217,12 @@ def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: st
         return _advance_jd_collection(db, config, workflow_run_id, jd_task, contract)
     task = _next_task(db, workflow_run_id)
     if task is None:
-        _wait_for_user(db, workflow_run_id, "new_jobs_insufficient", "所有已批准搜索组合均已完成，fresh_only 候选池仍不足。")
+        _wait_for_user(
+            db,
+            workflow_run_id,
+            "approved_search_space_exhausted",
+            "已耗尽本轮批准的搜索词、城市与合理平台组合，等待你调整搜索范围。",
+        )
         return get_workflow_run(db, workflow_run_id)
     payload = _load(task["payload_json"], {})
     capture_task_id = str(task["operation_ref_id"] or "")
@@ -165,12 +231,20 @@ def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: st
             _wait_for_user(db, workflow_run_id, "browser_not_running", "FineJob 专用 Chrome 未启动，暂不能继续 deep_job_search。")
             return get_workflow_run(db, workflow_run_id)
         pages = min(int(contract["stop_policy"]["min_depth"]), 10)
+        platform_filters = canonicalize_platform_filters(payload.get("platform_filters"))
+        _mark_search_combination_started(
+            db,
+            workflow_run_id,
+            str(payload.get("search_combination_id") or ""),
+        )
         capture = boss_capture_task_manager.start_capture(
             BossCaptureRequest(
                 keyword=str(payload["keyword"]), city=str(payload["city"]), pages=pages,
-                filters={}, include_details=False, max_details=None,
+                filters=platform_filters, include_details=False, max_details=None,
                 output_dir=config.output_root / "fine-job" / "boss-capture",
-                prefer_current_page=True, filter_strategy_id=str(contract["selected_strategy_ids"]["filter_strategy_id"]),
+                prefer_current_page=True,
+                force_search_navigation=not bool(payload.get("is_baseline")),
+                filter_strategy_id=str(contract["selected_strategy_ids"]["filter_strategy_id"]),
             ), output_dir=config.output_root / "fine-job" / "boss-capture", db=db,
         )
         _update_task_operation(db, task["id"], str(capture["id"]), "running", payload)
@@ -187,8 +261,8 @@ def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: st
     if capture.get("status") == "failed":
         _finish_task(db, task["id"], "failed", payload, {"error": capture.get("error_message")})
         return advance_deep_job_search(db, config, workflow_run_id)
-    _record_batch(db, workflow_run_id, task, capture, contract)
-    return _decide_next_step(db, config, workflow_run_id, task, capture, contract)
+    metrics = _record_batch(db, workflow_run_id, task, capture, contract)
+    return _decide_next_step(db, config, workflow_run_id, task, capture, contract, metrics)
 
 
 def get_workflow_run(db: Database, workflow_run_id: str) -> dict[str, object]:
@@ -200,6 +274,7 @@ def get_workflow_run(db: Database, workflow_run_id: str) -> dict[str, object]:
         **_serialize_run(db, run),
         "progress": _get_run_progress(db, workflow_run_id),
         "analysis_handoff": _get_analysis_handoff_summary(db, workflow_run_id),
+        "prefetch": _get_prefetch_summary(db, workflow_run_id),
         "tasks": [_serialize_task(row) for row in tasks],
         "context_snapshots": [_serialize_snapshot(row) for row in snapshots],
     }
@@ -432,9 +507,13 @@ def record_workflow_analysis_result(
         payload,
         {"job_id": job_id, "decision": decision, "evaluation_id": evaluation_id, **evaluation},
     )
+    _release_candidate_reservation(
+        db, workflow_run_id, "formal_analysis", workflow_task_id, job_id, "released"
+    )
     _complete_analysis_handoff_if_finished(
         db, workflow_run_id, _analysis_batch_id_from_payload(payload, workflow_run_id)
     )
+    _advance_prefetch(db, config, workflow_run_id)
     _refresh_counts(db, workflow_run_id)
     refreshed = _require_run(db, workflow_run_id)
     contract = _load(refreshed["completion_contract_json"], {})
@@ -446,6 +525,7 @@ def record_workflow_analysis_result(
     if target_reached and not analysis_policy["analyze_all_candidates"]:
         _skip_pending_analysis_items(db, workflow_run_id)
         _complete_analysis_handoff_if_finished(db, workflow_run_id, batch_id)
+        _abandon_prefetch_batches(db, workflow_run_id)
         _complete_run(db, workflow_run_id, "completion_target_reached", "已达到本轮完成目标，已保存成果并结束 Run。")
         return get_workflow_run(db, workflow_run_id)
 
@@ -474,6 +554,12 @@ def record_workflow_analysis_result(
 
     if _next_analysis_task(db, workflow_run_id) is not None:
         _update_run(db, workflow_run_id, status="waiting_codex", current_step="waiting_codex", next_action="codex_analysis", next_action_reason="当前 JD 批次仍有待保存的岗位分析 Item。")
+        return get_workflow_run(db, workflow_run_id)
+    promotion = _promote_ready_prefetch(db, workflow_run_id, contract)
+    if promotion == "promoted":
+        return get_workflow_run(db, workflow_run_id)
+    if promotion == "waiting":
+        _wait_for_prefetch(db, workflow_run_id)
         return get_workflow_run(db, workflow_run_id)
     if target_reached and analysis_policy["analyze_all_candidates"]:
         return _continue_frozen_candidate_pool(db, config, workflow_run_id, contract)
@@ -669,6 +755,7 @@ def ack_workflow_analysis_batch_started(
     workflow_run_id: str,
     analysis_batch_id: str,
     handoff_attempt_id: str,
+    config: AppConfig | None = None,
 ) -> dict[str, object]:
     """仅由当前有效交接尝试确认 Codex 已开始处理分析批次。"""
     with db.connect() as connection:
@@ -710,10 +797,15 @@ def ack_workflow_analysis_batch_started(
         next_action="codex_analysis",
         next_action_reason="Codex 已确认开始当前岗位分析批次。",
     )
+    if config is not None:
+        _ensure_prefetch_batch(db, config, workflow_run_id, analysis_batch_id)
+        _advance_prefetch(db, config, workflow_run_id)
     return get_workflow_run(db, workflow_run_id)
 
 
-def resume_deep_job_search_run(db: Database, workflow_run_id: str) -> dict[str, object]:
+def resume_deep_job_search_run(
+    db: Database, config: AppConfig, workflow_run_id: str
+) -> dict[str, object]:
     """仅在用户确认后恢复中断的采集组合，避免后台静默重复采集。"""
     run = _require_run(db, workflow_run_id)
     if bool(run["paused"]):
@@ -726,12 +818,19 @@ def resume_deep_job_search_run(db: Database, workflow_run_id: str) -> dict[str, 
             paused_from_next_action="",
             paused_from_next_action_reason="",
         )
+        _advance_prefetch(db, config, workflow_run_id)
+        refreshed = _require_run(db, workflow_run_id)
+        if (
+            refreshed["status"] == "waiting_codex"
+            and str(refreshed["next_action"] or "") == "wait_prefetch"
+        ):
+            _continue_after_prefetch_wait(db, config, workflow_run_id)
         return get_workflow_run(db, workflow_run_id)
     if run["status"] != "waiting_for_user":
         raise AppError(409, "WORKFLOW_NOT_WAITING", "当前 Workflow Run 不在等待用户恢复状态。")
     stop_reason = str(run["stop_reason"] or "")
     if stop_reason in {"analysis_batch_completed_waiting_user", "analysis_batch_waiting_user"}:
-        return _continue_after_analysis_batch(db, workflow_run_id)
+        return _continue_after_analysis_batch(db, config, workflow_run_id)
     if stop_reason not in {"capture_interrupted", "browser_not_running"}:
         raise AppError(409, "WORKFLOW_NOT_RESUMABLE", "当前等待原因需要先调整任务范围或上下文，不能直接恢复。")
     with db.connect() as connection:
@@ -797,12 +896,21 @@ def cancel_deep_job_search_run(db: Database, workflow_run_id: str) -> dict[str, 
             except AppError:
                 # 详情采集与已结束任务继续保留其当前执行结果，Run 不再创建后续任务。
                 pass
+    _cancel_prefetch_batches(db, workflow_run_id)
     with db.connect() as connection:
         connection.execute(
             """
             UPDATE fj_workflow_tasks
             SET status = 'skipped', updated_at = ?, completed_at = COALESCE(completed_at, ?)
             WHERE workflow_run_id = ? AND status IN ('pending', 'running', 'waiting_for_user')
+            """,
+            (utc_now(), utc_now(), workflow_run_id),
+        )
+        connection.execute(
+            """
+            UPDATE fj_workflow_candidate_reservations
+            SET status = 'cancelled', released_at = ?, terminal_at = ?
+            WHERE workflow_run_id = ? AND status = 'reserved'
             """,
             (utc_now(), utc_now(), workflow_run_id),
         )
@@ -823,14 +931,30 @@ def cancel_deep_job_search_run(db: Database, workflow_run_id: str) -> dict[str, 
     return get_workflow_run(db, workflow_run_id)
 
 
-def _record_batch(db: Database, workflow_run_id: str, task: Any, capture: dict[str, object], contract: dict[str, Any]) -> None:
+def _record_batch(
+    db: Database,
+    workflow_run_id: str,
+    task: Any,
+    capture: dict[str, object],
+    contract: dict[str, Any],
+) -> dict[str, object]:
     strategy = get_filter_strategy(db, str(contract["selected_strategy_ids"]["filter_strategy_id"]))
     results = evaluate_filter_strategy(list(capture.get("jobs") or []), strategy)
     _jobs, results = apply_filter_exclusions(db, strategy, list(capture.get("jobs") or []), results)
     boss_capture_task_manager.apply_filter_results(str(capture["id"]), results)
     result_by_id = {str(item["job_id"]): item for item in results}
     payload = _load(task["payload_json"], {})
-    new_candidates = 0
+    combination_id = str(payload.get("search_combination_id") or "")
+    if not combination_id:
+        combination_id = _ensure_search_combination_for_task(
+            db,
+            workflow_run_id,
+            payload,
+        )
+        payload["search_combination_id"] = combination_id
+    platform_filters = canonicalize_platform_filters(payload.get("platform_filters"))
+    metrics = build_metrics_for_window(list(capture.get("jobs") or []), results)
+    planner_policy = contract.get("planner_policy") if isinstance(contract.get("planner_policy"), dict) else {}
     now = utc_now()
     with db.connect() as connection:
         for job in capture.get("jobs") or []:
@@ -847,38 +971,588 @@ def _record_batch(db: Database, workflow_run_id: str, task: Any, capture: dict[s
                     scroll_depth, discovered_at, is_run_first_discovery, is_historical_duplicate,
                     is_filter_candidate
                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (new_id(), workflow_run_id, task["id"], job_id, payload["keyword"], payload["city"], _dump({"filter_strategy_id": strategy["id"]}), int(capture.get("total_pages_loaded") or 0), now, int(first), int(is_duplicate), int(filter_result.get("status") in {"pass", "review"})),
+                (
+                    new_id(),
+                    workflow_run_id,
+                    task["id"],
+                    job_id,
+                    payload["keyword"],
+                    payload["city"],
+                    _dump({
+                        "search_combination_id": combination_id,
+                        "platform_filters": platform_filters,
+                        "filter_strategy_id": strategy["id"],
+                    }),
+                    int(capture.get("total_pages_loaded") or 0),
+                    now,
+                    int(first),
+                    int(is_duplicate),
+                    int(filter_result.get("status") in {"pass", "review"}),
+                ),
             )
-            if first and not is_duplicate and filter_result.get("status") in {"pass", "review"}:
-                new_candidates += 1
     payload["depth"] = int(capture.get("total_pages_loaded") or payload.get("depth") or 0)
-    payload["low_yield_streak"] = int(payload.get("low_yield_streak") or 0) + 1 if new_candidates == 0 else 0
-    _finish_task(db, task["id"], "succeeded", payload, {"new_jobs": int(capture.get("last_added_jobs") or 0), "duplicates": int(capture.get("duplicate_jobs_count") or 0), "new_candidates": new_candidates, "capture_task_id": capture["id"]})
+    low_novelty_streak, low_qualified_yield_streak = _update_search_combination_metrics(
+        db,
+        combination_id,
+        metrics,
+        pages_seen=max(
+            0,
+            int(capture.get("total_pages_loaded") or 0)
+            - int(_load(task["payload_json"], {}).get("depth") or 0),
+        ),
+        low_novelty_threshold=float(planner_policy.get("low_novelty_threshold") or 0.25),
+        low_qualified_yield_threshold=float(planner_policy.get("low_qualified_yield_threshold") or 0.15),
+    )
+    metrics_dict = metrics.as_dict()
+    metrics_dict["low_novelty_streak"] = low_novelty_streak
+    metrics_dict["low_qualified_yield_streak"] = low_qualified_yield_streak
+    payload["low_yield_streak"] = low_novelty_streak
+    payload["low_novelty_streak"] = low_novelty_streak
+    payload["low_qualified_yield_streak"] = low_qualified_yield_streak
+    _finish_task(
+        db,
+        task["id"],
+        "succeeded",
+        payload,
+        {
+            "new_jobs": metrics.run_fresh_jobs,
+            "duplicates": metrics.historical_duplicates,
+            "new_candidates": metrics.candidate_jobs,
+            "historical_duplicates": metrics.historical_duplicates,
+            "cooldown_excluded": metrics.cooldown_excluded,
+            "strategy_pass": metrics.strategy_pass,
+            "strategy_review": metrics.strategy_review,
+            "strategy_reject": metrics.strategy_reject,
+            "qualified_fresh_jobs": metrics.qualified_fresh_jobs,
+            "candidate_jobs": metrics.candidate_jobs,
+            "metrics": metrics_dict,
+            "capture_task_id": capture["id"],
+        },
+    )
     _refresh_counts(db, workflow_run_id)
+    return metrics_dict
 
 
-def _decide_next_step(db: Database, config: AppConfig, workflow_run_id: str, task: Any, capture: dict[str, object], contract: dict[str, Any]) -> dict[str, object]:
+def _decide_next_step(
+    db: Database,
+    config: AppConfig,
+    workflow_run_id: str,
+    task: Any,
+    capture: dict[str, object],
+    contract: dict[str, Any],
+    metrics: dict[str, object] | None = None,
+) -> dict[str, object]:
     run = _require_run(db, workflow_run_id)
     candidate_target = int(contract["stop_policy"]["candidate_target_count"])
     telemetry = _load(run["telemetry_json"], {})
     if int(telemetry.get("fresh_candidates") or 0) >= candidate_target:
         _create_jd_tasks(db, workflow_run_id, candidate_target)
         return advance_deep_job_search(db, config, workflow_run_id)
+    with db.connect() as connection:
+        refreshed_task = connection.execute(
+            "SELECT * FROM fj_workflow_tasks WHERE id = ?",
+            (str(task["id"]),),
+        ).fetchone()
+    if refreshed_task is not None:
+        task = refreshed_task
     payload = _load(task["payload_json"], {})
+    task_result = _load(task["result_json"], {})
+    window = metrics or task_result.get("metrics") or {}
+    window_metrics = SearchWindowMetrics(
+        jobs_seen=int(window.get("jobs_seen") or 0),
+        run_fresh_jobs=int(window.get("run_fresh_jobs") or window.get("new_jobs") or 0),
+        historical_duplicates=int(window.get("historical_duplicates") or window.get("duplicates") or 0),
+        cooldown_excluded=int(window.get("cooldown_excluded") or 0),
+        strategy_pass=int(window.get("strategy_pass") or 0),
+        strategy_review=int(window.get("strategy_review") or 0),
+        strategy_reject=int(window.get("strategy_reject") or 0),
+        qualified_fresh_jobs=int(window.get("qualified_fresh_jobs") or window.get("candidate_jobs") or 0),
+        candidate_jobs=int(window.get("candidate_jobs") or window.get("new_candidates") or 0),
+        novelty_yield=float(window.get("novelty_yield") or 0),
+        qualified_novelty_yield=float(window.get("qualified_novelty_yield") or 0),
+        duplicate_rate=float(window.get("duplicate_rate") or 0),
+        low_novelty_streak=int(window.get("low_novelty_streak") or payload.get("low_novelty_streak") or 0),
+        low_qualified_yield_streak=int(window.get("low_qualified_yield_streak") or payload.get("low_qualified_yield_streak") or 0),
+        failure_code_counts={
+            str(key): int(value)
+            for key, value in (window.get("failure_code_counts") or {}).items()
+        },
+    )
     can_continue = bool(capture.get("continuation_available") and capture.get("has_more"))
     depth = int(payload.get("depth") or 0)
     stop = contract["stop_policy"]
-    if can_continue and depth < int(stop["max_depth"]) and int(payload.get("low_yield_streak") or 0) < int(stop["low_yield_streak_limit"]):
+    planner_policy = contract.get("planner_policy") if isinstance(contract.get("planner_policy"), dict) else {}
+    combination_id = str(payload.get("search_combination_id") or "")
+    combination = _get_search_combination(db, combination_id)
+    current_filters = canonicalize_platform_filters(
+        payload.get("platform_filters")
+        or (_load(combination["platform_filters_json"], {}) if combination is not None else {})
+    )
+    if (
+        can_continue
+        and depth < int(stop["max_depth"])
+        and (
+            window_metrics.qualified_fresh_jobs > 0
+            or (
+                window_metrics.run_fresh_jobs == 0
+                and window_metrics.low_novelty_streak < int(stop["low_yield_streak_limit"])
+                and window_metrics.duplicate_rate
+                < float(planner_policy.get("duplicate_skew_threshold") or 0.6)
+            )
+        )
+    ):
         next_pages = min(int(stop["scroll_batch_size"]), int(stop["max_depth"]) - depth, 10)
         continued = boss_capture_task_manager.continue_capture(str(capture["id"]), pages=max(1, next_pages))
         # 续采属于同一搜索组合；建立新 Task 保存每个批次的状态与来源。
         now = utc_now()
         with db.connect() as connection:
             next_task_id = new_id()
-            connection.execute("INSERT INTO fj_workflow_tasks (id, workflow_run_id, task_type, status, payload_json, operation_ref_type, operation_ref_id, created_at, updated_at) VALUES (?, ?, 'deep_job_search', 'running', ?, 'capture_task', ?, ?, ?)", (next_task_id, workflow_run_id, _dump(payload), str(continued["id"]), now, now))
+            connection.execute(
+                "INSERT INTO fj_workflow_tasks (id, workflow_run_id, task_type, status, payload_json, operation_ref_type, operation_ref_id, created_at, updated_at) VALUES (?, ?, 'deep_job_search', 'running', ?, 'capture_task', ?, ?, ?)",
+                (next_task_id, workflow_run_id, _dump(payload), str(continued["id"]), now, now),
+            )
         _update_run(db, workflow_run_id, status="running", current_step="searching", next_action="continue_scroll", next_action_reason="候选池尚未达到目标，当前组合仍有增量搜索预算。")
         return get_workflow_run(db, workflow_run_id)
-    return advance_deep_job_search(db, config, workflow_run_id)
+
+    duplicate_distribution = _historical_duplicate_distribution(
+        db,
+        workflow_run_id,
+        str(payload.get("keyword") or ""),
+        str(payload.get("city") or ""),
+    )
+    attempted_filters = _list_combination_filters(
+        db,
+        workflow_run_id,
+        str(payload.get("keyword") or ""),
+        str(payload.get("city") or ""),
+    )
+    decision = plan_next_combination(
+        current_filters=current_filters,
+        strategy=get_filter_strategy(db, str(contract["selected_strategy_ids"]["filter_strategy_id"])),
+        metrics=window_metrics,
+        attempted_filters=attempted_filters,
+        duplicate_distribution=duplicate_distribution,
+        force_transition=not can_continue or depth >= int(stop["max_depth"]),
+        low_yield_streak_limit=int(stop["low_yield_streak_limit"]),
+        low_novelty_threshold=float(planner_policy.get("low_novelty_threshold") or 0.25),
+        low_qualified_yield_threshold=float(planner_policy.get("low_qualified_yield_threshold") or 0.15),
+        duplicate_skew_threshold=float(planner_policy.get("duplicate_skew_threshold") or 0.6),
+        combination_safety_limit=int(planner_policy.get("combination_safety_limit") or 24),
+    )
+    _save_planner_decision(db, workflow_run_id, combination_id, decision)
+    if decision.action != "SCOPE_EXHAUSTED":
+        next_task = _create_search_combination_task(
+            db,
+            workflow_run_id,
+            keyword=str(payload.get("keyword") or ""),
+            city=str(payload.get("city") or ""),
+            platform_filters=decision.platform_filters,
+            parent_combination_id=combination_id or None,
+            transition_action=decision.action,
+            transition_reason=decision.switch_reason,
+            selected_axis=decision.selected_axis,
+            evidence=decision.evidence or {},
+        )
+        if next_task is not None:
+            return advance_deep_job_search(db, config, workflow_run_id)
+    _mark_search_combination_exhausted(
+        db,
+        combination_id,
+        decision.switch_reason or "approved_platform_search_space_exhausted",
+    )
+    if _create_next_approved_scope(db, workflow_run_id, payload, combination_id):
+        return advance_deep_job_search(db, config, workflow_run_id)
+    _wait_for_user(
+        db,
+        workflow_run_id,
+        "approved_search_space_exhausted",
+        "已耗尽本轮批准的搜索词、城市与合理平台组合，等待你调整搜索范围。",
+    )
+    return get_workflow_run(db, workflow_run_id)
+
+
+def _get_search_combination(db: Database, combination_id: str):
+    if not combination_id:
+        return None
+    with db.connect() as connection:
+        return connection.execute(
+            "SELECT * FROM fj_workflow_search_combinations WHERE id = ?",
+            (combination_id,),
+        ).fetchone()
+
+
+def _ensure_search_combination_for_task(
+    db: Database,
+    workflow_run_id: str,
+    payload: dict[str, object],
+) -> str:
+    """为旧版任务补建组合记录，保证升级后的 discovery 也能追踪来源。"""
+    keyword = str(payload.get("keyword") or "")
+    city = str(payload.get("city") or "")
+    filters = canonicalize_platform_filters(payload.get("platform_filters"))
+    identity = combination_identity(keyword, city, filters)
+    with db.connect() as connection:
+        existing = connection.execute(
+            "SELECT id FROM fj_workflow_search_combinations WHERE workflow_run_id = ? AND identity_json = ?",
+            (workflow_run_id, identity),
+        ).fetchone()
+        if existing is not None:
+            return str(existing["id"])
+        sequence = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM fj_workflow_search_combinations WHERE workflow_run_id = ?",
+                (workflow_run_id,),
+            ).fetchone()[0]
+        )
+        combination_id = new_id()
+        connection.execute(
+            """
+            INSERT INTO fj_workflow_search_combinations (
+              id, workflow_run_id, keyword, city, platform_filters_json,
+              identity_json, status, sequence, transition_action, transition_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, 'SWITCH_COMBINATION', 'legacy_task_backfill')
+            """,
+            (
+                combination_id,
+                workflow_run_id,
+                keyword,
+                city,
+                _dump(filters),
+                identity,
+                sequence + 1,
+            ),
+        )
+    return combination_id
+
+
+def _mark_search_combination_started(
+    db: Database,
+    workflow_run_id: str,
+    combination_id: str,
+) -> None:
+    if not combination_id:
+        return
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_workflow_search_combinations
+            SET status = 'running', started_at = COALESCE(started_at, ?)
+            WHERE id = ? AND workflow_run_id = ? AND status IN ('pending', 'running')
+            """,
+            (utc_now(), combination_id, workflow_run_id),
+        )
+
+
+def _update_search_combination_metrics(
+    db: Database,
+    combination_id: str,
+    metrics: SearchWindowMetrics,
+    *,
+    pages_seen: int,
+    low_novelty_threshold: float = 0.25,
+    low_qualified_yield_threshold: float = 0.15,
+) -> tuple[int, int]:
+    if not combination_id:
+        return metrics.low_novelty_streak, metrics.low_qualified_yield_streak
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM fj_workflow_search_combinations WHERE id = ?",
+            (combination_id,),
+        ).fetchone()
+        if row is None:
+            return metrics.low_novelty_streak, metrics.low_qualified_yield_streak
+        low_novelty_window = (
+            metrics.jobs_seen == 0
+            or metrics.novelty_yield < low_novelty_threshold
+        )
+        low_qualified_window = (
+            metrics.run_fresh_jobs > 0
+            and metrics.qualified_novelty_yield < low_qualified_yield_threshold
+        )
+        low_novelty = int(row["low_novelty_streak"] or 0) + 1 if low_novelty_window else 0
+        low_qualified = int(row["low_qualified_yield_streak"] or 0) + 1 if low_qualified_window else 0
+        jobs_seen = int(row["jobs_seen"] or 0) + metrics.jobs_seen
+        fresh = int(row["run_fresh_jobs"] or 0) + metrics.run_fresh_jobs
+        qualified = int(row["qualified_fresh_jobs"] or 0) + metrics.qualified_fresh_jobs
+        duplicates = int(row["historical_duplicates"] or 0) + metrics.historical_duplicates
+        connection.execute(
+            """
+            UPDATE fj_workflow_search_combinations
+            SET batch_count = batch_count + 1,
+                pages_seen = pages_seen + ?,
+                jobs_seen = ?,
+                run_fresh_jobs = ?,
+                historical_duplicates = ?,
+                cooldown_excluded = cooldown_excluded + ?,
+                strategy_pass = strategy_pass + ?,
+                strategy_review = strategy_review + ?,
+                strategy_reject = strategy_reject + ?,
+                qualified_fresh_jobs = ?,
+                candidate_jobs = candidate_jobs + ?,
+                novelty_yield = ?,
+                qualified_novelty_yield = ?,
+                duplicate_rate = ?,
+                low_novelty_streak = ?,
+                low_qualified_yield_streak = ?
+            WHERE id = ?
+            """,
+            (
+                max(0, int(pages_seen)),
+                jobs_seen,
+                fresh,
+                duplicates,
+                metrics.cooldown_excluded,
+                metrics.strategy_pass,
+                metrics.strategy_review,
+                metrics.strategy_reject,
+                qualified,
+                metrics.candidate_jobs,
+                round(fresh / jobs_seen, 4) if jobs_seen else 0,
+                round(qualified / fresh, 4) if fresh else 0,
+                round(duplicates / jobs_seen, 4) if jobs_seen else 0,
+                low_novelty,
+                low_qualified,
+                combination_id,
+            ),
+        )
+    return low_novelty, low_qualified
+
+
+def _historical_duplicate_distribution(
+    db: Database,
+    workflow_run_id: str,
+    keyword: str,
+    city: str,
+) -> dict[str, dict[str, int]]:
+    """统计当前 Scope 历史重复岗位在可映射维度上的分布。"""
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT j.company_scale, j.company_stage, j.company_industry,
+                   j.experience, j.degree, j.salary
+            FROM fj_workflow_job_discoveries d
+            JOIN fj_boss_jobs j ON j.id = d.job_id
+            WHERE d.workflow_run_id = ?
+              AND d.search_keyword = ?
+              AND d.city = ?
+              AND d.is_historical_duplicate = 1
+            """,
+            (workflow_run_id, keyword, city),
+        ).fetchall()
+    columns = {
+        "company_scale": "company_scale",
+        "company_stage": "company_stage",
+        "company_industry": "company_industry",
+        "experience": "experience",
+        "degree": "degree",
+        "salary": "salary",
+    }
+    distribution: dict[str, dict[str, int]] = {axis: {} for axis in columns}
+    for row in rows:
+        for axis, column in columns.items():
+            value = str(row[column] or "").strip()
+            if not value:
+                continue
+            # 经验、学历等字段已经是 BOSS 映射的展示值；薪资取粗 bucket 文本。
+            code = _planner_value_code(axis, value)
+            if code:
+                distribution[axis][code] = distribution[axis].get(code, 0) + 1
+    return distribution
+
+
+def _planner_value_code(axis: str, value: str) -> str | None:
+    from backend.app.services.fine_job.adaptive_search_planner import platform_filter_code
+
+    return platform_filter_code(axis, value)
+
+
+def _list_combination_filters(
+    db: Database,
+    workflow_run_id: str,
+    keyword: str,
+    city: str,
+) -> list[dict[str, str]]:
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT platform_filters_json
+            FROM fj_workflow_search_combinations
+            WHERE workflow_run_id = ? AND keyword = ? AND city = ?
+            ORDER BY sequence
+            """,
+            (workflow_run_id, keyword, city),
+        ).fetchall()
+    return [
+        canonicalize_platform_filters(_load(row["platform_filters_json"], {}))
+        for row in rows
+    ]
+
+
+def _save_planner_decision(
+    db: Database,
+    workflow_run_id: str,
+    combination_id: str,
+    decision,
+) -> None:
+    if not combination_id:
+        return
+    evidence = decision.evidence or {}
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_workflow_search_combinations
+            SET transition_reason = CASE WHEN ? <> '' THEN ? ELSE transition_reason END,
+                selected_axis = CASE WHEN ? <> '' THEN ? ELSE selected_axis END,
+                evidence_json = ?
+            WHERE id = ? AND workflow_run_id = ?
+            """,
+            (
+                decision.switch_reason,
+                decision.switch_reason,
+                decision.selected_axis,
+                decision.selected_axis,
+                _dump(evidence),
+                combination_id,
+                workflow_run_id,
+            ),
+        )
+
+
+def _mark_search_combination_exhausted(
+    db: Database,
+    combination_id: str,
+    stop_reason: str,
+) -> None:
+    if not combination_id:
+        return
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_workflow_search_combinations
+            SET status = 'exhausted', completed_at = COALESCE(completed_at, ?), stop_reason = ?
+            WHERE id = ? AND status IN ('pending', 'running')
+            """,
+            (utc_now(), stop_reason, combination_id),
+        )
+
+
+def _create_search_combination_task(
+    db: Database,
+    workflow_run_id: str,
+    *,
+    keyword: str,
+    city: str,
+    platform_filters: dict[str, str],
+    parent_combination_id: str | None,
+    transition_action: str,
+    transition_reason: str,
+    selected_axis: str,
+    evidence: dict[str, object],
+    is_baseline: bool = False,
+) -> dict[str, str] | None:
+    filters = canonicalize_platform_filters(platform_filters)
+    identity = combination_identity(keyword, city, filters)
+    with db.connect() as connection:
+        existing = connection.execute(
+            "SELECT id, status FROM fj_workflow_search_combinations WHERE workflow_run_id = ? AND identity_json = ?",
+            (workflow_run_id, identity),
+        ).fetchone()
+        if existing is not None:
+            return None
+        sequence = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM fj_workflow_search_combinations WHERE workflow_run_id = ?",
+                (workflow_run_id,),
+            ).fetchone()[0]
+        )
+        combination_id = new_id()
+        now = utc_now()
+        connection.execute(
+            """
+            INSERT INTO fj_workflow_search_combinations (
+              id, workflow_run_id, keyword, city, platform_filters_json,
+              identity_json, status, sequence, parent_combination_id,
+              transition_action, transition_reason, selected_axis, evidence_json
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                combination_id,
+                workflow_run_id,
+                keyword,
+                city,
+                _dump(filters),
+                identity,
+                sequence + 1,
+                parent_combination_id,
+                transition_action,
+                transition_reason,
+                selected_axis,
+                _dump(evidence),
+            ),
+        )
+        task_id = new_id()
+        connection.execute(
+            """
+            INSERT INTO fj_workflow_tasks (
+              id, workflow_run_id, task_type, payload_json, result_json, created_at, updated_at
+            ) VALUES (?, ?, 'deep_job_search', ?, '{}', ?, ?)
+            """,
+            (
+                task_id,
+                workflow_run_id,
+                _dump({
+                    "keyword": keyword,
+                    "city": city,
+                    "platform_filters": filters,
+                    "search_combination_id": combination_id,
+                    "is_baseline": is_baseline,
+                    "depth": 0,
+                    "low_yield_streak": 0,
+                    "low_novelty_streak": 0,
+                    "low_qualified_yield_streak": 0,
+                }),
+                now,
+                now,
+            ),
+        )
+    return {"combination_id": combination_id, "task_id": task_id}
+
+
+def _create_next_approved_scope(
+    db: Database,
+    workflow_run_id: str,
+    current_payload: dict[str, object],
+    parent_combination_id: str,
+) -> bool:
+    run = _require_run(db, workflow_run_id)
+    contract = _load(run["completion_contract_json"], {})
+    keywords = [str(value) for value in contract.get("allowed_search_keywords") or []]
+    cities = [str(value) for value in contract.get("allowed_cities") or []]
+    current_keyword = str(current_payload.get("keyword") or "")
+    current_city = str(current_payload.get("city") or "")
+    scopes = [(keyword, city) for keyword in keywords for city in cities]
+    try:
+        current_index = scopes.index((current_keyword, current_city))
+    except ValueError:
+        current_index = -1
+    if current_index + 1 >= len(scopes):
+        return False
+    next_keyword, next_city = scopes[current_index + 1]
+    reason = "approved_city_next" if next_keyword == current_keyword else "approved_keyword_next"
+    created = _create_search_combination_task(
+        db,
+        workflow_run_id,
+        keyword=next_keyword,
+        city=next_city,
+        platform_filters={},
+        parent_combination_id=parent_combination_id or None,
+        transition_action="SWITCH_COMBINATION",
+        transition_reason=reason,
+        selected_axis="",
+        evidence={"previous_scope": {"keyword": current_keyword, "city": current_city}},
+        is_baseline=True,
+    )
+    return created is not None
 
 
 def _create_jd_tasks(
@@ -899,6 +1573,7 @@ def _create_jd_tasks(
         scope_clause = f" AND d.job_id IN ({','.join('?' for _ in candidate_job_ids)})"
         scope_values.extend(candidate_job_ids)
     with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
         candidates = connection.execute(
             f"""
             SELECT d.job_id
@@ -913,6 +1588,20 @@ def _create_jd_tasks(
                   AND t.task_type IN ('deep_job_search_jd', 'deep_job_search_analysis')
                   AND json_extract(t.payload_json, '$.job_id') = d.job_id
               )
+              AND NOT EXISTS (
+                SELECT 1 FROM fj_workflow_candidate_reservations r
+                WHERE r.job_id = d.job_id
+                  AND r.status = 'reserved'
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM fj_workflow_prefetch_items pi
+                JOIN fj_workflow_prefetch_batches pb ON pb.id = pi.prefetch_batch_id
+                WHERE pi.workflow_run_id = d.workflow_run_id
+                  AND pi.job_id = d.job_id
+                  AND pb.status IN ('preparing', 'ready', 'failed')
+                  AND pi.status IN ('pending', 'collecting', 'ready', 'failed')
+              )
               {scope_clause}
             ORDER BY d.discovered_at ASC, d.job_id ASC
             LIMIT ?
@@ -923,13 +1612,22 @@ def _create_jd_tasks(
         batch_id = new_id()
         for candidate in candidates:
             job_id = str(candidate["job_id"])
+            task_id = new_id()
+            connection.execute(
+                """
+                INSERT INTO fj_workflow_candidate_reservations (
+                  id, workflow_run_id, job_id, owner_type, owner_id, status, created_at
+                ) VALUES (?, ?, ?, 'formal_jd', ?, 'reserved', ?)
+                """,
+                (new_id(), workflow_run_id, job_id, task_id, now),
+            )
             connection.execute(
                 """
                 INSERT INTO fj_workflow_tasks (
                   id, workflow_run_id, task_type, payload_json, result_json, created_at, updated_at
                 ) VALUES (?, ?, 'deep_job_search_jd', ?, '{}', ?, ?)
                 """,
-                (new_id(), workflow_run_id, _dump({"job_id": job_id, "jd_batch_id": batch_id}), now, now),
+                (task_id, workflow_run_id, _dump({"job_id": job_id, "jd_batch_id": batch_id}), now, now),
             )
     if not candidates:
         return 0
@@ -961,6 +1659,9 @@ def _advance_jd_collection(
         job = get_capture_history_job(db, job_id)
         if str(job.get("detail_status") or "") == "completed":
             _finish_task(db, task["id"], "succeeded", payload, {"job_id": job_id, "reused_detail": True})
+            _release_candidate_reservation(
+                db, workflow_run_id, "formal_jd", str(task["id"]), job_id, "released"
+            )
             if _next_jd_task(db, workflow_run_id) is not None:
                 return advance_deep_job_search(db, config, workflow_run_id)
             _finish_jd_collection(db, config, workflow_run_id, contract)
@@ -992,6 +1693,10 @@ def _advance_jd_collection(
             _finish_task(db, task["id"], "succeeded", payload, {"job_id": job_id, "detail_version": job.get("detail_version")})
         else:
             _finish_task(db, task["id"], "failed", payload, {"job_id": job_id, "error": "JD 采集没有返回完整详情。"})
+    _release_candidate_reservation(
+        db, workflow_run_id, "formal_jd", str(task["id"]), job_id,
+        "released" if detail_task.get("status") != "failed" else "failed",
+    )
     if _next_jd_task(db, workflow_run_id) is not None:
         return advance_deep_job_search(db, config, workflow_run_id)
     _finish_jd_collection(db, config, workflow_run_id, contract)
@@ -1044,9 +1749,28 @@ def _create_analysis_tasks(
     now = utc_now()
     analysis_batch_id = new_id()
     with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
         for jd_row, job_id in zip(jd_rows, job_ids, strict=True):
             if not job_id:
                 continue
+            analysis_task_id = new_id()
+            connection.execute(
+                """
+                UPDATE fj_workflow_candidate_reservations
+                SET status = 'released', released_at = ?, terminal_at = ?
+                WHERE workflow_run_id = ? AND owner_type = 'formal_jd'
+                  AND owner_id = ? AND job_id = ? AND status = 'reserved'
+                """,
+                (now, now, workflow_run_id, str(jd_row["id"]), job_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO fj_workflow_candidate_reservations (
+                  id, workflow_run_id, job_id, owner_type, owner_id, status, created_at
+                ) VALUES (?, ?, ?, 'formal_analysis', ?, 'reserved', ?)
+                """,
+                (new_id(), workflow_run_id, job_id, analysis_task_id, now),
+            )
             connection.execute(
                 """
                 INSERT INTO fj_workflow_tasks (
@@ -1054,7 +1778,7 @@ def _create_analysis_tasks(
                 ) VALUES (?, ?, 'deep_job_search_analysis', ?, '{}', ?, ?)
                 """,
                 (
-                    new_id(),
+                    analysis_task_id,
                     workflow_run_id,
                     _dump({
                         "job_id": job_id,
@@ -1073,6 +1797,789 @@ def _create_analysis_tasks(
         next_action="codex_analysis",
         next_action_reason="本批岗位 JD 已准备完成，等待 Codex 逐岗位保存正式分析结果。",
     )
+
+
+def _get_prefetch_summary(db: Database, workflow_run_id: str) -> dict[str, object]:
+    with db.connect() as connection:
+        batch = connection.execute(
+            """
+            SELECT * FROM fj_workflow_prefetch_batches
+            WHERE workflow_run_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (workflow_run_id,),
+        ).fetchone()
+        if batch is None:
+            return {
+                "prefetch_batch_id": "",
+                "source_analysis_batch_id": "",
+                "status": "none",
+                "target_count": 0,
+                "pending_count": 0,
+                "collecting_count": 0,
+                "ready_count": 0,
+                "failed_count": 0,
+                "created_at": None,
+                "started_at": None,
+                "completed_at": None,
+            }
+        counts = connection.execute(
+            """
+            SELECT
+              COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_count,
+              COALESCE(SUM(CASE WHEN status = 'collecting' THEN 1 ELSE 0 END), 0) AS collecting_count,
+              COALESCE(SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END), 0) AS ready_count,
+              COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count
+            FROM fj_workflow_prefetch_items
+            WHERE prefetch_batch_id = ?
+            """,
+            (batch["id"],),
+        ).fetchone()
+    return {
+        "prefetch_batch_id": str(batch["id"]),
+        "source_analysis_batch_id": str(batch["source_analysis_batch_id"]),
+        "status": str(batch["status"]),
+        "target_count": int(batch["target_count"] or 0),
+        "pending_count": int(counts["pending_count"] or 0),
+        "collecting_count": int(counts["collecting_count"] or 0),
+        "ready_count": int(counts["ready_count"] or 0),
+        "failed_count": int(counts["failed_count"] or 0),
+        "created_at": batch["created_at"],
+        "started_at": batch["started_at"],
+        "completed_at": batch["completed_at"],
+    }
+
+
+def _prefetch_source_batch_id(db: Database, workflow_run_id: str) -> str:
+    with db.connect() as connection:
+        handoff = connection.execute(
+            """
+            SELECT analysis_batch_id
+            FROM fj_workflow_analysis_handoffs
+            WHERE workflow_run_id = ? AND attempt_status = 'started'
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            (workflow_run_id,),
+        ).fetchone()
+        if handoff is not None:
+            return str(handoff["analysis_batch_id"])
+        batch = connection.execute(
+            """
+            SELECT source_analysis_batch_id
+            FROM fj_workflow_prefetch_batches
+            WHERE workflow_run_id = ? AND status IN ('preparing', 'ready')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (workflow_run_id,),
+        ).fetchone()
+    return str(batch["source_analysis_batch_id"]) if batch is not None else ""
+
+
+def _ensure_prefetch_batch(
+    db: Database,
+    config: AppConfig,
+    workflow_run_id: str,
+    source_analysis_batch_id: str,
+) -> str | None:
+    run = _require_run(db, workflow_run_id)
+    if bool(run["paused"]) or run["status"] in {
+        "completed", "completed_with_errors", "cancelled", "failed"
+    }:
+        return None
+    contract = _load(run["completion_contract_json"], {})
+    target_count = min(
+        int(_analysis_policy(contract)["analysis_batch_size"]),
+        int(contract["stop_policy"]["candidate_target_count"]),
+    )
+    if target_count <= 0:
+        return None
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        existing = connection.execute(
+            """
+            SELECT id FROM fj_workflow_prefetch_batches
+            WHERE workflow_run_id = ? AND source_analysis_batch_id = ?
+            """,
+            (workflow_run_id, source_analysis_batch_id),
+        ).fetchone()
+        if existing is not None:
+            return str(existing["id"])
+        batch_id = new_id()
+        now = utc_now()
+        candidates = connection.execute(
+            """
+            SELECT d.job_id, j.detail_status
+            FROM fj_workflow_job_discoveries d
+            JOIN fj_boss_jobs j ON j.id = d.job_id
+            WHERE d.workflow_run_id = ?
+              AND d.is_run_first_discovery = 1
+              AND d.is_historical_duplicate = 0
+              AND d.is_filter_candidate = 1
+              AND NOT EXISTS (
+                SELECT 1 FROM fj_workflow_tasks t
+                WHERE t.workflow_run_id = d.workflow_run_id
+                  AND t.task_type IN ('deep_job_search_jd', 'deep_job_search_analysis')
+                  AND json_extract(t.payload_json, '$.job_id') = d.job_id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM fj_workflow_candidate_reservations r
+                WHERE r.job_id = d.job_id
+                  AND r.status = 'reserved'
+              )
+            ORDER BY d.discovered_at ASC, d.job_id ASC
+            LIMIT ?
+            """,
+            (workflow_run_id, target_count),
+        ).fetchall()
+        status = "preparing" if candidates else "failed"
+        connection.execute(
+            """
+            INSERT INTO fj_workflow_prefetch_batches (
+              id, workflow_run_id, source_analysis_batch_id, target_count, status,
+              failure_reason, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                batch_id,
+                workflow_run_id,
+                source_analysis_batch_id,
+                target_count,
+                status,
+                "" if candidates else "no_available_candidates",
+                now,
+                now,
+            ),
+        )
+        for candidate in candidates:
+            job_id = str(candidate["job_id"])
+            item_id = new_id()
+            detail_status = str(candidate["detail_status"] or "not_collected")
+            connection.execute(
+                """
+                INSERT INTO fj_workflow_prefetch_items (
+                  id, workflow_run_id, prefetch_batch_id, job_id, status,
+                  lifecycle_status, detail_status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'preparing', ?, ?, ?)
+                """,
+                (
+                    item_id,
+                    workflow_run_id,
+                    batch_id,
+                    job_id,
+                    "ready" if detail_status == "completed" else "pending",
+                    detail_status,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO fj_workflow_candidate_reservations (
+                  id, workflow_run_id, job_id, owner_type, owner_id, status, created_at
+                ) VALUES (?, ?, ?, 'prefetch', ?, 'reserved', ?)
+                """,
+                (new_id(), workflow_run_id, job_id, item_id, now),
+            )
+            if detail_status == "completed":
+                connection.execute(
+                    """
+                    UPDATE fj_workflow_prefetch_items
+                    SET lifecycle_status = 'ready', completed_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, item_id),
+                )
+        if candidates and all(str(item["detail_status"] or "") == "completed" for item in candidates):
+            connection.execute(
+                """
+                UPDATE fj_workflow_prefetch_batches
+                SET status = 'ready', started_at = ?, completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, now, batch_id),
+            )
+    return batch_id
+
+
+def _advance_prefetch(
+    db: Database,
+    config: AppConfig,
+    workflow_run_id: str,
+    *,
+    allow_start: bool = True,
+) -> None:
+    run = _require_run(db, workflow_run_id)
+    source_batch_id = _prefetch_source_batch_id(db, workflow_run_id)
+    if not source_batch_id:
+        return
+    batch_id = _ensure_prefetch_batch(
+        db, config, workflow_run_id, source_batch_id
+    )
+    if not batch_id:
+        return
+    with db.connect() as connection:
+        batch = connection.execute(
+            "SELECT * FROM fj_workflow_prefetch_batches WHERE id = ?",
+            (batch_id,),
+        ).fetchone()
+        item = connection.execute(
+            """
+            SELECT * FROM fj_workflow_prefetch_items
+            WHERE prefetch_batch_id = ? AND status = 'collecting'
+            ORDER BY started_at, created_at
+            LIMIT 1
+            """,
+            (batch_id,),
+        ).fetchone()
+    if batch is None or str(batch["status"]) in {
+        "promoted", "abandoned", "cancelled", "failed"
+    }:
+        return
+    if item is not None:
+        operation_id = str(item["operation_ref_id"] or "")
+        if operation_id:
+            try:
+                detail_task = boss_capture_task_manager.get_task(operation_id)
+            except AppError:
+                _finish_prefetch_item(
+                    db, item, status="failed", detail_status="failed",
+                    error_message="BOSS 详情任务已中断。",
+                )
+                detail_task = None
+            if detail_task is not None and detail_task.get("status") in {"queued", "running"}:
+                return
+            if detail_task is not None and detail_task.get("status") == "failed":
+                _finish_prefetch_item(
+                    db, item, status="failed", detail_status="failed",
+                    error_message=str(detail_task.get("error_message") or "JD 采集失败。"),
+                )
+            elif detail_task is not None:
+                job = get_capture_history_job(db, str(item["job_id"]))
+                if str(job.get("detail_status") or "") == "completed":
+                    _finish_prefetch_item(
+                        db, item, status="ready", detail_status="completed"
+                    )
+                else:
+                    _finish_prefetch_item(
+                        db, item, status="failed", detail_status=str(job.get("detail_status") or "failed"),
+                        error_message="JD 采集未返回完整正式详情。",
+                    )
+    with db.connect() as connection:
+        counts = connection.execute(
+            """
+            SELECT
+              COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_count,
+              COALESCE(SUM(CASE WHEN status = 'collecting' THEN 1 ELSE 0 END), 0) AS collecting_count,
+              COALESCE(SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END), 0) AS ready_count
+            FROM fj_workflow_prefetch_items
+            WHERE prefetch_batch_id = ?
+            """,
+            (batch_id,),
+        ).fetchone()
+        pending_count = int(counts["pending_count"] or 0)
+        collecting_count = int(counts["collecting_count"] or 0)
+        ready_count = int(counts["ready_count"] or 0)
+        if collecting_count == 0 and pending_count == 0:
+            now = utc_now()
+            connection.execute(
+                """
+                UPDATE fj_workflow_prefetch_batches
+                SET status = ?, started_at = COALESCE(started_at, ?),
+                    completed_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'preparing'
+                """,
+                (
+                    "ready" if ready_count else "failed",
+                    now,
+                    now,
+                    now,
+                    batch_id,
+                ),
+            )
+            return
+    if not allow_start or bool(run["paused"]):
+        return
+    _start_prefetch_item(db, config, workflow_run_id, batch_id)
+
+
+def _start_prefetch_item(
+    db: Database, config: AppConfig, workflow_run_id: str, batch_id: str
+) -> None:
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        item = connection.execute(
+            """
+            SELECT * FROM fj_workflow_prefetch_items
+            WHERE prefetch_batch_id = ? AND status = 'pending'
+            ORDER BY created_at, id
+            LIMIT 1
+            """,
+            (batch_id,),
+        ).fetchone()
+        if item is None:
+            return
+        changed = connection.execute(
+            """
+            UPDATE fj_workflow_prefetch_items
+            SET status = 'collecting', lifecycle_status = 'preparing',
+                detail_status = CASE WHEN detail_status = 'not_collected' THEN 'queued' ELSE detail_status END,
+                started_at = ?, updated_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (now, now, item["id"]),
+        )
+        if changed.rowcount != 1:
+            return
+        connection.execute(
+            """
+            UPDATE fj_workflow_prefetch_batches
+            SET started_at = COALESCE(started_at, ?), updated_at = ?
+            WHERE id = ? AND status = 'preparing'
+            """,
+            (now, now, batch_id),
+        )
+    try:
+        job = get_capture_history_job(db, str(item["job_id"]))
+        if str(job.get("detail_status") or "") == "completed":
+            _finish_prefetch_item(db, item, status="ready", detail_status="completed")
+            return
+        if not boss_scraper_service.get_browser_status().running:
+            raise AppError(423, "BROWSER_NOT_RUNNING", "BOSS 浏览器未启动。")
+        detail_task = boss_capture_task_manager.start_history_detail(
+            job,
+            output_dir=config.output_root / "fine-job" / "boss-capture",
+            db=db,
+        )
+        with db.connect() as connection:
+            connection.execute(
+                """
+                UPDATE fj_workflow_prefetch_items
+                SET operation_ref_type = 'capture_task', operation_ref_id = ?,
+                    detail_status = 'collecting', updated_at = ?
+                WHERE id = ? AND status = 'collecting'
+                """,
+                (str(detail_task["id"]), utc_now(), item["id"]),
+            )
+    except Exception as exc:  # noqa: BLE001 - Prefetch 单 Item 失败后继续旁路批次
+        _finish_prefetch_item(
+            db, item, status="failed", detail_status="failed",
+            error_message=str(exc),
+        )
+
+
+def _finish_prefetch_item(
+    db: Database,
+    item: Any,
+    *,
+    status: str,
+    detail_status: str,
+    error_message: str = "",
+) -> None:
+    now = utc_now()
+    lifecycle = "ready" if status == "ready" else "abandoned"
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_workflow_prefetch_items
+            SET status = ?, lifecycle_status = ?, detail_status = ?,
+                error_message = ?, completed_at = ?, updated_at = ?
+            WHERE id = ? AND lifecycle_status = 'preparing'
+            """,
+            (
+                status,
+                lifecycle,
+                detail_status,
+                error_message,
+                now,
+                now,
+                item["id"],
+            ),
+        )
+        if status == "failed":
+            connection.execute(
+                """
+                UPDATE fj_workflow_candidate_reservations
+                SET status = 'failed', released_at = ?, terminal_at = ?
+                WHERE workflow_run_id = ? AND owner_type = 'prefetch'
+                  AND owner_id = ? AND status = 'reserved'
+                """,
+                (now, now, item["workflow_run_id"], item["id"]),
+            )
+
+
+def _prefetch_batch_state(db: Database, workflow_run_id: str) -> tuple[str, Any | None]:
+    with db.connect() as connection:
+        batch = connection.execute(
+            """
+            SELECT * FROM fj_workflow_prefetch_batches
+            WHERE workflow_run_id = ? AND status IN ('preparing', 'ready', 'failed')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (workflow_run_id,),
+        ).fetchone()
+        if batch is None:
+            return "none", None
+        counts = connection.execute(
+            """
+            SELECT
+              COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_count,
+              COALESCE(SUM(CASE WHEN status = 'collecting' THEN 1 ELSE 0 END), 0) AS collecting_count,
+              COALESCE(SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END), 0) AS ready_count
+            FROM fj_workflow_prefetch_items
+            WHERE prefetch_batch_id = ?
+            """,
+            (batch["id"],),
+        ).fetchone()
+    if int(counts["ready_count"] or 0) > 0:
+        return "ready", batch
+    if int(counts["pending_count"] or 0) or int(counts["collecting_count"] or 0):
+        return "waiting", batch
+    return "none", batch
+
+
+def _completion_target_reached_in_connection(
+    connection: Any, workflow_run_id: str, contract: dict[str, Any]
+) -> bool:
+    rows = connection.execute(
+        """
+        SELECT json_extract(payload_json, '$.job_id') AS job_id,
+               json_extract(result_json, '$.decision') AS decision
+        FROM fj_workflow_tasks
+        WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis'
+          AND status = 'succeeded'
+        """,
+        (workflow_run_id,),
+    ).fetchall()
+    decisions: dict[str, set[str]] = {"recommend": set(), "review": set()}
+    for row in rows:
+        decision = str(row["decision"] or "")
+        job_id = str(row["job_id"] or "")
+        if decision in decisions and job_id:
+            decisions[decision].add(job_id)
+    recommend_reached = len(decisions["recommend"]) >= int(
+        contract.get("recommend_target") or contract.get("target_count") or 0
+    )
+    review_target = contract.get("review_target")
+    configured = [recommend_reached]
+    if review_target is not None:
+        configured.append(len(decisions["review"]) >= int(review_target))
+    return (
+        any(configured) if contract.get("target_mode") == "any" else all(configured)
+    )
+
+
+def _promote_ready_prefetch(
+    db: Database, workflow_run_id: str, contract: dict[str, Any]
+) -> str:
+    state, batch = _prefetch_batch_state(db, workflow_run_id)
+    if state == "waiting":
+        return "waiting"
+    if state != "ready" or batch is None:
+        return "none"
+    # 先完成业务目标判断，只有确定需要提升时才绑定最新分析上下文。
+    if _business_target_reached(db, workflow_run_id, contract) and not _analysis_policy(
+        contract
+    )["analyze_all_candidates"]:
+        _abandon_prefetch_batches(db, workflow_run_id)
+        return "abandoned"
+    snapshot = _create_candidate_analysis_snapshot(db, workflow_run_id, contract)
+    if snapshot["status"] == "blocked":
+        _wait_for_user(db, workflow_run_id, "context_budget_exceeded", str(snapshot["blocker_reason"]))
+        return "waiting"
+    now = utc_now()
+    analysis_batch_id = new_id()
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        locked_batch = connection.execute(
+            "SELECT * FROM fj_workflow_prefetch_batches WHERE id = ?",
+            (batch["id"],),
+        ).fetchone()
+        if locked_batch is None or str(locked_batch["status"]) != "ready":
+            return "none"
+        if _completion_target_reached_in_connection(
+            connection, workflow_run_id, contract
+        ) and not _analysis_policy(contract)["analyze_all_candidates"]:
+            abandoned_at = utc_now()
+            connection.execute(
+                """
+                UPDATE fj_workflow_prefetch_items
+                SET lifecycle_status = 'abandoned', abandoned_at = ?, updated_at = ?
+                WHERE prefetch_batch_id = ? AND lifecycle_status <> 'promoted'
+                """,
+                (abandoned_at, abandoned_at, batch["id"]),
+            )
+            connection.execute(
+                """
+                UPDATE fj_workflow_candidate_reservations
+                SET status = 'abandoned', released_at = ?, terminal_at = ?
+                WHERE workflow_run_id = ? AND owner_type = 'prefetch'
+                  AND owner_id IN (
+                    SELECT id FROM fj_workflow_prefetch_items WHERE prefetch_batch_id = ?
+                  ) AND status = 'reserved'
+                """,
+                (abandoned_at, abandoned_at, workflow_run_id, batch["id"]),
+            )
+            connection.execute(
+                """
+                UPDATE fj_workflow_prefetch_batches
+                SET status = 'abandoned', abandoned_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (abandoned_at, abandoned_at, batch["id"]),
+            )
+            return "abandoned"
+        pending = connection.execute(
+            """
+            SELECT 1 FROM fj_workflow_prefetch_items
+            WHERE prefetch_batch_id = ? AND status IN ('pending', 'collecting')
+            LIMIT 1
+            """,
+            (batch["id"],),
+        ).fetchone()
+        if pending is not None:
+            return "waiting"
+        items = connection.execute(
+            """
+            SELECT * FROM fj_workflow_prefetch_items
+            WHERE prefetch_batch_id = ? AND status = 'ready'
+            ORDER BY created_at, id
+            """,
+            (batch["id"],),
+        ).fetchall()
+        if not items:
+            return "none"
+        for item in items:
+            reservation = connection.execute(
+                """
+                SELECT id FROM fj_workflow_candidate_reservations
+                WHERE workflow_run_id = ? AND owner_type = 'prefetch'
+                  AND owner_id = ? AND job_id = ? AND status = 'reserved'
+                """,
+                (workflow_run_id, item["id"], item["job_id"]),
+            ).fetchone()
+            if reservation is None:
+                return "none"
+        for item in items:
+            task_id = new_id()
+            connection.execute(
+                """
+                INSERT INTO fj_workflow_tasks (
+                  id, workflow_run_id, task_type, payload_json, result_json, created_at, updated_at
+                ) VALUES (?, ?, 'deep_job_search_analysis', ?, '{}', ?, ?)
+                """,
+                (
+                    task_id,
+                    workflow_run_id,
+                    _dump({
+                        "job_id": str(item["job_id"]),
+                        "jd_task_id": str(item["id"]),
+                        "prefetch_item_id": str(item["id"]),
+                        "analysis_batch_id": analysis_batch_id,
+                    }),
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE fj_workflow_prefetch_items
+                SET lifecycle_status = 'promoted', promoted_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, item["id"]),
+            )
+            connection.execute(
+                """
+                UPDATE fj_workflow_candidate_reservations
+                SET status = 'promoted', released_at = ?, terminal_at = ?
+                WHERE workflow_run_id = ? AND owner_type = 'prefetch'
+                  AND owner_id = ? AND status = 'reserved'
+                """,
+                (now, now, workflow_run_id, item["id"]),
+            )
+            connection.execute(
+                """
+                INSERT INTO fj_workflow_candidate_reservations (
+                  id, workflow_run_id, job_id, owner_type, owner_id, status, created_at
+                ) VALUES (?, ?, ?, 'formal_analysis', ?, 'reserved', ?)
+                """,
+                (new_id(), workflow_run_id, item["job_id"], task_id, now),
+            )
+        connection.execute(
+            """
+            UPDATE fj_workflow_prefetch_batches
+            SET status = 'promoted', promoted_at = ?, completed_at = COALESCE(completed_at, ?),
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, now, now, batch["id"]),
+        )
+        connection.execute(
+            """
+            UPDATE fj_workflow_runs
+            SET status = 'waiting_codex', current_step = 'waiting_codex',
+                next_action = 'codex_analysis',
+                next_action_reason = ?,
+                waiting_for_user = 0, stop_reason = '', updated_at = ?
+            WHERE id = ?
+            """,
+            ("旁路 Prefetch 已提升为新的正式 Analysis Batch，等待 Codex 接管。", now, workflow_run_id),
+        )
+    return "promoted"
+
+
+def _wait_for_prefetch(db: Database, workflow_run_id: str) -> None:
+    _update_run(
+        db,
+        workflow_run_id,
+        status="waiting_codex",
+        current_step="waiting_codex",
+        next_action="wait_prefetch",
+        next_action_reason="下一批 JD 正在旁路准备，当前 Run 保持正式批次边界。",
+        waiting_for_user=0,
+        stop_reason="",
+    )
+
+
+def _continue_after_prefetch_wait(
+    db: Database, config: AppConfig, workflow_run_id: str
+) -> None:
+    run = _require_run(db, workflow_run_id)
+    contract = _load(run["completion_contract_json"], {})
+    if _business_target_reached(db, workflow_run_id, contract) and not _analysis_policy(
+        contract
+    )["analyze_all_candidates"]:
+        _complete_run(
+            db,
+            workflow_run_id,
+            "completion_target_reached",
+            "已达到本轮完成目标，已保存成果并结束 Run。",
+        )
+        return
+    promotion = _promote_ready_prefetch(db, workflow_run_id, contract)
+    if promotion in {"promoted", "waiting"}:
+        return
+    if _analysis_policy(contract)["analyze_all_candidates"] and _business_target_reached(
+        db, workflow_run_id, contract
+    ):
+        _continue_frozen_candidate_pool(db, config, workflow_run_id, contract)
+        return
+    if _create_jd_tasks(
+        db, workflow_run_id, int(contract["stop_policy"]["candidate_target_count"])
+    ):
+        advance_deep_job_search(db, config, workflow_run_id)
+        return
+    _resume_search_or_wait(db, config, workflow_run_id)
+
+
+def _release_candidate_reservation(
+    db: Database,
+    workflow_run_id: str,
+    owner_type: str,
+    owner_id: str,
+    job_id: str,
+    status: str,
+) -> None:
+    if not job_id:
+        return
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_workflow_candidate_reservations
+            SET status = ?, released_at = ?, terminal_at = ?
+            WHERE workflow_run_id = ? AND owner_type = ? AND owner_id = ?
+              AND job_id = ? AND status = 'reserved'
+            """,
+            (status, now, now, workflow_run_id, owner_type, owner_id, job_id),
+        )
+
+
+def _abandon_prefetch_batches(db: Database, workflow_run_id: str) -> None:
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        batches = connection.execute(
+            """
+            SELECT id FROM fj_workflow_prefetch_batches
+            WHERE workflow_run_id = ? AND status <> 'promoted'
+            """,
+            (workflow_run_id,),
+        ).fetchall()
+        for batch in batches:
+            connection.execute(
+                """
+                UPDATE fj_workflow_prefetch_items
+                SET lifecycle_status = 'abandoned', abandoned_at = ?, updated_at = ?
+                WHERE prefetch_batch_id = ? AND lifecycle_status <> 'promoted'
+                """,
+                (now, now, batch["id"]),
+            )
+            connection.execute(
+                """
+                UPDATE fj_workflow_candidate_reservations
+                SET status = 'abandoned', released_at = ?, terminal_at = ?
+                WHERE workflow_run_id = ? AND owner_type = 'prefetch'
+                  AND owner_id IN (
+                    SELECT id FROM fj_workflow_prefetch_items WHERE prefetch_batch_id = ?
+                  ) AND status = 'reserved'
+                """,
+                (now, now, workflow_run_id, batch["id"]),
+            )
+            connection.execute(
+                """
+                UPDATE fj_workflow_prefetch_batches
+                SET status = 'abandoned', abandoned_at = ?, updated_at = ?
+                WHERE id = ? AND status <> 'promoted'
+                """,
+                (now, now, batch["id"]),
+            )
+
+
+def _cancel_prefetch_batches(db: Database, workflow_run_id: str) -> None:
+    now = utc_now()
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        batches = connection.execute(
+            """
+            SELECT id FROM fj_workflow_prefetch_batches
+            WHERE workflow_run_id = ? AND status <> 'promoted'
+            """,
+            (workflow_run_id,),
+        ).fetchall()
+        for batch in batches:
+            connection.execute(
+                """
+                UPDATE fj_workflow_prefetch_items
+                SET lifecycle_status = 'cancelled', abandoned_at = ?, updated_at = ?
+                WHERE prefetch_batch_id = ? AND lifecycle_status <> 'promoted'
+                """,
+                (now, now, batch["id"]),
+            )
+            connection.execute(
+                """
+                UPDATE fj_workflow_candidate_reservations
+                SET status = 'cancelled', released_at = ?, terminal_at = ?
+                WHERE workflow_run_id = ? AND owner_type = 'prefetch'
+                  AND owner_id IN (
+                    SELECT id FROM fj_workflow_prefetch_items WHERE prefetch_batch_id = ?
+                  ) AND status = 'reserved'
+                """,
+                (now, now, workflow_run_id, batch["id"]),
+            )
+            connection.execute(
+                """
+                UPDATE fj_workflow_prefetch_batches
+                SET status = 'cancelled', abandoned_at = ?, updated_at = ?
+                WHERE id = ? AND status <> 'promoted'
+                """,
+                (now, now, batch["id"]),
+            )
 
 
 def _create_candidate_analysis_snapshot(
@@ -1188,7 +2695,8 @@ def _compact_recommendation_strategy(strategy: dict[str, object]) -> dict[str, o
     fields = (
         "id", "name", "strategy_version", "filter_strategy_id", "candidate_profile_id",
         "resume_version_id", "evaluation_method", "desired_responsibilities", "required_skills",
-        "preferred_skills", "excluded_terms", "preferred_industries", "work_preferences",
+        "preferred_skills", "excluded_terms", "preferred_industries", "boss_active_statuses",
+        "work_preferences",
         "risk_notes", "minimum_confidence", "insufficient_info_action", "notes",
     )
     return {field: strategy.get(field) for field in fields}
@@ -1274,7 +2782,20 @@ def _save_context_snapshot(
 
 def _next_task(db: Database, workflow_run_id: str):
     with db.connect() as connection:
-        return connection.execute("SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search' AND status IN ('pending', 'running') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, created_at LIMIT 1", (workflow_run_id,)).fetchone()
+        return connection.execute(
+            """
+            SELECT t.*
+            FROM fj_workflow_tasks t
+            LEFT JOIN fj_workflow_search_combinations c
+              ON c.id = json_extract(t.payload_json, '$.search_combination_id')
+            WHERE t.workflow_run_id = ? AND t.task_type = 'deep_job_search'
+              AND t.status IN ('pending', 'running')
+            ORDER BY CASE t.status WHEN 'running' THEN 0 ELSE 1 END,
+                     COALESCE(c.sequence, 0), t.created_at
+            LIMIT 1
+            """,
+            (workflow_run_id,),
+        ).fetchone()
 
 
 def _next_jd_task(db: Database, workflow_run_id: str):
@@ -1380,6 +2901,15 @@ def _is_analysis_batch_complete(db: Database, workflow_run_id: str, analysis_bat
 def _skip_pending_analysis_items(db: Database, workflow_run_id: str) -> None:
     """完成目标后不再要求 Codex 保存当前批剩余 Item。"""
     with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, json_extract(payload_json, '$.job_id') AS job_id
+            FROM fj_workflow_tasks
+            WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis'
+              AND status = 'pending'
+            """,
+            (workflow_run_id,),
+        ).fetchall()
         connection.execute(
             """
             UPDATE fj_workflow_tasks
@@ -1388,6 +2918,17 @@ def _skip_pending_analysis_items(db: Database, workflow_run_id: str) -> None:
             """,
             (utc_now(), utc_now(), workflow_run_id),
         )
+        now = utc_now()
+        for row in rows:
+            connection.execute(
+                """
+                UPDATE fj_workflow_candidate_reservations
+                SET status = 'released', released_at = ?, terminal_at = ?
+                WHERE workflow_run_id = ? AND owner_type = 'formal_analysis'
+                  AND owner_id = ? AND status = 'reserved'
+                """,
+                (now, now, workflow_run_id, str(row["id"])),
+            )
 
 
 def _freeze_candidate_pool(
@@ -1439,6 +2980,7 @@ def _consume_stop_after_current_batch(
 
 
 def _complete_run(db: Database, workflow_run_id: str, stop_reason: str, reason: str) -> None:
+    _abandon_prefetch_batches(db, workflow_run_id)
     _update_run(
         db,
         workflow_run_id,
@@ -1472,7 +3014,9 @@ def _continue_frozen_candidate_pool(
     return get_workflow_run(db, workflow_run_id)
 
 
-def _continue_after_analysis_batch(db: Database, workflow_run_id: str) -> dict[str, object]:
+def _continue_after_analysis_batch(
+    db: Database, config: AppConfig, workflow_run_id: str
+) -> dict[str, object]:
     """用户确认后恢复批次衔接，仍由已有 handoff 生成后续 Codex 批次。"""
     run = _require_run(db, workflow_run_id)
     contract = _load(run["completion_contract_json"], {})
@@ -1486,6 +3030,13 @@ def _continue_after_analysis_batch(db: Database, workflow_run_id: str) -> dict[s
         waiting_for_user=0,
         stop_reason="",
     )
+    _advance_prefetch(db, config, workflow_run_id)
+    promotion = _promote_ready_prefetch(db, workflow_run_id, contract)
+    if promotion == "promoted":
+        return get_workflow_run(db, workflow_run_id)
+    if promotion == "waiting":
+        _wait_for_prefetch(db, workflow_run_id)
+        return get_workflow_run(db, workflow_run_id)
     if _business_target_reached(db, workflow_run_id, contract) and _analysis_policy(contract)["analyze_all_candidates"]:
         # 这里不需要浏览器配置；有候选时只创建 JD 任务，随后由正常 advance 调度。
         candidate_job_ids = _frozen_candidate_job_ids(contract) or []
@@ -1501,7 +3052,12 @@ def _continue_after_analysis_batch(db: Database, workflow_run_id: str) -> dict[s
 def _resume_search_or_wait(db: Database, config: AppConfig, workflow_run_id: str) -> None:
     _update_run(db, workflow_run_id, status="pending", current_step="searching", next_action="continue_search", next_action_reason="当前候选池已处理完，继续寻找 fresh_only 候选。", waiting_for_user=0, stop_reason="")
     if _next_task(db, workflow_run_id) is None:
-        _wait_for_user(db, workflow_run_id, "new_jobs_insufficient", "已批准搜索组合与候选池均已处理完，尚未达到本轮配置的完成目标。")
+        _wait_for_user(
+            db,
+            workflow_run_id,
+            "approved_search_space_exhausted",
+            "已耗尽本轮批准的搜索词、城市与合理平台组合，等待你调整搜索范围。",
+        )
         return
     advance_deep_job_search(db, config, workflow_run_id)
 
@@ -1521,6 +3077,45 @@ def _refresh_counts(db: Database, workflow_run_id: str) -> None:
         telemetry["recommend_count"] = completion_counts["recommend"]
         telemetry["review_count"] = completion_counts["review"]
         telemetry["search_batches"] = int(connection.execute("SELECT COUNT(*) FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search'", (workflow_run_id,)).fetchone()[0])
+        metrics_row = connection.execute(
+            """
+            SELECT
+              COALESCE(SUM(jobs_seen), 0) AS jobs_seen,
+              COALESCE(SUM(run_fresh_jobs), 0) AS run_fresh_jobs,
+              COALESCE(SUM(historical_duplicates), 0) AS historical_duplicates,
+              COALESCE(SUM(cooldown_excluded), 0) AS cooldown_excluded,
+              COALESCE(SUM(strategy_pass), 0) AS strategy_pass,
+              COALESCE(SUM(strategy_review), 0) AS strategy_review,
+              COALESCE(SUM(strategy_reject), 0) AS strategy_reject,
+              COALESCE(SUM(qualified_fresh_jobs), 0) AS qualified_fresh_jobs,
+              COALESCE(SUM(candidate_jobs), 0) AS candidate_jobs
+            FROM fj_workflow_search_combinations
+            WHERE workflow_run_id = ?
+            """,
+            (workflow_run_id,),
+        ).fetchone()
+        jobs_seen = int(metrics_row["jobs_seen"] or 0)
+        run_fresh_jobs = int(metrics_row["run_fresh_jobs"] or 0)
+        telemetry["search_metrics"] = {
+            key: int(metrics_row[key] or 0)
+            for key in (
+                "jobs_seen",
+                "run_fresh_jobs",
+                "historical_duplicates",
+                "cooldown_excluded",
+                "strategy_pass",
+                "strategy_review",
+                "strategy_reject",
+                "qualified_fresh_jobs",
+                "candidate_jobs",
+            )
+        }
+        telemetry["search_metrics"].update({
+            "novelty_yield": round(run_fresh_jobs / jobs_seen, 4) if jobs_seen else 0,
+            "qualified_novelty_yield": round(fresh / run_fresh_jobs, 4) if run_fresh_jobs else 0,
+            "duplicate_rate": round(int(metrics_row["historical_duplicates"] or 0) / jobs_seen, 4) if jobs_seen else 0,
+        })
+        telemetry["search_planner"] = _get_search_planner_summary(db, workflow_run_id)
         connection.execute("UPDATE fj_workflow_runs SET completed_count = ?, remaining_count = ?, telemetry_json = ?, updated_at = ? WHERE id = ?", (completed, max(0, target - completed), _dump(telemetry), utc_now(), workflow_run_id))
 
 
@@ -1566,7 +3161,83 @@ def _require_run(db: Database, workflow_run_id: str):
 
 def _serialize_run(db: Database, row: Any) -> dict[str, object]:
     contract = _load(row["completion_contract_json"], {})
-    return {"workflow_run_id": row["id"], "workflow_type": row["workflow_type"], "completion_contract": contract, "completion_progress": _completion_progress(db, str(row["id"]), contract), "status": "paused" if bool(row["paused"]) else row["status"], "completed_count": row["completed_count"], "remaining_count": row["remaining_count"], "current_step": row["current_step"], "next_action": row["next_action"], "next_action_reason": row["next_action_reason"], "waiting_for_user": bool(row["waiting_for_user"]), "stop_reason": row["stop_reason"], "codex_session_ref": row["codex_session_ref"], "codex_runtime_id": row["codex_runtime_id"], "telemetry": _load(row["telemetry_json"], {}), "created_at": row["created_at"], "updated_at": row["updated_at"], "completed_at": row["completed_at"]}
+    telemetry = _load(row["telemetry_json"], {})
+    if not isinstance(telemetry, dict):
+        telemetry = {}
+    telemetry["prefetch"] = _get_prefetch_summary(db, str(row["id"]))
+    telemetry["search_planner"] = _get_search_planner_summary(db, str(row["id"]))
+    return {"workflow_run_id": row["id"], "workflow_type": row["workflow_type"], "completion_contract": contract, "completion_progress": _completion_progress(db, str(row["id"]), contract), "status": "paused" if bool(row["paused"]) else row["status"], "completed_count": row["completed_count"], "remaining_count": row["remaining_count"], "current_step": row["current_step"], "next_action": row["next_action"], "next_action_reason": row["next_action_reason"], "waiting_for_user": bool(row["waiting_for_user"]), "stop_reason": row["stop_reason"], "codex_session_ref": row["codex_session_ref"], "codex_runtime_id": row["codex_runtime_id"], "telemetry": telemetry, "created_at": row["created_at"], "updated_at": row["updated_at"], "completed_at": row["completed_at"]}
+
+
+def _get_search_planner_summary(db: Database, workflow_run_id: str) -> dict[str, object]:
+    with db.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT * FROM fj_workflow_search_combinations
+            WHERE workflow_run_id = ?
+            ORDER BY sequence DESC
+            LIMIT 1
+            """,
+            (workflow_run_id,),
+        ).fetchone()
+        pending = connection.execute(
+            """
+            SELECT COUNT(*) AS amount
+            FROM fj_workflow_search_combinations
+            WHERE workflow_run_id = ? AND status IN ('pending', 'running')
+            """,
+            (workflow_run_id,),
+        ).fetchone()
+    if row is None:
+        return {
+            "current_scope": {"keyword": "", "city": ""},
+            "current_combination": None,
+            "last_transition": None,
+            "pending_combination_count": 0,
+        }
+    filters = canonicalize_platform_filters(_load(row["platform_filters_json"], {}))
+    metrics = {
+        key: int(row[key] or 0)
+        for key in (
+            "batch_count",
+            "pages_seen",
+            "jobs_seen",
+            "run_fresh_jobs",
+            "historical_duplicates",
+            "cooldown_excluded",
+            "strategy_pass",
+            "strategy_review",
+            "strategy_reject",
+            "qualified_fresh_jobs",
+            "candidate_jobs",
+            "low_novelty_streak",
+            "low_qualified_yield_streak",
+        )
+    }
+    metrics.update({
+        "novelty_yield": float(row["novelty_yield"] or 0),
+        "qualified_novelty_yield": float(row["qualified_novelty_yield"] or 0),
+        "duplicate_rate": float(row["duplicate_rate"] or 0),
+    })
+    return {
+        "current_scope": {"keyword": str(row["keyword"]), "city": str(row["city"])},
+        "current_combination": {
+            "id": str(row["id"]),
+            "sequence": int(row["sequence"] or 0),
+            "status": str(row["status"]),
+            "platform_filters": filters,
+            "platform_filter_labels": describe_platform_filters(filters),
+            "metrics": metrics,
+        },
+        "last_transition": {
+            "action": str(row["transition_action"]),
+            "reason": str(row["transition_reason"] or ""),
+            "selected_axis": str(row["selected_axis"] or ""),
+            "evidence": _load(row["evidence_json"], {}),
+            "stop_reason": str(row["stop_reason"] or ""),
+        },
+        "pending_combination_count": int(pending["amount"] or 0),
+    }
 
 
 def _analysis_batch_id_from_payload(payload: dict[str, Any], workflow_run_id: str) -> str:
@@ -1718,8 +3389,27 @@ def _get_run_progress(db: Database, workflow_run_id: str) -> dict[str, object]:
             SELECT
               COUNT(*) AS jobs_seen,
               COALESCE(SUM(CASE WHEN is_run_first_discovery = 1 AND is_historical_duplicate = 0 THEN 1 ELSE 0 END), 0) AS fresh_jobs,
+              COALESCE(SUM(CASE WHEN is_historical_duplicate = 1 THEN 1 ELSE 0 END), 0) AS historical_duplicates,
               COALESCE(SUM(CASE WHEN is_run_first_discovery = 1 AND is_historical_duplicate = 0 AND is_filter_candidate = 1 THEN 1 ELSE 0 END), 0) AS candidates
             FROM fj_workflow_job_discoveries
+            WHERE workflow_run_id = ?
+            """,
+            (workflow_run_id,),
+        ).fetchone()
+        combination_metrics = connection.execute(
+            """
+            SELECT
+              COUNT(*) AS combination_count,
+              COALESCE(SUM(jobs_seen), 0) AS jobs_seen,
+              COALESCE(SUM(run_fresh_jobs), 0) AS run_fresh_jobs,
+              COALESCE(SUM(historical_duplicates), 0) AS historical_duplicates,
+              COALESCE(SUM(cooldown_excluded), 0) AS cooldown_excluded,
+              COALESCE(SUM(strategy_pass), 0) AS strategy_pass,
+              COALESCE(SUM(strategy_review), 0) AS strategy_review,
+              COALESCE(SUM(strategy_reject), 0) AS strategy_reject,
+              COALESCE(SUM(qualified_fresh_jobs), 0) AS qualified_fresh_jobs,
+              COALESCE(SUM(candidate_jobs), 0) AS candidate_jobs
+            FROM fj_workflow_search_combinations
             WHERE workflow_run_id = ?
             """,
             (workflow_run_id,),
@@ -1750,8 +3440,11 @@ def _get_run_progress(db: Database, workflow_run_id: str) -> dict[str, object]:
         decision = str(_load(row["result_json"], {}).get("decision") or "")
         if decision in decisions:
             decisions[decision] += 1
+    use_combination_metrics = int(combination_metrics["combination_count"] or 0) > 0
+    # discovery 是候选池的权威行数；组合累计值补充策略与冷却维度统计。
     jobs_seen = int(discovery["jobs_seen"] or 0)
     fresh_jobs = int(discovery["fresh_jobs"] or 0)
+    historical_duplicates = int(discovery["historical_duplicates"] or 0)
     return {
         "current_keyword": str(task_payload.get("keyword") or ""),
         "current_city": str(task_payload.get("city") or ""),
@@ -1759,8 +3452,18 @@ def _get_run_progress(db: Database, workflow_run_id: str) -> dict[str, object]:
         "search_batch_count": batch_count,
         "jobs_seen": jobs_seen,
         "fresh_jobs": fresh_jobs,
-        "duplicate_jobs": max(0, jobs_seen - fresh_jobs),
+        "duplicate_jobs": historical_duplicates,
         "candidates": int(discovery["candidates"] or 0),
+        "historical_duplicates": historical_duplicates,
+        "cooldown_excluded": int(combination_metrics["cooldown_excluded"] or 0) if use_combination_metrics else 0,
+        "strategy_pass": int(combination_metrics["strategy_pass"] or 0) if use_combination_metrics else 0,
+        "strategy_review": int(combination_metrics["strategy_review"] or 0) if use_combination_metrics else 0,
+        "strategy_reject": int(combination_metrics["strategy_reject"] or 0) if use_combination_metrics else 0,
+        "qualified_fresh_jobs": int(discovery["candidates"] or 0),
+        "candidate_jobs": int(discovery["candidates"] or 0),
+        "novelty_yield": round(fresh_jobs / jobs_seen, 4) if jobs_seen else 0,
+        "qualified_novelty_yield": round(int(combination_metrics["qualified_fresh_jobs"] or 0) / fresh_jobs, 4) if use_combination_metrics and fresh_jobs else 0,
+        "duplicate_rate": round(historical_duplicates / jobs_seen, 4) if jobs_seen else 0,
         "current_batch_new_jobs": int(task_result.get("new_jobs") or 0),
         "current_batch_duplicates": int(task_result.get("duplicates") or 0),
         "jd_total": int(jd["total"] or 0),
@@ -1772,7 +3475,39 @@ def _get_run_progress(db: Database, workflow_run_id: str) -> dict[str, object]:
 
 
 def _serialize_task(row: Any) -> dict[str, object]:
-    return {"workflow_task_id": row["id"], "task_type": row["task_type"], "status": row["status"], "payload": _load(row["payload_json"], {}), "result": _load(row["result_json"], {}), "operation_ref_type": row["operation_ref_type"], "operation_ref_id": row["operation_ref_id"], "retryable": bool(row["retryable"])}
+    capture_status = None
+    if row["operation_ref_type"] == "capture_task" and row["operation_ref_id"]:
+        try:
+            capture_status = boss_capture_task_manager.get_task_status(
+                str(row["operation_ref_id"])
+            )
+        except AppError:
+            capture_status = {
+                "id": str(row["operation_ref_id"]),
+                "status": "unavailable",
+                "stage": "unavailable",
+                "message": "采集任务状态暂不可用。",
+                "progress_current": 0,
+                "progress_total": 0,
+                "jobs_collected": 0,
+                "details_completed": 0,
+                "details_failed": 0,
+                "current_job": None,
+                "error_message": "采集任务可能已随后端进程重启而失去运行上下文。",
+                "updated_at": None,
+                "finished_at": None,
+            }
+    return {
+        "workflow_task_id": row["id"],
+        "task_type": row["task_type"],
+        "status": row["status"],
+        "payload": _load(row["payload_json"], {}),
+        "result": _load(row["result_json"], {}),
+        "operation_ref_type": row["operation_ref_type"],
+        "operation_ref_id": row["operation_ref_id"],
+        "capture": capture_status,
+        "retryable": bool(row["retryable"]),
+    }
 
 
 def _serialize_analysis_item(
@@ -1781,6 +3516,7 @@ def _serialize_analysis_item(
     item = _serialize_task(row)
     payload = _load(row["payload_json"], {})
     job_payload = _load(discovery["payload_json"], {}) if discovery is not None else {}
+    search_combination = _load(discovery["search_combination_json"], {}) if discovery is not None else {}
     item["job"] = {
         "job_id": str(payload.get("job_id") or ""),
         "title": str(discovery["title"] or "") if discovery is not None else "",
@@ -1789,8 +3525,11 @@ def _serialize_analysis_item(
         "city": str(discovery["location"] or "") if discovery is not None else "",
         "discovery_keyword": str(discovery["search_keyword"] or "") if discovery is not None else "",
         "discovery_depth": int(discovery["scroll_depth"] or 0) if discovery is not None else 0,
+        "search_combination_id": str(search_combination.get("search_combination_id") or ""),
+        "platform_filters": canonicalize_platform_filters(search_combination.get("platform_filters")),
         "filter_result": str(job_payload.get("final_filter_status") or job_payload.get("filter_status") or ""),
         "filter_reasons": list(job_payload.get("filter_reasons") or []),
+        "filter_failure_codes": list(job_payload.get("filter_failure_codes") or []),
         "jd_status": str(discovery["detail_status"] or "") if discovery is not None else "",
     }
     item["analysis_result"] = item["result"]

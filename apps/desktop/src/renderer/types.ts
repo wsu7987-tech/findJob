@@ -288,6 +288,7 @@ export interface FineJobBossCapturedJob {
   final_filter_status?: "pass" | "pass_for_human" | "reject" | "review" | "exclude" | null;
   processing_state?: "new" | "reprocessable" | "duplicate" | "excluded" | null;
   filter_reasons?: string[];
+  filter_failure_codes?: string[];
   filter_missing_fields?: string[];
   filter_strategy_id?: string | null;
   company_id?: string | null;
@@ -353,6 +354,7 @@ export interface FineJobBossFilterResult {
   job_id: string;
   status: "pass" | "reject" | "review" | "exclude";
   reasons: string[];
+  failure_codes?: string[];
   missing_fields: string[];
   strategy_id?: string | null;
   cooldown_excluded?: boolean;
@@ -528,8 +530,7 @@ export interface FineJobFilterStrategy {
   skill_include_any: string[];
   skill_include_all: string[];
   skill_exclude: string[];
-  boss_active_statuses: string[];
-  cooldown_rules: FineJobCooldownRules;
+    cooldown_rules: FineJobCooldownRules;
   unknown_value_policy: FineJobUnknownValuePolicy;
   notes: string;
   candidate_profile_id?: string | null;
@@ -574,9 +575,10 @@ export interface FineJobRecommendationStrategy {
   desired_responsibilities: string[];
   required_skills: string[];
   preferred_skills: string[];
-  excluded_terms: string[];
-  preferred_industries: string[];
-  work_preferences: string;
+    excluded_terms: string[];
+    preferred_industries: string[];
+    boss_active_statuses: string[];
+    work_preferences: string;
   risk_notes: string;
   minimum_confidence: number;
   insufficient_info_action: "review" | "reject";
@@ -2423,6 +2425,34 @@ export interface FineJobWorkflowContextSnapshot {
   generated_at: string;
 }
 
+export interface FineJobWorkflowCaptureStatus {
+  id: string;
+  status: string;
+  stage: string;
+  message: string;
+  progress_current: number;
+  progress_total: number;
+  jobs_collected: number;
+  details_completed: number;
+  details_failed: number;
+  current_job?: { job_id?: string; title?: string; company?: string } | null;
+  error_message?: string | null;
+  updated_at?: string | null;
+  finished_at?: string | null;
+}
+
+export interface FineJobWorkflowTask {
+  workflow_task_id: string;
+  task_type: string;
+  status: string;
+  payload: Record<string, unknown>;
+  result: Record<string, unknown>;
+  operation_ref_type?: string | null;
+  operation_ref_id?: string | null;
+  capture?: FineJobWorkflowCaptureStatus | null;
+  retryable: boolean;
+}
+
 export interface FineJobWorkflowRun {
   workflow_run_id: string;
   workflow_type: "deep_job_search";
@@ -2440,7 +2470,50 @@ export interface FineJobWorkflowRun {
   next_action_reason: string;
   waiting_for_user: boolean;
   stop_reason: string;
-  telemetry: Record<string, number>;
+  telemetry: Record<string, unknown> & {
+    prefetch?: {
+      prefetch_batch_id: string;
+      source_analysis_batch_id: string;
+      status: string;
+      target_count: number;
+      pending_count: number;
+      collecting_count: number;
+      ready_count: number;
+      failed_count: number;
+      created_at?: string | null;
+      started_at?: string | null;
+      completed_at?: string | null;
+    };
+    search_metrics?: {
+      jobs_seen: number;
+      run_fresh_jobs: number;
+      historical_duplicates: number;
+      cooldown_excluded: number;
+      strategy_pass: number;
+      strategy_review: number;
+      strategy_reject: number;
+      qualified_fresh_jobs: number;
+      candidate_jobs: number;
+      novelty_yield: number;
+      qualified_novelty_yield: number;
+      duplicate_rate: number;
+    };
+    search_planner?: FineJobSearchPlannerSummary;
+  };
+  tasks?: FineJobWorkflowTask[];
+  prefetch?: {
+    prefetch_batch_id: string;
+    source_analysis_batch_id: string;
+    status: string;
+    target_count: number;
+    pending_count: number;
+    collecting_count: number;
+    ready_count: number;
+    failed_count: number;
+    created_at?: string | null;
+    started_at?: string | null;
+    completed_at?: string | null;
+  };
   progress: {
     current_keyword: string;
     current_city: string;
@@ -2457,6 +2530,16 @@ export interface FineJobWorkflowRun {
     recommend_count: number;
     review_count: number;
     reject_count: number;
+    historical_duplicates: number;
+    cooldown_excluded: number;
+    strategy_pass: number;
+    strategy_review: number;
+    strategy_reject: number;
+    qualified_fresh_jobs: number;
+    candidate_jobs: number;
+    novelty_yield: number;
+    qualified_novelty_yield: number;
+    duplicate_rate: number;
   };
   codex_session_ref?: string | null;
   codex_runtime_id?: string | null;
@@ -2498,6 +2581,12 @@ export interface FineJobWorkflowRun {
       after_analysis_batch?: "auto_continue" | "wait_for_user";
       codex_handoff?: "auto" | "manual";
     };
+    planner_policy?: {
+      low_novelty_threshold?: number;
+      low_qualified_yield_threshold?: number;
+      duplicate_skew_threshold?: number;
+      combination_safety_limit?: number;
+    };
     frozen_candidate_pool?: { job_ids?: string[]; frozen_at?: string; reason?: string };
     external_action_policy?: string;
     selected_strategy_ids?: { filter_strategy_id?: string; recommendation_strategy_id?: string };
@@ -2505,6 +2594,26 @@ export interface FineJobWorkflowRun {
     codex_execution_config?: { model?: string; reasoning_effort?: string };
     analysis_guidance?: { text?: string; version?: number };
   };
+}
+
+export interface FineJobSearchPlannerSummary {
+  current_scope: { keyword: string; city: string };
+  current_combination: {
+    id: string;
+    sequence: number;
+    status: string;
+    platform_filters: Record<string, string>;
+    platform_filter_labels: string[];
+    metrics: Record<string, number>;
+  } | null;
+  last_transition: {
+    action: string;
+    reason: string;
+    selected_axis: string;
+    evidence: Record<string, unknown>;
+    stop_reason: string;
+  } | null;
+  pending_combination_count: number;
 }
 
 export interface FineJobWorkflowAnalysisItem {
@@ -2522,8 +2631,11 @@ export interface FineJobWorkflowAnalysisItem {
     city: string;
     discovery_keyword: string;
     discovery_depth: number;
+    search_combination_id?: string;
+    platform_filters?: Record<string, string>;
     filter_result: string;
     filter_reasons: string[];
+    filter_failure_codes?: string[];
     jd_status: string;
   };
   feedback: Array<{ feedback_id: string; sentiment: string; reason: string | null; note: string; created_at: string }>;
