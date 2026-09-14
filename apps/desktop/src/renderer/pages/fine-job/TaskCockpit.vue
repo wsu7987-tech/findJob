@@ -302,6 +302,7 @@ const advanceRun = async () => {
   error.value = "";
   try {
     await workflowStore.refresh(identifier);
+    workflowStore.startPolling();
     await workflowStore.advance();
     await loadSnapshot();
     await loadAnalysisItems();
@@ -316,6 +317,7 @@ const resumeRun = async () => {
   error.value = "";
   try {
     await workflowStore.refresh(identifier);
+    workflowStore.startPolling();
     await workflowStore.resume();
     await loadSnapshot();
   } catch (value) {

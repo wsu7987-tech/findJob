@@ -8,7 +8,9 @@ import type {
   FineJobChatReviewTask,
   FineJobReviewItem,
   FineJobReviewStatus,
-  FineJobReviewTab
+  FineJobReviewTab,
+  FineJobReviewSortField,
+  FineJobReviewSortOrder
 } from "@/types";
 
 export const useFineJobWorkflowStore = defineStore("fineJobWorkflow", () => {
@@ -27,6 +29,8 @@ export const useFineJobWorkflowStore = defineStore("fineJobWorkflow", () => {
   const decision = ref<FineJobReviewItem["ai_decision"] | "">("");
   const executionState = ref<FineJobBossExecutionState | "">("");
   const createdRange = ref<[string, string] | null>(null);
+  const sortBy = ref<FineJobReviewSortField | "">("");
+  const sortOrder = ref<FineJobReviewSortOrder>("desc");
 
   const load = async (status: FineJobReviewTab = selectedStatus.value) => {
     loading.value = true;
@@ -47,6 +51,8 @@ export const useFineJobWorkflowStore = defineStore("fineJobWorkflow", () => {
           execution_state: executionState.value,
           created_from: createdRange.value?.[0],
           created_to: createdRange.value?.[1],
+          sort_by: sortBy.value || undefined,
+          sort_order: sortOrder.value,
           page: page.value,
           page_size: pageSize.value
         }),
@@ -208,6 +214,8 @@ export const useFineJobWorkflowStore = defineStore("fineJobWorkflow", () => {
     decision,
     executionState,
     createdRange,
+    sortBy,
+    sortOrder,
     load,
     approve,
     reject,

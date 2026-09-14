@@ -954,9 +954,6 @@ export const api = {
       body: JSON.stringify({ applied, note })
     });
   },
-  async getFineJobBossExecutorStatus() {
-    return request<FineJobBossExecutorDashboard>("/api/fine-job/boss-executor/status");
-  },
   async controlFineJobBossExecutor(command: "start" | "pause") {
     return request<FineJobBossExecutorDashboard>("/api/fine-job/boss-executor/desktop-control", {
       method: "POST",

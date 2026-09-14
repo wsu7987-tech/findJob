@@ -13,7 +13,6 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
   const pairingCode = ref<string | null>(null);
   const pairingExpiresAt = ref<string | null>(null);
   const openingJobId = ref<string | null>(null);
-  const loading = ref(false);
   const heartbeatTesting = ref(false);
   const error = ref<string | null>(null);
   const testJobs = ref<FineJobBossExecutorTestJob[]>([]);
@@ -28,19 +27,6 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
       pairingExpiresAt.value = null;
     }
     return value;
-  };
-
-  const load = async () => {
-    loading.value = true;
-    error.value = null;
-    try {
-      return setDashboard(await api.getFineJobBossExecutorStatus());
-    } catch (value) {
-      error.value = mapError(value);
-      throw value;
-    } finally {
-      loading.value = false;
-    }
   };
 
   const createPairingCode = async () => {
@@ -160,7 +146,6 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
     error.value = null;
     try {
       const result = await api.returnFineJobBossActionToReview(actionId);
-      await load();
       return result.action;
     } catch (value) {
       error.value = mapError(value);
@@ -172,7 +157,6 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
     error.value = null;
     try {
       const result = await api.markFineJobBossActionCompleted(actionId);
-      await load();
       return result.action;
     } catch (value) {
       error.value = mapError(value);
@@ -184,7 +168,6 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
     error.value = null;
     try {
       const result = await api.requeueFineJobBossAction(actionId);
-      await load();
       return result.action;
     } catch (value) {
       error.value = mapError(value);
@@ -238,7 +221,6 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
     error.value = null;
     try {
       const result = await api.createFineJobBossExecutorTestTask(payload);
-      await load();
       return result.task;
     } catch (value) {
       error.value = mapError(value);
@@ -251,11 +233,9 @@ export const useFineJobBossExecutorStore = defineStore("fineJobBossExecutor", ()
     pairingCode,
     pairingExpiresAt,
     openingJobId,
-    loading,
     heartbeatTesting,
     error,
     testJobs,
-    load,
     createPairingCode,
     control,
     testHeartbeat,

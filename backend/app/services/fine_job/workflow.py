@@ -13,6 +13,8 @@ from backend.app.utils import new_id, utc_now
 
 ReviewStatus = Literal["pending", "approved", "rejected", "dismissed"]
 ReviewExecutionView = Literal["running", "executed"]
+ReviewSortField = Literal["confidence"]
+ReviewSortOrder = Literal["asc", "desc"]
 ActionStatus = Literal[
     "queued", "running", "leased", "succeeded", "failed", "blocked", "unknown", "cancelled"
 ]
@@ -276,6 +278,8 @@ def list_review_items(
     execution_state: str | None = None,
     created_from: str | None = None,
     created_to: str | None = None,
+    sort_by: ReviewSortField | None = None,
+    sort_order: ReviewSortOrder = "desc",
     page: int = 1,
     page_size: int = 50,
 ) -> dict[str, object]:
@@ -327,6 +331,12 @@ def list_review_items(
         values.append(created_to)
     condition = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     offset = (page - 1) * page_size
+    sort_expression = "r.created_at"
+    sort_direction = "DESC"
+    if sort_by == "confidence":
+        # 从评估 JSON 中读取页面展示的置信度，排序结果覆盖全部分页数据。
+        sort_expression = "COALESCE(CAST(json_extract(e.evaluation_json, '$.confidence') AS REAL), 0)"
+        sort_direction = "ASC" if sort_order == "asc" else "DESC"
     with db.connect() as connection:
         total = int(
             connection.execute(
@@ -370,7 +380,7 @@ def list_review_items(
             LEFT JOIN fj_automation_actions a ON a.review_item_id = r.id
             LEFT JOIN fj_companies c ON c.id = j.company_id
             {condition}
-            ORDER BY r.created_at DESC, r.id DESC
+            ORDER BY {sort_expression} {sort_direction}, r.created_at DESC, r.id DESC
             LIMIT ? OFFSET ?
             """,
             [*values, page_size, offset],

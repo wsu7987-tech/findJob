@@ -701,6 +701,8 @@ export interface FineJobActionLogListEnvelope {
 
 export type FineJobReviewStatus = "pending" | "approved" | "rejected" | "dismissed";
 export type FineJobReviewTab = FineJobReviewStatus | "executed";
+export type FineJobReviewSortField = "confidence";
+export type FineJobReviewSortOrder = "asc" | "desc";
 export type FineJobAutomationActionStatus =
   | "queued"
   | "running"
@@ -1138,6 +1140,8 @@ export interface FineJobReviewQuery {
   execution_state?: FineJobBossExecutionState | "";
   created_from?: string;
   created_to?: string;
+  sort_by?: FineJobReviewSortField;
+  sort_order?: FineJobReviewSortOrder;
   page?: number;
   page_size?: number;
 }

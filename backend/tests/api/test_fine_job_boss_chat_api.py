@@ -1059,6 +1059,3 @@ def test_resume_action_requires_cached_selection_and_keeps_selected_filename(con
     detail_after_disconnect = configured_client.get(f"/api/fine-job/boss-chat/sessions/{session_id}").json()
     resumed_action = next(item for item in detail_after_disconnect["send_actions"] if item["id"] == selected.json()["action"]["id"])
     assert resumed_action["status"] == "queued"
-    queue_after_disconnect = configured_client.get("/api/fine-job/boss-executor/status").json()["queue"]["actions"]
-    queue_action = next(item for item in queue_after_disconnect if item["id"] == selected.json()["action"]["id"])
-    assert queue_action["execution_state"] == "queued"

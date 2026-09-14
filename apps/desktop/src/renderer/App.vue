@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watchEffect } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch, watchEffect } from "vue";
 import { RouterView, useRoute } from "vue-router";
 
 import AppShell from "@/components/AppShell.vue";
@@ -24,8 +24,19 @@ const route = useRoute();
 const showCodexTerminal = computed(() => route.name === "fine-job-codex");
 const workflowCodexController = startFineJobWorkflowCodexController({
   workflowStore: workflowRunStore,
-  codexStore
+  codexStore,
+  isActive: () => workflowRunStore.pollingActive
 });
+
+watch(
+  () => workflowRunStore.pollingActive,
+  (active) => {
+    // Codex 交接控制器跟随任务轮询生命周期启停，不在应用启动时接管历史任务。
+    if (active) workflowCodexController.start();
+    else workflowCodexController.stop();
+  },
+  { immediate: true }
+);
 
 watchEffect(() => {
   if (typeof document === "undefined") {
@@ -48,7 +59,6 @@ onMounted(() => {
   void configStore.probeGenerationCapabilities();
   // 桌面端启动时主动确认一次插件连接状态。
   void executorStore.testHeartbeat().catch(() => undefined);
-  workflowCodexController.start();
 });
 </script>
 

@@ -178,11 +178,6 @@ async def control(
     return await boss_executor.set_plugin_control(db, str(executor["id"]), payload.command)
 
 
-@router.get("/boss-executor/status")
-def status(db: Database = Depends(get_database)):
-    return boss_executor.executor_status(db)
-
-
 @router.post("/boss-executor/desktop-control")
 async def desktop_control(
     payload: BossExecutorControlRequest,

@@ -248,6 +248,7 @@ const submitDeepJobSearchTask = async (requestedAction?: "submit" | "continue") 
   const action = requestedAction ?? task.action;
   try {
     const run = await workflowStore.refresh(task.workflowRunId);
+    if (action !== "view") workflowStore.startPolling();
     updateWorkflowHandoffControls(run);
     if (action === "view") {
       workflowAnalysisMessage.value = isRunning.value && run?.codex_session_ref === store.sessionRef
@@ -277,6 +278,7 @@ const resubmitWorkflowAnalysis = async () => {
   if (!task) return;
   try {
     const run = await workflowStore.refresh(task.workflowRunId);
+    workflowStore.startPolling();
     updateWorkflowHandoffControls(run);
     if (!run) return;
     const result = await resubmitWorkflowCodexSubmit(run, store);
@@ -293,6 +295,7 @@ const retryWorkflowAnalysis = async () => {
   if (!task) return;
   try {
     const run = await workflowStore.refresh(task.workflowRunId);
+    workflowStore.startPolling();
     updateWorkflowHandoffControls(run);
     if (!run) return;
     const result = await retryWorkflowCodexHandoff(run, store);

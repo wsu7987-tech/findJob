@@ -30,6 +30,8 @@ from backend.app.services.fine_job.workflow import (
     link_review_items_chat,
     list_automation_actions,
     list_review_items,
+    ReviewSortField,
+    ReviewSortOrder,
     reject_review_item,
     restore_review_item,
 )
@@ -47,6 +49,8 @@ def get_fine_job_review_items(
     execution_state: str | None = Query(default=None, max_length=80),
     created_from: str | None = Query(default=None, max_length=40),
     created_to: str | None = Query(default=None, max_length=40),
+    sort_by: ReviewSortField | None = Query(default=None),
+    sort_order: ReviewSortOrder = Query(default="desc"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=100),
     db: Database = Depends(get_database),
@@ -60,6 +64,8 @@ def get_fine_job_review_items(
         execution_state=execution_state,
         created_from=created_from,
         created_to=created_to,
+        sort_by=sort_by,
+        sort_order=sort_order,
         page=page,
         page_size=page_size,
     ))

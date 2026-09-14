@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, h, onMounted, ref } from "vue";
 import { ElButton, ElMessage, ElMessageBox } from "element-plus";
 import { useRouter } from "vue-router";
 
@@ -16,11 +16,10 @@ const selectedRows = ref<FineJobReviewItem[]>([]);
 const detailItem = ref<FineJobReviewItem | null>(null);
 const detailDrawerOpen = ref(false);
 const navigationErrors = ref<Record<string, string>>({});
-let executorPollTimer: number | null = null;
 
 type ReviewQueueRow =
-  | { id: string; kind: "greeting"; reviewItem: FineJobReviewItem }
-  | { id: string; kind: "chat"; chatTask: FineJobChatReviewTask };
+  | { id: string; kind: "greeting"; reviewItem: FineJobReviewItem; confidence: number | null }
+  | { id: string; kind: "chat"; chatTask: FineJobChatReviewTask; confidence: number | null };
 
 const reviewTabs: Array<{ label: string; name: FineJobReviewTab }> = [
   { label: "待确认", name: "pending" },
@@ -42,7 +41,11 @@ const reviewRows = computed<ReviewQueueRow[]>(() => {
   const greetingRows = workflowStore.items.map((reviewItem) => ({
     id: reviewItem.id,
     kind: "greeting" as const,
-    reviewItem
+    reviewItem,
+    // 将嵌套评估值映射到表格排序字段。
+    confidence: Number.isFinite(Number(reviewItem.evaluation?.confidence))
+      ? Number(reviewItem.evaluation.confidence)
+      : null
   }));
   const chatTasks = workflowStore.selectedStatus === "pending"
     ? workflowStore.chatReviewTasks
@@ -55,25 +58,11 @@ const reviewRows = computed<ReviewQueueRow[]>(() => {
     ...chatTasks.map((chatTask) => ({
       id: chatTask.id,
       kind: "chat" as const,
-      chatTask
+      chatTask,
+      confidence: null
     })),
     ...greetingRows
   ];
-});
-
-const executorLabel = computed(() => {
-  const executor = executorStore.dashboard?.executor;
-  if (!executor) return "未配对";
-  if (!executor.browser_connected) return "FineJob未连接";
-  if (executor.risk_state !== "none") return "风险暂停";
-  if (executor.queue_state === "running") return "运行中";
-  return "已暂停";
-});
-
-const executorType = computed(() => {
-  if (executorLabel.value === "运行中") return "success";
-  if (["未配对", "FineJob未连接"].includes(executorLabel.value)) return "info";
-  return "warning";
 });
 
 const loadStatus = async (status: FineJobReviewTab, resetPage = false) => {
@@ -89,6 +78,19 @@ const loadStatus = async (status: FineJobReviewTab, resetPage = false) => {
 const search = () => loadStatus(workflowStore.selectedStatus, true);
 const handleTabChange = (name: string | number) =>
   loadStatus(String(name) as FineJobReviewTab, true);
+const handleSortChange = async ({
+  prop,
+  order
+}: {
+  prop: string;
+  order: "ascending" | "descending" | null;
+}) => {
+  if (prop !== "confidence") return;
+  // 排序交给后端处理，保证跨分页的岗位顺序一致。
+  workflowStore.sortBy = order ? "confidence" : "";
+  workflowStore.sortOrder = order === "ascending" ? "asc" : "desc";
+  await loadStatus(workflowStore.selectedStatus, true);
+};
 const resetFilters = () => {
   workflowStore.query = "";
   workflowStore.decision = "";
@@ -111,7 +113,6 @@ const approve = async (item: FineJobReviewItem) => {
   }
   try {
     await workflowStore.approve(item, "", item.status === "rejected");
-    await executorStore.load();
     ElMessage.success("已创建 BOSS 默认招呼执行任务");
   } catch {
     ElMessage.error(workflowStore.error ?? "批准失败");
@@ -189,7 +190,6 @@ const runBatch = async (operation: "approve" | "reject" | "archive") => {
       operation,
       operation === "approve" && hasRejected
     );
-    await executorStore.load();
     result.failed
       ? ElMessage.warning(`完成 ${result.succeeded} 条，失败 ${result.failed} 条`)
       : ElMessage.success(`已完成 ${result.succeeded} 条`);
@@ -380,7 +380,6 @@ const approveChatReviewTask = async (task: FineJobChatReviewTask) => {
       await api.confirmFineJobChatResumeAction(task.id);
     }
     await loadStatus("pending");
-    await executorStore.load();
     ElMessage.success("任务已进入执行队列");
   } catch (errorValue) {
     if (errorValue === "cancel" || errorValue === "close") return;
@@ -444,21 +443,8 @@ const confidencePercent = (evaluation: FineJobReviewItem["evaluation"]) => {
 const gapSummary = (item: FineJobReviewItem) =>
   evaluationGaps(item.evaluation).map((gap) => gap.item).join("；");
 
-const createPairingCode = async () => {
-  try {
-    await executorStore.createPairingCode();
-  } catch {
-    ElMessage.error(executorStore.error ?? "生成配对码失败");
-  }
-};
-
 onMounted(() => {
   void loadStatus("pending");
-  void executorStore.load();
-  executorPollTimer = window.setInterval(() => void executorStore.load().catch(() => undefined), 5000);
-});
-onBeforeUnmount(() => {
-  if (executorPollTimer !== null) window.clearInterval(executorPollTimer);
 });
 </script>
 
@@ -470,36 +456,13 @@ onBeforeUnmount(() => {
         <h1>待确认</h1>
         <p class="secondary-text">{{ pageDescription }}</p>
       </div>
-      <el-button :loading="workflowStore.loading" @click="loadStatus(workflowStore.selectedStatus)">刷新</el-button>
+      <div class="card-actions">
+        <el-button :loading="workflowStore.loading" @click="loadStatus(workflowStore.selectedStatus)">刷新</el-button>
+        <el-button type="primary" plain @click="router.push({ name: 'fine-job-runs' })">查看运行状态</el-button>
+      </div>
     </div>
 
     <el-alert v-if="workflowStore.error" type="error" title="待确认操作失败" :description="workflowStore.error" show-icon />
-
-    <section class="page-panel executor-summary">
-      <div>
-        <span class="secondary-text">BOSS 执行器</span>
-        <div class="executor-summary__main">
-          <el-tag :type="executorType">{{ executorLabel }}</el-tag>
-          <strong>队列 {{ executorStore.dashboard?.queue.total ?? 0 }}</strong>
-          <span v-if="executorStore.dashboard?.executor?.last_heartbeat_at" class="secondary-text">
-            最近心跳 {{ formatDateTime(executorStore.dashboard.executor.last_heartbeat_at) }}
-          </span>
-        </div>
-      </div>
-      <div class="card-actions">
-        <el-button v-if="!executorStore.dashboard?.executor || !executorStore.dashboard.executor.browser_connected" @click="createPairingCode">生成配对码</el-button>
-        <el-button type="primary" plain @click="router.push({ name: 'fine-job-runs' })">查看运行状态</el-button>
-      </div>
-    </section>
-
-    <el-alert
-      v-if="executorStore.pairingCode"
-      type="warning"
-      :closable="false"
-      :title="`配对码：${executorStore.pairingCode}`"
-      :description="`有效期至 ${formatDateTime(executorStore.pairingExpiresAt || '')}`"
-      show-icon
-    />
 
     <section class="page-panel review-filters">
       <el-form label-position="top">
@@ -582,9 +545,10 @@ onBeforeUnmount(() => {
         row-key="id"
         empty-text="当前筛选条件下暂无事项"
         @selection-change="handleSelectionChange"
+        @sort-change="handleSortChange"
       >
         <el-table-column v-if="['pending', 'rejected'].includes(workflowStore.selectedStatus)" type="selection" width="46" />
-        <el-table-column label="任务类型" width="125">
+        <el-table-column label="任务类型" width="100">
           <template #default="{ row }">
             <span v-if="row.kind === 'greeting'">打招呼</span>
             <el-button v-else link type="primary" @click="openChat(row.chatTask.session_id)">{{ row.chatTask.task_type }}</el-button>
@@ -617,21 +581,22 @@ onBeforeUnmount(() => {
           </template>
         </el-table-column>
 
-        <el-table-column label="任务详情" min-width="260" show-overflow-tooltip>
-          <template #default="{ row }">
-            {{ row.kind === 'greeting'
-              ? row.reviewItem.final_message || row.reviewItem.draft_message || "待生成招呼语"
-              : row.chatTask.task_detail }}
-          </template>
-        </el-table-column>
+
         <el-table-column label="AI 结论" width="115">
           <template #default="{ row }">
             <el-tag v-if="row.kind === 'greeting'" :type="decisionType(row.reviewItem.ai_decision)">{{ decisionLabel(row.reviewItem.ai_decision) }}</el-tag>
             <span v-else>-</span>
           </template>
         </el-table-column>
-        <el-table-column label="置信度" width="90">
+        <el-table-column prop="confidence" label="置信度" width="100" sortable="custom">
           <template #default="{ row }">{{ row.kind === 'greeting' ? `${confidencePercent(row.reviewItem.evaluation)}%` : "-" }}</template>
+        </el-table-column>
+        <el-table-column label="任务详情" min-width="260" show-overflow-tooltip>
+          <template #default="{ row }">
+            {{ row.kind === 'greeting'
+              ? row.reviewItem.final_message || row.reviewItem.draft_message || "待生成招呼语"
+              : row.chatTask.task_detail }}
+          </template>
         </el-table-column>
         <el-table-column label="关键判断" min-width="240" show-overflow-tooltip>
           <template #default="{ row }">{{ row.kind === 'greeting' ? evaluationSummary(row.reviewItem.evaluation) : row.chatTask.peer_name || "待确认发送" }}</template>
@@ -721,14 +686,13 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.executor-summary, .executor-summary__main, .batch-toolbar, .detail-heading, .filter-actions, .tag-list {
+.batch-toolbar, .detail-heading, .filter-actions, .tag-list {
   display: flex;
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
 }
-.executor-summary, .detail-heading { justify-content: space-between; }
-.executor-summary__main { margin-top: 8px; }
+.detail-heading { justify-content: space-between; }
 .review-status-tabs { margin-bottom: 14px; }
 .review-filter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 4px 16px; }
 .batch-toolbar { padding: 10px 0 14px; }

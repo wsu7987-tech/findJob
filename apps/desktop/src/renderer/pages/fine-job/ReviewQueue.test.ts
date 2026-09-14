@@ -14,7 +14,6 @@ const mocks = vi.hoisted(() => ({
   listFineJobReviewItems: vi.fn(),
   listFineJobAutomationActions: vi.fn(),
   listFineJobChatReviewTasks: vi.fn(),
-  getFineJobBossExecutorStatus: vi.fn(),
   routerPush: vi.fn(),
   messageError: vi.fn(),
   messageSuccess: vi.fn()
@@ -26,8 +25,7 @@ vi.mock("@/services/api", () => ({
   api: {
     listFineJobReviewItems: mocks.listFineJobReviewItems,
     listFineJobAutomationActions: mocks.listFineJobAutomationActions,
-    listFineJobChatReviewTasks: mocks.listFineJobChatReviewTasks,
-    getFineJobBossExecutorStatus: mocks.getFineJobBossExecutorStatus
+    listFineJobChatReviewTasks: mocks.listFineJobChatReviewTasks
   }
 }));
 
@@ -104,14 +102,6 @@ describe("ReviewQueue", () => {
     mocks.listFineJobReviewItems.mockResolvedValue({ items: [], total: 0 });
     mocks.listFineJobAutomationActions.mockResolvedValue({ actions: [], total: 0 });
     mocks.listFineJobChatReviewTasks.mockResolvedValue({ items: [] });
-    mocks.getFineJobBossExecutorStatus.mockResolvedValue({
-      executor: null,
-      current_task: null,
-      queue: {
-        total: 0,
-        actions: []
-      }
-    });
   });
 
   it("使用不依赖 TabPane 的状态控件切换待确认列表", async () => {

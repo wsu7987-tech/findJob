@@ -19,6 +19,7 @@ type ControllerDependencies = {
   getLatestRun: () => Promise<FineJobWorkflowRun | null>;
   workflowStore: WorkflowRunStore;
   codexStore: CodexStore;
+  isActive?: () => boolean;
   intervalMs?: number;
   handoffDependencies?: Parameters<typeof triggerWorkflowCodexHandoff>[3];
 };
@@ -36,21 +37,24 @@ export const createFineJobWorkflowCodexController = (dependencies: ControllerDep
   let polling = false;
 
   const tick = async () => {
-    if (polling) return;
+    // 控制器只在当前 Workflow 已明确进入运行流程后访问后端。
+    if (polling || (dependencies.isActive && !dependencies.isActive())) return;
     polling = true;
     try {
       const run = await dependencies.getLatestRun();
-      if (!run) return;
+      if (!run || (dependencies.isActive && !dependencies.isActive())) return;
       let refreshed = run;
       // Codex ACK started 后由同一 App-level 轮询驱动旁路 JD，后端仍保持当前正式 Run 状态。
       if (needsPrefetchProgress(run)) {
         refreshed = await api.advanceFineJobWorkflowRun(run.workflow_run_id);
       }
+      if (dependencies.isActive && !dependencies.isActive()) return;
       dependencies.workflowStore.setRun(refreshed);
       // 只检查当前已 ready 的 Analysis Batch，不推进 JD 或其他 Workflow Step。
       const result = await triggerWorkflowCodexHandoff(
         refreshed, dependencies.codexStore, "auto", dependencies.handoffDependencies
       );
+      if (dependencies.isActive && !dependencies.isActive()) return;
       dependencies.workflowStore.setRun(result.run);
     } finally {
       polling = false;

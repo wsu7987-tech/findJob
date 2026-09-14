@@ -10,23 +10,16 @@ describe("fineJobBossExecutor store", () => {
     vi.restoreAllMocks();
   });
 
-  it("生成配对码并读取执行器队列", async () => {
+  it("生成执行器配对码", async () => {
     vi.spyOn(api, "createFineJobBossPairingCode").mockResolvedValue({
       code: "123456",
       expires_at: "2026-08-23T19:00:00Z"
     });
-    vi.spyOn(api, "getFineJobBossExecutorStatus").mockResolvedValue({
-      executor: null,
-      queue: { actions: [], total: 0 },
-      protocol_version: "1.1"
-    });
     const store = useFineJobBossExecutorStore();
 
     await store.createPairingCode();
-    await store.load();
 
     expect(store.pairingCode).toBe("123456");
-    expect(store.dashboard?.protocol_version).toBe("1.1");
   });
 
   it("从历史页请求专用Chrome打开岗位", async () => {
@@ -123,9 +116,6 @@ describe("fineJobBossExecutor store", () => {
         company_name: "FineJob 系统测试", encrypt_job_id: "test-id",
         close_page_after_completion: true, delay_seconds: 8
       }
-    });
-    vi.spyOn(api, "getFineJobBossExecutorStatus").mockResolvedValue({
-      executor: null, queue: { actions: [], total: 0 }, protocol_version: "1.1"
     });
     const store = useFineJobBossExecutorStore();
 

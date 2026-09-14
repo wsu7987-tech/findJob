@@ -72,6 +72,8 @@ describe("fineJobWorkflow store", () => {
       execution_state: "",
       created_from: undefined,
       created_to: undefined,
+      sort_by: undefined,
+      sort_order: "desc",
       page: 1,
       page_size: 20
     });

@@ -20,12 +20,13 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
   const loading = ref(false);
   const advancing = ref(false);
   const error = ref<string | null>(null);
+  const pollingActive = ref(false);
   let pollingTimer: ReturnType<typeof setInterval> | null = null;
 
   const setRun = (run: FineJobWorkflowRun | null) => {
     currentRun.value = run;
-    if (run && !terminalStatuses.has(run.status)) ensurePolling();
     if (!run || terminalStatuses.has(run.status)) stopPolling();
+    if (run && pollingActive.value && !terminalStatuses.has(run.status)) ensurePolling();
     return run;
   };
 
@@ -55,17 +56,25 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
 
   const tick = async () => {
     const run = currentRun.value;
-    if (!run || terminalStatuses.has(run.status) || advancing.value) return;
+    if (!pollingActive.value || !run || terminalStatuses.has(run.status) || advancing.value) return;
     const refreshed = await refresh(run.workflow_run_id);
     if (refreshed && !boundaryStatuses.has(refreshed.status)) await advance();
   };
 
+  const startPolling = () => {
+    // 只有用户明确启动或恢复任务后，才允许建立 Workflow 轮询。
+    pollingActive.value = true;
+    if (currentRun.value && !terminalStatuses.has(currentRun.value.status)) ensurePolling();
+  };
+
   const ensurePolling = () => {
+    if (!pollingActive.value) return;
     if (pollingTimer) return;
     pollingTimer = setInterval(() => { void tick(); }, 1200);
   };
 
   const stopPolling = () => {
+    pollingActive.value = false;
     if (!pollingTimer) return;
     clearInterval(pollingTimer);
     pollingTimer = null;
@@ -76,6 +85,7 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
     error.value = null;
     try {
       setRun(await api.createFineJobDeepJobSearchRun(payload));
+      startPolling();
       await advance();
       return currentRun.value;
     } finally {
@@ -102,6 +112,7 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
   const resume = async () => {
     if (!currentRun.value) return null;
     setRun(await api.resumeFineJobWorkflowRun(currentRun.value.workflow_run_id));
+    startPolling();
     await advance();
     return currentRun.value;
   };
@@ -113,6 +124,7 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
 
   return {
     currentRun,
+    pollingActive,
     loading,
     advancing,
     error,
@@ -124,6 +136,7 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
     pause,
     resume,
     cancel,
+    startPolling,
     ensurePolling,
     stopPolling
   };
