@@ -333,6 +333,10 @@ export interface FineJobBossCaptureTask {
   last_added_jobs?: number;
   total_pages_loaded?: number;
   stop_requested?: boolean;
+  pause_requested?: boolean;
+  capture_source?: "smart" | "custom";
+  workflow_run_id?: string | null;
+  smart_capture_id?: string | null;
   current_job?: Record<string, unknown> | null;
   estimated_seconds_min: number;
   estimated_seconds_max: number;
@@ -343,6 +347,37 @@ export interface FineJobBossCaptureTask {
   updated_at: string;
   finished_at?: string | null;
   error_message?: string | null;
+}
+
+export type FineJobSmartCaptureStatus =
+  | "pending"
+  | "running"
+  | "pausing"
+  | "paused"
+  | "waiting_next_batch"
+  | "completed"
+  | "stopped"
+  | "failed"
+  | "interrupted";
+
+export interface FineJobSmartCapture {
+  smart_capture_id: string;
+  source: "task_cockpit" | "boss_capture";
+  workflow_run_id?: string | null;
+  status: FineJobSmartCaptureStatus;
+  current_batch_id?: string | null;
+  search_config: Record<string, unknown>;
+  target_count?: number | null;
+  stage: string;
+  message: string;
+  error_message?: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string | null;
+  batches: Array<Record<string, unknown>>;
+  current_batch?: FineJobBossCaptureTask | Record<string, unknown> | null;
+  jobs: FineJobBossCapturedJob[];
+  workflow_run?: FineJobWorkflowRun | null;
 }
 
 export interface FineJobBossDetailSuggestionResponse {
@@ -2401,7 +2436,7 @@ export interface QASessionListEnvelope {
 export interface ApiErrorShape {
   error_category?: string | null;
   error_message?: string | null;
-  detail?: string | Record<string, unknown> | null;
+  detail?: string | Record<string, unknown> | Array<Record<string, unknown>> | null;
 }
 
 export interface FineJobWorkflowContextSection {
@@ -2460,6 +2495,7 @@ export interface FineJobWorkflowTask {
 export interface FineJobWorkflowRun {
   workflow_run_id: string;
   workflow_type: "deep_job_search";
+  capture_jobs?: FineJobBossCapturedJob[];
   status: string;
   completed_count: number;
   remaining_count: number;
@@ -2571,11 +2607,14 @@ export interface FineJobWorkflowRun {
     start_ack_timeout_seconds: number;
   };
   completion_contract?: {
+    delivery_target_enabled?: boolean;
     target_count?: number;
     recommend_target?: number;
     review_target?: number | null;
     target_mode?: "any" | "all";
     analysis_policy?: {
+      enabled?: boolean;
+      manual_batch_only?: boolean;
       analyze_all_candidates?: boolean;
       stop_after_current_batch?: boolean;
       analysis_batch_size?: number;
@@ -2598,6 +2637,13 @@ export interface FineJobWorkflowRun {
     codex_execution_config?: { model?: string; reasoning_effort?: string };
     analysis_guidance?: { text?: string; version?: number };
   };
+}
+
+export interface FineJobActiveCollectionTask {
+  kind: "smart" | "custom";
+  id: string;
+  status: string;
+  message: string;
 }
 
 export interface FineJobSearchPlannerSummary {

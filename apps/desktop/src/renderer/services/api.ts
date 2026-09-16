@@ -100,7 +100,9 @@
   FineJobCodexPermissions,
   FineJobWorkflowContextSnapshot,
   FineJobWorkflowAnalysisItem,
+  FineJobActiveCollectionTask,
   FineJobWorkflowRun,
+  FineJobSmartCapture,
   FineJobCompanyEnvelope,
   FineJobCompanyListEnvelope,
   FineJobCompanyType,
@@ -1436,18 +1438,68 @@ export const api = {
       `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}`
     );
   },
-  async getLatestFineJobWorkflowRun() {
+  async listFineJobWorkflowCaptureJobs(workflowRunId: string) {
+    return request<{ items: FineJobBossHistoryJob[]; total: number }>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/capture-jobs`
+    );
+  },
+  async getLatestFineJobWorkflowRun(includeCompleted = false) {
+    const suffix = includeCompleted ? "?include_completed=true" : "";
     return request<{ workflow_run: FineJobWorkflowRun | null }>(
-      "/api/fine-job/workflow-runs/latest"
+      `/api/fine-job/workflow-runs/latest${suffix}`
+    );
+  },
+  async getFineJobActiveCollectionTask() {
+    return request<{ active_task: FineJobActiveCollectionTask | null }>(
+      "/api/fine-job/workflow-runs/collection-active"
+    );
+  },
+  async getCurrentFineJobSmartCapture() {
+    return request<{ smart_capture: FineJobSmartCapture | null }>(
+      "/api/fine-job/smart-captures/current"
+    );
+  },
+  async createFineJobSmartCapture(payload: {
+    filter_strategy_id: string;
+    allowed_search_keywords: string[];
+    allowed_cities: string[];
+    candidate_target_count: number;
+    pages?: number;
+    include_details?: boolean;
+    prefer_current_page?: boolean;
+    filters?: Record<string, string>;
+  }) {
+    return request<FineJobSmartCapture>("/api/fine-job/smart-captures", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  },
+  async pauseFineJobSmartCapture(smartCaptureId: string) {
+    return request<FineJobSmartCapture>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/pause`,
+      { method: "POST" }
+    );
+  },
+  async resumeFineJobSmartCapture(smartCaptureId: string) {
+    return request<FineJobSmartCapture>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/resume`,
+      { method: "POST" }
+    );
+  },
+  async stopFineJobSmartCapture(smartCaptureId: string) {
+    return request<FineJobSmartCapture>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/stop`,
+      { method: "POST" }
     );
   },
   async createFineJobDeepJobSearchRun(payload: {
     filter_strategy_id: string;
-    recommendation_strategy_id: string;
-    codex_model: string;
-    codex_reasoning_effort: "minimal" | "low" | "medium" | "high" | "xhigh";
+    delivery_target_enabled?: boolean;
+    recommendation_strategy_id?: string;
+    codex_model?: string;
+    codex_reasoning_effort?: "minimal" | "low" | "medium" | "high" | "xhigh";
     analysis_guidance?: string;
-    recommend_target: number;
+    recommend_target?: number;
     review_target?: number;
     target_mode?: "any" | "all";
     analyze_all_candidates?: boolean;
@@ -1466,15 +1518,30 @@ export const api = {
     low_qualified_yield_threshold?: number;
     search_combination_safety_limit?: number;
     context_soft_budget_characters?: number;
-  }) {
+  }, createdFrom: "task_cockpit" | "boss_capture" = "task_cockpit") {
     return request<FineJobWorkflowRun>("/api/fine-job/workflow-runs", {
       method: "POST",
       body: JSON.stringify({
         task_type: "deep_job_search",
-        created_from: "task_cockpit",
+        created_from: createdFrom,
         deep_job_search: payload
       })
     });
+  },
+  async createFineJobWorkflowManualAnalysisBatch(
+    workflowRunId: string,
+    payload: {
+      recommendation_strategy_id: string;
+      job_ids: string[];
+      analysis_batch_size?: number;
+      codex_model?: string;
+      codex_reasoning_effort?: "minimal" | "low" | "medium" | "high" | "xhigh";
+    }
+  ) {
+    return request<FineJobWorkflowRun>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/analysis-batches`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
   },
   async advanceFineJobWorkflowRun(workflowRunId: string) {
     return request<FineJobWorkflowRun>(

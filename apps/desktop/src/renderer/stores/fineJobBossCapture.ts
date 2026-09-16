@@ -248,6 +248,19 @@ export const useFineJobBossCaptureStore = defineStore("fineJobBossCapture", () =
     }
   };
 
+  const clearTask = () => {
+    stopPolling();
+    task.value = null;
+  };
+
+  const setTask = (nextTask: FineJobBossCaptureTask | null) => {
+    stopPolling();
+    task.value = nextTask;
+    if (nextTask && (nextTask.status === "queued" || nextTask.status === "running")) {
+      startPolling(nextTask.id);
+    }
+  };
+
   const startPolling = (taskId: string) => {
     stopPolling();
     const poll = async () => {
@@ -301,6 +314,8 @@ export const useFineJobBossCaptureStore = defineStore("fineJobBossCapture", () =
     applyFilter,
     evaluateDeliveries,
     refreshTask,
+    clearTask,
+    setTask,
     resumePolling,
     stopPolling
   };

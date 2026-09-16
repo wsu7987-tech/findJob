@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, status
+import json
+from collections.abc import Iterator
+from queue import Empty
+
+from fastapi import APIRouter, Depends, Query, status
+from fastapi.responses import StreamingResponse
 
 from backend.app.config import AppConfig
 from backend.app.dependencies import get_config, get_database
@@ -12,10 +17,12 @@ from backend.app.schemas.fine_job.workflow_runs import (
     WorkflowAnalysisHandoffStartAckRequest,
     WorkflowAnalysisFeedbackRequest,
     WorkflowAnalysisGuidanceUpdateRequest,
+    WorkflowManualAnalysisBatchRequest,
     WorkflowRunCodexSessionRequest,
     WorkflowRunCreateRequest,
 )
 from backend.app.services.fine_job import workflow_runs
+from backend.app.services.fine_job.workflow_run_events import workflow_run_event_broker
 from backend.app.services.fine_job.codex_tools import CodexToolService
 
 
@@ -24,12 +31,22 @@ router = APIRouter(prefix="/fine-job/workflow-runs", tags=["fine-job-workflow-ru
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create(payload: WorkflowRunCreateRequest, config: AppConfig = Depends(get_config), db: Database = Depends(get_database)):
+    workflow_runs.configure_realtime_runtime(db, config)
     return workflow_runs.create_deep_job_search_run(db, config, payload.deep_job_search.model_dump(), created_from=payload.created_from)
 
 
 @router.get("/latest")
-def latest(db: Database = Depends(get_database)):
-    return {"workflow_run": workflow_runs.get_latest_active_workflow_run(db)}
+def latest(
+    include_completed: bool = Query(default=False),
+    db: Database = Depends(get_database),
+):
+    return {"workflow_run": workflow_runs.get_latest_workflow_run(db, include_completed=include_completed)}
+
+
+@router.get("/collection-active")
+def collection_active(db: Database = Depends(get_database)):
+    """供两个采集入口在创建任务前读取统一互斥状态。"""
+    return {"active_task": workflow_runs.get_active_collection_task(db)}
 
 
 @router.get("/{workflow_run_id}")
@@ -37,8 +54,39 @@ def get(workflow_run_id: str, db: Database = Depends(get_database)):
     return workflow_runs.get_workflow_run(db, workflow_run_id)
 
 
+@router.get("/{workflow_run_id}/events")
+def events(workflow_run_id: str, db: Database = Depends(get_database)) -> StreamingResponse:
+    initial_snapshot = workflow_runs.get_workflow_run(db, workflow_run_id)
+    subscriber = workflow_run_event_broker.subscribe(workflow_run_id)
+
+    def event_stream() -> Iterator[str]:
+        try:
+            yield f"data: {json.dumps(initial_snapshot, ensure_ascii=False)}\\n\\n"
+            while True:
+                try:
+                    snapshot = subscriber.get(timeout=15)
+                except Empty:
+                    yield ": heartbeat\\n\\n"
+                    continue
+                yield f"data: {json.dumps(snapshot, ensure_ascii=False)}\\n\\n"
+        finally:
+            workflow_run_event_broker.unsubscribe(workflow_run_id, subscriber)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/{workflow_run_id}/capture-jobs")
+def capture_jobs(workflow_run_id: str, db: Database = Depends(get_database)):
+    return workflow_runs.list_workflow_capture_jobs(db, workflow_run_id)
+
+
 @router.post("/{workflow_run_id}/advance")
 def advance(workflow_run_id: str, config: AppConfig = Depends(get_config), db: Database = Depends(get_database)):
+    workflow_runs.configure_realtime_runtime(db, config)
     return workflow_runs.advance_deep_job_search(db, config, workflow_run_id)
 
 
@@ -48,6 +96,7 @@ def resume(
     config: AppConfig = Depends(get_config),
     db: Database = Depends(get_database),
 ):
+    workflow_runs.configure_realtime_runtime(db, config)
     return workflow_runs.resume_deep_job_search_run(db, config, workflow_run_id)
 
 
@@ -69,6 +118,25 @@ def context_snapshot(workflow_run_id: str, channel: str = "deep_job_search", db:
 @router.get("/{workflow_run_id}/analysis-items")
 def list_analysis_items(workflow_run_id: str, db: Database = Depends(get_database)):
     return workflow_runs.list_workflow_analysis_items(db, workflow_run_id)
+
+
+@router.post("/{workflow_run_id}/analysis-batches")
+def create_manual_analysis_batch(
+    workflow_run_id: str,
+    payload: WorkflowManualAnalysisBatchRequest,
+    config: AppConfig = Depends(get_config),
+    db: Database = Depends(get_database),
+):
+    return workflow_runs.create_manual_analysis_batch(
+        db,
+        config,
+        workflow_run_id,
+        recommendation_strategy_id=payload.recommendation_strategy_id,
+        job_ids=payload.job_ids,
+        analysis_batch_size=payload.analysis_batch_size,
+        codex_model=payload.codex_model,
+        codex_reasoning_effort=payload.codex_reasoning_effort,
+    )
 
 
 @router.get("/{workflow_run_id}/analysis-items/{workflow_task_id}/context")

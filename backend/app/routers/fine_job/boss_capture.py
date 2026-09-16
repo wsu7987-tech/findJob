@@ -65,6 +65,7 @@ from backend.app.services.fine_job.filter_exclusions import (
     apply_filter_exclusions,
     assert_job_action_allowed,
 )
+from backend.app.services.fine_job.workflow_runs import assert_collection_start_allowed
 
 
 router = APIRouter(prefix="/fine-job/boss-capture", tags=["fine-job-boss-capture"])
@@ -189,6 +190,7 @@ def start_boss_capture(
     config: AppConfig = Depends(get_config),
     db: Database = Depends(get_database),
 ) -> BossCaptureTaskResponse:
+    assert_collection_start_allowed(db, requested_kind="custom")
     if not boss_scraper_service.get_browser_status().running:
         raise AppError(
             status_code=409,
@@ -206,6 +208,7 @@ def start_boss_capture(
             output_dir=config.output_root / "fine-job" / "boss-capture",
             prefer_current_page=payload.prefer_current_page,
             filter_strategy_id=payload.filter_strategy_id,
+            capture_source="custom",
         ),
         output_dir=config.output_root / "fine-job" / "boss-capture",
         db=db,

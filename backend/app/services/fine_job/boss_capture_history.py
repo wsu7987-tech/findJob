@@ -39,17 +39,27 @@ def create_capture_batch(
     pages: int,
     auto_details: bool,
     created_at: str,
+    smart_capture_id: str | None = None,
 ) -> None:
     with db.connect() as connection:
         connection.execute(
             """
             INSERT INTO fj_boss_capture_batches (
-              id, keyword, city, pages, auto_details, status,
+              id, smart_capture_id, keyword, city, pages, auto_details, status,
               created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)
             """,
-            (capture_id, keyword, city, pages, int(auto_details), created_at, created_at),
+            (
+                capture_id,
+                smart_capture_id,
+                keyword,
+                city,
+                pages,
+                int(auto_details),
+                created_at,
+                created_at,
+            ),
         )
 
 
@@ -63,6 +73,12 @@ def update_capture_batch(
     details_completed: int | None = None,
     details_failed: int | None = None,
     finished_at: str | None = None,
+    stage: str | None = None,
+    message: str | None = None,
+    error_message: str | None = None,
+    progress_current: int | None = None,
+    progress_total: int | None = None,
+    control_status: str | None = None,
 ) -> None:
     assignments = ["status = ?", "updated_at = ?"]
     values: list[object] = [status, utc_now()]
@@ -72,6 +88,12 @@ def update_capture_batch(
         ("details_completed", details_completed),
         ("details_failed", details_failed),
         ("finished_at", finished_at),
+        ("stage", stage),
+        ("message", message),
+        ("error_message", error_message),
+        ("progress_current", progress_current),
+        ("progress_total", progress_total),
+        ("control_status", control_status),
     ):
         if value is not None:
             assignments.append(f"{column} = ?")

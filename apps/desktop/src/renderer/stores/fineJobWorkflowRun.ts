@@ -1,7 +1,7 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
 
-import { api } from "@/services/api";
+import { api, getBackendOrigin } from "@/services/api";
 import type { FineJobWorkflowRun } from "@/types";
 
 const boundaryStatuses = new Set([
@@ -21,7 +21,49 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
   const advancing = ref(false);
   const error = ref<string | null>(null);
   const pollingActive = ref(false);
-  let pollingTimer: ReturnType<typeof setInterval> | null = null;
+  const streamActive = ref(false);
+  let eventSource: EventSource | null = null;
+  let subscribedRunId = "";
+
+  const stopPolling = () => {
+    pollingActive.value = false;
+    streamActive.value = false;
+    subscribedRunId = "";
+    eventSource?.close();
+    eventSource = null;
+  };
+
+  const ensurePolling = () => {
+    const workflowRunId = currentRun.value?.workflow_run_id;
+    if (!pollingActive.value || !workflowRunId || terminalStatuses.has(currentRun.value?.status || "")) return;
+    if (eventSource && subscribedRunId === workflowRunId) return;
+    eventSource?.close();
+    eventSource = null;
+    subscribedRunId = workflowRunId;
+    void getBackendOrigin().then((origin) => {
+      if (!pollingActive.value || subscribedRunId !== workflowRunId) return;
+      const eventUrl = new URL(`/api/fine-job/workflow-runs/${workflowRunId}/events`, origin).toString();
+      const source = new EventSource(eventUrl);
+      eventSource = source;
+      source.onopen = () => {
+        streamActive.value = true;
+        error.value = null;
+      };
+      source.onmessage = (event) => {
+        try {
+          setRun(JSON.parse(event.data) as FineJobWorkflowRun);
+        } catch (value) {
+          error.value = value instanceof Error ? value.message : String(value);
+        }
+      };
+      source.onerror = () => {
+        // EventSource 会自动重连；重连后服务端会先发送当前完整快照。
+        streamActive.value = false;
+      };
+    }).catch((value) => {
+      error.value = value instanceof Error ? value.message : String(value);
+    });
+  };
 
   const setRun = (run: FineJobWorkflowRun | null) => {
     currentRun.value = run;
@@ -54,37 +96,20 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
     }
   };
 
-  const tick = async () => {
-    const run = currentRun.value;
-    if (!pollingActive.value || !run || terminalStatuses.has(run.status) || advancing.value) return;
-    const refreshed = await refresh(run.workflow_run_id);
-    if (refreshed && !boundaryStatuses.has(refreshed.status)) await advance();
-  };
-
   const startPolling = () => {
-    // 只有用户明确启动或恢复任务后，才允许建立 Workflow 轮询。
+    // 保留旧方法名，调用方无需改动；实际建立的是 SSE 状态订阅。
     pollingActive.value = true;
     if (currentRun.value && !terminalStatuses.has(currentRun.value.status)) ensurePolling();
   };
 
-  const ensurePolling = () => {
-    if (!pollingActive.value) return;
-    if (pollingTimer) return;
-    pollingTimer = setInterval(() => { void tick(); }, 1200);
-  };
-
-  const stopPolling = () => {
-    pollingActive.value = false;
-    if (!pollingTimer) return;
-    clearInterval(pollingTimer);
-    pollingTimer = null;
-  };
-
-  const create = async (payload: Parameters<typeof api.createFineJobDeepJobSearchRun>[0]) => {
+  const create = async (
+    payload: Parameters<typeof api.createFineJobDeepJobSearchRun>[0],
+    createdFrom: "task_cockpit" | "boss_capture" = "task_cockpit"
+  ) => {
     loading.value = true;
     error.value = null;
     try {
-      setRun(await api.createFineJobDeepJobSearchRun(payload));
+      setRun(await api.createFineJobDeepJobSearchRun(payload, createdFrom));
       startPolling();
       await advance();
       return currentRun.value;
@@ -93,12 +118,14 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
     }
   };
 
-  const restoreLatest = async () => {
+  const restoreLatest = async (includeCompleted = false) => {
     loading.value = true;
     error.value = null;
     try {
-      const response = await api.getLatestFineJobWorkflowRun();
-      return setRun(response.workflow_run);
+      const response = await api.getLatestFineJobWorkflowRun(includeCompleted);
+      const run = setRun(response.workflow_run);
+      if (run && !terminalStatuses.has(run.status)) startPolling();
+      return run;
     } finally {
       loading.value = false;
     }
@@ -125,6 +152,7 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
   return {
     currentRun,
     pollingActive,
+    streamActive,
     loading,
     advancing,
     error,

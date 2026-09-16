@@ -207,6 +207,11 @@ const captureStatusText = computed(() => {
 const syncStrategyScope = () => {
   selectedKeywords.value = [...(selectedStrategy.value?.search_keywords ?? [])];
   selectedCities.value = [...(selectedStrategy.value?.cities ?? [])];
+  // 切换筛选策略后只保留与其关联的建议投递策略。
+  const compatible = compatibleRecommendationStrategies.value;
+  if (!compatible.some((item) => item.id === selectedRecommendationStrategyId.value)) {
+    selectedRecommendationStrategyId.value = compatible[0]?.id ?? "";
+  }
 };
 
 const loadSnapshot = async () => {
@@ -265,6 +270,14 @@ const createRun = async () => {
   const strategy = selectedStrategy.value;
   if (!strategy?.id || !selectedRecommendationStrategy.value?.id || !codexModel.value || !selectedKeywords.value.length || !selectedCities.value.length) {
     error.value = "请完成筛选策略、建议投递策略、Codex 模型、搜索词和城市选择。";
+    return;
+  }
+  if (selectedRecommendationStrategy.value.filter_strategy_id !== strategy.id) {
+    error.value = "建议投递策略必须与当前岗位筛选策略匹配。";
+    return;
+  }
+  if (candidateTargetCount.value < recommendTarget.value) {
+    error.value = "候选池目标不能小于 Recommend 完成目标。";
     return;
   }
   error.value = "";
@@ -526,7 +539,7 @@ watch(workflowRun, (run) => {
       <el-button type="primary" :loading="workflowStore.loading" @click="loadSnapshot">查看本轮上下文</el-button>
       <el-button :loading="workflowStore.advancing" :disabled="!workflowRunId" @click="advanceRun">立即推进</el-button>
       <el-button v-if="workflowRun && workflowRun.status !== 'paused' && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)" @click="pauseRun">暂停</el-button>
-      <el-button v-if="workflowRun?.status === 'paused' || (workflowRun?.status === 'waiting_for_user' && ['capture_interrupted', 'browser_not_running', 'analysis_batch_completed_waiting_user', 'analysis_batch_waiting_user'].includes(workflowRun.stop_reason))" :loading="workflowStore.advancing" @click="resumeRun">继续</el-button>
+      <el-button v-if="workflowRun?.status === 'paused' || (workflowRun?.status === 'waiting_for_user' && ['capture_interrupted', 'browser_not_running', 'collection_task_active', 'analysis_batch_completed_waiting_user', 'analysis_batch_waiting_user'].includes(workflowRun.stop_reason))" :loading="workflowStore.advancing" @click="resumeRun">继续</el-button>
       <el-button v-if="workflowRun && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)" type="danger" plain @click="cancelRun">停止任务</el-button>
       <el-button v-if="workflowCodexEntry" type="primary" @click="openWorkflowCodex(workflowCodexEntry.action)">{{ workflowCodexEntry.label }}</el-button>
       <el-button

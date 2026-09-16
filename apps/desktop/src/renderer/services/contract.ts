@@ -95,13 +95,28 @@ export const mapApiError = (
     return "请求失败，请稍后再试。";
   }
 
-  if (payload.error_category && apiErrorMap[payload.error_category]) {
-    return apiErrorMap[payload.error_category];
-  }
-
   // 业务接口也可能返回 404（例如内存任务在后端重启后已失效），优先展示后端给出的具体原因。
   if (typeof payload.error_message === "string" && payload.error_message.length > 0) {
     return payload.error_message;
+  }
+
+  // FastAPI 的请求校验错误使用 detail 数组，转换为可直接定位字段的提示。
+  if (Array.isArray(payload.detail)) {
+    const validationMessages = payload.detail.flatMap((item) => {
+      const location = Array.isArray(item.loc)
+        ? item.loc.filter((value) => value !== "body").map(String).join(".")
+        : "";
+      const message = typeof item.msg === "string" ? item.msg : "";
+      if (!message) return [];
+      return [location ? `${location}：${message}` : message];
+    });
+    if (validationMessages.length > 0) {
+      return `输入校验失败：${validationMessages.join("；")}`;
+    }
+  }
+
+  if (payload.error_category && apiErrorMap[payload.error_category]) {
+    return apiErrorMap[payload.error_category];
   }
 
   if (payload.statusCode === 404 || payload.statusCode === 501) {

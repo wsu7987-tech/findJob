@@ -31,6 +31,9 @@ class BossCaptureRequest:
     prefer_current_page: bool = False
     force_search_navigation: bool = False
     filter_strategy_id: str | None = None
+    capture_source: str = "custom"
+    workflow_run_id: str | None = None
+    smart_capture_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -795,6 +798,7 @@ class BossScraperService:
                     request.max_details,
                     str(details_path),
                     **detail_kwargs,
+                    should_stop=should_stop,
                 )
             elif progress_callback:
                 jobs = list_data.get("jobs") or []
@@ -904,6 +908,7 @@ class BossScraperService:
         output_path: Path,
         cdp_port: int = engine.DEFAULT_CDP_PORT,
         progress_callback: Callable[[dict[str, object]], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> list[dict[str, object]]:
         selected = set(job_ids)
         jobs = [
@@ -922,6 +927,7 @@ class BossScraperService:
                 cdp_port=cdp_port,
                 fmt="json",
                 progress_callback=progress_callback,
+                should_stop=should_stop,
             )
 
     def capture_chat_job_detail(

@@ -852,6 +852,7 @@ class CodexToolService:
         )
 
     def start_job_capture(self, arguments: dict[str, Any]) -> dict[str, object]:
+        workflow_runs.assert_collection_start_allowed(self.db, requested_kind="custom")
         filter_strategy_id = str(arguments.get("filter_strategy_id") or "").strip()
         strategy = get_filter_strategy(self.db, filter_strategy_id)
         if not strategy.get("enabled"):
@@ -885,6 +886,7 @@ class CodexToolService:
                 output_dir=self.config.output_root / "fine-job" / "boss-capture",
                 prefer_current_page=True,
                 filter_strategy_id=filter_strategy_id,
+                capture_source="custom",
             ),
             output_dir=self.config.output_root / "fine-job" / "boss-capture",
             db=self.db,

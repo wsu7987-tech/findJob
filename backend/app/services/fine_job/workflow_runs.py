@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from threading import RLock, Thread
 from typing import Any
 
 from backend.app.config import AppConfig
 from backend.app.db import Database
 from backend.app.errors import AppError
 from backend.app.services.fine_job.boss_capture_tasks import boss_capture_task_manager
+from backend.app.services.fine_job.workflow_run_events import workflow_run_event_broker
 from backend.app.services.fine_job.boss_capture_history import get_capture_history_job
 from backend.app.services.fine_job.boss_scraper.service import BossCaptureRequest, boss_scraper_service
 from backend.app.services.fine_job.adaptive_search_planner import (
@@ -20,7 +22,7 @@ from backend.app.services.fine_job.adaptive_search_planner import (
 )
 from backend.app.services.fine_job.filter_exclusions import apply_filter_exclusions
 from backend.app.services.fine_job.job_evaluation import evaluate_filter_strategy
-from backend.app.services.fine_job import profile_store, profile_v3
+from backend.app.services.fine_job import profile_store, profile_v3, smart_captures
 from backend.app.services.fine_job.profile_context import get_profile_context
 from backend.app.services.fine_job.strategies import (
     get_filter_strategy,
@@ -32,21 +34,86 @@ from backend.app.utils import new_id, utc_now
 
 HARD_CONTEXT_BUDGET = 1_000_000
 START_ACK_TIMEOUT_SECONDS = 45
+_realtime_runtime: tuple[Database, AppConfig] | None = None
+_realtime_runtime_lock = RLock()
+
+
+def configure_realtime_runtime(db: Database, config: AppConfig) -> None:
+    """保存当前应用运行时，用于后台采集完成后继续推进 Workflow。"""
+    global _realtime_runtime
+    with _realtime_runtime_lock:
+        _realtime_runtime = (db, config)
+
+
+def _on_capture_task_updated(capture: dict[str, object]) -> None:
+    """将采集器进度转换为 Workflow 快照事件，并在结束时继续编排。"""
+    with _realtime_runtime_lock:
+        runtime = _realtime_runtime
+    if runtime is None:
+        return
+    db, config = runtime
+    smart_captures.sync_capture_snapshot(db, capture)
+    capture_id = str(capture.get("id") or "")
+    if not capture_id:
+        return
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT workflow_run_id
+            FROM fj_workflow_tasks
+            WHERE operation_ref_type = 'capture_task' AND operation_ref_id = ?
+            """,
+            (capture_id,),
+        ).fetchall()
+    for row in rows:
+        workflow_run_id = str(row["workflow_run_id"])
+        try:
+            workflow_run_event_broker.publish(workflow_run_id, get_workflow_run(db, workflow_run_id))
+        except Exception:
+            continue
+        stage = str(capture.get("stage") or "")
+        if (
+            str(capture.get("status") or "") in {"completed", "failed"}
+            and not stage.endswith("paused")
+            and not stage.endswith("stopped")
+        ):
+            Thread(
+                target=_advance_after_capture_finished,
+                args=(db, config, workflow_run_id),
+                daemon=True,
+            ).start()
+
+
+def _advance_after_capture_finished(db: Database, config: AppConfig, workflow_run_id: str) -> None:
+    """采集结束后由后端继续推进，页面只订阅状态。"""
+    try:
+        snapshot = advance_deep_job_search(db, config, workflow_run_id)
+        workflow_run_event_broker.publish(workflow_run_id, snapshot)
+    except Exception:
+        # 后续恢复入口仍可读取已持久化的 Run 状态并由用户继续处理。
+        return
+
+
+boss_capture_task_manager.add_listener(_on_capture_task_updated)
 
 
 def create_deep_job_search_run(
     db: Database, config: AppConfig, payload: dict[str, Any], *, created_from: str
 ) -> dict[str, object]:
     """创建搜索 Run；采集器与筛选器仍由既有服务负责。"""
+    assert_collection_start_allowed(db, requested_kind="smart")
     filter_strategy_id = str(payload["filter_strategy_id"])
     strategy = get_filter_strategy(db, filter_strategy_id)
     if not strategy.get("enabled"):
         raise AppError(409, "FILTER_STRATEGY_DISABLED", "岗位筛选策略当前未启用。")
-    recommendation_strategy = _require_workflow_recommendation_strategy(
-        db,
-        recommendation_strategy_id=str(payload["recommendation_strategy_id"]),
-        filter_strategy_id=filter_strategy_id,
-    )
+    delivery_target_enabled = bool(payload.get("delivery_target_enabled", True))
+    recommendation_strategy = None
+    if delivery_target_enabled:
+        recommendation_strategy = _require_workflow_recommendation_strategy(
+            db,
+            recommendation_strategy_id=str(payload["recommendation_strategy_id"]),
+            filter_strategy_id=filter_strategy_id,
+        )
     allowed_keywords = {str(item["keyword"]) for item in list_search_keywords(db, filter_strategy_id) if item.get("enabled")}
     requested_keywords = [str(value).strip() for value in payload["allowed_search_keywords"] if str(value).strip()]
     invalid_keywords = [value for value in requested_keywords if value not in allowed_keywords]
@@ -58,10 +125,10 @@ def create_deep_job_search_run(
     if invalid_cities:
         raise AppError(422, "SEARCH_CITY_INVALID", f"城市未在当前策略中配置：{'、'.join(invalid_cities)}")
 
-    recommend_target = int(payload["recommend_target"])
+    recommend_target = int(payload.get("recommend_target") or 0)
     review_target = payload.get("review_target")
-    candidate_target = int(payload.get("candidate_target_count") or recommend_target * 3)
-    if candidate_target < recommend_target:
+    candidate_target = int(payload.get("candidate_target_count") or (recommend_target * 3 if recommend_target else 15))
+    if delivery_target_enabled and candidate_target < recommend_target:
         raise AppError(422, "VALIDATION_FAILED", "候选池目标不能小于本轮推荐岗位目标。")
     min_depth = int(payload.get("min_depth") or 5)
     max_depth = int(payload.get("max_depth") or 20)
@@ -69,6 +136,7 @@ def create_deep_job_search_run(
         raise AppError(422, "VALIDATION_FAILED", "最大搜索深度不能小于最低探索深度。")
     contract = {
         "task_type": "deep_job_search",
+        "delivery_target_enabled": delivery_target_enabled,
         # target_count 只用于兼容历史读取；运行时只从 recommend_target 解析推荐目标。
         "recommend_target": recommend_target,
         "review_target": int(review_target) if review_target is not None else None,
@@ -78,19 +146,19 @@ def create_deep_job_search_run(
         "source_policy": "fresh_only",
         "selected_strategy_ids": {
             "filter_strategy_id": filter_strategy_id,
-            "recommendation_strategy_id": str(recommendation_strategy["id"]),
+            "recommendation_strategy_id": str(recommendation_strategy["id"]) if recommendation_strategy else "",
         },
         "selected_strategy_versions": {
             "filter_strategy_version": int(strategy.get("strategy_version") or 1),
-            "recommendation_strategy_version": int(recommendation_strategy.get("strategy_version") or 1),
+            "recommendation_strategy_version": int(recommendation_strategy.get("strategy_version") or 1) if recommendation_strategy else None,
         },
         "allowed_search_keywords": requested_keywords,
         "allowed_cities": requested_cities,
         "allow_historical_jobs": False,
         "external_action_policy": "analysis_only",
         "codex_execution_config": {
-            "model": str(payload["codex_model"]),
-            "reasoning_effort": str(payload["codex_reasoning_effort"]),
+            "model": str(payload.get("codex_model") or ""),
+            "reasoning_effort": str(payload.get("codex_reasoning_effort") or ""),
         },
         "analysis_guidance": {
             "text": str(payload.get("analysis_guidance") or "").strip(),
@@ -112,6 +180,7 @@ def create_deep_job_search_run(
             "combination_safety_limit": int(payload.get("search_combination_safety_limit") or 24),
         },
         "analysis_policy": {
+            "enabled": delivery_target_enabled,
             "analyze_all_candidates": bool(payload.get("analyze_all_candidates")),
             "stop_after_current_batch": bool(payload.get("stop_after_current_batch")),
             "analysis_batch_size": int(payload.get("analysis_batch_size") or payload.get("jd_batch_size") or 5),
@@ -183,6 +252,13 @@ def create_deep_job_search_run(
                 now,
             ),
         )
+    smart_captures.create_smart_capture(
+        db,
+        source="task_cockpit",
+        workflow_run_id=workflow_run_id,
+        search_config=payload,
+        target_count=candidate_target,
+    )
     snapshot = _create_search_context_snapshot(
         db, workflow_run_id, strategy, recommendation_strategy, contract,
         int(payload.get("context_soft_budget_characters") or 12000),
@@ -237,6 +313,28 @@ def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: st
             workflow_run_id,
             str(payload.get("search_combination_id") or ""),
         )
+        linked_capture = smart_captures.get_by_workflow_run(db, workflow_run_id)
+        if linked_capture is None:
+            linked_capture = smart_captures.create_smart_capture(
+                db,
+                source="task_cockpit",
+                workflow_run_id=workflow_run_id,
+                search_config=contract,
+                target_count=int(contract["stop_policy"]["candidate_target_count"]),
+            )
+        active_capture = smart_captures.get_active_smart_capture(db)
+        if (
+            active_capture is not None
+            and str(active_capture["smart_capture_id"]) != str(linked_capture["smart_capture_id"])
+        ):
+            _mark_task_waiting_for_user(db, task["id"], payload)
+            _wait_for_user(
+                db,
+                workflow_run_id,
+                "collection_task_active",
+                "当前存在独立岗位采集任务，停止该任务后可继续驾驶舱采集。",
+            )
+            return get_workflow_run(db, workflow_run_id)
         capture = boss_capture_task_manager.start_capture(
             BossCaptureRequest(
                 keyword=str(payload["keyword"]), city=str(payload["city"]), pages=pages,
@@ -245,7 +343,15 @@ def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: st
                 prefer_current_page=True,
                 force_search_navigation=not bool(payload.get("is_baseline")),
                 filter_strategy_id=str(contract["selected_strategy_ids"]["filter_strategy_id"]),
+                capture_source="smart",
+                workflow_run_id=workflow_run_id,
+                smart_capture_id=str(linked_capture["smart_capture_id"]),
             ), output_dir=config.output_root / "fine-job" / "boss-capture", db=db,
+        )
+        smart_captures.bind_batch(
+            db,
+            str(linked_capture["smart_capture_id"]),
+            str(capture["id"]),
         )
         _update_task_operation(db, task["id"], str(capture["id"]), "running", payload)
         _update_run(db, workflow_run_id, status="running", current_step="searching", next_action="wait_capture", next_action_reason="正在执行后端岗位采集。")
@@ -259,8 +365,14 @@ def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: st
     if capture.get("status") in {"queued", "running"}:
         return get_workflow_run(db, workflow_run_id)
     if capture.get("status") == "failed":
-        _finish_task(db, task["id"], "failed", payload, {"error": capture.get("error_message")})
-        return advance_deep_job_search(db, config, workflow_run_id)
+        _mark_task_waiting_for_user(db, task["id"], payload)
+        _wait_for_user(
+            db,
+            workflow_run_id,
+            "capture_interrupted",
+            str(capture.get("error_message") or "岗位采集失败，请继续任务后重试当前搜索组合。"),
+        )
+        return get_workflow_run(db, workflow_run_id)
     metrics = _record_batch(db, workflow_run_id, task, capture, contract)
     return _decide_next_step(db, config, workflow_run_id, task, capture, contract, metrics)
 
@@ -276,22 +388,115 @@ def get_workflow_run(db: Database, workflow_run_id: str) -> dict[str, object]:
         "analysis_handoff": _get_analysis_handoff_summary(db, workflow_run_id),
         "prefetch": _get_prefetch_summary(db, workflow_run_id),
         "tasks": [_serialize_task(row) for row in tasks],
+        "capture_jobs": list_workflow_capture_jobs(db, workflow_run_id)["items"],
         "context_snapshots": [_serialize_snapshot(row) for row in snapshots],
     }
 
 
-def get_latest_active_workflow_run(db: Database) -> dict[str, object] | None:
-    """返回最近一个仍可继续查看或推进的 Workflow Run。"""
+def get_latest_workflow_run(
+    db: Database, *, include_completed: bool = False
+) -> dict[str, object] | None:
+    """返回最近的 Workflow Run；岗位采集页面可读取已完成 Run 的岗位列表。"""
+    status_filter = "" if include_completed else "WHERE status NOT IN ('completed', 'completed_with_errors', 'cancelled', 'failed')"
     with db.connect() as connection:
         row = connection.execute(
-            """
-            SELECT * FROM fj_workflow_runs
-            WHERE status NOT IN ('completed', 'completed_with_errors', 'cancelled', 'failed')
-            ORDER BY updated_at DESC, created_at DESC
-            LIMIT 1
-            """
+            f"SELECT * FROM fj_workflow_runs {status_filter} ORDER BY updated_at DESC, created_at DESC LIMIT 1"
         ).fetchone()
     return get_workflow_run(db, str(row["id"])) if row is not None else None
+
+
+def get_latest_active_workflow_run(db: Database) -> dict[str, object] | None:
+    """返回最近一个仍可继续查看或推进的 Workflow Run。"""
+    return get_latest_workflow_run(db)
+
+
+def get_active_collection_task(db: Database) -> dict[str, object] | None:
+    """返回唯一允许存在的未结束岗位采集任务。"""
+    smart_capture = smart_captures.get_active_smart_capture(db)
+    if smart_capture is not None:
+        return {
+            "kind": "smart",
+            "id": str(smart_capture["smart_capture_id"]),
+            "status": str(smart_capture["status"]),
+            "message": str(smart_capture.get("message") or "智能采集尚未结束。"),
+        }
+
+    task = boss_capture_task_manager.get_active_task(capture_source="custom")
+    if task is None:
+        return None
+    return {
+        "kind": "custom",
+        "id": str(task["id"]),
+        "status": str(task["status"]),
+        "message": str(task.get("message") or "自定义采集尚未结束。"),
+    }
+
+
+def assert_collection_start_allowed(db: Database, *, requested_kind: str) -> None:
+    """确保智能采集与自定义采集在任意入口都严格互斥。"""
+    active = get_active_collection_task(db)
+    if active is None:
+        return
+    active_label = "智能采集" if active["kind"] == "smart" else "自定义采集"
+    requested_label = "智能采集" if requested_kind == "smart" else "自定义采集"
+    raise AppError(
+        409,
+        "COLLECTION_TASK_ACTIVE",
+        f"当前{active_label}尚未结束，请先停止{active_label}后再开始{requested_label}。",
+    )
+
+
+def list_workflow_capture_jobs(db: Database, workflow_run_id: str) -> dict[str, object]:
+    """返回整个智能采集 Run 已保存的岗位，供岗位采集列表汇总展示。"""
+    _require_run(db, workflow_run_id)
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT job_id
+            FROM fj_workflow_job_discoveries
+            WHERE workflow_run_id = ?
+            ORDER BY discovered_at ASC
+            """,
+            (workflow_run_id,),
+        ).fetchall()
+
+    items_by_id: dict[str, dict[str, object]] = {}
+    for row in rows:
+        try:
+            item = get_capture_history_job(db, str(row["job_id"]))
+            items_by_id[str(item.get("id") or item.get("job_id") or "")] = item
+        except AppError:
+            # 岗位可能已被用户删除；保留其余正式保存记录继续展示。
+            continue
+
+    # 当前批次尚未写入 Workflow Discovery 时，直接补入采集任务内存快照。
+    with db.connect() as connection:
+        task_rows = connection.execute(
+            """
+            SELECT operation_ref_id
+            FROM fj_workflow_tasks
+            WHERE workflow_run_id = ? AND task_type = 'deep_job_search'
+              AND operation_ref_type = 'capture_task' AND operation_ref_id IS NOT NULL
+            ORDER BY created_at ASC
+            """,
+            (workflow_run_id,),
+        ).fetchall()
+    for task_row in task_rows:
+        try:
+            task = boss_capture_task_manager.get_task(str(task_row["operation_ref_id"]))
+        except AppError:
+            continue
+        for job in task.get("jobs") or []:
+            if not isinstance(job, dict):
+                continue
+            key = str(job.get("history_record_id") or job.get("job_id") or "")
+            if not key:
+                continue
+            # 当前采集任务包含最新详情和筛选状态，覆盖历史汇总中的旧快照。
+            items_by_id[key] = dict(job)
+
+    items = list(items_by_id.values())
+    return {"items": items, "total": len(items)}
 
 
 def get_context_snapshot(db: Database, workflow_run_id: str, channel: str = "deep_job_search") -> dict[str, object]:
@@ -521,6 +726,15 @@ def record_workflow_analysis_result(
     analysis_policy = _analysis_policy(contract)
     batch_id = _analysis_batch_id_from_payload(payload, workflow_run_id)
     batch_complete = _is_analysis_batch_complete(db, workflow_run_id, batch_id)
+
+    if batch_complete and analysis_policy.get("manual_batch_only"):
+        _wait_for_user(
+            db,
+            workflow_run_id,
+            "manual_analysis_batch_completed",
+            "当前批量建议已完成；可从岗位列表继续选择下一批岗位交给 Codex。",
+        )
+        return get_workflow_run(db, workflow_run_id)
 
     if target_reached and not analysis_policy["analyze_all_candidates"]:
         _skip_pending_analysis_items(db, workflow_run_id)
@@ -804,11 +1018,53 @@ def ack_workflow_analysis_batch_started(
 
 
 def resume_deep_job_search_run(
-    db: Database, config: AppConfig, workflow_run_id: str
+    db: Database,
+    config: AppConfig,
+    workflow_run_id: str,
+    *,
+    sync_capture: bool = True,
 ) -> dict[str, object]:
     """仅在用户确认后恢复中断的采集组合，避免后台静默重复采集。"""
     run = _require_run(db, workflow_run_id)
+    if sync_capture:
+        linked_capture = smart_captures.get_by_workflow_run(db, workflow_run_id)
+        if linked_capture is not None and str(linked_capture["status"]) in {
+            "paused", "pausing", "waiting_next_batch", "interrupted"
+        }:
+            smart_captures.resume_smart_capture(
+                db,
+                config,
+                str(linked_capture["smart_capture_id"]),
+                sync_workflow=False,
+            )
     if bool(run["paused"]):
+        refreshed_capture = smart_captures.get_by_workflow_run(db, workflow_run_id)
+        if refreshed_capture is not None and str(refreshed_capture["status"]) == "interrupted":
+            with db.connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE fj_workflow_tasks
+                    SET status = 'pending', operation_ref_type = NULL, operation_ref_id = NULL,
+                        updated_at = ?
+                    WHERE workflow_run_id = ? AND task_type = 'deep_job_search'
+                      AND status IN ('running', 'waiting_for_user')
+                    """,
+                    (utc_now(), workflow_run_id),
+                )
+            _update_run(
+                db,
+                workflow_run_id,
+                status="pending",
+                current_step="resume_requested",
+                next_action="restart_current_combination",
+                next_action_reason="采集执行已中断，将重新开始当前搜索组合。",
+                waiting_for_user=0,
+                stop_reason="",
+                paused=0,
+                paused_from_next_action="",
+                paused_from_next_action_reason="",
+            )
+            return get_workflow_run(db, workflow_run_id)
         _update_run(
             db,
             workflow_run_id,
@@ -831,7 +1087,7 @@ def resume_deep_job_search_run(
     stop_reason = str(run["stop_reason"] or "")
     if stop_reason in {"analysis_batch_completed_waiting_user", "analysis_batch_waiting_user"}:
         return _continue_after_analysis_batch(db, config, workflow_run_id)
-    if stop_reason not in {"capture_interrupted", "browser_not_running"}:
+    if stop_reason not in {"capture_interrupted", "browser_not_running", "collection_task_active"}:
         raise AppError(409, "WORKFLOW_NOT_RESUMABLE", "当前等待原因需要先调整任务范围或上下文，不能直接恢复。")
     with db.connect() as connection:
         connection.execute(
@@ -856,13 +1112,26 @@ def resume_deep_job_search_run(
     return get_workflow_run(db, workflow_run_id)
 
 
-def pause_deep_job_search_run(db: Database, workflow_run_id: str) -> dict[str, object]:
+def pause_deep_job_search_run(
+    db: Database,
+    workflow_run_id: str,
+    *,
+    sync_capture: bool = True,
+) -> dict[str, object]:
     """暂停 Workflow 自动推进，保留已启动采集和所有已获得成果。"""
     run = _require_run(db, workflow_run_id)
     if run["status"] in {"completed", "completed_with_errors", "cancelled", "failed"}:
         raise AppError(409, "WORKFLOW_NOT_PAUSABLE", "当前 Workflow Run 已结束，不能暂停。")
     if bool(run["paused"]):
         return get_workflow_run(db, workflow_run_id)
+    if sync_capture:
+        linked_capture = smart_captures.get_by_workflow_run(db, workflow_run_id)
+        if linked_capture is not None and str(linked_capture["status"]) in smart_captures.ACTIVE_STATUSES:
+            smart_captures.pause_smart_capture(
+                db,
+                str(linked_capture["smart_capture_id"]),
+                sync_workflow=False,
+            )
     _update_run(
         db,
         workflow_run_id,
@@ -875,11 +1144,24 @@ def pause_deep_job_search_run(db: Database, workflow_run_id: str) -> dict[str, o
     return get_workflow_run(db, workflow_run_id)
 
 
-def cancel_deep_job_search_run(db: Database, workflow_run_id: str) -> dict[str, object]:
+def cancel_deep_job_search_run(
+    db: Database,
+    workflow_run_id: str,
+    *,
+    sync_capture: bool = True,
+) -> dict[str, object]:
     """停止 Workflow，并在列表采集仍运行时请求已有采集器安全停止。"""
     run = _require_run(db, workflow_run_id)
     if run["status"] in {"completed", "completed_with_errors", "cancelled", "failed"}:
         return get_workflow_run(db, workflow_run_id)
+    if sync_capture:
+        linked_capture = smart_captures.get_by_workflow_run(db, workflow_run_id)
+        if linked_capture is not None and str(linked_capture["status"]) not in smart_captures.TERMINAL_STATUSES:
+            smart_captures.stop_smart_capture(
+                db,
+                str(linked_capture["smart_capture_id"]),
+                sync_workflow=False,
+            )
     with db.connect() as connection:
         active_tasks = connection.execute(
             """
@@ -1046,6 +1328,17 @@ def _decide_next_step(
     candidate_target = int(contract["stop_policy"]["candidate_target_count"])
     telemetry = _load(run["telemetry_json"], {})
     if int(telemetry.get("fresh_candidates") or 0) >= candidate_target:
+        if not bool(contract.get("delivery_target_enabled", True)):
+            # 关闭投递目标时冻结候选池并停在岗位列表，等待用户选择分析岗位。
+            _freeze_candidate_pool(db, workflow_run_id, contract)
+            smart_captures.mark_workflow_capture_completed(db, workflow_run_id)
+            _wait_for_user(
+                db,
+                workflow_run_id,
+                "candidate_target_reached_waiting_analysis",
+                "候选岗位目标已达到，等待从岗位列表选择岗位交给 Codex。",
+            )
+            return get_workflow_run(db, workflow_run_id)
         _create_jd_tasks(db, workflow_run_id, candidate_target)
         return advance_deep_job_search(db, config, workflow_run_id)
     with db.connect() as connection:
@@ -1631,6 +1924,8 @@ def _create_jd_tasks(
             )
     if not candidates:
         return 0
+    # 进入 JD 阶段后不再占用列表采集能力；后续若需补搜，绑定新批次时会重新进入运行态。
+    smart_captures.mark_workflow_capture_completed(db, workflow_run_id)
     _update_run(
         db,
         workflow_run_id,
@@ -1797,6 +2092,116 @@ def _create_analysis_tasks(
         next_action="codex_analysis",
         next_action_reason="本批岗位 JD 已准备完成，等待 Codex 逐岗位保存正式分析结果。",
     )
+
+
+def create_manual_analysis_batch(
+    db: Database,
+    config: AppConfig,
+    workflow_run_id: str,
+    *,
+    recommendation_strategy_id: str,
+    job_ids: list[str],
+    analysis_batch_size: int,
+    codex_model: str | None = None,
+    codex_reasoning_effort: str | None = None,
+) -> dict[str, object]:
+    """将候选列表中选中的岗位接入已有 Codex 分析批次。"""
+    run = _require_run(db, workflow_run_id)
+    contract = _load(run["completion_contract_json"], {})
+    filter_strategy_id = str((contract.get("selected_strategy_ids") or {}).get("filter_strategy_id") or "")
+    recommendation_strategy = _require_workflow_recommendation_strategy(
+        db,
+        recommendation_strategy_id=recommendation_strategy_id,
+        filter_strategy_id=filter_strategy_id,
+    )
+    frozen_ids = set(_frozen_candidate_job_ids(contract) or [])
+    if not frozen_ids:
+        raise AppError(409, "CANDIDATE_POOL_NOT_READY", "候选岗位目标尚未完成，暂不能创建分析批次。")
+
+    normalized_job_ids = list(dict.fromkeys(str(job_id).strip() for job_id in job_ids if str(job_id).strip()))
+    invalid_ids = [job_id for job_id in normalized_job_ids if job_id not in frozen_ids]
+    if invalid_ids:
+        raise AppError(422, "CANDIDATE_NOT_IN_POOL", "只能选择本轮候选池中的岗位。")
+
+    ready_job_ids: list[str] = []
+    for job_id in normalized_job_ids:
+        job = get_capture_history_job(db, job_id)
+        if str(job.get("detail_status") or "") != "completed":
+            raise AppError(409, "CAPTURE_NOT_READY", f"岗位 {job_id} 的详情尚未完成，不能进入 Codex 分析。")
+        if not _analysis_exists_for_job(db, workflow_run_id, job_id):
+            ready_job_ids.append(job_id)
+    if not ready_job_ids:
+        raise AppError(409, "ANALYSIS_ALREADY_CREATED", "所选岗位都已经进入分析任务。")
+    ready_job_ids = ready_job_ids[: max(1, int(analysis_batch_size))]
+
+    strategy_versions = contract.get("selected_strategy_versions")
+    if not isinstance(strategy_versions, dict):
+        strategy_versions = {}
+    strategy_versions["recommendation_strategy_version"] = int(recommendation_strategy.get("strategy_version") or 1)
+    selected_strategy_ids = contract.get("selected_strategy_ids")
+    if not isinstance(selected_strategy_ids, dict):
+        selected_strategy_ids = {}
+    selected_strategy_ids["recommendation_strategy_id"] = recommendation_strategy_id
+    contract["selected_strategy_ids"] = selected_strategy_ids
+    contract["selected_strategy_versions"] = strategy_versions
+    contract["delivery_target_enabled"] = True
+    contract["codex_execution_config"] = {
+        "model": str(codex_model or config.codex_model or ""),
+        "reasoning_effort": str(codex_reasoning_effort or config.codex_reasoning_effort or "medium"),
+    }
+    analysis_policy = _analysis_policy(contract)
+    analysis_policy["enabled"] = True
+    analysis_policy["manual_batch_only"] = True
+    analysis_policy["analysis_batch_size"] = min(int(analysis_batch_size), len(ready_job_ids))
+    contract["analysis_policy"] = analysis_policy
+    contract["recommend_target"] = max(1, len(ready_job_ids))
+    contract["target_count"] = contract["recommend_target"]
+    _update_run(db, workflow_run_id, completion_contract_json=_dump(contract))
+
+    snapshot = _create_candidate_analysis_snapshot(db, workflow_run_id, contract)
+    if snapshot["status"] == "blocked":
+        _wait_for_user(db, workflow_run_id, "context_budget_exceeded", str(snapshot["blocker_reason"]))
+        return get_workflow_run(db, workflow_run_id)
+
+    now = utc_now()
+    analysis_batch_id = new_id()
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        for job_id in ready_job_ids:
+            task_id = new_id()
+            connection.execute(
+                """
+                INSERT INTO fj_workflow_candidate_reservations (
+                  id, workflow_run_id, job_id, owner_type, owner_id, status, created_at
+                ) VALUES (?, ?, ?, 'formal_analysis', ?, 'reserved', ?)
+                """,
+                (new_id(), workflow_run_id, job_id, task_id, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO fj_workflow_tasks (
+                  id, workflow_run_id, task_type, status, payload_json, result_json, created_at, updated_at
+                ) VALUES (?, ?, 'deep_job_search_analysis', 'pending', ?, '{}', ?, ?)
+                """,
+                (
+                    task_id,
+                    workflow_run_id,
+                    _dump({"job_id": job_id, "analysis_batch_id": analysis_batch_id, "manual_batch": True}),
+                    now,
+                    now,
+                ),
+            )
+    _update_run(
+        db,
+        workflow_run_id,
+        status="waiting_codex",
+        current_step="waiting_codex",
+        next_action="codex_analysis",
+        next_action_reason="已根据岗位列表选择创建 Codex 分析批次，等待 Codex 生成建议。",
+        waiting_for_user=0,
+        stop_reason="",
+    )
+    return get_workflow_run(db, workflow_run_id)
 
 
 def _get_prefetch_summary(db: Database, workflow_run_id: str) -> dict[str, object]:
@@ -2652,20 +3057,21 @@ def _create_search_context_snapshot(
     db: Database,
     workflow_run_id: str,
     strategy: dict[str, object],
-    recommendation_strategy: dict[str, object],
+    recommendation_strategy: dict[str, object] | None,
     contract: dict[str, Any],
     soft_budget: int,
 ) -> dict[str, object]:
-    profile = profile_store.get_profile(db, str(recommendation_strategy["candidate_profile_id"]))
     sections = [
         _section("task_goal", "shared_base", {"recommend_target": contract["recommend_target"], "review_target": contract.get("review_target"), "target_mode": contract.get("target_mode"), "source_policy": contract["source_policy"], "keywords": contract["allowed_search_keywords"], "cities": contract["allowed_cities"]}, "workflow_run", 1, True, ""),
         _section("filter_strategy", "task_channel", strategy, "filter_strategy", int(strategy.get("strategy_version") or 1), True, ""),
-        _section("recommendation_strategy", "task_channel", _compact_recommendation_strategy(recommendation_strategy), "recommendation_strategy", int(recommendation_strategy.get("strategy_version") or 1), True, "最终投递建议策略会在候选分析阶段作为主要规则。"),
-        _section("candidate_compact_facts", "shared_base", {"profile_id": profile["id"], "versions": profile["versions"]}, "candidate_profile", int(profile["versions"]["facts_version"]), True, "搜索阶段只注入候选人版本摘要；详细事实在 JD 分析 Item 按需读取。"),
         _section("complete_resume", "excluded", None, "resume", None, False, "搜索阶段不需要完整简历。"),
         _section("historical_payload", "excluded", None, "boss_job", None, False, "fresh_only 搜索不注入历史岗位 payload。"),
         _section("unrelated_chat", "excluded", None, "chat", None, False, "deep_job_search 不读取无关聊天。"),
     ]
+    if recommendation_strategy is not None:
+        profile = profile_store.get_profile(db, str(recommendation_strategy["candidate_profile_id"]))
+        sections.insert(2, _section("recommendation_strategy", "task_channel", _compact_recommendation_strategy(recommendation_strategy), "recommendation_strategy", int(recommendation_strategy.get("strategy_version") or 1), True, "最终投递建议策略会在候选分析阶段作为主要规则。"))
+        sections.insert(3, _section("candidate_compact_facts", "shared_base", {"profile_id": profile["id"], "versions": profile["versions"]}, "candidate_profile", int(profile["versions"]["facts_version"]), True, "搜索阶段只注入候选人版本摘要；详细事实在 JD 分析 Item 按需读取。"))
     characters = sum(int(item["character_count"]) for item in sections if item["included"])
     status = "blocked" if characters > soft_budget else "ready"
     blocker = "上下文超过本轮软预算，请裁剪后重试。" if status == "blocked" else ""
@@ -3149,6 +3555,11 @@ def _update_run(db: Database, workflow_run_id: str, **fields: object) -> None:
     assignments = ", ".join(f"{key} = ?" for key in keys)
     with db.connect() as connection:
         connection.execute(f"UPDATE fj_workflow_runs SET {assignments} WHERE id = ?", [*fields.values(), workflow_run_id])
+    try:
+        workflow_run_event_broker.publish(workflow_run_id, get_workflow_run(db, workflow_run_id))
+    except Exception:
+        # 实时通道短暂不可用时，数据库中的最新快照会在重连后补发。
+        return
 
 
 def _require_run(db: Database, workflow_run_id: str):

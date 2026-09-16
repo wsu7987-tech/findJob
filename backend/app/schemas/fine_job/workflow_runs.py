@@ -7,9 +7,11 @@ from pydantic import BaseModel, Field, model_validator
 
 class DeepJobSearchConfig(BaseModel):
     filter_strategy_id: str = Field(min_length=1, max_length=100)
-    recommendation_strategy_id: str = Field(min_length=1, max_length=100)
-    codex_model: str = Field(min_length=1, max_length=128)
-    codex_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"]
+    # 默认开启，确保驾驶舱已有请求继续保持原来的自动分析行为。
+    delivery_target_enabled: bool = True
+    recommendation_strategy_id: str | None = Field(default=None, min_length=1, max_length=100)
+    codex_model: str | None = Field(default=None, min_length=1, max_length=128)
+    codex_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
     analysis_guidance: str = Field(default="", max_length=4000)
     recommend_target: int | None = Field(default=None, ge=1, le=100)
     review_target: int | None = Field(default=None, ge=1, le=100)
@@ -40,6 +42,14 @@ class DeepJobSearchConfig(BaseModel):
 
     @model_validator(mode="after")
     def normalize_recommend_target(self) -> "DeepJobSearchConfig":
+        if self.delivery_target_enabled and (
+            not self.recommendation_strategy_id
+            or not self.codex_model
+            or not self.codex_reasoning_effort
+        ):
+            raise ValueError("开启投递目标时必须填写建议投递策略和 Codex 配置。")
+        if not self.delivery_target_enabled:
+            return self
         if self.recommend_target is None and self.target_count is None:
             raise ValueError("recommend_target 为必填字段。")
         if (
@@ -56,6 +66,14 @@ class WorkflowRunCreateRequest(BaseModel):
     task_type: Literal["deep_job_search"]
     deep_job_search: DeepJobSearchConfig
     created_from: str = Field(default="task_cockpit", min_length=1, max_length=80)
+
+
+class WorkflowManualAnalysisBatchRequest(BaseModel):
+    recommendation_strategy_id: str = Field(min_length=1, max_length=100)
+    job_ids: list[str] = Field(min_length=1, max_length=20)
+    analysis_batch_size: int = Field(default=5, ge=1, le=20)
+    codex_model: str | None = Field(default=None, min_length=1, max_length=128)
+    codex_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
 
 
 class WorkflowRunCodexSessionRequest(BaseModel):

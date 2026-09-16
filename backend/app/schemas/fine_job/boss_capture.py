@@ -66,6 +66,10 @@ class BossCaptureTaskResponse(BaseModel):
     last_added_jobs: int = 0
     total_pages_loaded: int = 0
     stop_requested: bool = False
+    pause_requested: bool = False
+    capture_source: Literal["smart", "custom"] = "custom"
+    workflow_run_id: str | None = None
+    smart_capture_id: str | None = None
     current_job: dict[str, Any] | None = None
     estimated_seconds_min: int = 0
     estimated_seconds_max: int = 0

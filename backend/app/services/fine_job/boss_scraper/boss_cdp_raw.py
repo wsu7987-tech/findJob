@@ -1869,6 +1869,8 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     "stage": "list_collecting",
                     "current": pg,
                     "total": max_pages,
+                    # 每页完成后携带累计岗位，让任务快照可即时刷新岗位列表。
+                    "jobs": list(all_jobs),
                     "jobs_collected": len(all_jobs),
                     "message": f"正在采集岗位列表：第 {pg}/{max_pages} 页，已获得 {len(all_jobs)} 个岗位。",
                 })
@@ -1964,7 +1966,7 @@ def build_detail_record(job, extracted):
 
 def scrape_details(list_data, max_details=None, output_path=None,
                    cdp_port=DEFAULT_CDP_PORT, fmt="json",
-                   progress_callback=None):
+                   progress_callback=None, should_stop=None):
     jobs = list_data.get("jobs", [])
     if max_details:
         jobs = jobs[:max_details]
@@ -1976,6 +1978,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
     seen_links = set()
 
     for idx, job in enumerate(jobs):
+        if should_stop and should_stop():
+            raise CaptureStopRequested()
         link = job.get("job_link", "")
         title = job.get("title", "")
         company = job.get("boss_name", "")
@@ -2011,7 +2015,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
         detail_url = build_detail_url(job)
         ws.send("Page.navigate", {"url": detail_url}, sid)
         print(f"  加载页面...")
-        _countdown_wait(random.uniform(5, 10), "详情采集页面等待")
+        _countdown_wait(random.uniform(5, 10), "详情采集页面等待", should_stop=should_stop)
 
         # 模拟人类阅读详情页的滚动行为
         scroll_count = random.randint(3, 7)
@@ -2025,9 +2029,9 @@ def scrape_details(list_data, max_details=None, output_path=None,
             ws.eval_js(f"window.scrollBy(0,{delta})", sid)
             # 有时快滚，有时停下来"阅读"
             if random.random() < 0.35:
-                _countdown_wait(random.uniform(2.0, 5.0), "详情采集滚动等待")
+                _countdown_wait(random.uniform(2.0, 5.0), "详情采集滚动等待", should_stop=should_stop)
             else:
-                _countdown_wait(random.uniform(0.8, 1.8), "详情采集滚动等待")
+                _countdown_wait(random.uniform(0.8, 1.8), "详情采集滚动等待", should_stop=should_stop)
 
         # 偶尔模拟鼠标移动
         if random.random() < 0.5:
@@ -2036,7 +2040,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
                 "x": random.randint(200, 800),
                 "y": random.randint(200, 600)
             }, sid)
-            _countdown_wait(random.uniform(0.5, 1.5), "详情采集操作等待")
+            _countdown_wait(random.uniform(0.5, 1.5), "详情采集操作等待", should_stop=should_stop)
 
         print(f"  提取 JD...")
         val = ws.eval_js(EXTRACT_DETAIL_JS, sid)
@@ -2107,7 +2111,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
         if idx < len(jobs) - 1:
             gap = random.uniform(10, 25)
             print("  准备采集下一个岗位")
-            _countdown_wait(gap, "详情采集滚动等待")
+            _countdown_wait(gap, "详情采集滚动等待", should_stop=should_stop)
 
     # 最终保存（dirname 为空时回退到当前目录，与循环内/其它写文件处保持一致）
     _atomic_write_json(output_path, results)
