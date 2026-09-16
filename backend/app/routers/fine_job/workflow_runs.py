@@ -38,9 +38,16 @@ def create(payload: WorkflowRunCreateRequest, config: AppConfig = Depends(get_co
 @router.get("/latest")
 def latest(
     include_completed: bool = Query(default=False),
+    created_from: str | None = Query(default=None, max_length=80),
     db: Database = Depends(get_database),
 ):
-    return {"workflow_run": workflow_runs.get_latest_workflow_run(db, include_completed=include_completed)}
+    return {
+        "workflow_run": workflow_runs.get_latest_workflow_run(
+            db,
+            include_completed=include_completed,
+            created_from=created_from,
+        )
+    }
 
 
 @router.get("/collection-active")

@@ -157,7 +157,7 @@ onMounted(async () => {
     } catch {
       // 仍允许输入当前 Codex 配置兼容的模型 ID，并显示最终保存配置。
     }
-    await workflowStore.restoreLatest(true);
+    await workflowStore.restoreLatest(true, "task_cockpit");
   } catch (value) {
     ElMessage.error(value instanceof Error ? value.message : String(value));
   }

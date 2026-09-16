@@ -214,6 +214,19 @@ def start_independent_capture(
     return _start_new_batch(db, config, str(capture["smart_capture_id"]), payload)
 
 
+def start_linked_capture_batch(
+    db: Database,
+    config: AppConfig,
+    smart_capture_id: str,
+    payload: dict[str, Any],
+) -> dict[str, object]:
+    """由岗位采集子任务启动驾驶舱已编排的当前搜索批次。"""
+    capture = get_smart_capture(db, smart_capture_id)
+    if not str(capture.get("workflow_run_id") or ""):
+        raise AppError(409, "SMART_CAPTURE_NOT_LINKED", "当前岗位采集任务没有关联驾驶舱任务。")
+    return _start_new_batch(db, config, smart_capture_id, payload)
+
+
 def bind_batch(db: Database, smart_capture_id: str, batch_id: str) -> None:
     now = utc_now()
     with db.connect() as connection:
@@ -350,7 +363,13 @@ def resume_smart_capture(
         from backend.app.services.fine_job import workflow_runs
 
         workflow_run = capture.get("workflow_run") or {}
-        if str(workflow_run.get("status") or "") in {"paused", "waiting_for_user"}:
+        workflow_status = str(workflow_run.get("status") or "")
+        workflow_stop_reason = str(workflow_run.get("stop_reason") or "")
+        # 只恢复由采集状态造成的驾驶舱等待，范围或 Context 等待仍保留原有人工处理入口。
+        if bool(workflow_run.get("paused")) or (
+            workflow_status == "waiting_for_user"
+            and workflow_stop_reason in {"capture_interrupted", "browser_not_running", "collection_task_active"}
+        ):
             workflow_runs.resume_deep_job_search_run(
                 db,
                 config,
@@ -556,6 +575,7 @@ def _start_new_batch(
     city = str(payload.get("city") or (cities[0] if cities else "")).strip()
     if not keyword or not city:
         raise AppError(422, "VALIDATION_FAILED", "岗位采集任务缺少搜索词或城市。")
+    capture = get_smart_capture(db, smart_capture_id)
     task = boss_capture_task_manager.start_capture(
         BossCaptureRequest(
             keyword=keyword,
@@ -564,8 +584,10 @@ def _start_new_batch(
             filters=dict(payload.get("filters") or {}),
             include_details=bool(payload.get("include_details", False)),
             prefer_current_page=bool(payload.get("prefer_current_page", True)),
+            force_search_navigation=bool(payload.get("force_search_navigation", False)),
             filter_strategy_id=str(payload.get("filter_strategy_id") or "") or None,
             capture_source="smart",
+            workflow_run_id=str(capture.get("workflow_run_id") or "") or None,
             smart_capture_id=smart_capture_id,
         ),
         output_dir=config.output_root / "fine-job" / "boss-capture",

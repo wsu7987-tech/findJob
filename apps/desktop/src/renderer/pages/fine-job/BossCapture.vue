@@ -17,7 +17,6 @@ import {
 import type {
   FineJobBossCapturedJob,
   FineJobBossCaptureTask,
-  FineJobSmartCapture,
   FineJobWorkflowAnalysisItem,
   FineJobWorkflowContextSnapshot
 } from "@/types";
@@ -155,7 +154,15 @@ const smartAnalysisDetailOpen = ref(false);
 const smartFeedbackReason = ref("technical_direction");
 const smartControlLoading = ref(false);
 const smartCaptureControlLoading = ref(false);
-const currentSmartCapture = ref<FineJobSmartCapture | null>(null);
+const currentSmartCapture = computed(() => {
+  const run = smartWorkflowRun.value;
+  if (!run) return null;
+  return {
+    workflow_run_id: run.workflow_run_id,
+    status: run.status,
+    message: run.next_action_reason
+  };
+});
 const selectedJobIds = ref<string[]>([]);
 const selectedJobId = ref<string | null>(null);
 const detailDrawerOpen = ref(false);
@@ -648,8 +655,9 @@ onMounted(async () => {
     smartCodexModels.value = mergeSmartCodexModels(loadCachedSmartCodexModels(), "");
     smartCodexModelLoadError.value = value instanceof Error ? value.message : "Codex 配置加载失败，可直接输入模型 ID。";
   }
-  const { smart_capture: restoredCapture } = await api.getCurrentFineJobSmartCapture();
-  await applyCurrentSmartCapture(restoredCapture);
+  // 岗位采集页只自动恢复尚未结束的既有智能采集，避免把历史完成任务当作当前任务。
+  const restoredRun = await workflowStore.restoreLatest(false);
+  await applyCurrentSmartWorkflow(restoredRun);
   // 进入页面时优先展示正在执行的任务；普通采集任务没有智能 Run，因此落到自定义采集。
   if (taskRunning.value && !currentTaskBelongsToSmartWorkflow.value) {
     activeCaptureConditionTab.value = "custom";
@@ -725,56 +733,59 @@ const syncSmartStrategyScope = () => {
 };
 
 const resetSmartWorkflowView = () => {
-  // 自定义采集只切换岗位列表与采集控制，已有驾驶舱镜像继续保持原状态。
-  currentSmartCapture.value = null;
+  // 自定义采集与驾驶舱任务独立，切换时清空当前页面的驾驶舱镜像。
   smartWorkflowJobs.value = [];
   smartCaptureTaskRefsKey.value = "";
   smartCaptureTaskIds.value = [];
+  smartWorkflowRunId.value = "";
+  smartRunLookupId.value = "";
+  smartContextSnapshot.value = null;
+  smartAnalysisItems.value = [];
+  smartSelectedAnalysisItem.value = null;
+  smartSelectedAnalysisContext.value = null;
   selectedJobIds.value = [];
   selectedJobId.value = null;
   jobsTable.value?.clearSelection();
 };
 
-const applyCurrentSmartCapture = async (capture: FineJobSmartCapture | null) => {
-  currentSmartCapture.value = capture;
-  if (!capture) {
+const applyCurrentSmartWorkflow = async (run: typeof workflowStore.currentRun) => {
+  if (!run) {
     smartWorkflowJobs.value = [];
+    smartWorkflowRunId.value = "";
+    smartRunLookupId.value = "";
+    smartContextSnapshot.value = null;
+    smartAnalysisItems.value = [];
+    smartSelectedAnalysisItem.value = null;
+    smartSelectedAnalysisContext.value = null;
     if (captureStore.task?.capture_source === "smart") captureStore.clearTask();
     return;
   }
   activeCaptureConditionTab.value = "smart";
-  smartWorkflowJobs.value = [...(capture.jobs ?? [])];
-  const batch = capture.current_batch as Partial<FineJobBossCaptureTask> | null;
-  if (batch?.id && batch.status && batch.stage && Array.isArray(batch.jobs)) {
-    captureStore.setTask(batch as FineJobBossCaptureTask);
-  } else if (captureStore.task?.id !== capture.current_batch_id) {
-    captureStore.clearTask();
-  }
-  const linkedRun = capture.workflow_run ?? null;
-  if (!linkedRun) {
-    return;
-  }
   const displayedRun = workflowStore.currentRun;
   if (
     !displayedRun
-    || displayedRun.workflow_run_id !== linkedRun.workflow_run_id
-    || displayedRun.updated_at !== linkedRun.updated_at
+    || displayedRun.workflow_run_id !== run.workflow_run_id
+    || displayedRun.updated_at !== run.updated_at
   ) {
-    workflowStore.setRun(linkedRun);
+    workflowStore.setRun(run);
   }
-  smartWorkflowRunId.value = linkedRun.workflow_run_id;
-  smartRunLookupId.value = linkedRun.workflow_run_id;
-  smartAnalysisGuidance.value = linkedRun.completion_contract?.analysis_guidance?.text || "";
-  smartCodexHandoff.value = linkedRun.completion_contract?.execution_policy?.codex_handoff ?? "auto";
+  smartWorkflowRunId.value = run.workflow_run_id;
+  smartRunLookupId.value = run.workflow_run_id;
+  smartWorkflowJobs.value = [...(run.capture_jobs ?? [])];
+  smartAnalysisGuidance.value = run.completion_contract?.analysis_guidance?.text || "";
+  smartCodexHandoff.value = run.completion_contract?.execution_policy?.codex_handoff ?? "auto";
+  await syncSmartCaptureTask(run);
   await loadSmartContextSnapshot();
   await loadSmartAnalysisItems();
   if (!workflowStore.pollingActive) workflowStore.startPolling();
 };
 
-const refreshCurrentSmartCapture = async () => {
-  const { smart_capture: capture } = await api.getCurrentFineJobSmartCapture();
-  await applyCurrentSmartCapture(capture);
-  return capture;
+const refreshCurrentSmartWorkflow = async () => {
+  const run = smartWorkflowRun.value
+    ? await workflowStore.refresh(smartWorkflowRun.value.workflow_run_id)
+    : null;
+  await applyCurrentSmartWorkflow(run);
+  return run;
 };
 
 const showCollectionStartBlocked = async (errorValue: unknown, targetLabel: string) => {
@@ -809,16 +820,30 @@ const startSmartCapture = async () => {
   try {
     if (!await ensureCollectionStartAvailable("智能采集")) return;
     smartCaptureControlLoading.value = true;
-    const capture = await api.createFineJobSmartCapture({
+    const run = await workflowStore.create({
       filter_strategy_id: strategy.id,
+      delivery_target_enabled: smartDeliveryTargetEnabled.value,
+      recommendation_strategy_id: smartDeliveryTargetEnabled.value
+        ? smartRecommendationStrategyId.value || undefined
+        : undefined,
+      codex_model: smartDeliveryTargetEnabled.value ? smartCodexModel.value || undefined : undefined,
+      codex_reasoning_effort: smartDeliveryTargetEnabled.value ? smartCodexReasoningEffort.value : undefined,
+      analysis_guidance: smartAnalysisGuidance.value,
+      recommend_target: smartDeliveryTargetEnabled.value ? smartRecommendTarget.value : undefined,
+      review_target: smartDeliveryTargetEnabled.value && smartEnableReviewTarget.value ? smartReviewTarget.value : undefined,
+      target_mode: smartTargetMode.value,
+      analyze_all_candidates: smartAnalyzeAllCandidates.value,
+      stop_after_current_batch: smartStopAfterCurrentBatch.value,
+      analysis_batch_size: smartAnalysisBatchSize.value,
+      execution_policy_after_analysis_batch: smartAfterAnalysisBatch.value,
+      execution_policy_codex_handoff: smartCodexHandoff.value,
       candidate_target_count: smartCandidateTargetCount.value,
       allowed_search_keywords: smartSelectedKeywords.value,
       allowed_cities: smartSelectedCities.value,
-      pages: form.pages,
-      include_details: form.includeDetails,
-      prefer_current_page: form.preferCurrentPage
-    });
-    await applyCurrentSmartCapture(capture);
+      min_depth: form.pages,
+      context_soft_budget_characters: smartContextSoftBudgetCharacters.value
+    }, "boss_capture");
+    await applyCurrentSmartWorkflow(run);
     ElMessage.success("智能采集任务已启动");
   } catch (errorValue) {
     await showCollectionStartBlocked(errorValue, "智能采集");
@@ -828,12 +853,11 @@ const startSmartCapture = async () => {
 };
 
 const pauseCurrentSmartCapture = async () => {
-  if (!currentSmartCapture.value) return;
+  if (!smartWorkflowRun.value) return;
   try {
     smartCaptureControlLoading.value = true;
-    await applyCurrentSmartCapture(
-      await api.pauseFineJobSmartCapture(currentSmartCapture.value.smart_capture_id)
-    );
+    await workflowStore.pause();
+    await refreshCurrentSmartWorkflow();
     ElMessage.success("正在安全暂停岗位采集任务");
   } catch (errorValue) {
     ElMessage.error(errorValue instanceof Error ? errorValue.message : "暂停岗位采集失败");
@@ -843,12 +867,11 @@ const pauseCurrentSmartCapture = async () => {
 };
 
 const resumeCurrentSmartCapture = async () => {
-  if (!currentSmartCapture.value) return;
+  if (!smartWorkflowRun.value) return;
   try {
     smartCaptureControlLoading.value = true;
-    await applyCurrentSmartCapture(
-      await api.resumeFineJobSmartCapture(currentSmartCapture.value.smart_capture_id)
-    );
+    await workflowStore.resume();
+    await refreshCurrentSmartWorkflow();
     ElMessage.success("岗位采集任务已继续");
   } catch (errorValue) {
     ElMessage.error(errorValue instanceof Error ? errorValue.message : "继续岗位采集失败");
@@ -858,12 +881,11 @@ const resumeCurrentSmartCapture = async () => {
 };
 
 const stopCurrentSmartCapture = async () => {
-  if (!currentSmartCapture.value) return;
+  if (!smartWorkflowRun.value) return;
   try {
     smartCaptureControlLoading.value = true;
-    await applyCurrentSmartCapture(
-      await api.stopFineJobSmartCapture(currentSmartCapture.value.smart_capture_id)
-    );
+    await workflowStore.cancel();
+    await refreshCurrentSmartWorkflow();
     ElMessage.success("岗位采集任务已停止");
   } catch (errorValue) {
     ElMessage.error(errorValue instanceof Error ? errorValue.message : "停止岗位采集失败");
@@ -876,7 +898,7 @@ const pauseSmartWorkflow = async () => {
   try {
     smartControlLoading.value = true;
     await workflowStore.pause();
-    await refreshCurrentSmartCapture();
+    await refreshCurrentSmartWorkflow();
     ElMessage.success("正在同步暂停驾驶舱任务和关联岗位采集。");
   } catch (errorValue) {
     ElMessage.error(errorValue instanceof Error ? errorValue.message : "暂停智能任务失败");
@@ -889,7 +911,7 @@ const resumeSmartWorkflow = async () => {
   try {
     smartControlLoading.value = true;
     await workflowStore.resume();
-    await refreshCurrentSmartCapture();
+    await refreshCurrentSmartWorkflow();
     ElMessage.success("智能任务已继续推进。");
   } catch (errorValue) {
     ElMessage.error(errorValue instanceof Error ? errorValue.message : "继续智能任务失败");
@@ -902,7 +924,7 @@ const stopSmartWorkflow = async () => {
   try {
     smartControlLoading.value = true;
     const run = await workflowStore.cancel();
-    await refreshCurrentSmartCapture();
+    await refreshCurrentSmartWorkflow();
     if (run) await syncSmartCaptureTask(run);
     ElMessage.success("已发送停止请求，正在等待当前采集步骤结束。");
   } catch (errorValue) {
@@ -1158,7 +1180,7 @@ watch(
       void syncSmartCaptureTask(run);
       void loadSmartAnalysisItems();
       if (currentSmartCapture.value?.workflow_run_id === run.workflow_run_id) {
-        void refreshCurrentSmartCapture();
+        void refreshCurrentSmartWorkflow();
       }
     }
   }
@@ -1167,7 +1189,7 @@ watch(
 watch(
   () => captureStore.task?.updated_at,
   () => {
-    if (currentSmartCapture.value) void refreshCurrentSmartCapture();
+    if (currentSmartCapture.value) void refreshCurrentSmartWorkflow();
   }
 );
 

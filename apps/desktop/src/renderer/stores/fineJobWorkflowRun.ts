@@ -118,11 +118,14 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
     }
   };
 
-  const restoreLatest = async (includeCompleted = false) => {
+  const restoreLatest = async (
+    includeCompleted = false,
+    createdFrom?: "task_cockpit" | "boss_capture"
+  ) => {
     loading.value = true;
     error.value = null;
     try {
-      const response = await api.getLatestFineJobWorkflowRun(includeCompleted);
+      const response = await api.getLatestFineJobWorkflowRun(includeCompleted, createdFrom);
       const run = setRun(response.workflow_run);
       if (run && !terminalStatuses.has(run.status)) startPolling();
       return run;

@@ -22,7 +22,7 @@ from backend.app.services.fine_job.adaptive_search_planner import (
 )
 from backend.app.services.fine_job.filter_exclusions import apply_filter_exclusions
 from backend.app.services.fine_job.job_evaluation import evaluate_filter_strategy
-from backend.app.services.fine_job import profile_store, profile_v3, smart_captures
+from backend.app.services.fine_job import profile_store, profile_v3
 from backend.app.services.fine_job.profile_context import get_profile_context
 from backend.app.services.fine_job.strategies import (
     get_filter_strategy,
@@ -52,7 +52,6 @@ def _on_capture_task_updated(capture: dict[str, object]) -> None:
     if runtime is None:
         return
     db, config = runtime
-    smart_captures.sync_capture_snapshot(db, capture)
     capture_id = str(capture.get("id") or "")
     if not capture_id:
         return
@@ -252,13 +251,6 @@ def create_deep_job_search_run(
                 now,
             ),
         )
-    smart_captures.create_smart_capture(
-        db,
-        source="task_cockpit",
-        workflow_run_id=workflow_run_id,
-        search_config=payload,
-        target_count=candidate_target,
-    )
     snapshot = _create_search_context_snapshot(
         db, workflow_run_id, strategy, recommendation_strategy, contract,
         int(payload.get("context_soft_budget_characters") or 12000),
@@ -313,28 +305,7 @@ def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: st
             workflow_run_id,
             str(payload.get("search_combination_id") or ""),
         )
-        linked_capture = smart_captures.get_by_workflow_run(db, workflow_run_id)
-        if linked_capture is None:
-            linked_capture = smart_captures.create_smart_capture(
-                db,
-                source="task_cockpit",
-                workflow_run_id=workflow_run_id,
-                search_config=contract,
-                target_count=int(contract["stop_policy"]["candidate_target_count"]),
-            )
-        active_capture = smart_captures.get_active_smart_capture(db)
-        if (
-            active_capture is not None
-            and str(active_capture["smart_capture_id"]) != str(linked_capture["smart_capture_id"])
-        ):
-            _mark_task_waiting_for_user(db, task["id"], payload)
-            _wait_for_user(
-                db,
-                workflow_run_id,
-                "collection_task_active",
-                "当前存在独立岗位采集任务，停止该任务后可继续驾驶舱采集。",
-            )
-            return get_workflow_run(db, workflow_run_id)
+        # 复用既有 deep_job_search 采集任务启动批次，Workflow 只编排已有子任务。
         capture = boss_capture_task_manager.start_capture(
             BossCaptureRequest(
                 keyword=str(payload["keyword"]), city=str(payload["city"]), pages=pages,
@@ -345,13 +316,7 @@ def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: st
                 filter_strategy_id=str(contract["selected_strategy_ids"]["filter_strategy_id"]),
                 capture_source="smart",
                 workflow_run_id=workflow_run_id,
-                smart_capture_id=str(linked_capture["smart_capture_id"]),
             ), output_dir=config.output_root / "fine-job" / "boss-capture", db=db,
-        )
-        smart_captures.bind_batch(
-            db,
-            str(linked_capture["smart_capture_id"]),
-            str(capture["id"]),
         )
         _update_task_operation(db, task["id"], str(capture["id"]), "running", payload)
         _update_run(db, workflow_run_id, status="running", current_step="searching", next_action="wait_capture", next_action_reason="正在执行后端岗位采集。")
@@ -394,13 +359,21 @@ def get_workflow_run(db: Database, workflow_run_id: str) -> dict[str, object]:
 
 
 def get_latest_workflow_run(
-    db: Database, *, include_completed: bool = False
+    db: Database, *, include_completed: bool = False, created_from: str | None = None
 ) -> dict[str, object] | None:
     """返回最近的 Workflow Run；岗位采集页面可读取已完成 Run 的岗位列表。"""
-    status_filter = "" if include_completed else "WHERE status NOT IN ('completed', 'completed_with_errors', 'cancelled', 'failed')"
+    conditions: list[str] = []
+    values: list[object] = []
+    if not include_completed:
+        conditions.append("status NOT IN ('completed', 'completed_with_errors', 'cancelled', 'failed')")
+    if created_from:
+        conditions.append("json_extract(completion_contract_json, '$.created_from') = ?")
+        values.append(created_from)
+    status_filter = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     with db.connect() as connection:
         row = connection.execute(
-            f"SELECT * FROM fj_workflow_runs {status_filter} ORDER BY updated_at DESC, created_at DESC LIMIT 1"
+            f"SELECT * FROM fj_workflow_runs {status_filter} ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+            tuple(values),
         ).fetchone()
     return get_workflow_run(db, str(row["id"])) if row is not None else None
 
@@ -412,20 +385,11 @@ def get_latest_active_workflow_run(db: Database) -> dict[str, object] | None:
 
 def get_active_collection_task(db: Database) -> dict[str, object] | None:
     """返回唯一允许存在的未结束岗位采集任务。"""
-    smart_capture = smart_captures.get_active_smart_capture(db)
-    if smart_capture is not None:
-        return {
-            "kind": "smart",
-            "id": str(smart_capture["smart_capture_id"]),
-            "status": str(smart_capture["status"]),
-            "message": str(smart_capture.get("message") or "智能采集尚未结束。"),
-        }
-
-    task = boss_capture_task_manager.get_active_task(capture_source="custom")
+    task = boss_capture_task_manager.get_active_task()
     if task is None:
         return None
     return {
-        "kind": "custom",
+        "kind": "smart" if task.get("capture_source") == "smart" else "custom",
         "id": str(task["id"]),
         "status": str(task["status"]),
         "message": str(task.get("message") or "自定义采集尚未结束。"),
@@ -1027,19 +991,9 @@ def resume_deep_job_search_run(
     """仅在用户确认后恢复中断的采集组合，避免后台静默重复采集。"""
     run = _require_run(db, workflow_run_id)
     if sync_capture:
-        linked_capture = smart_captures.get_by_workflow_run(db, workflow_run_id)
-        if linked_capture is not None and str(linked_capture["status"]) in {
-            "paused", "pausing", "waiting_next_batch", "interrupted"
-        }:
-            smart_captures.resume_smart_capture(
-                db,
-                config,
-                str(linked_capture["smart_capture_id"]),
-                sync_workflow=False,
-            )
+        _resume_current_capture_batch(db, workflow_run_id)
     if bool(run["paused"]):
-        refreshed_capture = smart_captures.get_by_workflow_run(db, workflow_run_id)
-        if refreshed_capture is not None and str(refreshed_capture["status"]) == "interrupted":
+        if _capture_batch_is_missing(db, workflow_run_id):
             with db.connect() as connection:
                 connection.execute(
                     """
@@ -1112,6 +1066,61 @@ def resume_deep_job_search_run(
     return get_workflow_run(db, workflow_run_id)
 
 
+def _get_current_capture_operation_id(db: Database, workflow_run_id: str) -> str:
+    """读取既有智能采集子任务当前绑定的批次，不创建额外任务身份。"""
+    with db.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT operation_ref_id
+            FROM fj_workflow_tasks
+            WHERE workflow_run_id = ? AND task_type = 'deep_job_search'
+              AND operation_ref_type = 'capture_task' AND operation_ref_id IS NOT NULL
+            ORDER BY updated_at DESC, created_at DESC LIMIT 1
+            """,
+            (workflow_run_id,),
+        ).fetchone()
+    return str(row["operation_ref_id"] or "") if row is not None else ""
+
+
+def _pause_current_capture_batch(db: Database, workflow_run_id: str) -> None:
+    operation_id = _get_current_capture_operation_id(db, workflow_run_id)
+    if not operation_id:
+        return
+    try:
+        capture = boss_capture_task_manager.get_task(operation_id)
+        if capture.get("status") in {"queued", "running"}:
+            boss_capture_task_manager.pause_capture(operation_id)
+    except AppError:
+        # 执行器已结束时仅暂停后续编排，已持久化结果继续保留。
+        return
+
+
+def _resume_current_capture_batch(db: Database, workflow_run_id: str) -> None:
+    operation_id = _get_current_capture_operation_id(db, workflow_run_id)
+    if not operation_id:
+        return
+    try:
+        capture = boss_capture_task_manager.get_task(operation_id)
+    except AppError:
+        return
+    if str(capture.get("stage") or "").endswith("paused"):
+        boss_capture_task_manager.resume_paused_capture(
+            operation_id,
+            pages=max(1, int(capture.get("pages") or 1)),
+        )
+
+
+def _capture_batch_is_missing(db: Database, workflow_run_id: str) -> bool:
+    operation_id = _get_current_capture_operation_id(db, workflow_run_id)
+    if not operation_id:
+        return False
+    try:
+        boss_capture_task_manager.get_task(operation_id)
+    except AppError:
+        return True
+    return False
+
+
 def pause_deep_job_search_run(
     db: Database,
     workflow_run_id: str,
@@ -1125,13 +1134,7 @@ def pause_deep_job_search_run(
     if bool(run["paused"]):
         return get_workflow_run(db, workflow_run_id)
     if sync_capture:
-        linked_capture = smart_captures.get_by_workflow_run(db, workflow_run_id)
-        if linked_capture is not None and str(linked_capture["status"]) in smart_captures.ACTIVE_STATUSES:
-            smart_captures.pause_smart_capture(
-                db,
-                str(linked_capture["smart_capture_id"]),
-                sync_workflow=False,
-            )
+        _pause_current_capture_batch(db, workflow_run_id)
     _update_run(
         db,
         workflow_run_id,
@@ -1154,14 +1157,6 @@ def cancel_deep_job_search_run(
     run = _require_run(db, workflow_run_id)
     if run["status"] in {"completed", "completed_with_errors", "cancelled", "failed"}:
         return get_workflow_run(db, workflow_run_id)
-    if sync_capture:
-        linked_capture = smart_captures.get_by_workflow_run(db, workflow_run_id)
-        if linked_capture is not None and str(linked_capture["status"]) not in smart_captures.TERMINAL_STATUSES:
-            smart_captures.stop_smart_capture(
-                db,
-                str(linked_capture["smart_capture_id"]),
-                sync_workflow=False,
-            )
     with db.connect() as connection:
         active_tasks = connection.execute(
             """
@@ -1331,7 +1326,6 @@ def _decide_next_step(
         if not bool(contract.get("delivery_target_enabled", True)):
             # 关闭投递目标时冻结候选池并停在岗位列表，等待用户选择分析岗位。
             _freeze_candidate_pool(db, workflow_run_id, contract)
-            smart_captures.mark_workflow_capture_completed(db, workflow_run_id)
             _wait_for_user(
                 db,
                 workflow_run_id,
@@ -1925,7 +1919,6 @@ def _create_jd_tasks(
     if not candidates:
         return 0
     # 进入 JD 阶段后不再占用列表采集能力；后续若需补搜，绑定新批次时会重新进入运行态。
-    smart_captures.mark_workflow_capture_completed(db, workflow_run_id)
     _update_run(
         db,
         workflow_run_id,

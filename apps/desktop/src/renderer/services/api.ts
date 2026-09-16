@@ -1443,8 +1443,14 @@ export const api = {
       `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/capture-jobs`
     );
   },
-  async getLatestFineJobWorkflowRun(includeCompleted = false) {
-    const suffix = includeCompleted ? "?include_completed=true" : "";
+  async getLatestFineJobWorkflowRun(
+    includeCompleted = false,
+    createdFrom?: "task_cockpit" | "boss_capture"
+  ) {
+    const query = new URLSearchParams();
+    if (includeCompleted) query.set("include_completed", "true");
+    if (createdFrom) query.set("created_from", createdFrom);
+    const suffix = query.size ? `?${query.toString()}` : "";
     return request<{ workflow_run: FineJobWorkflowRun | null }>(
       `/api/fine-job/workflow-runs/latest${suffix}`
     );
