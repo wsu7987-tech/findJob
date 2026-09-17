@@ -368,6 +368,7 @@ export interface FineJobSmartCapture {
   status: FineJobSmartCaptureStatus;
   current_batch_id?: string | null;
   search_config: Record<string, unknown>;
+  execution_config: Record<string, unknown>;
   target_count?: number | null;
   stage: string;
   waiting_reason: string;
@@ -2505,9 +2506,31 @@ export interface FineJobWorkflowTask {
   retryable: boolean;
 }
 
+export interface FineJobWorkflowChild {
+  child_relation_id: string;
+  workflow_run_id: string;
+  child_type: string;
+  child_ref: string;
+  smart_capture_id?: string | null;
+  sequence: number;
+  status: string;
+  control_state: string;
+  waiting_reason: string;
+  control_cause: string;
+  capabilities: Record<string, boolean>;
+  result_summary: Record<string, unknown>;
+  started_at?: string | null;
+  completed_at?: string | null;
+  created_at: string;
+  updated_at: string;
+  state_version: number;
+  child_state_version: number;
+}
+
 export interface FineJobWorkflowRun {
   workflow_run_id: string;
   workflow_type: "deep_job_search";
+  idempotency_key?: string | null;
   capture_jobs?: FineJobBossCapturedJob[];
   status: string;
   completed_count: number;
@@ -2554,6 +2577,7 @@ export interface FineJobWorkflowRun {
     search_planner?: FineJobSearchPlannerSummary;
   };
   tasks?: FineJobWorkflowTask[];
+  children?: FineJobWorkflowChild[];
   prefetch?: {
     prefetch_batch_id: string;
     source_analysis_batch_id: string;

@@ -3,7 +3,10 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import json
 
+import pytest
+
 from backend.app.services.fine_job import workflow_runs
+from backend.app.services.fine_job import smart_captures
 from backend.app.services.fine_job.boss_capture_history import (
     create_capture_batch,
     record_capture_jobs,
@@ -27,7 +30,7 @@ def _strategy_payload(**updates):
     return payload
 
 
-def _create_run(configured_client, strategy_updates=None, **updates):
+def _create_run(configured_client, strategy_updates=None, idempotency_key=None, **updates):
     strategy_payload = _strategy_payload()
     strategy_payload.update(strategy_updates or {})
     strategy = configured_client.post(
@@ -69,22 +72,117 @@ def _create_run(configured_client, strategy_updates=None, **updates):
     deep_job_search.update(updates)
     if "recommend_target" in updates and "target_count" not in updates:
         deep_job_search.pop("target_count")
+    request_payload = {
+        "task_type": "deep_job_search",
+        "created_from": "task_cockpit",
+        "deep_job_search": deep_job_search,
+    }
+    if idempotency_key is not None:
+        request_payload["idempotency_key"] = idempotency_key
     response = configured_client.post(
         "/api/fine-job/workflow-runs",
-        json={
-            "task_type": "deep_job_search",
-            "created_from": "task_cockpit",
-            "deep_job_search": deep_job_search,
-        },
+        json=request_payload,
     )
     assert response.status_code == 201
     return response.json()
+
+
+def test_workflow_create_retry_returns_one_parent_child_current_identity(
+    configured_client, test_db
+) -> None:
+    first = _create_run(configured_client, idempotency_key="cockpit-create-retry-1")
+    second = _create_run(configured_client, idempotency_key="cockpit-create-retry-1")
+
+    assert second["workflow_run_id"] == first["workflow_run_id"]
+    assert second["idempotency_key"] == "cockpit-create-retry-1"
+    assert second["children"][0]["child_relation_id"] == first["children"][0]["child_relation_id"]
+    with test_db.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) AS count FROM fj_workflow_runs WHERE idempotency_key = ?",
+            ("cockpit-create-retry-1",),
+        ).fetchone()["count"] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) AS count FROM fj_smart_captures WHERE workflow_run_id = ?",
+            (first["workflow_run_id"],),
+        ).fetchone()["count"] == 1
+        assert connection.execute(
+            "SELECT smart_capture_id FROM fj_smart_capture_current WHERE slot = 1"
+        ).fetchone()["smart_capture_id"] == first["children"][0]["smart_capture_id"]
+
+
+def test_independent_active_capture_rejects_cockpit_without_orphan_parent(
+    configured_client, test_db, monkeypatch
+) -> None:
+    smart_captures.create_smart_capture(
+        test_db,
+        source="boss_capture",
+        workflow_run_id=None,
+        search_config={
+            "allowed_search_keywords": ["Python"],
+            "allowed_cities": ["上海"],
+        },
+        target_count=15,
+    )
+    monkeypatch.setattr(
+        workflow_runs,
+        "get_filter_strategy",
+        lambda db, strategy_id: {
+            "enabled": True,
+            "cities": ["上海"],
+            "strategy_version": 1,
+        },
+    )
+    monkeypatch.setattr(
+        workflow_runs,
+        "list_search_keywords",
+        lambda db, strategy_id: [{"keyword": "Python", "enabled": True}],
+    )
+
+    with pytest.raises(AppError) as error:
+        workflow_runs.create_deep_job_search_run(
+            test_db,
+            configured_client.app.state.config,
+            {
+                "filter_strategy_id": "strategy-1",
+                "delivery_target_enabled": False,
+                "allowed_search_keywords": ["Python"],
+                "allowed_cities": ["上海"],
+                "candidate_target_count": 15,
+                "min_depth": 1,
+                "max_depth": 1,
+            },
+            created_from="task_cockpit",
+        )
+
+    assert error.value.error_category == "COLLECTION_TASK_ACTIVE"
+    with test_db.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) AS count FROM fj_workflow_runs"
+        ).fetchone()["count"] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) AS count FROM fj_smart_captures WHERE workflow_run_id IS NOT NULL"
+        ).fetchone()["count"] == 0
 
 
 def test_create_workflow_run_exposes_real_search_context_snapshot(configured_client) -> None:
     run = _create_run(configured_client)
 
     assert run["status"] == "pending"
+    assert len(run["children"]) == 1
+    child = run["children"][0]
+    assert child["child_type"] == "smart_capture"
+    assert child["child_ref"] == child["smart_capture_id"]
+    assert child["status"] == "pending"
+    assert child["capabilities"]["start"] is True
+    smart_capture = configured_client.get(
+        f"/api/fine-job/smart-captures/{child['smart_capture_id']}"
+    ).json()
+    assert smart_capture["workflow_run_id"] == run["workflow_run_id"]
+    assert smart_capture["execution_config"]["search"]["filter_strategy_id"]
+    assert smart_capture["execution_config"]["analysis"]["codex_model"] == "gpt-5.6-luna"
+    assert configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/children"
+    ).json()["children"][0]["child_relation_id"] == child["child_relation_id"]
     assert run["completion_contract"]["source_policy"] == "fresh_only"
     assert run["completion_contract"]["recommend_target"] == 2
     assert run["completion_contract"]["review_target"] is None
@@ -126,6 +224,27 @@ def test_create_workflow_run_exposes_real_search_context_snapshot(configured_cli
         item["section_id"] == "complete_resume" and not item["included"]
         for item in snapshot["sections"]
     )
+
+
+def test_linked_child_projection_tracks_smart_capture_lifecycle(configured_client, test_db) -> None:
+    run = _create_run(configured_client)
+    child = run["children"][0]
+
+    smart_captures._update_capture(
+        test_db,
+        child["smart_capture_id"],
+        status="running",
+        stage="capturing",
+        message="正在采集岗位。",
+    )
+
+    refreshed = configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}"
+    ).json()
+    projected = refreshed["children"][0]
+    assert projected["status"] == "running"
+    assert projected["child_state_version"] > child["child_state_version"]
+    assert projected["state_version"] > child["state_version"]
 
 
 def test_workflow_run_can_require_manual_codex_handoff(configured_client) -> None:

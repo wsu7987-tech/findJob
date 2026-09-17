@@ -115,6 +115,51 @@ def test_database_initializes_boss_capture_history_tables(app_paths: dict[str, s
     assert {"company_stage", "company_industry", "welfare"} <= boss_job_columns
 
 
+def test_database_initializes_workflow_child_relation_and_create_idempotency(
+    app_paths: dict[str, str],
+) -> None:
+    database = Database(app_paths["sqlite_path"])
+    database.initialize()
+
+    with database.connect() as connection:
+        workflow_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(fj_workflow_runs)")
+        }
+        child_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(fj_workflow_children)")
+        }
+        child_indexes = {
+            row[1] for row in connection.execute("PRAGMA index_list(fj_workflow_children)")
+        }
+        workflow_indexes = {
+            row[1]
+            for row in connection.execute("PRAGMA index_list(fj_workflow_runs)")
+        }
+
+    assert "idempotency_key" in workflow_columns
+    assert {
+        "id",
+        "workflow_run_id",
+        "child_type",
+        "child_ref",
+        "sequence",
+        "status",
+        "control_state",
+        "waiting_reason",
+        "control_cause",
+        "capabilities_json",
+        "result_summary_json",
+        "started_at",
+        "completed_at",
+        "created_at",
+        "updated_at",
+        "state_version",
+        "child_state_version",
+    } <= child_columns
+    assert "idx_fj_workflow_children_identity" in child_indexes
+    assert "idx_fj_workflow_runs_idempotency_key" in workflow_indexes
+
+
 def test_database_initializes_retrieval_index_versions_schema(
     app_paths: dict[str, str],
 ) -> None:

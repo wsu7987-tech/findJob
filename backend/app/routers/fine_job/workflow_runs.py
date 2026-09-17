@@ -32,7 +32,13 @@ router = APIRouter(prefix="/fine-job/workflow-runs", tags=["fine-job-workflow-ru
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create(payload: WorkflowRunCreateRequest, config: AppConfig = Depends(get_config), db: Database = Depends(get_database)):
     workflow_runs.configure_realtime_runtime(db, config)
-    return workflow_runs.create_deep_job_search_run(db, config, payload.deep_job_search.model_dump(), created_from=payload.created_from)
+    return workflow_runs.create_deep_job_search_run(
+        db,
+        config,
+        payload.deep_job_search.model_dump(),
+        created_from=payload.created_from,
+        idempotency_key=payload.idempotency_key,
+    )
 
 
 @router.get("/latest")
@@ -54,6 +60,11 @@ def latest(
 def collection_active(db: Database = Depends(get_database)):
     """供两个采集入口在创建任务前读取统一互斥状态。"""
     return {"active_task": workflow_runs.get_active_collection_task(db)}
+
+
+@router.get("/{workflow_run_id}/children")
+def children(workflow_run_id: str, db: Database = Depends(get_database)):
+    return {"children": workflow_runs.get_workflow_children(db, workflow_run_id)}
 
 
 @router.get("/{workflow_run_id}")

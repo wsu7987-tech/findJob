@@ -66,6 +66,8 @@ class WorkflowRunCreateRequest(BaseModel):
     task_type: Literal["deep_job_search"]
     deep_job_search: DeepJobSearchConfig
     created_from: str = Field(default="task_cockpit", min_length=1, max_length=80)
+    # 创建请求重试时复用同一父子身份，避免生成第二组记录。
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class WorkflowManualAnalysisBatchRequest(BaseModel):

@@ -969,6 +969,7 @@ CREATE TABLE IF NOT EXISTS fj_smart_captures (
   status TEXT NOT NULL DEFAULT 'pending',
   current_batch_id TEXT,
   search_config_json TEXT NOT NULL DEFAULT '{}',
+  execution_config_json TEXT NOT NULL DEFAULT '{}',
   target_count INTEGER,
   stage TEXT NOT NULL DEFAULT 'created',
   waiting_reason TEXT NOT NULL DEFAULT '',
@@ -1885,6 +1886,7 @@ CREATE INDEX IF NOT EXISTS idx_fj_codex_sessions_updated_at
 CREATE TABLE IF NOT EXISTS fj_workflow_runs (
   id TEXT PRIMARY KEY,
   workflow_type TEXT NOT NULL,
+  idempotency_key TEXT,
   completion_contract_json TEXT NOT NULL DEFAULT '{}',
   status TEXT NOT NULL DEFAULT 'pending',
   completed_count INTEGER NOT NULL DEFAULT 0,
@@ -1934,6 +1936,37 @@ CREATE TABLE IF NOT EXISTS fj_workflow_tasks (
 
 CREATE INDEX IF NOT EXISTS idx_fj_workflow_tasks_run_status
   ON fj_workflow_tasks(workflow_run_id, status, created_at);
+
+-- Parent 只通过这张关系表读取 child 的顺序、状态投影和结果摘要。
+CREATE TABLE IF NOT EXISTS fj_workflow_children (
+  id TEXT PRIMARY KEY,
+  workflow_run_id TEXT NOT NULL,
+  child_type TEXT NOT NULL,
+  child_ref TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  control_state TEXT NOT NULL DEFAULT 'active',
+  waiting_reason TEXT NOT NULL DEFAULT '',
+  control_cause TEXT NOT NULL DEFAULT '',
+  capabilities_json TEXT NOT NULL DEFAULT '{}',
+  result_summary_json TEXT NOT NULL DEFAULT '{}',
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  state_version INTEGER NOT NULL DEFAULT 1,
+  child_state_version INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE CASCADE,
+  UNIQUE (workflow_run_id, child_type, child_ref),
+  CHECK (sequence > 0),
+  CHECK (state_version > 0),
+  CHECK (child_state_version >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_workflow_children_workflow_sequence
+  ON fj_workflow_children(workflow_run_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_fj_workflow_children_child_ref
+  ON fj_workflow_children(child_type, child_ref);
 
 -- Codex 分析批次独立记录交接状态，避免把 Prompt 提交状态混入岗位分析结果。
 CREATE TABLE IF NOT EXISTS fj_workflow_analysis_handoffs (
@@ -2391,6 +2424,7 @@ class Database:
             self._ensure_job_progress_schema(connection)
             self._ensure_workflow_run_schema(connection)
             self._ensure_smart_capture_schema(connection)
+            self._ensure_workflow_children_schema(connection)
             # 兼容升级只从可靠旧事实追加事件，并按完整事件流重放 shadow Pipeline。
             from backend.app.services.fine_job.job_activity import migrate_legacy_job_activity
             from backend.app.services.fine_job.execution_reconciliation import (
@@ -2448,6 +2482,7 @@ class Database:
             for row in connection.execute("PRAGMA table_info(fj_workflow_runs)")
         }
         run_migrations = {
+            "idempotency_key": "ALTER TABLE fj_workflow_runs ADD COLUMN idempotency_key TEXT",
             "paused": "ALTER TABLE fj_workflow_runs ADD COLUMN paused INTEGER NOT NULL DEFAULT 0",
             "paused_from_next_action": (
                 "ALTER TABLE fj_workflow_runs "
@@ -2461,6 +2496,10 @@ class Database:
         for column, statement in run_migrations.items():
             if column not in run_columns:
                 connection.execute(statement)
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_runs_idempotency_key "
+            "ON fj_workflow_runs(idempotency_key) WHERE idempotency_key IS NOT NULL"
+        )
         handoff_table = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fj_workflow_analysis_handoffs'"
         ).fetchone()
@@ -2560,6 +2599,7 @@ class Database:
             "status": "ALTER TABLE fj_smart_captures ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'",
             "current_batch_id": "ALTER TABLE fj_smart_captures ADD COLUMN current_batch_id TEXT",
             "search_config_json": "ALTER TABLE fj_smart_captures ADD COLUMN search_config_json TEXT NOT NULL DEFAULT '{}'",
+            "execution_config_json": "ALTER TABLE fj_smart_captures ADD COLUMN execution_config_json TEXT NOT NULL DEFAULT '{}'",
             "target_count": "ALTER TABLE fj_smart_captures ADD COLUMN target_count INTEGER",
             "stage": "ALTER TABLE fj_smart_captures ADD COLUMN stage TEXT NOT NULL DEFAULT 'created'",
             "waiting_reason": "ALTER TABLE fj_smart_captures ADD COLUMN waiting_reason TEXT NOT NULL DEFAULT ''",
@@ -2635,6 +2675,118 @@ class Database:
             )
             """
         )
+        # 旧 Smart Capture 没有独立配置 owner 时，先保留已有搜索配置作为可读取的最小执行配置。
+        connection.execute(
+            """
+            UPDATE fj_smart_captures
+            SET execution_config_json = search_config_json
+            WHERE COALESCE(TRIM(execution_config_json), '') IN ('', '{}')
+            """
+        )
+
+    def _ensure_workflow_children_schema(self, connection: sqlite3.Connection) -> None:
+        """为已有数据库补齐通用 parent-child relation，并回填可确认的 linked 关系。"""
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fj_workflow_children (
+              id TEXT PRIMARY KEY,
+              workflow_run_id TEXT NOT NULL,
+              child_type TEXT NOT NULL,
+              child_ref TEXT NOT NULL,
+              sequence INTEGER NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending',
+              control_state TEXT NOT NULL DEFAULT 'active',
+              waiting_reason TEXT NOT NULL DEFAULT '',
+              control_cause TEXT NOT NULL DEFAULT '',
+              capabilities_json TEXT NOT NULL DEFAULT '{}',
+              result_summary_json TEXT NOT NULL DEFAULT '{}',
+              started_at TEXT,
+              completed_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              state_version INTEGER NOT NULL DEFAULT 1,
+              child_state_version INTEGER NOT NULL DEFAULT 0,
+              FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE CASCADE,
+              UNIQUE (workflow_run_id, child_type, child_ref),
+              CHECK (sequence > 0),
+              CHECK (state_version > 0),
+              CHECK (child_state_version >= 0)
+            )
+            """
+        )
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(fj_workflow_children)")
+        }
+        migrations = {
+            "control_state": "ALTER TABLE fj_workflow_children ADD COLUMN control_state TEXT NOT NULL DEFAULT 'active'",
+            "waiting_reason": "ALTER TABLE fj_workflow_children ADD COLUMN waiting_reason TEXT NOT NULL DEFAULT ''",
+            "control_cause": "ALTER TABLE fj_workflow_children ADD COLUMN control_cause TEXT NOT NULL DEFAULT ''",
+            "capabilities_json": "ALTER TABLE fj_workflow_children ADD COLUMN capabilities_json TEXT NOT NULL DEFAULT '{}'",
+            "result_summary_json": "ALTER TABLE fj_workflow_children ADD COLUMN result_summary_json TEXT NOT NULL DEFAULT '{}'",
+            "started_at": "ALTER TABLE fj_workflow_children ADD COLUMN started_at TEXT",
+            "completed_at": "ALTER TABLE fj_workflow_children ADD COLUMN completed_at TEXT",
+            "state_version": "ALTER TABLE fj_workflow_children ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1",
+            "child_state_version": "ALTER TABLE fj_workflow_children ADD COLUMN child_state_version INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                connection.execute(statement)
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_children_identity "
+            "ON fj_workflow_children(workflow_run_id, child_type, child_ref)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_children_workflow_sequence "
+            "ON fj_workflow_children(workflow_run_id, sequence)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_children_child_ref "
+            "ON fj_workflow_children(child_type, child_ref)"
+        )
+
+        linked_rows = connection.execute(
+            """
+            SELECT c.*, r.created_at AS workflow_created_at
+            FROM fj_smart_captures c
+            JOIN fj_workflow_runs r ON r.id = c.workflow_run_id
+            WHERE c.workflow_run_id IS NOT NULL
+            """
+        ).fetchall()
+        for row in linked_rows:
+            relation_exists = connection.execute(
+                """
+                SELECT 1 FROM fj_workflow_children
+                WHERE workflow_run_id = ? AND child_type = 'smart_capture' AND child_ref = ?
+                """,
+                (str(row["workflow_run_id"]), str(row["id"])),
+            ).fetchone()
+            if relation_exists is not None:
+                continue
+            relation_id = str(uuid4())
+            now = str(row["updated_at"] or row["workflow_created_at"] or "")
+            connection.execute(
+                """
+                INSERT INTO fj_workflow_children (
+                  id, workflow_run_id, child_type, child_ref, sequence, status,
+                  waiting_reason, control_cause, started_at, completed_at,
+                  created_at, updated_at, child_state_version
+                ) VALUES (?, ?, 'smart_capture', ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    relation_id,
+                    str(row["workflow_run_id"]),
+                    str(row["id"]),
+                    str(row["status"] or "pending"),
+                    str(row["waiting_reason"] or ""),
+                    str(row["control_cause"] or ""),
+                    now if str(row["status"] or "") in {"running", "pausing", "paused", "waiting_next_batch", "waiting_for_user", "interrupted", "completed", "stopped", "failed"} else None,
+                    row["completed_at"],
+                    str(row["created_at"] or now),
+                    now,
+                    max(1, int(row["state_version"] or 1)),
+                ),
+            )
 
     @staticmethod
     def _list_smart_capture_legacy_tables(
@@ -2675,6 +2827,7 @@ class Database:
             "workflow_run_id": "TEXT",
             "current_batch_id": "TEXT",
             "search_config_json": "TEXT NOT NULL DEFAULT '{}'",
+            "execution_config_json": "TEXT NOT NULL DEFAULT '{}'",
             "target_count": "INTEGER",
             "stage": "TEXT NOT NULL DEFAULT 'created'",
             "waiting_reason": "TEXT NOT NULL DEFAULT ''",
@@ -2697,7 +2850,7 @@ class Database:
             f"""
             INSERT OR IGNORE INTO fj_smart_captures (
               id, source, workflow_run_id, status, current_batch_id,
-              search_config_json, target_count, stage, waiting_reason, control_cause,
+              search_config_json, execution_config_json, target_count, stage, waiting_reason, control_cause,
               state_version, progress_json, result_summary_json, message, error_message,
               created_at, updated_at, completed_at
             )
@@ -2729,6 +2882,11 @@ class Database:
               CASE
                 WHEN COALESCE(search_config_json, '{{}}') <> '{{}}' THEN search_config_json
                 ELSE COALESCE(config_json, '{{}}')
+              END,
+              CASE
+                WHEN COALESCE(execution_config_json, '{{}}') <> '{{}}' THEN execution_config_json
+                WHEN COALESCE(config_json, '{{}}') <> '{{}}' THEN config_json
+                ELSE COALESCE(search_config_json, '{{}}')
               END,
               target_count,
               COALESCE(stage, 'created'),
@@ -2830,6 +2988,7 @@ class Database:
               status TEXT NOT NULL DEFAULT 'pending',
               current_batch_id TEXT,
               search_config_json TEXT NOT NULL DEFAULT '{}',
+              execution_config_json TEXT NOT NULL DEFAULT '{}',
               target_count INTEGER,
               stage TEXT NOT NULL DEFAULT 'created',
               waiting_reason TEXT NOT NULL DEFAULT '',

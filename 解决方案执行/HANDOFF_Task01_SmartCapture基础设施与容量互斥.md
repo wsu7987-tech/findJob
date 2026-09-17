@@ -142,7 +142,7 @@ pytest -q backend/tests/api/test_fine_job_smart_captures_api.py
 pnpm exec vite build（工作目录 apps/desktop）
 通过；2270 modules transformed，exit 0。
 ```
-```
+
 
 ## 7. 遗留问题与边界
 

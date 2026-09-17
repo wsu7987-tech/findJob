@@ -13,6 +13,7 @@ from backend.app.services.fine_job.collection_capacity import (
     assert_collection_start_allowed_in_connection,
     recover_collection_capacity,
 )
+from backend.app.services.fine_job import workflow_children
 from backend.app.services.fine_job.boss_scraper.service import (
     BossCaptureRequest,
     boss_scraper_service,
@@ -105,6 +106,21 @@ def recover_interrupted_smart_captures(db: Database) -> None:
             """,
             (now,),
         )
+        linked_captures = connection.execute(
+            "SELECT * FROM fj_smart_captures WHERE workflow_run_id IS NOT NULL"
+        ).fetchall()
+        for linked_capture in linked_captures:
+            workflow_children.project_smart_capture_in_connection(
+                connection,
+                linked_capture,
+                capabilities=_capabilities(
+                    status=str(linked_capture["status"]),
+                    stage=str(linked_capture["stage"] or ""),
+                    waiting_reason=str(linked_capture["waiting_reason"] or ""),
+                    control_cause=str(linked_capture["control_cause"] or ""),
+                ),
+                now=now,
+            )
         current = connection.execute(
             """
             SELECT c.id, c.status
@@ -127,6 +143,7 @@ def create_smart_capture(
     workflow_run_id: str | None,
     search_config: dict[str, Any],
     target_count: int | None = None,
+    execution_config: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     """创建岗位采集身份，并在同一写事务内占用 current slot。"""
     with db.connect() as connection:
@@ -138,6 +155,7 @@ def create_smart_capture(
             workflow_run_id=workflow_run_id,
             search_config=search_config,
             target_count=target_count,
+            execution_config=execution_config,
         )
     return get_smart_capture(db, capture_id)
 
@@ -150,6 +168,7 @@ def create_smart_capture_in_connection(
     workflow_run_id: str | None,
     search_config: dict[str, Any],
     target_count: int | None = None,
+    execution_config: dict[str, Any] | None = None,
 ) -> str:
     """在调用方的写事务中创建 Smart Capture，保证关联对象与 current 同时提交。"""
     if source not in {"task_cockpit", "boss_capture"}:
@@ -181,16 +200,17 @@ def create_smart_capture_in_connection(
     connection.execute(
         """
         INSERT INTO fj_smart_captures (
-          id, source, workflow_run_id, status, search_config_json,
+          id, source, workflow_run_id, status, search_config_json, execution_config_json,
           target_count, stage, waiting_reason, control_cause, state_version,
           progress_json, result_summary_json, message, created_at, updated_at
-        ) VALUES (?, ?, ?, 'pending', ?, ?, 'created', '', '', 1, '{}', '{}', ?, ?, ?)
+        ) VALUES (?, ?, ?, 'pending', ?, ?, ?, 'created', '', '', 1, '{}', '{}', ?, ?, ?)
         """,
         (
             capture_id,
             source,
             workflow_run_id,
             json.dumps(search_config, ensure_ascii=False),
+            json.dumps(execution_config or search_config, ensure_ascii=False, sort_keys=True),
             target_count,
             "岗位采集任务已创建，等待启动首个批次。",
             now,
@@ -207,6 +227,21 @@ def create_smart_capture_in_connection(
         """,
         (capture_id, now),
     )
+    if workflow_run_id:
+        workflow_children.create_child_relation_in_connection(
+            connection,
+            workflow_run_id=workflow_run_id,
+            child_ref=capture_id,
+            status="pending",
+            capabilities=_capabilities(
+                status="pending",
+                stage="created",
+                waiting_reason="",
+                control_cause="",
+            ),
+            child_state_version=1,
+            created_at=now,
+        )
     return capture_id
 
 
@@ -258,6 +293,7 @@ def start_independent_capture(
         workflow_run_id=None,
         search_config=payload,
         target_count=int(payload.get("candidate_target_count") or 0) or None,
+        execution_config=_build_execution_config(payload),
     )
     return _start_new_batch(db, config, str(capture["smart_capture_id"]), payload)
 
@@ -341,6 +377,22 @@ def bind_batch(db: Database, smart_capture_id: str, batch_id: str) -> None:
             """,
             (smart_capture_id, now),
         )
+        capture_row = connection.execute(
+            "SELECT * FROM fj_smart_captures WHERE id = ?",
+            (smart_capture_id,),
+        ).fetchone()
+        if capture_row is not None:
+            workflow_children.project_smart_capture_in_connection(
+                connection,
+                capture_row,
+                capabilities=_capabilities(
+                    status="running",
+                    stage="capturing",
+                    waiting_reason="",
+                    control_cause="",
+                ),
+                now=now,
+            )
     try:
         sync_capture_snapshot(db, boss_capture_task_manager.get_task(batch_id))
     except AppError:
@@ -696,6 +748,9 @@ def get_smart_capture(db: Database, smart_capture_id: str) -> dict[str, object]:
         "status": status,
         "current_batch_id": current_batch_id or None,
         "search_config": _load_json(str(data.get("search_config_json") or "{}")),
+        "execution_config": _load_json(
+            str(data.get("execution_config_json") or data.get("search_config_json") or "{}")
+        ),
         "target_count": data.get("target_count"),
         "stage": str(data.get("stage") or ""),
         "waiting_reason": waiting_reason,
@@ -780,7 +835,7 @@ def _update_capture(
             """
             SELECT status, stage, waiting_reason, control_cause, current_batch_id,
                    progress_json, result_summary_json, message, error_message,
-                   completed_at, state_version
+                   completed_at, state_version, workflow_run_id
             FROM fj_smart_captures WHERE id = ?
             """,
             (smart_capture_id,),
@@ -869,6 +924,22 @@ def _update_capture(
                 smart_capture_id,
             ),
         )
+        updated_row = connection.execute(
+            "SELECT * FROM fj_smart_captures WHERE id = ?",
+            (smart_capture_id,),
+        ).fetchone()
+        if updated_row is not None:
+            workflow_children.project_smart_capture_in_connection(
+                connection,
+                updated_row,
+                capabilities=_capabilities(
+                    status=status,
+                    stage=stage,
+                    waiting_reason=next_waiting_reason,
+                    control_cause=next_control_cause,
+                ),
+                now=now,
+            )
 
 
 def _progress_from_task(task: dict[str, object]) -> dict[str, object]:
@@ -918,6 +989,43 @@ def _canonical_status(status: str, waiting_reason: str) -> str:
     if status == "waiting_next_batch" and waiting_reason in LEGACY_MANUAL_WAITING_REASONS:
         return "waiting_for_user"
     return status
+
+
+def _build_execution_config(payload: dict[str, Any]) -> dict[str, object]:
+    """把 linked/independent 共用的完整执行配置固定在 Smart Capture owner。"""
+    return {
+        "search": {
+            "filter_strategy_id": str(payload.get("filter_strategy_id") or ""),
+            "keywords": list(payload.get("allowed_search_keywords") or []),
+            "cities": list(payload.get("allowed_cities") or []),
+            "pages": int(payload.get("pages") or payload.get("min_depth") or 1),
+            "filters": dict(payload.get("filters") or {}),
+        },
+        "candidate_target_count": int(payload.get("candidate_target_count") or 0) or None,
+        "delivery_target": {
+            "enabled": bool(payload.get("delivery_target_enabled", False)),
+            "recommend_target": payload.get("recommend_target") or payload.get("target_count"),
+            "review_target": payload.get("review_target"),
+        },
+        "jd_detail_policy": {
+            "include_details": bool(payload.get("include_details", False)),
+            "analyze_all_candidates": bool(payload.get("analyze_all_candidates", False)),
+            "batch_size": int(payload.get("analysis_batch_size") or payload.get("jd_batch_size") or 5),
+        },
+        "analysis": {
+            "codex_model": str(payload.get("codex_model") or ""),
+            "codex_reasoning_effort": str(payload.get("codex_reasoning_effort") or ""),
+            "guidance": str(payload.get("analysis_guidance") or ""),
+            "handoff": str(payload.get("execution_policy_codex_handoff") or "auto"),
+        },
+        "context_budget": int(payload.get("context_soft_budget_characters") or 12000),
+        "stop_policy": {
+            "min_depth": int(payload.get("min_depth") or payload.get("pages") or 1),
+            "scroll_batch_size": int(payload.get("scroll_batch_size") or 3),
+            "max_depth": int(payload.get("max_depth") or payload.get("pages") or 1),
+            "low_yield_streak_limit": int(payload.get("low_yield_streak_limit") or 3),
+        },
+    }
 
 
 def _load_json(value: str) -> dict[str, Any]:

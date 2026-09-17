@@ -6,6 +6,7 @@ import pytest
 
 from backend.app.errors import AppError
 from backend.app.services.fine_job import smart_captures
+from backend.app.services.fine_job import workflow_children
 from backend.app.services.fine_job import workflow_runs
 from backend.app.services.fine_job.boss_capture_history import create_capture_batch
 from backend.app.services.fine_job.boss_scraper.service import BossBrowserStatus
@@ -124,6 +125,77 @@ def test_terminal_smart_capture_allows_next_create_and_replaces_current(test_db)
     assert current is not None
     assert current["smart_capture_id"] == second["smart_capture_id"]
     assert current["smart_capture_id"] != first["smart_capture_id"]
+
+
+def test_independent_smart_capture_does_not_create_hidden_child_relation(test_db) -> None:
+    capture = _create_capture(test_db)
+
+    with test_db.connect() as connection:
+        relation_count = connection.execute(
+            "SELECT COUNT(*) AS count FROM fj_workflow_children WHERE child_ref = ?",
+            (str(capture["smart_capture_id"]),),
+        ).fetchone()["count"]
+
+    assert relation_count == 0
+
+
+def test_linked_parent_and_child_roll_back_together_when_relation_insert_fails(
+    test_db, monkeypatch
+) -> None:
+    def fail_relation(*args, **kwargs):
+        raise RuntimeError("relation insert failed")
+
+    monkeypatch.setattr(
+        workflow_children,
+        "create_child_relation_in_connection",
+        fail_relation,
+    )
+    workflow_run_id = "workflow-atomic-create"
+
+    with pytest.raises(RuntimeError, match="relation insert failed"):
+        with test_db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            workflow_runs._create_workflow_identity_in_connection(
+                connection,
+                test_db,
+                workflow_run_id=workflow_run_id,
+                idempotency_key=None,
+                contract={},
+                recommend_target=1,
+                requested_keywords=["Python"],
+                requested_cities=["上海"],
+                min_depth=1,
+                max_depth=1,
+                filter_strategy_id="strategy-1",
+                candidate_target=15,
+                review_target=None,
+                payload=_payload(),
+                now="2026-09-18T00:00:00Z",
+            )
+
+    with test_db.connect() as connection:
+        assert connection.execute(
+            "SELECT 1 FROM fj_workflow_runs WHERE id = ?", (workflow_run_id,)
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT 1 FROM fj_smart_captures WHERE workflow_run_id = ?",
+            (workflow_run_id,),
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT 1 FROM fj_workflow_children WHERE workflow_run_id = ?",
+            (workflow_run_id,),
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT 1 FROM fj_workflow_tasks WHERE workflow_run_id = ?",
+            (workflow_run_id,),
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT 1 FROM fj_workflow_search_combinations WHERE workflow_run_id = ?",
+            (workflow_run_id,),
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT 1 FROM fj_smart_capture_current WHERE slot = 1"
+        ).fetchone() is None
 
 
 def test_orphan_pending_smart_capture_does_not_block_current_slot(test_db) -> None:

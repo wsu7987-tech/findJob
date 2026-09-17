@@ -11,9 +11,11 @@ from backend.app.errors import AppError
 from backend.app.services.fine_job.boss_capture_tasks import boss_capture_task_manager
 from backend.app.services.fine_job.collection_capacity import (
     assert_collection_start_allowed as assert_collection_capacity_start_allowed,
+    assert_collection_start_allowed_in_connection,
     get_active_collection_task as get_active_collection_capacity_task,
 )
 from backend.app.services.fine_job import smart_captures
+from backend.app.services.fine_job import workflow_children
 from backend.app.services.fine_job.workflow_run_events import workflow_run_event_broker
 from backend.app.services.fine_job.boss_capture_history import get_capture_history_job
 from backend.app.services.fine_job.boss_scraper.service import BossCaptureRequest, boss_scraper_service
@@ -102,10 +104,21 @@ boss_capture_task_manager.add_listener(_on_capture_task_updated)
 
 
 def create_deep_job_search_run(
-    db: Database, config: AppConfig, payload: dict[str, Any], *, created_from: str
+    db: Database,
+    config: AppConfig,
+    payload: dict[str, Any],
+    *,
+    created_from: str,
+    idempotency_key: str | None = None,
 ) -> dict[str, object]:
-    """创建搜索 Run；采集器与筛选器仍由既有服务负责。"""
-    assert_collection_start_allowed(db, requested_kind="smart")
+    """原子创建父级、linked child、relation 与 current，并支持安全重试。"""
+    normalized_idempotency_key = str(idempotency_key or "").strip() or None
+    if normalized_idempotency_key:
+        existing_id = _find_workflow_run_id_by_idempotency_key(
+            db, normalized_idempotency_key
+        )
+        if existing_id is not None:
+            return get_workflow_run(db, existing_id)
     filter_strategy_id = str(payload["filter_strategy_id"])
     strategy = get_filter_strategy(db, filter_strategy_id)
     if not strategy.get("enabled"):
@@ -198,81 +211,37 @@ def create_deep_job_search_run(
     }
     workflow_run_id = new_id()
     now = utc_now()
+    replayed_workflow_run_id: str | None = None
     with db.connect() as connection:
-        # Workflow 与 Smart Capture 作为同一采集身份提交，创建成功立即占用 current 槽位。
         connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            """
-            INSERT INTO fj_workflow_runs (
-              id, workflow_type, completion_contract_json, status, completed_count,
-              remaining_count, current_step, next_action, next_action_reason,
-              waiting_for_user, paused, telemetry_json, created_at, updated_at
-            ) VALUES (?, 'deep_job_search', ?, 'pending', 0, ?, 'created',
-                      'start_search', '等待开始第一个已批准搜索组合。', 0, 0, '{}', ?, ?)
-            """,
-            (workflow_run_id, _dump(contract), recommend_target, now, now),
-        )
-        # 先只建立第一个 Scope 的 baseline 组合，后续组合由 Planner 按结果按需创建。
-        keyword = requested_keywords[0]
-        city = requested_cities[0]
-        combination_id = new_id()
-        filters: dict[str, str] = {}
-        connection.execute(
-            """
-            INSERT INTO fj_workflow_search_combinations (
-              id, workflow_run_id, keyword, city, platform_filters_json,
-              identity_json, status, sequence, transition_action, transition_reason
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 1, 'SWITCH_COMBINATION', 'baseline')
-            """,
-            (
-                combination_id,
-                workflow_run_id,
-                keyword,
-                city,
-                _dump(filters),
-                combination_identity(keyword, city, filters),
-            ),
-        )
-        task_id = new_id()
-        connection.execute(
-            """
-            INSERT INTO fj_workflow_tasks (
-              id, workflow_run_id, task_type, payload_json, result_json, created_at, updated_at
-            ) VALUES (?, ?, 'deep_job_search', ?, '{}', ?, ?)
-            """,
-            (
-                task_id,
-                workflow_run_id,
-                _dump({
-                    "keyword": keyword,
-                    "city": city,
-                    "platform_filters": filters,
-                    "search_combination_id": combination_id,
-                    "is_baseline": True,
-                    "depth": 0,
-                    "low_yield_streak": 0,
-                    "low_novelty_streak": 0,
-                    "low_qualified_yield_streak": 0,
-                }),
-                now,
-                now,
-            ),
-        )
-        smart_captures.create_smart_capture_in_connection(
-            connection,
-            db,
-            source="task_cockpit",
-            workflow_run_id=workflow_run_id,
-            search_config={
-                "allowed_search_keywords": requested_keywords,
-                "allowed_cities": requested_cities,
-                "pages": min_depth,
-                "include_details": False,
-                "prefer_current_page": True,
-                "filter_strategy_id": filter_strategy_id,
-            },
-            target_count=candidate_target,
-        )
+        # 写锁内先回读幂等键，覆盖响应丢失后的重试和并发重复点击。
+        if normalized_idempotency_key:
+            existing = connection.execute(
+                "SELECT id FROM fj_workflow_runs WHERE idempotency_key = ?",
+                (normalized_idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                replayed_workflow_run_id = str(existing["id"])
+        if replayed_workflow_run_id is None:
+            _create_workflow_identity_in_connection(
+                connection,
+                db,
+                workflow_run_id=workflow_run_id,
+                idempotency_key=normalized_idempotency_key,
+                contract=contract,
+                recommend_target=recommend_target,
+                requested_keywords=requested_keywords,
+                requested_cities=requested_cities,
+                min_depth=min_depth,
+                max_depth=max_depth,
+                filter_strategy_id=filter_strategy_id,
+                candidate_target=candidate_target,
+                review_target=review_target,
+                payload=payload,
+                now=now,
+            )
+    if replayed_workflow_run_id is not None:
+        return get_workflow_run(db, replayed_workflow_run_id)
     snapshot = _create_search_context_snapshot(
         db, workflow_run_id, strategy, recommendation_strategy, contract,
         int(payload.get("context_soft_budget_characters") or 12000),
@@ -280,6 +249,123 @@ def create_deep_job_search_run(
     if snapshot["status"] == "blocked":
         _wait_for_user(db, workflow_run_id, "context_budget_exceeded", str(snapshot["blocker_reason"]))
     return get_workflow_run(db, workflow_run_id)
+
+
+def _create_workflow_identity_in_connection(
+    connection: Any,
+    db: Database,
+    *,
+    workflow_run_id: str,
+    idempotency_key: str | None,
+    contract: dict[str, object],
+    recommend_target: int,
+    requested_keywords: list[str],
+    requested_cities: list[str],
+    min_depth: int,
+    max_depth: int,
+    filter_strategy_id: str,
+    candidate_target: int,
+    review_target: object,
+    payload: dict[str, Any],
+    now: str,
+) -> None:
+    """在同一 SQLite 事务中写入 parent、child、relation 和 current。"""
+    # 先在 BEGIN IMMEDIATE 持有的写锁内检查 current 与 custom 容量，再落身份记录。
+    assert_collection_start_allowed_in_connection(
+        connection,
+        db,
+        requested_kind="smart",
+    )
+    connection.execute(
+        """
+        INSERT INTO fj_workflow_runs (
+          id, workflow_type, idempotency_key, completion_contract_json, status,
+          completed_count, remaining_count, current_step, next_action,
+          next_action_reason, waiting_for_user, paused, telemetry_json,
+          created_at, updated_at
+        ) VALUES (?, 'deep_job_search', ?, ?, 'pending', 0, ?, 'created',
+                  'start_search', '等待开始第一个已批准搜索组合。', 0, 0, '{}', ?, ?)
+        """,
+        (
+            workflow_run_id,
+            idempotency_key,
+            _dump(contract),
+            recommend_target,
+            now,
+            now,
+        ),
+    )
+    # 先写父层 baseline task，再由同一事务创建 linked Smart Capture identity。
+    keyword = requested_keywords[0]
+    city = requested_cities[0]
+    combination_id = new_id()
+    filters: dict[str, str] = {}
+    connection.execute(
+        """
+        INSERT INTO fj_workflow_search_combinations (
+          id, workflow_run_id, keyword, city, platform_filters_json,
+          identity_json, status, sequence, transition_action, transition_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 1, 'SWITCH_COMBINATION', 'baseline')
+        """,
+        (
+            combination_id,
+            workflow_run_id,
+            keyword,
+            city,
+            _dump(filters),
+            combination_identity(keyword, city, filters),
+        ),
+    )
+    task_id = new_id()
+    connection.execute(
+        """
+        INSERT INTO fj_workflow_tasks (
+          id, workflow_run_id, task_type, payload_json, result_json, created_at, updated_at
+        ) VALUES (?, ?, 'deep_job_search', ?, '{}', ?, ?)
+        """,
+        (
+            task_id,
+            workflow_run_id,
+            _dump({
+                "keyword": keyword,
+                "city": city,
+                "platform_filters": filters,
+                "search_combination_id": combination_id,
+                "is_baseline": True,
+                "depth": 0,
+                "low_yield_streak": 0,
+                "low_novelty_streak": 0,
+                "low_qualified_yield_streak": 0,
+            }),
+            now,
+            now,
+        ),
+    )
+    smart_captures.create_smart_capture_in_connection(
+        connection,
+        db,
+        source="task_cockpit",
+        workflow_run_id=workflow_run_id,
+        search_config={
+            "allowed_search_keywords": requested_keywords,
+            "allowed_cities": requested_cities,
+            "pages": min_depth,
+            "include_details": False,
+            "prefer_current_page": True,
+            "filter_strategy_id": filter_strategy_id,
+        },
+        target_count=candidate_target,
+        execution_config=smart_captures._build_execution_config(
+            {
+                **payload,
+                "candidate_target_count": candidate_target,
+                "recommend_target": recommend_target,
+                "review_target": review_target,
+                "min_depth": min_depth,
+                "max_depth": max_depth,
+            }
+        ),
+    )
 
 
 def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: str) -> dict[str, object]:
@@ -388,6 +474,7 @@ def get_workflow_run(db: Database, workflow_run_id: str) -> dict[str, object]:
         "progress": _get_run_progress(db, workflow_run_id),
         "analysis_handoff": _get_analysis_handoff_summary(db, workflow_run_id),
         "prefetch": _get_prefetch_summary(db, workflow_run_id),
+        "children": workflow_children.list_workflow_children(db, workflow_run_id),
         "tasks": [_serialize_task(row) for row in tasks],
         "capture_jobs": list_workflow_capture_jobs(db, workflow_run_id)["items"],
         "context_snapshots": [_serialize_snapshot(row) for row in snapshots],
@@ -422,6 +509,12 @@ def get_latest_active_workflow_run(db: Database) -> dict[str, object] | None:
 def get_active_collection_task(db: Database) -> dict[str, object] | None:
     """返回唯一允许存在的未结束岗位采集任务。"""
     return get_active_collection_capacity_task(db)
+
+
+def get_workflow_children(db: Database, workflow_run_id: str) -> list[dict[str, object]]:
+    """按已存在的 parent 校验后返回稳定的 child relation 快照。"""
+    _require_run(db, workflow_run_id)
+    return workflow_children.list_workflow_children(db, workflow_run_id)
 
 
 def assert_collection_start_allowed(db: Database, *, requested_kind: str) -> None:
@@ -3597,6 +3690,18 @@ def _require_run(db: Database, workflow_run_id: str):
     return row
 
 
+def _find_workflow_run_id_by_idempotency_key(
+    db: Database, idempotency_key: str
+) -> str | None:
+    """只读取已经提交的 parent，重试时返回原始身份。"""
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT id FROM fj_workflow_runs WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+    return str(row["id"]) if row is not None else None
+
+
 def _serialize_run(db: Database, row: Any) -> dict[str, object]:
     contract = _load(row["completion_contract_json"], {})
     telemetry = _load(row["telemetry_json"], {})
@@ -3604,7 +3709,7 @@ def _serialize_run(db: Database, row: Any) -> dict[str, object]:
         telemetry = {}
     telemetry["prefetch"] = _get_prefetch_summary(db, str(row["id"]))
     telemetry["search_planner"] = _get_search_planner_summary(db, str(row["id"]))
-    return {"workflow_run_id": row["id"], "workflow_type": row["workflow_type"], "completion_contract": contract, "completion_progress": _completion_progress(db, str(row["id"]), contract), "status": "paused" if bool(row["paused"]) else row["status"], "completed_count": row["completed_count"], "remaining_count": row["remaining_count"], "current_step": row["current_step"], "next_action": row["next_action"], "next_action_reason": row["next_action_reason"], "waiting_for_user": bool(row["waiting_for_user"]), "stop_reason": row["stop_reason"], "codex_session_ref": row["codex_session_ref"], "codex_runtime_id": row["codex_runtime_id"], "telemetry": telemetry, "created_at": row["created_at"], "updated_at": row["updated_at"], "completed_at": row["completed_at"]}
+    return {"workflow_run_id": row["id"], "workflow_type": row["workflow_type"], "idempotency_key": row["idempotency_key"], "completion_contract": contract, "completion_progress": _completion_progress(db, str(row["id"]), contract), "status": "paused" if bool(row["paused"]) else row["status"], "completed_count": row["completed_count"], "remaining_count": row["remaining_count"], "current_step": row["current_step"], "next_action": row["next_action"], "next_action_reason": row["next_action_reason"], "waiting_for_user": bool(row["waiting_for_user"]), "stop_reason": row["stop_reason"], "codex_session_ref": row["codex_session_ref"], "codex_runtime_id": row["codex_runtime_id"], "telemetry": telemetry, "created_at": row["created_at"], "updated_at": row["updated_at"], "completed_at": row["completed_at"]}
 
 
 def _get_search_planner_summary(db: Database, workflow_run_id: str) -> dict[str, object]:

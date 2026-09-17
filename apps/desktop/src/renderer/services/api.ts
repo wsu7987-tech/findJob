@@ -1536,12 +1536,13 @@ export const api = {
     low_qualified_yield_threshold?: number;
     search_combination_safety_limit?: number;
     context_soft_budget_characters?: number;
-  }, createdFrom: "task_cockpit" | "boss_capture" = "task_cockpit") {
+  }, createdFrom: "task_cockpit" | "boss_capture" = "task_cockpit", idempotencyKey?: string) {
     return request<FineJobWorkflowRun>("/api/fine-job/workflow-runs", {
       method: "POST",
       body: JSON.stringify({
         task_type: "deep_job_search",
         created_from: createdFrom,
+        ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
         deep_job_search: payload
       })
     });
