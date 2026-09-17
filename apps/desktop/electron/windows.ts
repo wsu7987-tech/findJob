@@ -7,7 +7,7 @@ import type {
 
 declare const require: NodeRequire;
 
-const { BrowserWindow } = require("electron/main") as typeof import("electron");
+const { BrowserWindow } = require("electron") as typeof import("electron");
 
 export interface WindowManagerOptions {
   debugLog: (message: string) => void;

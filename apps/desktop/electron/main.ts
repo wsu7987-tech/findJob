@@ -32,7 +32,7 @@ require("electron/js2c/browser_init");
 debugLog("main module loaded: after browser_init");
 const bootstrapKeepAlive = setInterval(() => {}, 1000);
 
-const { app, BrowserWindow, dialog, ipcMain, shell } = require("electron/main") as typeof import("electron");
+const { app, BrowserWindow, dialog, ipcMain, shell } = require("electron") as typeof import("electron");
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
 const quitState = createQuitState();
 

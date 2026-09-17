@@ -355,6 +355,7 @@ export type FineJobSmartCaptureStatus =
   | "pausing"
   | "paused"
   | "waiting_next_batch"
+  | "waiting_for_user"
   | "completed"
   | "stopped"
   | "failed"
@@ -369,6 +370,18 @@ export interface FineJobSmartCapture {
   search_config: Record<string, unknown>;
   target_count?: number | null;
   stage: string;
+  waiting_reason: string;
+  control_cause: string;
+  state_version: number;
+  capabilities: {
+    start: boolean;
+    pause: boolean;
+    resume: boolean;
+    retry: boolean;
+    stop: boolean;
+  };
+  progress: Record<string, unknown>;
+  result_summary: Record<string, unknown>;
   message: string;
   error_message?: string | null;
   created_at: string;

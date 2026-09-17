@@ -932,6 +932,7 @@ CREATE INDEX IF NOT EXISTS idx_fj_job_recommendation_strategies_updated_at
 CREATE TABLE IF NOT EXISTS fj_boss_capture_batches (
   id TEXT PRIMARY KEY,
   smart_capture_id TEXT,
+  capture_source TEXT NOT NULL DEFAULT 'custom',
   keyword TEXT NOT NULL,
   city TEXT NOT NULL,
   pages INTEGER NOT NULL DEFAULT 1,
@@ -951,6 +952,7 @@ CREATE TABLE IF NOT EXISTS fj_boss_capture_batches (
   updated_at TEXT NOT NULL,
   finished_at TEXT,
   FOREIGN KEY (smart_capture_id) REFERENCES fj_smart_captures(id) ON DELETE SET NULL,
+  CHECK (capture_source IN ('smart', 'custom')),
   CHECK (auto_details IN (0, 1)),
   CHECK (status IN ('queued', 'running', 'completed', 'failed')),
   CHECK (control_status IN ('active', 'pausing', 'paused', 'stopped', 'interrupted'))
@@ -969,6 +971,11 @@ CREATE TABLE IF NOT EXISTS fj_smart_captures (
   search_config_json TEXT NOT NULL DEFAULT '{}',
   target_count INTEGER,
   stage TEXT NOT NULL DEFAULT 'created',
+  waiting_reason TEXT NOT NULL DEFAULT '',
+  control_cause TEXT NOT NULL DEFAULT '',
+  state_version INTEGER NOT NULL DEFAULT 1,
+  progress_json TEXT NOT NULL DEFAULT '{}',
+  result_summary_json TEXT NOT NULL DEFAULT '{}',
   message TEXT NOT NULL DEFAULT '',
   error_message TEXT,
   created_at TEXT NOT NULL,
@@ -976,7 +983,8 @@ CREATE TABLE IF NOT EXISTS fj_smart_captures (
   completed_at TEXT,
   FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE SET NULL,
   CHECK (source IN ('task_cockpit', 'boss_capture')),
-  CHECK (status IN ('pending', 'running', 'pausing', 'paused', 'waiting_next_batch', 'completed', 'stopped', 'failed', 'interrupted'))
+  CHECK (status IN ('pending', 'running', 'pausing', 'paused', 'waiting_next_batch', 'waiting_for_user', 'completed', 'stopped', 'failed', 'interrupted')),
+  CHECK (state_version > 0)
 );
 
 CREATE TABLE IF NOT EXISTS fj_smart_capture_current (
@@ -984,6 +992,15 @@ CREATE TABLE IF NOT EXISTS fj_smart_capture_current (
   smart_capture_id TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY (smart_capture_id) REFERENCES fj_smart_captures(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS fj_collection_execution_capacity (
+  slot INTEGER PRIMARY KEY CHECK (slot = 1),
+  capture_source TEXT NOT NULL,
+  capture_ref TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (capture_source = 'custom')
 );
 
 CREATE TABLE IF NOT EXISTS fj_companies (
@@ -2510,6 +2527,7 @@ class Database:
         }
         migrations = {
             "smart_capture_id": "ALTER TABLE fj_boss_capture_batches ADD COLUMN smart_capture_id TEXT",
+            "capture_source": "ALTER TABLE fj_boss_capture_batches ADD COLUMN capture_source TEXT NOT NULL DEFAULT 'custom'",
             "stage": "ALTER TABLE fj_boss_capture_batches ADD COLUMN stage TEXT NOT NULL DEFAULT 'queued'",
             "message": "ALTER TABLE fj_boss_capture_batches ADD COLUMN message TEXT NOT NULL DEFAULT ''",
             "error_message": "ALTER TABLE fj_boss_capture_batches ADD COLUMN error_message TEXT",
@@ -2520,6 +2538,14 @@ class Database:
         for column, statement in migrations.items():
             if column not in batch_columns:
                 connection.execute(statement)
+        # 旧批次只有 smart_capture_id 可用于区分来源，先把可确认的记录归入 Smart Capture。
+        connection.execute(
+            """
+            UPDATE fj_boss_capture_batches
+            SET capture_source = 'smart'
+            WHERE smart_capture_id IS NOT NULL
+            """
+        )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_fj_boss_capture_batches_smart_capture "
             "ON fj_boss_capture_batches(smart_capture_id, created_at)"
@@ -2536,6 +2562,11 @@ class Database:
             "search_config_json": "ALTER TABLE fj_smart_captures ADD COLUMN search_config_json TEXT NOT NULL DEFAULT '{}'",
             "target_count": "ALTER TABLE fj_smart_captures ADD COLUMN target_count INTEGER",
             "stage": "ALTER TABLE fj_smart_captures ADD COLUMN stage TEXT NOT NULL DEFAULT 'created'",
+            "waiting_reason": "ALTER TABLE fj_smart_captures ADD COLUMN waiting_reason TEXT NOT NULL DEFAULT ''",
+            "control_cause": "ALTER TABLE fj_smart_captures ADD COLUMN control_cause TEXT NOT NULL DEFAULT ''",
+            "state_version": "ALTER TABLE fj_smart_captures ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1",
+            "progress_json": "ALTER TABLE fj_smart_captures ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'",
+            "result_summary_json": "ALTER TABLE fj_smart_captures ADD COLUMN result_summary_json TEXT NOT NULL DEFAULT '{}'",
             "message": "ALTER TABLE fj_smart_captures ADD COLUMN message TEXT NOT NULL DEFAULT ''",
             "error_message": "ALTER TABLE fj_smart_captures ADD COLUMN error_message TEXT",
             "created_at": "ALTER TABLE fj_smart_captures ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
@@ -2550,8 +2581,19 @@ class Database:
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fj_smart_captures'"
         ).fetchone()
         smart_capture_sql = str(smart_capture_table["sql"] or "") if smart_capture_table else ""
-        if "'standalone', 'orchestration'" in smart_capture_sql:
-            self._rebuild_legacy_smart_capture_table(connection)
+        legacy_tables = self._list_smart_capture_legacy_tables(connection)
+        needs_rebuild = (
+            "'standalone', 'orchestration'" in smart_capture_sql
+            or "'waiting_for_user'" not in smart_capture_sql
+        )
+        if needs_rebuild:
+            self._rebuild_legacy_smart_capture_table(
+                connection,
+                legacy_tables=legacy_tables,
+            )
+        elif legacy_tables:
+            # 上一轮迁移可能已创建新表但尚未清理备份表，启动时继续合并并清理。
+            self._merge_legacy_smart_capture_tables(connection, legacy_tables)
 
         self._repair_smart_capture_batch_foreign_key(connection)
 
@@ -2577,43 +2619,86 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_fj_smart_captures_status "
             "ON fj_smart_captures(status, updated_at DESC)"
         )
-
-    def _rebuild_legacy_smart_capture_table(self, connection: sqlite3.Connection) -> None:
-        """转换上一轮遗留的岗位采集父任务枚举与字段名称。"""
-        current_rows = connection.execute(
-            "SELECT slot, smart_capture_id, updated_at FROM fj_smart_capture_current"
-        ).fetchall()
-        connection.execute("DROP TABLE fj_smart_capture_current")
         connection.execute(
-            "ALTER TABLE fj_smart_captures RENAME TO fj_smart_captures_legacy_status"
+            "CREATE INDEX IF NOT EXISTS idx_fj_boss_capture_batches_source_status "
+            "ON fj_boss_capture_batches(capture_source, status, updated_at DESC)"
         )
         connection.execute(
             """
-            CREATE TABLE fj_smart_captures (
-              id TEXT PRIMARY KEY,
-              source TEXT NOT NULL,
-              workflow_run_id TEXT,
-              status TEXT NOT NULL DEFAULT 'pending',
-              current_batch_id TEXT,
-              search_config_json TEXT NOT NULL DEFAULT '{}',
-              target_count INTEGER,
-              stage TEXT NOT NULL DEFAULT 'created',
-              message TEXT NOT NULL DEFAULT '',
-              error_message TEXT,
+            CREATE TABLE IF NOT EXISTS fj_collection_execution_capacity (
+              slot INTEGER PRIMARY KEY CHECK (slot = 1),
+              capture_source TEXT NOT NULL,
+              capture_ref TEXT NOT NULL UNIQUE,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL,
-              completed_at TEXT,
-              FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE SET NULL,
-              CHECK (source IN ('task_cockpit', 'boss_capture')),
-              CHECK (status IN ('pending', 'running', 'pausing', 'paused', 'waiting_next_batch', 'completed', 'stopped', 'failed', 'interrupted'))
+              CHECK (capture_source = 'custom')
             )
             """
         )
-        connection.execute(
+
+    @staticmethod
+    def _list_smart_capture_legacy_tables(
+        connection: sqlite3.Connection,
+    ) -> list[str]:
+        rows = connection.execute(
             """
-            INSERT INTO fj_smart_captures (
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name GLOB 'fj_smart_captures_legacy_status*'
+            ORDER BY name
+            """
+        ).fetchall()
+        return [str(row["name"]) for row in rows]
+
+    @staticmethod
+    def _quote_sql_identifier(identifier: str) -> str:
+        return '"' + identifier.replace('"', '""') + '"'
+
+    @staticmethod
+    def _copy_legacy_smart_capture_rows(
+        connection: sqlite3.Connection,
+        table_name: str,
+    ) -> None:
+        # 统一把旧枚举和旧字段映射到当前 Smart Capture 生命周期模型。
+        quoted_table = Database._quote_sql_identifier(table_name)
+        existing_columns = {
+            row["name"]
+            for row in connection.execute(
+                f"PRAGMA table_info({quoted_table})"
+            ).fetchall()
+        }
+        legacy_columns = {
+            "orchestration_run_id": "TEXT",
+            "capture_task_id": "TEXT",
+            "config_json": "TEXT NOT NULL DEFAULT '{}'",
+            "workflow_run_id": "TEXT",
+            "current_batch_id": "TEXT",
+            "search_config_json": "TEXT NOT NULL DEFAULT '{}'",
+            "target_count": "INTEGER",
+            "stage": "TEXT NOT NULL DEFAULT 'created'",
+            "waiting_reason": "TEXT NOT NULL DEFAULT ''",
+            "control_cause": "TEXT NOT NULL DEFAULT ''",
+            "state_version": "INTEGER NOT NULL DEFAULT 1",
+            "progress_json": "TEXT NOT NULL DEFAULT '{}'",
+            "result_summary_json": "TEXT NOT NULL DEFAULT '{}'",
+            "message": "TEXT NOT NULL DEFAULT ''",
+            "error_message": "TEXT",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+            "updated_at": "TEXT NOT NULL DEFAULT ''",
+            "completed_at": "TEXT",
+        }
+        for column, definition in legacy_columns.items():
+            if column not in existing_columns:
+                connection.execute(
+                    f"ALTER TABLE {quoted_table} ADD COLUMN {Database._quote_sql_identifier(column)} {definition}"
+                )
+        connection.execute(
+            f"""
+            INSERT OR IGNORE INTO fj_smart_captures (
               id, source, workflow_run_id, status, current_batch_id,
-              search_config_json, target_count, stage, message, error_message,
+              search_config_json, target_count, stage, waiting_reason, control_cause,
+              state_version, progress_json, result_summary_json, message, error_message,
               created_at, updated_at, completed_at
             )
             SELECT
@@ -2630,26 +2715,149 @@ class Database:
                 WHEN 'pending' THEN 'pending'
                 WHEN 'running' THEN 'running'
                 WHEN 'paused' THEN 'paused'
+                WHEN 'waiting_next_batch'
+                  AND COALESCE(waiting_reason, '') IN (
+                    'browser', 'browser_not_running', 'context_budget',
+                    'manual_decision', 'codex', 'child_control', 'capture_interrupted'
+                  ) THEN 'waiting_for_user'
+                WHEN 'waiting_next_batch' THEN 'waiting_next_batch'
                 WHEN 'completed' THEN 'completed'
                 WHEN 'failed' THEN 'failed'
                 ELSE 'interrupted'
               END,
               COALESCE(current_batch_id, capture_task_id),
               CASE
-                WHEN COALESCE(search_config_json, '{}') <> '{}' THEN search_config_json
-                ELSE COALESCE(config_json, '{}')
+                WHEN COALESCE(search_config_json, '{{}}') <> '{{}}' THEN search_config_json
+                ELSE COALESCE(config_json, '{{}}')
               END,
               target_count,
               COALESCE(stage, 'created'),
+              COALESCE(waiting_reason, ''),
+              COALESCE(control_cause, ''),
+              CASE WHEN COALESCE(state_version, 0) > 0 THEN state_version ELSE 1 END,
+              COALESCE(progress_json, '{{}}'),
+              COALESCE(result_summary_json, '{{}}'),
               COALESCE(message, ''),
               error_message,
               created_at,
               updated_at,
               completed_at
-            FROM fj_smart_captures_legacy_status
+            FROM {quoted_table}
             """
         )
-        connection.execute("DROP TABLE fj_smart_captures_legacy_status")
+
+    @staticmethod
+    def _legacy_current_rows(
+        connection: sqlite3.Connection,
+        table_names: list[str],
+    ) -> list[tuple[int, str, str]]:
+        rows: list[tuple[int, str, str]] = []
+        for table_name in table_names:
+            quoted_table = Database._quote_sql_identifier(table_name)
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    f"PRAGMA table_info({quoted_table})"
+                ).fetchall()
+            }
+            if "is_current" not in columns:
+                continue
+            for row in connection.execute(
+                f"SELECT id, updated_at FROM {quoted_table} WHERE is_current = 1"
+            ).fetchall():
+                rows.append((1, str(row["id"]), str(row["updated_at"])))
+        return rows
+
+    def _merge_legacy_smart_capture_tables(
+        self,
+        connection: sqlite3.Connection,
+        legacy_tables: list[str],
+    ) -> None:
+        legacy_current_rows = self._legacy_current_rows(connection, legacy_tables)
+        for table_name in legacy_tables:
+            self._copy_legacy_smart_capture_rows(connection, table_name)
+            connection.execute(
+                f"DROP TABLE {self._quote_sql_identifier(table_name)}"
+            )
+        current_pointer = connection.execute(
+            "SELECT 1 FROM fj_smart_capture_current WHERE slot = 1"
+        ).fetchone()
+        if current_pointer is None:
+            for slot, smart_capture_id, updated_at in legacy_current_rows:
+                exists = connection.execute(
+                    "SELECT 1 FROM fj_smart_captures WHERE id = ?",
+                    (smart_capture_id,),
+                ).fetchone()
+                if exists is not None:
+                    connection.execute(
+                        """
+                        INSERT INTO fj_smart_capture_current
+                          (slot, smart_capture_id, updated_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (slot, smart_capture_id, updated_at),
+                    )
+                    break
+
+    def _rebuild_legacy_smart_capture_table(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        legacy_tables: list[str] | None = None,
+    ) -> None:
+        """转换上一轮遗留的岗位采集父任务枚举与字段名称。"""
+        legacy_tables = legacy_tables or self._list_smart_capture_legacy_tables(connection)
+        legacy_current_rows = self._legacy_current_rows(connection, legacy_tables)
+        current_rows = connection.execute(
+            "SELECT slot, smart_capture_id, updated_at FROM fj_smart_capture_current"
+        ).fetchall()
+        connection.execute("DROP TABLE fj_smart_capture_current")
+        migrating_table = "fj_smart_captures_legacy_status_migrating"
+        suffix = 1
+        existing_names = set(legacy_tables)
+        while migrating_table in existing_names:
+            migrating_table = f"fj_smart_captures_legacy_status_migrating_{suffix}"
+            suffix += 1
+        connection.execute(
+            f"ALTER TABLE fj_smart_captures RENAME TO {self._quote_sql_identifier(migrating_table)}"
+        )
+        connection.execute(
+            """
+            CREATE TABLE fj_smart_captures (
+              id TEXT PRIMARY KEY,
+              source TEXT NOT NULL,
+              workflow_run_id TEXT,
+              status TEXT NOT NULL DEFAULT 'pending',
+              current_batch_id TEXT,
+              search_config_json TEXT NOT NULL DEFAULT '{}',
+              target_count INTEGER,
+              stage TEXT NOT NULL DEFAULT 'created',
+              waiting_reason TEXT NOT NULL DEFAULT '',
+              control_cause TEXT NOT NULL DEFAULT '',
+              state_version INTEGER NOT NULL DEFAULT 1,
+              progress_json TEXT NOT NULL DEFAULT '{}',
+              result_summary_json TEXT NOT NULL DEFAULT '{}',
+              message TEXT NOT NULL DEFAULT '',
+              error_message TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              completed_at TEXT,
+              FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE SET NULL,
+              CHECK (source IN ('task_cockpit', 'boss_capture')),
+              CHECK (status IN ('pending', 'running', 'pausing', 'paused', 'waiting_next_batch', 'waiting_for_user', 'completed', 'stopped', 'failed', 'interrupted')),
+              CHECK (state_version > 0)
+            )
+            """
+        )
+        self._copy_legacy_smart_capture_rows(connection, migrating_table)
+        for table_name in legacy_tables:
+            self._copy_legacy_smart_capture_rows(connection, table_name)
+            connection.execute(
+                f"DROP TABLE {self._quote_sql_identifier(table_name)}"
+            )
+        connection.execute(
+            f"DROP TABLE {self._quote_sql_identifier(migrating_table)}"
+        )
         connection.execute(
             """
             CREATE TABLE fj_smart_capture_current (
@@ -2660,6 +2868,7 @@ class Database:
             )
             """
         )
+        pointer_inserted = False
         for row in current_rows:
             exists = connection.execute(
                 "SELECT 1 FROM fj_smart_captures WHERE id = ?",
@@ -2670,6 +2879,21 @@ class Database:
                     "INSERT OR REPLACE INTO fj_smart_capture_current (slot, smart_capture_id, updated_at) VALUES (?, ?, ?)",
                     (row["slot"], row["smart_capture_id"], row["updated_at"]),
                 )
+                pointer_inserted = True
+        if not pointer_inserted:
+            for slot, smart_capture_id, updated_at in legacy_current_rows:
+                exists = connection.execute(
+                    "SELECT 1 FROM fj_smart_captures WHERE id = ?",
+                    (smart_capture_id,),
+                ).fetchone()
+                if exists is not None:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO fj_smart_capture_current (slot, smart_capture_id, updated_at) VALUES (?, ?, ?)",
+                        (slot, smart_capture_id, updated_at),
+                    )
+                    break
+        # 临时改名会让 SQLite 改写批次外键，先恢复外键目标再回填批次关联。
+        self._repair_smart_capture_batch_foreign_key(connection)
         connection.execute(
             """
             UPDATE fj_boss_capture_batches
@@ -2722,6 +2946,7 @@ class Database:
                 CREATE TABLE fj_boss_capture_batches (
                   id TEXT PRIMARY KEY,
                   smart_capture_id TEXT,
+                  capture_source TEXT NOT NULL DEFAULT 'custom',
                   keyword TEXT NOT NULL,
                   city TEXT NOT NULL,
                   pages INTEGER NOT NULL DEFAULT 1,
@@ -2741,6 +2966,7 @@ class Database:
                   updated_at TEXT NOT NULL,
                   finished_at TEXT,
                   FOREIGN KEY (smart_capture_id) REFERENCES fj_smart_captures(id) ON DELETE SET NULL,
+                  CHECK (capture_source IN ('smart', 'custom')),
                   CHECK (auto_details IN (0, 1)),
                   CHECK (status IN ('queued', 'running', 'completed', 'failed')),
                   CHECK (control_status IN ('active', 'pausing', 'paused', 'stopped', 'interrupted'))
@@ -2750,7 +2976,7 @@ class Database:
             connection.execute(
                 """
                 INSERT INTO fj_boss_capture_batches (
-                  id, smart_capture_id, keyword, city, pages, auto_details, status,
+                  id, smart_capture_id, capture_source, keyword, city, pages, auto_details, status,
                   source_url, jobs_collected, details_completed, details_failed,
                   stage, message, error_message, progress_current, progress_total,
                   control_status, created_at, updated_at, finished_at
@@ -2763,6 +2989,10 @@ class Database:
                       WHERE capture.id = batch.smart_capture_id
                     ) THEN batch.smart_capture_id
                     ELSE NULL
+                  END,
+                  CASE
+                    WHEN batch.smart_capture_id IS NOT NULL THEN 'smart'
+                    ELSE batch.capture_source
                   END,
                   batch.keyword,
                   batch.city,

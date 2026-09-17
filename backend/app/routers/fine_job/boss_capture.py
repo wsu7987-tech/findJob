@@ -65,7 +65,10 @@ from backend.app.services.fine_job.filter_exclusions import (
     apply_filter_exclusions,
     assert_job_action_allowed,
 )
-from backend.app.services.fine_job.workflow_runs import assert_collection_start_allowed
+from backend.app.services.fine_job.collection_capacity import (
+    start_custom_collection,
+    start_custom_collection_phase,
+)
 
 
 router = APIRouter(prefix="/fine-job/boss-capture", tags=["fine-job-boss-capture"])
@@ -190,29 +193,31 @@ def start_boss_capture(
     config: AppConfig = Depends(get_config),
     db: Database = Depends(get_database),
 ) -> BossCaptureTaskResponse:
-    assert_collection_start_allowed(db, requested_kind="custom")
-    if not boss_scraper_service.get_browser_status().running:
-        raise AppError(
-            status_code=409,
-            error_category="BROWSER_NOT_RUNNING",
-            error_message="FineJob 专用 Chrome 未启动，请先打开并完成 BOSS 登录。",
-        )
-    task = boss_capture_task_manager.start_capture(
-        BossCaptureRequest(
-            keyword=payload.keyword,
-            city=payload.city,
-            pages=payload.pages,
-            filters=payload.filters,
-            include_details=payload.include_details,
-            max_details=None,
+    def start_task() -> dict[str, object]:
+        if not boss_scraper_service.get_browser_status().running:
+            raise AppError(
+                status_code=409,
+                error_category="BROWSER_NOT_RUNNING",
+                error_message="FineJob 专用 Chrome 未启动，请先打开并完成 BOSS 登录。",
+            )
+        return boss_capture_task_manager.start_capture(
+            BossCaptureRequest(
+                keyword=payload.keyword,
+                city=payload.city,
+                pages=payload.pages,
+                filters=payload.filters,
+                include_details=payload.include_details,
+                max_details=None,
+                output_dir=config.output_root / "fine-job" / "boss-capture",
+                prefer_current_page=payload.prefer_current_page,
+                filter_strategy_id=payload.filter_strategy_id,
+                capture_source="custom",
+            ),
             output_dir=config.output_root / "fine-job" / "boss-capture",
-            prefer_current_page=payload.prefer_current_page,
-            filter_strategy_id=payload.filter_strategy_id,
-            capture_source="custom",
-        ),
-        output_dir=config.output_root / "fine-job" / "boss-capture",
-        db=db,
-    )
+            db=db,
+        )
+
+    task = start_custom_collection(db, start_task)
     return BossCaptureTaskResponse(**task)
 
 
@@ -302,13 +307,14 @@ def capture_history_job_details(
             error_category="BROWSER_NOT_RUNNING",
             error_message="FineJob 专用 Chrome 未启动，请先打开并完成 BOSS 登录。",
         )
-    start_kwargs = {
-        "output_dir": config.output_root / "fine-job" / "boss-capture",
-        "db": db,
-    }
-    return BossCaptureTaskResponse(
-        **boss_capture_task_manager.start_history_detail(job, **start_kwargs)
-    )
+    def start_task() -> dict[str, object]:
+        return boss_capture_task_manager.start_history_detail(
+            job,
+            output_dir=config.output_root / "fine-job" / "boss-capture",
+            db=db,
+        )
+
+    return BossCaptureTaskResponse(**start_custom_collection(db, start_task))
 
 
 @router.get("/tasks/{task_id}", response_model=BossCaptureTaskResponse)
@@ -324,15 +330,19 @@ def get_boss_capture_task(task_id: str) -> BossCaptureTaskResponse:
 def continue_boss_capture(
     task_id: str,
     payload: BossContinueCaptureRequest,
+    db: Database = Depends(get_database),
 ) -> BossCaptureTaskResponse:
-    if not boss_scraper_service.get_browser_status().running:
-        raise AppError(
-            status_code=409,
-            error_category="BROWSER_NOT_RUNNING",
-            error_message="FineJob 专用 Chrome 未启动，原搜索页面无法继续下滑。",
-        )
+    def continue_task() -> dict[str, object]:
+        if not boss_scraper_service.get_browser_status().running:
+            raise AppError(
+                status_code=409,
+                error_category="BROWSER_NOT_RUNNING",
+                error_message="FineJob 专用 Chrome 未启动，原搜索页面无法继续下滑。",
+            )
+        return boss_capture_task_manager.continue_capture(task_id, pages=payload.pages)
+
     return BossCaptureTaskResponse(
-        **boss_capture_task_manager.continue_capture(task_id, pages=payload.pages)
+        **start_custom_collection_phase(db, task_id, continue_task)
     )
 
 
@@ -352,12 +362,19 @@ def stop_boss_capture(task_id: str) -> BossCaptureTaskResponse:
 def capture_selected_boss_details(
     task_id: str,
     payload: BossDetailCaptureRequest,
+    db: Database = Depends(get_database),
 ) -> BossCaptureTaskResponse:
     start_kwargs = {"force": payload.force}
     if payload.manual_override:
         start_kwargs["manual_override"] = True
     return BossCaptureTaskResponse(
-        **boss_capture_task_manager.start_details(task_id, payload.job_ids, **start_kwargs)
+        **start_custom_collection_phase(
+            db,
+            task_id,
+            lambda: boss_capture_task_manager.start_details(
+                task_id, payload.job_ids, **start_kwargs
+            ),
+        )
     )
 
 

@@ -7,6 +7,12 @@ from backend.app.config import AppConfig
 from backend.app.db import Database
 from backend.app.errors import AppError
 from backend.app.services.fine_job.boss_capture_tasks import boss_capture_task_manager
+from backend.app.services.fine_job.collection_capacity import (
+    SMART_CAPTURE_ACTIVE_STATUSES,
+    assert_collection_start_allowed,
+    assert_collection_start_allowed_in_connection,
+    recover_collection_capacity,
+)
 from backend.app.services.fine_job.boss_scraper.service import (
     BossCaptureRequest,
     boss_scraper_service,
@@ -14,21 +20,50 @@ from backend.app.services.fine_job.boss_scraper.service import (
 from backend.app.utils import new_id, utc_now
 
 
-ACTIVE_STATUSES = {"running", "pausing", "paused", "waiting_next_batch", "interrupted"}
+ACTIVE_STATUSES = set(SMART_CAPTURE_ACTIVE_STATUSES)
 TERMINAL_STATUSES = {"completed", "stopped", "failed"}
+LEGACY_MANUAL_WAITING_REASONS = {
+    "browser",
+    "browser_not_running",
+    "context_budget",
+    "manual_decision",
+    "codex",
+    "child_control",
+    "capture_interrupted",
+}
+
+
+def _on_capture_task_updated(capture: dict[str, object]) -> None:
+    """把 Smart Capture 批次进度持久化到独立 snapshot。"""
+    db = capture.get("_db")
+    smart_capture_id = str(capture.get("smart_capture_id") or "")
+    if not isinstance(db, Database) or not smart_capture_id:
+        return
+    try:
+        sync_capture_snapshot(db, capture)
+    except Exception:
+        # 后台进度同步失败时保留采集线程，下一次轮询仍可读取批次状态。
+        return
+
+
+boss_capture_task_manager.add_listener(_on_capture_task_updated)
 
 
 def recover_interrupted_smart_captures(db: Database) -> None:
     """应用启动时把失去进程执行器的任务收敛到可继续状态。"""
+    recover_collection_capacity(db)
     now = utc_now()
     with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             """
             UPDATE fj_smart_captures
             SET status = 'interrupted', stage = 'interrupted',
                 message = '应用重启后采集执行已中断，请点击继续恢复当前任务。',
+                waiting_reason = 'capture_interrupted', control_cause = 'recovery',
+                state_version = state_version + 1,
                 updated_at = ?
-            WHERE status IN ('running', 'pausing', 'waiting_next_batch')
+            WHERE status IN ('running', 'pausing')
             """,
             (now,),
         )
@@ -78,28 +113,10 @@ def recover_interrupted_smart_captures(db: Database) -> None:
             WHERE current_task.slot = 1
             """
         ).fetchone()
-        placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
-        active = connection.execute(
-            f"SELECT id, status FROM fj_smart_captures WHERE status IN ({placeholders}) "
-            "ORDER BY updated_at DESC, created_at DESC LIMIT 1",
-            tuple(ACTIVE_STATUSES),
-        ).fetchone()
-        selected = current if current is not None and str(current["status"]) in ACTIVE_STATUSES else active
-        if selected is None:
-            selected = current or connection.execute(
-                "SELECT id, status FROM fj_smart_captures ORDER BY updated_at DESC, created_at DESC LIMIT 1"
-            ).fetchone()
-        if selected is not None:
-            # 当前活动任务优先；没有活动任务时保留最近一次最终快照供页面恢复。
+        # current 指针是持久化身份，重启只收敛状态，不按更新时间改指向历史任务。
+        if current is not None:
             connection.execute(
-                """
-                INSERT INTO fj_smart_capture_current (slot, smart_capture_id, updated_at)
-                VALUES (1, ?, ?)
-                ON CONFLICT(slot) DO UPDATE SET
-                  smart_capture_id = excluded.smart_capture_id,
-                  updated_at = excluded.updated_at
-                """,
-                (str(selected["id"]), now),
+                "UPDATE fj_smart_capture_current SET updated_at = updated_at WHERE slot = 1"
             )
 
 
@@ -111,49 +128,86 @@ def create_smart_capture(
     search_config: dict[str, Any],
     target_count: int | None = None,
 ) -> dict[str, object]:
-    """创建独立岗位采集身份，并由服务端切换当前任务。"""
+    """创建岗位采集身份，并在同一写事务内占用 current slot。"""
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        capture_id = create_smart_capture_in_connection(
+            connection,
+            db,
+            source=source,
+            workflow_run_id=workflow_run_id,
+            search_config=search_config,
+            target_count=target_count,
+        )
+    return get_smart_capture(db, capture_id)
+
+
+def create_smart_capture_in_connection(
+    connection: Any,
+    db: Database,
+    *,
+    source: str,
+    workflow_run_id: str | None,
+    search_config: dict[str, Any],
+    target_count: int | None = None,
+) -> str:
+    """在调用方的写事务中创建 Smart Capture，保证关联对象与 current 同时提交。"""
     if source not in {"task_cockpit", "boss_capture"}:
         raise AppError(422, "VALIDATION_FAILED", "岗位采集任务来源无效。")
     capture_id = new_id()
     now = utc_now()
-    with db.connect() as connection:
-        connection.execute(
-            """
-            INSERT INTO fj_smart_captures (
-              id, source, workflow_run_id, status, search_config_json,
-              target_count, stage, message, created_at, updated_at
-            ) VALUES (?, ?, ?, 'pending', ?, ?, 'created', ?, ?, ?)
-            """,
-            (
-                capture_id,
-                source,
-                workflow_run_id,
-                json.dumps(search_config, ensure_ascii=False),
-                target_count,
-                "岗位采集任务已创建，等待启动首个批次。",
-                now,
-                now,
-            ),
+    assert_collection_start_allowed_in_connection(
+        connection, db, requested_kind="smart"
+    )
+    placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
+    active_row = connection.execute(
+        f"""
+        SELECT capture.id
+        FROM fj_smart_capture_current current_task
+        JOIN fj_smart_captures capture
+          ON capture.id = current_task.smart_capture_id
+        WHERE current_task.slot = 1
+          AND capture.status IN ({placeholders})
+        LIMIT 1
+        """,
+        tuple(sorted(ACTIVE_STATUSES)),
+    ).fetchone()
+    if active_row is not None:
+        raise AppError(
+            409,
+            "COLLECTION_TASK_ACTIVE",
+            "当前岗位采集任务尚未结束，请先暂停后继续或停止当前任务。",
         )
-        placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
-        active_row = connection.execute(
-            f"SELECT id FROM fj_smart_captures WHERE status IN ({placeholders}) "
-            "ORDER BY updated_at DESC, created_at DESC LIMIT 1",
-            tuple(ACTIVE_STATUSES),
-        ).fetchone()
-        if source == "boss_capture" or active_row is None:
-            # 活动采集保持当前任务身份；驾驶舱关联任务在真正启动批次时接管当前指针。
-            connection.execute(
-                """
-                INSERT INTO fj_smart_capture_current (slot, smart_capture_id, updated_at)
-                VALUES (1, ?, ?)
-                ON CONFLICT(slot) DO UPDATE SET
-                  smart_capture_id = excluded.smart_capture_id,
-                  updated_at = excluded.updated_at
-                """,
-                (capture_id, now),
-            )
-    return get_smart_capture(db, capture_id)
+    connection.execute(
+        """
+        INSERT INTO fj_smart_captures (
+          id, source, workflow_run_id, status, search_config_json,
+          target_count, stage, waiting_reason, control_cause, state_version,
+          progress_json, result_summary_json, message, created_at, updated_at
+        ) VALUES (?, ?, ?, 'pending', ?, ?, 'created', '', '', 1, '{}', '{}', ?, ?, ?)
+        """,
+        (
+            capture_id,
+            source,
+            workflow_run_id,
+            json.dumps(search_config, ensure_ascii=False),
+            target_count,
+            "岗位采集任务已创建，等待启动首个批次。",
+            now,
+            now,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO fj_smart_capture_current (slot, smart_capture_id, updated_at)
+        VALUES (1, ?, ?)
+        ON CONFLICT(slot) DO UPDATE SET
+          smart_capture_id = excluded.smart_capture_id,
+          updated_at = excluded.updated_at
+        """,
+        (capture_id, now),
+    )
+    return capture_id
 
 
 def get_by_workflow_run(db: Database, workflow_run_id: str) -> dict[str, object] | None:
@@ -184,14 +238,7 @@ def get_active_smart_capture(db: Database) -> dict[str, object] | None:
     current = get_current_smart_capture(db)
     if current is not None and str(current["status"]) in ACTIVE_STATUSES:
         return current
-    with db.connect() as connection:
-        placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
-        row = connection.execute(
-            f"SELECT id FROM fj_smart_captures WHERE status IN ({placeholders}) "
-            "ORDER BY updated_at DESC, created_at DESC LIMIT 1",
-            tuple(ACTIVE_STATUSES),
-        ).fetchone()
-    return get_smart_capture(db, str(row["id"])) if row is not None else None
+    return None
 
 
 def start_independent_capture(
@@ -200,6 +247,7 @@ def start_independent_capture(
     payload: dict[str, Any],
 ) -> dict[str, object]:
     """从岗位采集页创建不关联 Workflow Run 的任务并启动首批采集。"""
+    assert_collection_start_allowed(db, requested_kind="smart")
     if get_active_smart_capture(db) is not None:
         raise AppError(409, "COLLECTION_TASK_ACTIVE", "当前岗位采集任务尚未结束，请先暂停后继续或停止当前任务。")
     if not boss_scraper_service.get_browser_status().running:
@@ -212,6 +260,39 @@ def start_independent_capture(
         target_count=int(payload.get("candidate_target_count") or 0) or None,
     )
     return _start_new_batch(db, config, str(capture["smart_capture_id"]), payload)
+
+
+def start_smart_capture(
+    db: Database,
+    config: AppConfig,
+    smart_capture_id: str,
+) -> dict[str, object]:
+    """启动已创建的 pending Smart Capture，供恢复和 linked adapter 使用。"""
+    capture = get_smart_capture(db, smart_capture_id)
+    if str(capture["status"]) != "pending":
+        raise AppError(409, "SMART_CAPTURE_NOT_STARTABLE", "当前岗位采集任务不在待启动状态。")
+    payload = dict(capture.get("search_config") or {})
+    return _start_new_batch(db, config, smart_capture_id, payload)
+
+
+def retry_smart_capture(
+    db: Database,
+    config: AppConfig,
+    smart_capture_id: str,
+) -> dict[str, object]:
+    """只恢复 pending/interrupted，failed 终态保持不可重试。"""
+    capture = get_smart_capture(db, smart_capture_id)
+    status = str(capture["status"])
+    if status == "failed":
+        raise AppError(409, "SMART_CAPTURE_NOT_RETRYABLE", "失败的岗位采集任务已经结束，不能重试。")
+    if status not in {"pending", "interrupted"}:
+        raise AppError(409, "SMART_CAPTURE_NOT_RETRYABLE", "当前岗位采集任务不在可重试状态。")
+    return _start_new_batch(
+        db,
+        config,
+        smart_capture_id,
+        dict(capture.get("search_config") or {}),
+    )
 
 
 def start_linked_capture_batch(
@@ -230,15 +311,22 @@ def start_linked_capture_batch(
 def bind_batch(db: Database, smart_capture_id: str, batch_id: str) -> None:
     now = utc_now()
     with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
         connection.execute(
-            "UPDATE fj_boss_capture_batches SET smart_capture_id = ? WHERE id = ?",
+            """
+            UPDATE fj_boss_capture_batches
+            SET smart_capture_id = ?, capture_source = 'smart'
+            WHERE id = ?
+            """,
             (smart_capture_id, batch_id),
         )
         connection.execute(
             """
             UPDATE fj_smart_captures
             SET current_batch_id = ?, status = 'running', stage = 'capturing',
-                message = '正在采集岗位。', updated_at = ?, error_message = NULL
+                waiting_reason = '', control_cause = '',
+                message = '正在采集岗位。', error_message = NULL,
+                state_version = state_version + 1, updated_at = ?
             WHERE id = ?
             """,
             (batch_id, now, smart_capture_id),
@@ -285,6 +373,8 @@ def pause_smart_capture(
         smart_capture_id,
         status="pausing" if requested_batch_pause else "paused",
         stage="pause_requested" if requested_batch_pause else "paused",
+        waiting_reason="manual_decision",
+        control_cause="user_pause",
         message=(
             "正在安全暂停当前采集批次。"
             if requested_batch_pause
@@ -309,7 +399,16 @@ def resume_smart_capture(
     sync_workflow: bool = True,
 ) -> dict[str, object]:
     capture = get_smart_capture(db, smart_capture_id)
-    if str(capture["status"]) not in {"paused", "pausing", "waiting_next_batch", "interrupted"}:
+    resumable_waiting = str(capture.get("waiting_reason") or "") in {
+        "capture_interrupted",
+        "browser_not_running",
+    }
+    if str(capture["status"]) not in {
+        "paused",
+        "pausing",
+        "waiting_next_batch",
+        "interrupted",
+    } and not (str(capture["status"]) == "waiting_for_user" and resumable_waiting):
         raise AppError(409, "SMART_CAPTURE_NOT_RESUMABLE", "当前岗位采集任务不在可继续状态。")
     if not boss_scraper_service.get_browser_status().running:
         raise AppError(409, "BROWSER_NOT_RUNNING", "FineJob 专用 Chrome 未启动，暂不能继续岗位采集。")
@@ -338,6 +437,8 @@ def resume_smart_capture(
             smart_capture_id,
             status="running",
             stage="capturing",
+            waiting_reason="",
+            control_cause="",
             message="岗位采集任务已继续。",
         )
     elif not workflow_run_id:
@@ -349,6 +450,8 @@ def resume_smart_capture(
             smart_capture_id,
             status="interrupted",
             stage="interrupted",
+            waiting_reason="capture_interrupted",
+            control_cause="recovery",
             message="原采集执行进程已中断，正在重新启动当前搜索组合。",
         )
     else:
@@ -357,6 +460,8 @@ def resume_smart_capture(
             smart_capture_id,
             status="running",
             stage="resume_requested",
+            waiting_reason="",
+            control_cause="recovery",
             message="正在由驾驶舱重新启动中断的采集组合。",
         )
     if sync_workflow and workflow_run_id:
@@ -403,6 +508,12 @@ def stop_smart_capture(
     sync_workflow: bool = True,
 ) -> dict[str, object]:
     capture = get_smart_capture(db, smart_capture_id)
+    if str(capture["status"]) == "failed":
+        raise AppError(409, "SMART_CAPTURE_NOT_STOPPABLE", "失败的岗位采集任务已经结束。")
+    if str(capture["status"]) == "completed":
+        raise AppError(409, "SMART_CAPTURE_NOT_STOPPABLE", "已完成的岗位采集任务不能再次停止。")
+    if str(capture["status"]) == "stopped":
+        return capture
     batch_id = str(capture.get("current_batch_id") or "")
     if batch_id:
         try:
@@ -416,6 +527,8 @@ def stop_smart_capture(
         smart_capture_id,
         status="stopped",
         stage="stopped",
+        waiting_reason="",
+        control_cause="child_user_stop",
         message="岗位采集任务已停止，已获得的岗位继续保留。",
         completed=True,
     )
@@ -445,31 +558,54 @@ def sync_capture_snapshot(db: Database, task: dict[str, object]) -> None:
     stage = str(task.get("stage") or "")
     if status in {"queued", "running"}:
         parent_status = "pausing" if bool(task.get("pause_requested")) else "running"
+        waiting_reason = "manual_decision" if bool(task.get("pause_requested")) else ""
+        control_cause = "user_pause" if bool(task.get("pause_requested")) else ""
     elif status == "failed":
         parent_status = "failed"
+        waiting_reason = ""
+        control_cause = ""
     elif stage.endswith("paused"):
         parent_status = "paused"
+        waiting_reason = "manual_decision"
+        control_cause = "user_pause"
     elif stage.endswith("stopped"):
         parent_status = "stopped"
+        waiting_reason = ""
+        control_cause = "child_user_stop"
     else:
+        is_linked_workflow_capture = str(parent["source"]) == "task_cockpit"
         reached_independent_target = (
-            str(parent["source"]) == "boss_capture"
+            not is_linked_workflow_capture
             and int(parent["target_count"] or 0) > 0
             and int(task.get("jobs_collected") or len(task.get("jobs") or []))
             >= int(parent["target_count"])
         )
+        # 驾驶舱的单个子批次结束后，Workflow 仍可能暂停或进入下一组合。
+        # 只有 Workflow 自身完成时才允许关联 Smart Capture 释放 current 槽位。
         parent_status = (
-            "completed"
+            "waiting_next_batch"
+            if is_linked_workflow_capture
+            else "completed"
             if reached_independent_target or not bool(task.get("has_more"))
             else "waiting_next_batch"
         )
+        waiting_reason = "" if parent_status == "completed" else "next_batch"
+        control_cause = ""
     _update_capture(
         db,
         smart_capture_id,
         status=parent_status,
         stage=stage or status,
+        waiting_reason=waiting_reason,
+        control_cause=control_cause,
         message=str(task.get("message") or ""),
         error_message=str(task.get("error_message") or "") or None,
+        progress=_progress_from_task(task),
+        result_summary=(
+            _result_summary_from_task(task)
+            if parent_status in TERMINAL_STATUSES
+            else None
+        ),
         completed=parent_status in TERMINAL_STATUSES,
     )
 
@@ -483,7 +619,10 @@ def mark_workflow_capture_completed(db: Database, workflow_run_id: str) -> None:
         str(capture["smart_capture_id"]),
         status="completed",
         stage="completed",
+        waiting_reason="",
+        control_cause="",
         message="关联岗位采集已完成，驾驶舱正在消费岗位结果。",
+        result_summary={"workflow_run_id": workflow_run_id},
         completed=True,
     )
 
@@ -540,15 +679,36 @@ def get_smart_capture(db: Database, smart_capture_id: str) -> dict[str, object]:
             workflow_run = workflow_runs.get_workflow_run(db, workflow_run_id)
         except AppError:
             workflow_run = None
+    progress = _load_json(str(data.get("progress_json") or "{}"))
+    if current_task is not None:
+        progress = _progress_from_task(current_task)
+    result_summary = _load_json(str(data.get("result_summary_json") or "{}"))
+    status = str(data["status"])
+    waiting_reason = str(data.get("waiting_reason") or "")
+    control_cause = str(data.get("control_cause") or "")
+    if status == "waiting_next_batch" and waiting_reason in LEGACY_MANUAL_WAITING_REASONS:
+        # 旧数据读取时统一到人工阻塞的 canonical lifecycle。
+        status = "waiting_for_user"
     return {
         "smart_capture_id": str(data["id"]),
         "source": str(data["source"]),
         "workflow_run_id": workflow_run_id or None,
-        "status": str(data["status"]),
+        "status": status,
         "current_batch_id": current_batch_id or None,
         "search_config": _load_json(str(data.get("search_config_json") or "{}")),
         "target_count": data.get("target_count"),
         "stage": str(data.get("stage") or ""),
+        "waiting_reason": waiting_reason,
+        "control_cause": control_cause,
+        "state_version": int(data.get("state_version") or 1),
+        "capabilities": _capabilities(
+            status=status,
+            stage=str(data.get("stage") or ""),
+            waiting_reason=waiting_reason,
+            control_cause=control_cause,
+        ),
+        "progress": progress,
+        "result_summary": result_summary,
         "message": str(data.get("message") or ""),
         "error_message": data.get("error_message"),
         "created_at": str(data["created_at"]),
@@ -567,6 +727,8 @@ def _start_new_batch(
     smart_capture_id: str,
     payload: dict[str, Any],
 ) -> dict[str, object]:
+    # pending/recovery 启动仍需经过统一执行容量检查，防止 custom 在两次请求间插入。
+    assert_collection_start_allowed(db, requested_kind="smart")
     if not boss_scraper_service.get_browser_status().running:
         raise AppError(409, "BROWSER_NOT_RUNNING", "FineJob 专用 Chrome 未启动，请先打开并完成 BOSS 登录。")
     keywords = [str(value) for value in payload.get("allowed_search_keywords") or [] if str(value)]
@@ -606,18 +768,156 @@ def _update_capture(
     message: str,
     error_message: str | None = None,
     completed: bool = False,
+    waiting_reason: str | None = None,
+    control_cause: str | None = None,
+    current_batch_id: str | None = None,
+    progress: dict[str, object] | None = None,
+    result_summary: dict[str, object] | None = None,
 ) -> None:
     now = utc_now()
     with db.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT status, stage, waiting_reason, control_cause, current_batch_id,
+                   progress_json, result_summary_json, message, error_message,
+                   completed_at, state_version
+            FROM fj_smart_captures WHERE id = ?
+            """,
+            (smart_capture_id,),
+        ).fetchone()
+        if row is None:
+            raise AppError(404, "SMART_CAPTURE_NOT_FOUND", "岗位采集任务不存在。")
+        next_waiting_reason = (
+            str(row["waiting_reason"] or "")
+            if waiting_reason is None
+            else waiting_reason
+        )
+        next_control_cause = (
+            str(row["control_cause"] or "")
+            if control_cause is None
+            else control_cause
+        )
+        status = _canonical_status(status, next_waiting_reason)
+        next_batch_id = (
+            row["current_batch_id"] if current_batch_id is None else current_batch_id
+        )
+        next_progress_json = (
+            str(row["progress_json"] or "{}")
+            if progress is None
+            else json.dumps(progress, ensure_ascii=False, sort_keys=True)
+        )
+        next_result_summary_json = (
+            str(row["result_summary_json"] or "{}")
+            if result_summary is None
+            else json.dumps(result_summary, ensure_ascii=False, sort_keys=True)
+        )
+        next_completed_at = (
+            row["completed_at"] or now
+            if completed
+            else None
+        )
+        current_observable = (
+            str(row["status"]),
+            str(row["stage"]),
+            str(row["waiting_reason"] or ""),
+            str(row["control_cause"] or ""),
+            row["current_batch_id"],
+            str(row["progress_json"] or "{}"),
+            str(row["result_summary_json"] or "{}"),
+            str(row["message"] or ""),
+            row["error_message"],
+            row["completed_at"],
+        )
+        next_observable = (
+            status,
+            stage,
+            next_waiting_reason,
+            next_control_cause,
+            next_batch_id,
+            next_progress_json,
+            next_result_summary_json,
+            message,
+            error_message,
+            next_completed_at,
+        )
+        if current_observable == next_observable:
+            return
+        state_version = max(1, int(row["state_version"] or 1)) + 1
         connection.execute(
             """
             UPDATE fj_smart_captures
-            SET status = ?, stage = ?, message = ?, error_message = ?,
+            SET status = ?, stage = ?, waiting_reason = ?, control_cause = ?,
+                current_batch_id = ?, progress_json = ?, result_summary_json = ?,
+                message = ?, error_message = ?, state_version = ?,
                 updated_at = ?, completed_at = CASE WHEN ? THEN COALESCE(completed_at, ?) ELSE NULL END
             WHERE id = ?
             """,
-            (status, stage, message, error_message, now, int(completed), now, smart_capture_id),
+            (
+                status,
+                stage,
+                next_waiting_reason,
+                next_control_cause,
+                next_batch_id,
+                next_progress_json,
+                next_result_summary_json,
+                message,
+                error_message,
+                state_version,
+                now,
+                int(completed),
+                now,
+                smart_capture_id,
+            ),
         )
+
+
+def _progress_from_task(task: dict[str, object]) -> dict[str, object]:
+    """将批次进度转换为 Smart Capture snapshot 的稳定字段。"""
+    return {
+        "current": int(task.get("progress_current") or 0),
+        "total": int(task.get("progress_total") or 0),
+        "jobs_collected": int(task.get("jobs_collected") or len(task.get("jobs") or [])),
+        "details_completed": int(task.get("details_completed") or 0),
+        "details_failed": int(task.get("details_failed") or 0),
+    }
+
+
+def _result_summary_from_task(task: dict[str, object]) -> dict[str, object]:
+    """终态快照保留已采集数量和批次完成结果。"""
+    return {
+        "jobs_collected": int(task.get("jobs_collected") or len(task.get("jobs") or [])),
+        "details_completed": int(task.get("details_completed") or 0),
+        "details_failed": int(task.get("details_failed") or 0),
+        "has_more": bool(task.get("has_more")),
+    }
+
+
+def _capabilities(
+    *,
+    status: str,
+    stage: str,
+    waiting_reason: str,
+    control_cause: str,
+) -> dict[str, bool]:
+    """按 Smart Capture lifecycle 计算固定五项能力，不暴露 parent cancel。"""
+    terminal = status in TERMINAL_STATUSES
+    recoverable_waiting = waiting_reason in {"capture_interrupted", "browser_not_running"}
+    return {
+        "start": status == "pending",
+        "pause": status in {"running", "pausing"},
+        "resume": status in {"paused", "pausing", "waiting_next_batch", "interrupted"}
+        or (status == "waiting_for_user" and recoverable_waiting),
+        "retry": status in {"pending", "interrupted"}
+        or (status == "waiting_for_user" and recoverable_waiting),
+        "stop": not terminal,
+    }
+
+
+def _canonical_status(status: str, waiting_reason: str) -> str:
+    """禁止新写入用 waiting_next_batch 表达人工阻塞。"""
+    if status == "waiting_next_batch" and waiting_reason in LEGACY_MANUAL_WAITING_REASONS:
+        return "waiting_for_user"
+    return status
 
 
 def _load_json(value: str) -> dict[str, Any]:

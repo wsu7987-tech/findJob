@@ -51,8 +51,13 @@ class BossCaptureTaskManager:
             self._listeners.add(listener)
 
     def _notify_task_updated(self, task_id: str) -> None:
-        snapshot = self.get_task(task_id)
         with self._lock:
+            task = self._require_task(task_id)
+            snapshot = {
+                key: value for key, value in deepcopy(task).items() if not key.startswith("_")
+            }
+            # 监听器需要用任务所属数据库同步 Smart Capture，公开轮询快照不携带该内部引用。
+            snapshot["_db"] = task.get("_db")
             listeners = list(self._listeners)
         for listener in listeners:
             try:
@@ -128,6 +133,7 @@ class BossCaptureTaskManager:
                 auto_details=request.include_details,
                 created_at=now,
                 smart_capture_id=request.smart_capture_id,
+                capture_source=request.capture_source,
             )
         with self._lock:
             self._tasks[task_id] = task
@@ -244,7 +250,12 @@ class BossCaptureTaskManager:
             )
         raise AppError(409, "CAPTURE_NOT_RESUMABLE", "当前采集批次没有可恢复的暂停步骤。")
 
-    def get_active_task(self, *, capture_source: str | None = None) -> dict[str, object] | None:
+    def get_active_task(
+        self,
+        *,
+        capture_source: str | None = None,
+        db: Database | None = None,
+    ) -> dict[str, object] | None:
         """返回仍在执行的采集任务，供新任务启动前执行互斥校验。"""
         with self._lock:
             active_tasks = [
@@ -252,6 +263,13 @@ class BossCaptureTaskManager:
                 for task in self._tasks.values()
                 if task.get("status") in {"queued", "running"}
                 and (capture_source is None or task.get("capture_source") == capture_source)
+                and (
+                    db is None
+                    or (
+                        isinstance(task.get("_db"), Database)
+                        and str(task["_db"].sqlite_path) == str(db.sqlite_path)
+                    )
+                )
             ]
             if not active_tasks:
                 return None
@@ -368,6 +386,7 @@ class BossCaptureTaskManager:
         task: dict[str, object] = {
             "id": task_id,
             "status": "queued",
+            "capture_source": "custom",
             "stage": "details_queued",
             "message": "历史岗位详情任务已创建，正在等待执行。",
             "keyword": str(job.get("title") or ""),
@@ -1005,6 +1024,19 @@ class BossCaptureTaskManager:
             progress_total=int(task.get("progress_total") or 0),
             control_status=control_status,
         )
+        if (
+            str(task.get("capture_source") or "custom") == "custom"
+            and (
+                status in {"completed", "failed"}
+                or control_status in {"paused", "stopped", "interrupted"}
+            )
+        ):
+            # custom 采集进入终态或安全暂停后释放统一执行容量。
+            from backend.app.services.fine_job.collection_capacity import (
+                release_custom_collection,
+            )
+
+            release_custom_collection(db, str(task.get("id") or ""))
 
     @staticmethod
     def _set_list_jobs(task: dict[str, object], jobs: list[dict[str, object]]) -> None:

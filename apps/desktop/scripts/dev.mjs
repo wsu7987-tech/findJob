@@ -47,8 +47,7 @@ const mainWatchProcess = spawnProcess(
     "--outfile=dist-electron/main.cjs",
     "--sourcemap",
     "--external:electron",
-    "--external:electron/main",
-    "--external:electron/renderer",
+    "--external:electron",
     "--external:node-pty",
     "--tsconfig=tsconfig.json",
     "--watch=forever"
@@ -68,8 +67,7 @@ const preloadWatchProcess = spawnProcess(
     "--outfile=dist-electron/preload.cjs",
     "--sourcemap",
     "--external:electron",
-    "--external:electron/main",
-    "--external:electron/renderer",
+    "--external:electron",
     "--tsconfig=tsconfig.json",
     "--watch=forever"
   ],

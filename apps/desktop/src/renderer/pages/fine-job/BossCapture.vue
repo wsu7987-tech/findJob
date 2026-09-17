@@ -147,6 +147,8 @@ const smartRunLookupId = ref("");
 const smartWorkflowJobs = ref<FineJobBossCapturedJob[]>([]);
 const smartCaptureTaskRefsKey = ref("");
 const smartCaptureTaskIds = ref<string[]>([]);
+// 智能采集批次仅随 Workflow SSE 快照更新，不接入自定义采集的定时轮询 store。
+const smartCaptureTask = ref<FineJobBossCaptureTask | null>(null);
 const smartAnalysisItems = ref<FineJobWorkflowAnalysisItem[]>([]);
 const smartSelectedAnalysisItem = ref<FineJobWorkflowAnalysisItem | null>(null);
 const smartSelectedAnalysisContext = ref<Record<string, unknown> | null>(null);
@@ -186,6 +188,14 @@ const smartWorkflowRun = computed(() => {
   const run = workflowStore.currentRun;
   return run?.workflow_run_id === smartWorkflowRunId.value ? run : null;
 });
+// Workflow 进入这些终态后，采集槽位已释放，页面允许重新开始或切换采集模式。
+const smartWorkflowTerminalStatuses = [
+  "completed",
+  "completed_with_errors",
+  "cancelled",
+  "failed",
+  "stopped"
+];
 const smartCaptureRunning = computed(() =>
   ["pending", "running", "pausing"].includes(currentSmartCapture.value?.status ?? "")
 );
@@ -194,7 +204,7 @@ const smartCaptureResumable = computed(() =>
 );
 const smartCaptureCanStart = computed(() =>
   !currentSmartCapture.value
-  || ["completed", "stopped", "failed"].includes(currentSmartCapture.value.status)
+  || smartWorkflowTerminalStatuses.includes(currentSmartCapture.value.status)
 );
 const smartActiveAnalysisItem = computed(() =>
   smartAnalysisItems.value.find((item) => item.status === "running") ?? null
@@ -357,13 +367,9 @@ const mergeDisplayJobs = (...sources: FineJobBossCapturedJob[][]) => {
   return [...jobs.values()];
 };
 const workflowDisplayJobs = computed(() => {
-  // 智能采集期间只接入属于当前智能任务的采集快照，避免带入旧的自定义采集岗位。
+  // 智能采集只合并自身的专用快照，避免带入自定义采集任务的岗位。
   if (currentSmartCapture.value) {
-    const currentTaskId = captureStore.task?.id;
-    const currentSmartJobs = currentTaskId && smartCaptureTaskIds.value.includes(currentTaskId)
-      ? captureStore.task?.jobs ?? []
-      : [];
-    return mergeDisplayJobs(smartWorkflowJobs.value, currentSmartJobs);
+    return mergeDisplayJobs(smartWorkflowJobs.value, smartCaptureTask.value?.jobs ?? []);
   }
   return captureStore.task?.jobs ?? [];
 });
@@ -664,7 +670,8 @@ onMounted(async () => {
   }
   form.keyword = initialFilter?.search_keywords[0] || initialFilter?.title_include_any[0] || "";
   form.city = initialFilter?.cities[0] || "";
-  captureStore.resumePolling();
+  // 仅自定义任务使用现有定时轮询；智能任务由 Workflow SSE 驱动。
+  if (!currentTaskIsSmartCapture.value) captureStore.resumePolling();
 });
 
 onBeforeUnmount(() => captureStore.stopPolling());
@@ -737,6 +744,7 @@ const resetSmartWorkflowView = () => {
   smartWorkflowJobs.value = [];
   smartCaptureTaskRefsKey.value = "";
   smartCaptureTaskIds.value = [];
+  smartCaptureTask.value = null;
   smartWorkflowRunId.value = "";
   smartRunLookupId.value = "";
   smartContextSnapshot.value = null;
@@ -753,6 +761,9 @@ const applyCurrentSmartWorkflow = async (run: typeof workflowStore.currentRun) =
     smartWorkflowJobs.value = [];
     smartWorkflowRunId.value = "";
     smartRunLookupId.value = "";
+    smartCaptureTaskRefsKey.value = "";
+    smartCaptureTaskIds.value = [];
+    smartCaptureTask.value = null;
     smartContextSnapshot.value = null;
     smartAnalysisItems.value = [];
     smartSelectedAnalysisItem.value = null;
@@ -760,7 +771,6 @@ const applyCurrentSmartWorkflow = async (run: typeof workflowStore.currentRun) =
     if (captureStore.task?.capture_source === "smart") captureStore.clearTask();
     return;
   }
-  activeCaptureConditionTab.value = "smart";
   const displayedRun = workflowStore.currentRun;
   if (
     !displayedRun
@@ -774,6 +784,18 @@ const applyCurrentSmartWorkflow = async (run: typeof workflowStore.currentRun) =
   smartWorkflowJobs.value = [...(run.capture_jobs ?? [])];
   smartAnalysisGuidance.value = run.completion_contract?.analysis_guidance?.text || "";
   smartCodexHandoff.value = run.completion_contract?.execution_policy?.codex_handoff ?? "auto";
+  // 旧页面状态可能残留智能任务；清除后阻止它重新进入自定义采集轮询。
+  const linkedCaptureTaskIds = new Set(
+    (run.tasks ?? [])
+      .filter((task) => task.task_type === "deep_job_search" && task.operation_ref_id)
+      .map((task) => task.operation_ref_id as string)
+  );
+  if (
+    captureStore.task?.capture_source === "smart"
+    || linkedCaptureTaskIds.has(captureStore.task?.id ?? "")
+  ) {
+    captureStore.clearTask();
+  }
   await syncSmartCaptureTask(run);
   await loadSmartContextSnapshot();
   await loadSmartAnalysisItems();
@@ -1166,10 +1188,21 @@ const syncSmartCaptureTask = async (run: typeof workflowStore.currentRun) => {
   const captureTask = [...(run?.tasks ?? [])]
     .reverse()
     .find((task) => task.task_type === "deep_job_search" && task.operation_ref_id);
-  if (!captureTask?.operation_ref_id || captureTask.operation_ref_id === captureStore.task?.id) return;
-  const refreshedTask = await captureStore.refreshTask(captureTask.operation_ref_id);
-  if (refreshedTask?.jobs?.length) {
-    smartWorkflowJobs.value = mergeDisplayJobs(smartWorkflowJobs.value, refreshedTask.jobs);
+  if (!captureTask?.operation_ref_id) {
+    smartCaptureTask.value = null;
+    return;
+  }
+  if (captureTask.operation_ref_id === smartCaptureTask.value?.id) return;
+  try {
+    // 新批次首次出现时只读取一次，用于补足 SSE 首帧尚未包含的岗位列表。
+    const refreshedTask = await api.getFineJobBossCaptureTask(captureTask.operation_ref_id);
+    smartCaptureTask.value = refreshedTask;
+    if (refreshedTask.jobs?.length) {
+      smartWorkflowJobs.value = mergeDisplayJobs(smartWorkflowJobs.value, refreshedTask.jobs);
+    }
+  } catch {
+    // SSE 快照仍会继续刷新 Workflow；单次补读失败不启动轮询或中断页面展示。
+    smartCaptureTask.value = null;
   }
 };
 
@@ -1179,17 +1212,7 @@ watch(
     if (run?.workflow_run_id === smartWorkflowRunId.value) {
       void syncSmartCaptureTask(run);
       void loadSmartAnalysisItems();
-      if (currentSmartCapture.value?.workflow_run_id === run.workflow_run_id) {
-        void refreshCurrentSmartWorkflow();
-      }
     }
-  }
-);
-
-watch(
-  () => captureStore.task?.updated_at,
-  () => {
-    if (currentSmartCapture.value) void refreshCurrentSmartWorkflow();
   }
 );
 
@@ -1791,7 +1814,7 @@ function formatDuration(seconds: number) {
               继续采集
             </el-button>
             <el-button
-              v-if="currentSmartCapture && !['completed', 'stopped', 'failed'].includes(currentSmartCapture.status)"
+              v-if="currentSmartCapture && !smartWorkflowTerminalStatuses.includes(currentSmartCapture.status)"
               type="danger"
               plain
               :loading="smartCaptureControlLoading"

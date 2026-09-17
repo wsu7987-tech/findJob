@@ -2,7 +2,7 @@ import type { ContextBridge, IpcRenderer } from "electron";
 
 declare const require: NodeRequire;
 
-const { contextBridge, ipcRenderer } = require("electron/renderer") as {
+const { contextBridge, ipcRenderer } = require("electron") as {
   contextBridge: ContextBridge;
   ipcRenderer: IpcRenderer;
 };

@@ -40,19 +40,23 @@ def create_capture_batch(
     auto_details: bool,
     created_at: str,
     smart_capture_id: str | None = None,
+    capture_source: Literal["smart", "custom"] = "custom",
 ) -> None:
+    if smart_capture_id is not None:
+        capture_source = "smart"
     with db.connect() as connection:
         connection.execute(
             """
             INSERT INTO fj_boss_capture_batches (
-              id, smart_capture_id, keyword, city, pages, auto_details, status,
+              id, smart_capture_id, capture_source, keyword, city, pages, auto_details, status,
               created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
             """,
             (
                 capture_id,
                 smart_capture_id,
+                capture_source,
                 keyword,
                 city,
                 pages,

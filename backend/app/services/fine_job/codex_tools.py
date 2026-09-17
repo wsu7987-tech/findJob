@@ -11,6 +11,10 @@ from backend.app.services.fine_job.boss_capture_history import (
     update_capture_job_delivery_evaluation,
 )
 from backend.app.services.fine_job.boss_capture_tasks import boss_capture_task_manager
+from backend.app.services.fine_job.collection_capacity import (
+    start_custom_collection,
+    start_custom_collection_phase,
+)
 from backend.app.services.fine_job.boss_chat import (
     cancel_reply,
     confirm_reply,
@@ -852,7 +856,6 @@ class CodexToolService:
         )
 
     def start_job_capture(self, arguments: dict[str, Any]) -> dict[str, object]:
-        workflow_runs.assert_collection_start_allowed(self.db, requested_kind="custom")
         filter_strategy_id = str(arguments.get("filter_strategy_id") or "").strip()
         strategy = get_filter_strategy(self.db, filter_strategy_id)
         if not strategy.get("enabled"):
@@ -872,25 +875,28 @@ class CodexToolService:
             raise AppError(422, "SEARCH_KEYWORD_INVALID", "请选择该筛选策略中已启用的搜索词。")
         if not city or city not in allowed_cities:
             raise AppError(422, "SEARCH_CITY_INVALID", "请选择该筛选策略中的城市。")
-        if not boss_scraper_service.get_browser_status().running:
-            raise AppError(409, "BROWSER_NOT_RUNNING", "FineJob 专用 Chrome 未运行。")
         pages = min(10, max(1, int(arguments.get("pages") or 1)))
-        task = boss_capture_task_manager.start_capture(
-            BossCaptureRequest(
-                keyword=keyword,
-                city=city,
-                pages=pages,
-                filters={},
-                include_details=False,
-                max_details=None,
+        def start_task() -> dict[str, object]:
+            if not boss_scraper_service.get_browser_status().running:
+                raise AppError(409, "BROWSER_NOT_RUNNING", "FineJob 专用 Chrome 未运行。")
+            return boss_capture_task_manager.start_capture(
+                BossCaptureRequest(
+                    keyword=keyword,
+                    city=city,
+                    pages=pages,
+                    filters={},
+                    include_details=False,
+                    max_details=None,
+                    output_dir=self.config.output_root / "fine-job" / "boss-capture",
+                    prefer_current_page=True,
+                    filter_strategy_id=filter_strategy_id,
+                    capture_source="custom",
+                ),
                 output_dir=self.config.output_root / "fine-job" / "boss-capture",
-                prefer_current_page=True,
-                filter_strategy_id=filter_strategy_id,
-                capture_source="custom",
-            ),
-            output_dir=self.config.output_root / "fine-job" / "boss-capture",
-            db=self.db,
-        )
+                db=self.db,
+            )
+
+        task = start_custom_collection(self.db, start_task)
         task_id = str(task["id"])
         return _result(
             result_type="task",
@@ -904,9 +910,12 @@ class CodexToolService:
     def continue_job_capture(self, arguments: dict[str, Any]) -> dict[str, object]:
         task_id = str(arguments.get("capture_task_id") or "").strip()
         pages = min(10, max(1, int(arguments.get("pages") or 1)))
-        if not boss_scraper_service.get_browser_status().running:
-            raise AppError(409, "BROWSER_NOT_RUNNING", "FineJob 专用 Chrome 未运行。")
-        task = boss_capture_task_manager.continue_capture(task_id, pages=pages)
+        def continue_task() -> dict[str, object]:
+            if not boss_scraper_service.get_browser_status().running:
+                raise AppError(409, "BROWSER_NOT_RUNNING", "FineJob 专用 Chrome 未运行。")
+            return boss_capture_task_manager.continue_capture(task_id, pages=pages)
+
+        task = start_custom_collection_phase(self.db, task_id, continue_task)
         return _result(
             result_type="task",
             status=str(task.get("status") or "queued"),
@@ -1005,7 +1014,13 @@ class CodexToolService:
         detail_kwargs = {"force": bool(arguments.get("force", False))}
         if manual_override:
             detail_kwargs["manual_override"] = True
-        task = boss_capture_task_manager.start_details(task_id, job_ids, **detail_kwargs)
+        task = start_custom_collection_phase(
+            self.db,
+            task_id,
+            lambda: boss_capture_task_manager.start_details(
+                task_id, job_ids, **detail_kwargs
+            ),
+        )
         return _result(
             result_type="task",
             status=str(task.get("status") or "queued"),
@@ -1117,10 +1132,13 @@ class CodexToolService:
             action="detail",
             allow_manual_override=manual_override,
         )
-        task = boss_capture_task_manager.start_history_detail(
-            job,
-            output_dir=self.config.output_root / "fine-job" / "boss-capture",
-            db=self.db,
+        task = start_custom_collection(
+            self.db,
+            lambda: boss_capture_task_manager.start_history_detail(
+                job,
+                output_dir=self.config.output_root / "fine-job" / "boss-capture",
+                db=self.db,
+            ),
         )
         task_id = str(task["id"])
         return _result(

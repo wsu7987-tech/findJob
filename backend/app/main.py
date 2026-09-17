@@ -27,6 +27,7 @@ from backend.app.routers.fine_job.resumes import router as fine_job_resumes_rout
 from backend.app.routers.fine_job.strategies import router as fine_job_strategies_router
 from backend.app.routers.fine_job.workflow import router as fine_job_workflow_router
 from backend.app.routers.fine_job.workflow_runs import router as fine_job_workflow_runs_router
+from backend.app.routers.fine_job.smart_captures import router as fine_job_smart_captures_router
 from backend.app.routers.health import router as health_router
 from backend.app.routers.internal_codex import router as internal_codex_router
 from backend.app.routers.parse_results import router as parse_results_router
@@ -47,7 +48,7 @@ from backend.app.services.pdf_reparse_job_store import PdfReparseJobStore
 from backend.app.services.web_draft_store import WebDraftStore
 from backend.app.services.web_reparse_job_store import WebReparseJobStore
 from backend.app.services.web_session_profiles import WebSessionProfileStore
-from backend.app.services.fine_job import boss_executor, workflow_runs
+from backend.app.services.fine_job import boss_executor, smart_captures, workflow_runs
 from backend.app.services.fine_job.codex_runtime import CodexRuntimeRegistry
 from backend.app.services.fine_job.profile_store import ensure_default_profile
 
@@ -64,6 +65,8 @@ def create_app() -> FastAPI:
     db.initialize()
     # 采集任务在后台线程更新时，需要可用的数据库与配置来同步父任务和 Workflow Run。
     workflow_runs.configure_realtime_runtime(db, config)
+    # 启动时把丢失的采集执行器收敛为可恢复状态，并清理 custom 执行容量。
+    smart_captures.recover_interrupted_smart_captures(db)
     # 后端启动后等待插件主动完成一次心跳测试，再恢复执行器连接状态。
     boss_executor.reset_executor_connections(db)
     ensure_default_profile(db)
@@ -112,6 +115,7 @@ def create_app() -> FastAPI:
     app.include_router(fine_job_strategies_router, prefix="/api")
     app.include_router(fine_job_workflow_router, prefix="/api")
     app.include_router(fine_job_workflow_runs_router, prefix="/api")
+    app.include_router(fine_job_smart_captures_router, prefix="/api")
     app.include_router(parse_results_router, prefix="/api")
     app.include_router(pdf_drafts_router, prefix="/api")
     app.include_router(web_drafts_router, prefix="/api")

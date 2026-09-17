@@ -1486,9 +1486,21 @@ export const api = {
       { method: "POST" }
     );
   },
+  async startFineJobSmartCapture(smartCaptureId: string) {
+    return request<FineJobSmartCapture>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/start`,
+      { method: "POST" }
+    );
+  },
   async resumeFineJobSmartCapture(smartCaptureId: string) {
     return request<FineJobSmartCapture>(
       `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/resume`,
+      { method: "POST" }
+    );
+  },
+  async retryFineJobSmartCapture(smartCaptureId: string) {
+    return request<FineJobSmartCapture>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/retry`,
       { method: "POST" }
     );
   },

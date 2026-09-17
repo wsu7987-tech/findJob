@@ -9,6 +9,11 @@ from backend.app.config import AppConfig
 from backend.app.db import Database
 from backend.app.errors import AppError
 from backend.app.services.fine_job.boss_capture_tasks import boss_capture_task_manager
+from backend.app.services.fine_job.collection_capacity import (
+    assert_collection_start_allowed as assert_collection_capacity_start_allowed,
+    get_active_collection_task as get_active_collection_capacity_task,
+)
+from backend.app.services.fine_job import smart_captures
 from backend.app.services.fine_job.workflow_run_events import workflow_run_event_broker
 from backend.app.services.fine_job.boss_capture_history import get_capture_history_job
 from backend.app.services.fine_job.boss_scraper.service import BossCaptureRequest, boss_scraper_service
@@ -194,6 +199,8 @@ def create_deep_job_search_run(
     workflow_run_id = new_id()
     now = utc_now()
     with db.connect() as connection:
+        # Workflow 与 Smart Capture 作为同一采集身份提交，创建成功立即占用 current 槽位。
+        connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             """
             INSERT INTO fj_workflow_runs (
@@ -251,6 +258,21 @@ def create_deep_job_search_run(
                 now,
             ),
         )
+        smart_captures.create_smart_capture_in_connection(
+            connection,
+            db,
+            source="task_cockpit",
+            workflow_run_id=workflow_run_id,
+            search_config={
+                "allowed_search_keywords": requested_keywords,
+                "allowed_cities": requested_cities,
+                "pages": min_depth,
+                "include_details": False,
+                "prefer_current_page": True,
+                "filter_strategy_id": filter_strategy_id,
+            },
+            target_count=candidate_target,
+        )
     snapshot = _create_search_context_snapshot(
         db, workflow_run_id, strategy, recommendation_strategy, contract,
         int(payload.get("context_soft_budget_characters") or 12000),
@@ -295,8 +317,14 @@ def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: st
     payload = _load(task["payload_json"], {})
     capture_task_id = str(task["operation_ref_id"] or "")
     if not capture_task_id:
+        # 由关联 Smart Capture 启动批次，使 current 身份、容量和批次关系保持一致。
         if not boss_scraper_service.get_browser_status().running:
-            _wait_for_user(db, workflow_run_id, "browser_not_running", "FineJob 专用 Chrome 未启动，暂不能继续 deep_job_search。")
+            _wait_for_user(
+                db,
+                workflow_run_id,
+                "browser_not_running",
+                "FineJob 专用 Chrome 未启动，暂不能继续 deep_job_search。",
+            )
             return get_workflow_run(db, workflow_run_id)
         pages = min(int(contract["stop_policy"]["min_depth"]), 10)
         platform_filters = canonicalize_platform_filters(payload.get("platform_filters"))
@@ -305,20 +333,28 @@ def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: st
             workflow_run_id,
             str(payload.get("search_combination_id") or ""),
         )
-        # 复用既有 deep_job_search 采集任务启动批次，Workflow 只编排已有子任务。
-        capture = boss_capture_task_manager.start_capture(
-            BossCaptureRequest(
-                keyword=str(payload["keyword"]), city=str(payload["city"]), pages=pages,
-                filters=platform_filters, include_details=False, max_details=None,
-                output_dir=config.output_root / "fine-job" / "boss-capture",
-                prefer_current_page=True,
-                force_search_navigation=not bool(payload.get("is_baseline")),
-                filter_strategy_id=str(contract["selected_strategy_ids"]["filter_strategy_id"]),
-                capture_source="smart",
-                workflow_run_id=workflow_run_id,
-            ), output_dir=config.output_root / "fine-job" / "boss-capture", db=db,
+        linked_capture = smart_captures.require_by_workflow_run(db, workflow_run_id)
+        capture = smart_captures.start_linked_capture_batch(
+            db,
+            config,
+            str(linked_capture["smart_capture_id"]),
+            {
+                **payload,
+                "pages": pages,
+                "filters": platform_filters,
+                "include_details": False,
+                "prefer_current_page": True,
+                "force_search_navigation": not bool(payload.get("is_baseline")),
+                "filter_strategy_id": str(contract["selected_strategy_ids"]["filter_strategy_id"]),
+            },
         )
-        _update_task_operation(db, task["id"], str(capture["id"]), "running", payload)
+        _update_task_operation(
+            db,
+            task["id"],
+            str(capture.get("current_batch_id") or ""),
+            "running",
+            payload,
+        )
         _update_run(db, workflow_run_id, status="running", current_step="searching", next_action="wait_capture", next_action_reason="正在执行后端岗位采集。")
         return get_workflow_run(db, workflow_run_id)
     try:
@@ -385,29 +421,12 @@ def get_latest_active_workflow_run(db: Database) -> dict[str, object] | None:
 
 def get_active_collection_task(db: Database) -> dict[str, object] | None:
     """返回唯一允许存在的未结束岗位采集任务。"""
-    task = boss_capture_task_manager.get_active_task()
-    if task is None:
-        return None
-    return {
-        "kind": "smart" if task.get("capture_source") == "smart" else "custom",
-        "id": str(task["id"]),
-        "status": str(task["status"]),
-        "message": str(task.get("message") or "自定义采集尚未结束。"),
-    }
+    return get_active_collection_capacity_task(db)
 
 
 def assert_collection_start_allowed(db: Database, *, requested_kind: str) -> None:
     """确保智能采集与自定义采集在任意入口都严格互斥。"""
-    active = get_active_collection_task(db)
-    if active is None:
-        return
-    active_label = "智能采集" if active["kind"] == "smart" else "自定义采集"
-    requested_label = "智能采集" if requested_kind == "smart" else "自定义采集"
-    raise AppError(
-        409,
-        "COLLECTION_TASK_ACTIVE",
-        f"当前{active_label}尚未结束，请先停止{active_label}后再开始{requested_label}。",
-    )
+    assert_collection_capacity_start_allowed(db, requested_kind=requested_kind)
 
 
 def list_workflow_capture_jobs(db: Database, workflow_run_id: str) -> dict[str, object]:
@@ -1157,6 +1176,19 @@ def cancel_deep_job_search_run(
     run = _require_run(db, workflow_run_id)
     if run["status"] in {"completed", "completed_with_errors", "cancelled", "failed"}:
         return get_workflow_run(db, workflow_run_id)
+    if sync_capture:
+        linked_capture = smart_captures.get_by_workflow_run(db, workflow_run_id)
+        if linked_capture is not None and str(linked_capture["status"]) not in {
+            "completed",
+            "stopped",
+            "failed",
+        }:
+            # 父任务取消统一映射为子采集停止，避免 current 槽位遗留为活动状态。
+            smart_captures.stop_smart_capture(
+                db,
+                str(linked_capture["smart_capture_id"]),
+                sync_workflow=False,
+            )
     with db.connect() as connection:
         active_tasks = connection.execute(
             """
@@ -3391,6 +3423,8 @@ def _complete_run(db: Database, workflow_run_id: str, stop_reason: str, reason: 
         stop_reason=stop_reason,
         completed_at=utc_now(),
     )
+    # Workflow 终态是关联 Smart Capture 释放 current 槽位的唯一完成信号。
+    smart_captures.mark_workflow_capture_completed(db, workflow_run_id)
 
 
 def _continue_frozen_candidate_pool(

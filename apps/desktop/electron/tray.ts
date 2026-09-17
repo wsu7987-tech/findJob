@@ -2,7 +2,7 @@ import type { App, Tray as ElectronTray } from "electron";
 
 declare const require: NodeRequire;
 
-const { Menu, Tray, nativeImage } = require("electron/main") as typeof import("electron");
+const { Menu, Tray, nativeImage } = require("electron") as typeof import("electron");
 
 export interface TrayControllerOptions {
   app: App;
