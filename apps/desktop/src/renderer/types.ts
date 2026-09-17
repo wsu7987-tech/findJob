@@ -2525,6 +2525,7 @@ export interface FineJobWorkflowChild {
   updated_at: string;
   state_version: number;
   child_state_version: number;
+  transition_id: string;
 }
 
 export interface FineJobWorkflowRun {
@@ -2533,6 +2534,11 @@ export interface FineJobWorkflowRun {
   idempotency_key?: string | null;
   capture_jobs?: FineJobBossCapturedJob[];
   status: string;
+  control_state: string;
+  waiting_reason: string;
+  control_cause: string;
+  state_version: number;
+  transition_id: string;
   completed_count: number;
   remaining_count: number;
   completion_progress?: {

@@ -15,6 +15,7 @@ from backend.app.services.fine_job.boss_scraper.service import BossBrowserStatus
 from backend.app.services.fine_job.codex_tools import CodexToolService
 from backend.app.errors import AppError
 from backend.app.utils import new_id, utc_now
+from backend.app.services.fine_job import workflow_children
 
 
 def _strategy_payload(**updates):
@@ -1648,3 +1649,347 @@ def test_non_resumable_stop_reason_is_not_resumed(configured_client, test_db) ->
 
     assert response.status_code == 409
     assert response.json()["error_category"] == "WORKFLOW_NOT_RESUMABLE"
+
+
+def test_parent_pause_resume_is_atomic_and_does_not_append_advance(
+    configured_client, test_db
+) -> None:
+    run = _create_run(configured_client)
+    child = run["children"][0]
+
+    paused = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/pause",
+        json={"transition_id": "parent-pause-1"},
+    ).json()
+    assert paused["control_state"] == "paused"
+    assert paused["control_cause"] == "parent_pause"
+    assert paused["transition_id"] == "parent-pause-1"
+    assert paused["children"][0]["status"] == "pending"
+    repeated_pause = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/pause",
+        json={"transition_id": "parent-pause-2"},
+    ).json()
+    assert repeated_pause["state_version"] == paused["state_version"]
+
+    resumed = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/resume",
+        json={"transition_id": "parent-resume-1"},
+    ).json()
+    assert resumed["control_state"] == "active"
+    assert resumed["status"] == "running"
+    assert resumed["children"][0]["status"] == "pending"
+    with test_db.connect() as connection:
+        task = connection.execute(
+            "SELECT status, operation_ref_id FROM fj_workflow_tasks WHERE workflow_run_id = ?",
+            (run["workflow_run_id"],),
+        ).fetchone()
+    assert task["status"] == "pending"
+    assert task["operation_ref_id"] is None
+    assert child["child_ref"] == resumed["children"][0]["child_ref"]
+
+
+def test_child_pause_resume_uses_child_waiting_state(configured_client, test_db, monkeypatch) -> None:
+    run = _create_run(configured_client)
+    child_id = run["children"][0]["smart_capture_id"]
+    smart_captures._update_capture(
+        test_db,
+        child_id,
+        status="running",
+        stage="capturing",
+        waiting_reason="",
+        control_cause="",
+        transition_id="child-start-1",
+        message="正在采集",
+    )
+    paused = configured_client.post(
+        f"/api/fine-job/smart-captures/{child_id}/pause",
+        json={"transition_id": "child-pause-1"},
+    ).json()
+    assert paused["status"] == "paused"
+    assert paused["control_cause"] == "child_self_pause"
+    repeated_pause = configured_client.post(
+        f"/api/fine-job/smart-captures/{child_id}/pause",
+        json={"transition_id": "child-pause-2"},
+    ).json()
+    assert repeated_pause["state_version"] == paused["state_version"]
+
+    waiting = configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}"
+    ).json()
+    assert waiting["control_state"] == "waiting_child_paused"
+    assert waiting["control_cause"] == "child_self_pause"
+
+    monkeypatch.setattr(
+        smart_captures.boss_scraper_service,
+        "get_browser_status",
+        lambda: BossBrowserStatus(running=True, cdp_port=9222),
+    )
+    resumed = configured_client.post(
+        f"/api/fine-job/smart-captures/{child_id}/resume",
+        json={"transition_id": "child-resume-1"},
+    ).json()
+    assert resumed["status"] == "running"
+    parent = configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}"
+    ).json()
+    assert parent["control_state"] == "active"
+    assert parent["status"] == "running"
+
+
+def test_child_stop_waits_for_parent_decision_and_skip_or_end_preserves_child(
+    configured_client,
+) -> None:
+    run = _create_run(configured_client)
+    child = run["children"][0]
+    stopped = configured_client.post(
+        f"/api/fine-job/smart-captures/{child['smart_capture_id']}/stop",
+        json={"transition_id": "child-stop-skip-1"},
+    ).json()
+    assert stopped["status"] == "stopped"
+    waiting = configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}"
+    ).json()
+    assert waiting["control_state"] == "child_cancelled_waiting_decision"
+    skipped = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/children/{child['child_relation_id']}/skip",
+        json={"transition_id": "child-skip-1"},
+    ).json()
+    assert skipped["status"] == "completed"
+    assert skipped["children"][0]["status"] == "stopped"
+
+    second = _create_run(configured_client)
+    second_child = second["children"][0]
+    configured_client.post(
+        f"/api/fine-job/smart-captures/{second_child['smart_capture_id']}/stop",
+        json={"transition_id": "child-stop-end-1"},
+    )
+    ended = configured_client.post(
+        f"/api/fine-job/workflow-runs/{second['workflow_run_id']}/children/{second_child['child_relation_id']}/end",
+        json={"transition_id": "child-end-1"},
+    ).json()
+    assert ended["status"] == "cancelled"
+    assert ended["children"][0]["status"] == "stopped"
+
+
+def test_hard_failed_child_waits_without_retry_and_supports_skip_or_end(
+    configured_client, test_db
+) -> None:
+    run = _create_run(configured_client)
+    child = run["children"][0]
+    smart_captures._update_capture(
+        test_db,
+        child["smart_capture_id"],
+        status="failed",
+        stage="failed",
+        waiting_reason="child_failed",
+        control_cause="child_failure",
+        transition_id="child-failed-1",
+        message="采集失败",
+        completed=True,
+    )
+    waiting = configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}"
+    ).json()
+    assert waiting["control_state"] == "child_failed_waiting_decision"
+    assert waiting["children"][0]["status"] == "failed"
+    assert waiting["children"][0]["capabilities"]["retry"] is False
+    retry = configured_client.post(
+        f"/api/fine-job/smart-captures/{child['smart_capture_id']}/retry"
+    )
+    assert retry.status_code == 409
+    skipped = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/children/{child['child_relation_id']}/skip",
+        json={"transition_id": "failed-skip-1"},
+    ).json()
+    assert skipped["status"] == "completed"
+    assert skipped["children"][0]["status"] == "failed"
+
+    second = _create_run(configured_client)
+    second_child = second["children"][0]
+    smart_captures._update_capture(
+        test_db,
+        second_child["smart_capture_id"],
+        status="failed",
+        stage="failed",
+        waiting_reason="child_failed",
+        control_cause="child_failure",
+        transition_id="child-failed-end-1",
+        message="采集失败",
+        completed=True,
+    )
+    ended = configured_client.post(
+        f"/api/fine-job/workflow-runs/{second['workflow_run_id']}/children/{second_child['child_relation_id']}/end",
+        json={"transition_id": "failed-end-1"},
+    ).json()
+    assert ended["status"] == "cancelled"
+    assert ended["children"][0]["status"] == "failed"
+
+
+def test_parent_controls_preserve_failed_child_and_pause_callback_priority(
+    configured_client, test_db
+) -> None:
+    run = _create_run(configured_client)
+    child = run["children"][0]
+    smart_captures._update_capture(
+        test_db,
+        child["smart_capture_id"],
+        status="running",
+        stage="capturing",
+        waiting_reason="",
+        control_cause="",
+        transition_id="child-running-1",
+        message="正在采集",
+    )
+    paused = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/pause",
+        json={"transition_id": "parent-pause-race-1"},
+    ).json()
+    assert paused["control_state"] == "paused"
+    smart_captures._update_capture(
+        test_db,
+        child["smart_capture_id"],
+        status="failed",
+        stage="failed",
+        waiting_reason="child_failed",
+        control_cause="child_failure",
+        transition_id="late-child-failure-1",
+        message="迟到失败回调",
+        completed=True,
+    )
+    still_paused = configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}"
+    ).json()
+    assert still_paused["control_state"] == "paused"
+    resumed = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/resume",
+        json={"transition_id": "parent-resume-race-1"},
+    ).json()
+    assert resumed["control_state"] == "child_failed_waiting_decision"
+    assert resumed["children"][0]["status"] == "failed"
+    blocked_pause = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/pause"
+    )
+    assert blocked_pause.status_code == 409
+    cancelled = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/cancel"
+    ).json()
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["children"][0]["status"] == "failed"
+
+
+def test_parent_cancel_ignores_late_child_event(configured_client, test_db) -> None:
+    run = _create_run(configured_client)
+    child = run["children"][0]
+    cancelled = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/cancel",
+        json={"transition_id": "parent-cancel-race-1"},
+    ).json()
+    assert cancelled["status"] == "cancelled"
+    with test_db.connect() as connection:
+        relation = connection.execute(
+            "SELECT child_state_version FROM fj_workflow_children WHERE id = ?",
+            (child["child_relation_id"],),
+        ).fetchone()
+        workflow_children.record_child_event_in_connection(
+            connection,
+            child_relation_id=child["child_relation_id"],
+            child_type="smart_capture",
+            child_ref=child["smart_capture_id"],
+            child_status="interrupted",
+            transition_id="late-after-cancel-1",
+            state_version=int(relation["child_state_version"]) + 1,
+            waiting_reason="capture_interrupted",
+            control_cause="recovery",
+            event_id="late-after-cancel-event",
+        )
+    final = configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}"
+    ).json()
+    assert final["status"] == "cancelled"
+    assert final["children"][0]["status"] == "stopped"
+
+
+def test_interrupted_child_requires_explicit_resume_and_restores_parent(
+    configured_client, test_db, monkeypatch
+) -> None:
+    run = _create_run(configured_client)
+    child = run["children"][0]
+    smart_captures._update_capture(
+        test_db,
+        child["smart_capture_id"],
+        status="interrupted",
+        stage="interrupted",
+        waiting_reason="capture_interrupted",
+        control_cause="recovery",
+        transition_id="child-interrupted-1",
+        message="执行器已中断",
+    )
+    waiting = configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}"
+    ).json()
+    assert waiting["control_state"] == "waiting_child_interrupted"
+    assert waiting["waiting_reason"] == "capture_interrupted"
+    monkeypatch.setattr(
+        smart_captures.boss_scraper_service,
+        "get_browser_status",
+        lambda: BossBrowserStatus(running=True, cdp_port=9222),
+    )
+    resumed = configured_client.post(
+        f"/api/fine-job/smart-captures/{child['smart_capture_id']}/resume",
+        json={"transition_id": "child-interrupted-resume-1"},
+    ).json()
+    assert resumed["status"] == "running"
+    restored = configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}"
+    ).json()
+    assert restored["control_state"] == "active"
+
+
+def test_duplicate_child_event_and_late_cancel_event_do_not_rewrite_parent(
+    configured_client, test_db
+) -> None:
+    run = _create_run(configured_client)
+    child = run["children"][0]
+    smart_captures._update_capture(
+        test_db,
+        child["smart_capture_id"],
+        status="stopped",
+        stage="stopped",
+        control_cause="child_user_stop",
+        transition_id="stop-event-1",
+        message="已停止",
+        completed=True,
+    )
+    stopped = configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}"
+    ).json()
+    assert stopped["control_state"] == "child_cancelled_waiting_decision"
+    with test_db.connect() as connection:
+        relation = connection.execute(
+            "SELECT child_state_version FROM fj_workflow_children WHERE id = ?",
+            (child["child_relation_id"],),
+        ).fetchone()
+        event_version = int(relation["child_state_version"])
+        result = workflow_children.record_child_event_in_connection(
+            connection,
+            child_relation_id=child["child_relation_id"],
+            child_type="smart_capture",
+            child_ref=child["smart_capture_id"],
+            child_status="stopped",
+            transition_id="late-stop-1",
+            state_version=event_version,
+            control_cause="child_user_stop",
+            event_id="duplicate-stop-event",
+        )
+        assert result == "duplicate-stop-event"
+    configured_client.post(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/children/{child['child_relation_id']}/end",
+        json={"transition_id": "end-after-stop-1"},
+    )
+    with test_db.connect() as connection:
+        workflow_children.consume_child_event_in_connection(connection, "duplicate-stop-event")
+    final = configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}"
+    ).json()
+    assert final["status"] == "cancelled"
+    assert final["control_state"] == "active"

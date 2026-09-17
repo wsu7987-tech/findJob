@@ -13,7 +13,7 @@ const boundaryStatuses = new Set([
   "completed_with_errors",
   "failed"
 ]);
-const terminalStatuses = new Set(["paused", "cancelled", "completed", "completed_with_errors", "failed"]);
+const terminalStatuses = new Set(["cancelled", "completed", "completed_with_errors", "failed"]);
 
 export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", () => {
   const currentRun = ref<FineJobWorkflowRun | null>(null);
@@ -143,13 +143,24 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
     if (!currentRun.value) return null;
     setRun(await api.resumeFineJobWorkflowRun(currentRun.value.workflow_run_id));
     startPolling();
-    await advance();
     return currentRun.value;
   };
 
   const cancel = async () => {
     if (!currentRun.value) return null;
     return setRun(await api.cancelFineJobWorkflowRun(currentRun.value.workflow_run_id));
+  };
+
+  const decideChild = async (decision: "skip" | "end") => {
+    const run = currentRun.value;
+    if (!run || !["child_cancelled_waiting_decision", "child_failed_waiting_decision"].includes(run.control_state)) {
+      return null;
+    }
+    const child = run?.children?.find((item) =>
+      item.control_state === run.control_state
+    );
+    if (!child) return null;
+    return setRun(await api.decideFineJobWorkflowChild(run.workflow_run_id, child.child_relation_id, decision));
   };
 
   return {
@@ -167,6 +178,7 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
     pause,
     resume,
     cancel,
+    decideChild,
     startPolling,
     ensurePolling,
     stopPolling

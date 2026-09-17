@@ -54,6 +54,7 @@ def recover_interrupted_smart_captures(db: Database) -> None:
     """应用启动时把失去进程执行器的任务收敛到可继续状态。"""
     recover_collection_capacity(db)
     now = utc_now()
+    recovery_transition_id = new_id()
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         connection.execute(
@@ -62,11 +63,11 @@ def recover_interrupted_smart_captures(db: Database) -> None:
             SET status = 'interrupted', stage = 'interrupted',
                 message = '应用重启后采集执行已中断，请点击继续恢复当前任务。',
                 waiting_reason = 'capture_interrupted', control_cause = 'recovery',
-                state_version = state_version + 1,
+                transition_id = ?, state_version = state_version + 1,
                 updated_at = ?
             WHERE status IN ('running', 'pausing')
             """,
-            (now,),
+            (recovery_transition_id, now),
         )
         linked_runs = connection.execute(
             """
@@ -110,17 +111,27 @@ def recover_interrupted_smart_captures(db: Database) -> None:
             "SELECT * FROM fj_smart_captures WHERE workflow_run_id IS NOT NULL"
         ).fetchall()
         for linked_capture in linked_captures:
-            workflow_children.project_smart_capture_in_connection(
-                connection,
-                linked_capture,
-                capabilities=_capabilities(
-                    status=str(linked_capture["status"]),
-                    stage=str(linked_capture["stage"] or ""),
-                    waiting_reason=str(linked_capture["waiting_reason"] or ""),
-                    control_cause=str(linked_capture["control_cause"] or ""),
-                ),
-                now=now,
-            )
+            relation = connection.execute(
+                """
+                SELECT id FROM fj_workflow_children
+                WHERE workflow_run_id = ? AND child_type = 'smart_capture' AND child_ref = ?
+                """,
+                (str(linked_capture["workflow_run_id"]), str(linked_capture["id"])),
+            ).fetchone()
+            if relation is not None:
+                workflow_children.record_child_event_in_connection(
+                    connection,
+                    child_relation_id=str(relation["id"]),
+                    child_type=workflow_children.SMART_CAPTURE_CHILD_TYPE,
+                    child_ref=str(linked_capture["id"]),
+                    child_status="interrupted",
+                    transition_id=recovery_transition_id,
+                    state_version=max(1, int(linked_capture["state_version"] or 1)),
+                    waiting_reason="capture_interrupted",
+                    control_cause="recovery",
+                    result_summary=_load_json(str(linked_capture["result_summary_json"] or "{}")),
+                    occurred_at=now,
+                )
         current = connection.execute(
             """
             SELECT c.id, c.status
@@ -276,6 +287,379 @@ def get_active_smart_capture(db: Database) -> dict[str, object] | None:
     return None
 
 
+def _update_parent_control_in_connection(
+    connection: Any,
+    workflow_run_id: str,
+    *,
+    status: str,
+    control_state: str,
+    waiting_reason: str,
+    control_cause: str,
+    transition_id: str,
+    next_action: str,
+    next_action_reason: str,
+    waiting_for_user: int,
+    paused: int,
+    completed_at: str | None = None,
+) -> None:
+    """在 child 控制事务内同步父层语义字段。"""
+    connection.execute(
+        """
+        UPDATE fj_workflow_runs
+        SET status = ?, control_state = ?, waiting_reason = ?, control_cause = ?,
+            transition_id = ?, state_version = state_version + 1,
+            current_step = ?, next_action = ?, next_action_reason = ?,
+            waiting_for_user = ?, paused = ?, completed_at = COALESCE(?, completed_at),
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            status,
+            control_state,
+            waiting_reason,
+            control_cause,
+            transition_id,
+            control_state,
+            next_action,
+            next_action_reason,
+            waiting_for_user,
+            paused,
+            completed_at,
+            utc_now(),
+            workflow_run_id,
+        ),
+    )
+
+
+def _set_child_state_in_connection(
+    connection: Any,
+    smart_capture_id: str,
+    *,
+    status: str,
+    stage: str,
+    waiting_reason: str,
+    control_cause: str,
+    transition_id: str,
+    message: str,
+    completed: bool = False,
+    result_summary: dict[str, object] | None = None,
+) -> str:
+    """更新 child lifecycle，并为 linked child 产生一次可消费事件。"""
+    now = utc_now()
+    row = connection.execute(
+        "SELECT * FROM fj_smart_captures WHERE id = ?",
+        (smart_capture_id,),
+    ).fetchone()
+    if row is None:
+        raise AppError(404, "SMART_CAPTURE_NOT_FOUND", "岗位采集任务不存在。")
+    next_status = _canonical_status(status, waiting_reason)
+    # child 终态只允许保留原结果，迟到回调和父层控制都不能改写有效 outcome。
+    if str(row["status"]) in TERMINAL_STATUSES:
+        return str(row["current_batch_id"] or "")
+    next_result = (
+        str(row["result_summary_json"] or "{}")
+        if result_summary is None
+        else json.dumps(result_summary, ensure_ascii=False, sort_keys=True)
+    )
+    next_completed_at = row["completed_at"] or now if completed else None
+    observable = (
+        str(row["status"]), str(row["stage"]), str(row["waiting_reason"] or ""),
+        str(row["control_cause"] or ""), str(row["message"] or ""),
+        str(row["result_summary_json"] or "{}"), row["completed_at"],
+    )
+    next_observable = (
+        next_status, stage, waiting_reason, control_cause, message, next_result,
+        next_completed_at,
+    )
+    if observable == next_observable and str(row["transition_id"] or "") == transition_id:
+        return str(row["current_batch_id"] or "")
+    next_version = max(1, int(row["state_version"] or 1)) + 1
+    connection.execute(
+        """
+        UPDATE fj_smart_captures
+        SET status = ?, stage = ?, waiting_reason = ?, control_cause = ?,
+            message = ?, result_summary_json = ?, completed_at = CASE WHEN ?
+              THEN COALESCE(completed_at, ?) ELSE NULL END,
+            transition_id = ?, state_version = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            next_status,
+            stage,
+            waiting_reason,
+            control_cause,
+            message,
+            next_result,
+            int(completed),
+            now,
+            transition_id,
+            next_version,
+            now,
+            smart_capture_id,
+        ),
+    )
+    updated = connection.execute(
+        "SELECT * FROM fj_smart_captures WHERE id = ?", (smart_capture_id,)
+    ).fetchone()
+    if updated is None:
+        return ""
+    relation = connection.execute(
+        """
+        SELECT id FROM fj_workflow_children
+        WHERE workflow_run_id = ? AND child_type = 'smart_capture' AND child_ref = ?
+        """,
+        (str(updated["workflow_run_id"] or ""), smart_capture_id),
+    ).fetchone()
+    if relation is not None and next_status in {"completed", "stopped", "failed", "interrupted"}:
+        workflow_children.record_child_event_in_connection(
+            connection,
+            child_relation_id=str(relation["id"]),
+            child_type=workflow_children.SMART_CAPTURE_CHILD_TYPE,
+            child_ref=smart_capture_id,
+            child_status=next_status,
+            transition_id=transition_id,
+            state_version=next_version,
+            waiting_reason=waiting_reason,
+            control_cause=control_cause,
+            result_summary=_load_json(next_result),
+            occurred_at=now,
+        )
+    elif relation is not None:
+        workflow_children.project_smart_capture_in_connection(
+            connection,
+            updated,
+            capabilities=_capabilities(
+                status=next_status,
+                stage=stage,
+                waiting_reason=waiting_reason,
+                control_cause=control_cause,
+            ),
+            now=now,
+        )
+    return str(updated["current_batch_id"] or "")
+
+
+def parent_pause_child_in_connection(
+    connection: Any, workflow_run_id: str, transition_id: str
+) -> str:
+    """父暂停与 linked child 的 pausing/paused 在同一事务内落库。"""
+    capture = connection.execute(
+        "SELECT * FROM fj_smart_captures WHERE workflow_run_id = ?",
+        (workflow_run_id,),
+    ).fetchone()
+    if capture is None:
+        return ""
+    batch_id = str(capture["current_batch_id"] or "")
+    batch = connection.execute(
+        "SELECT status FROM fj_boss_capture_batches WHERE id = ?", (batch_id,)
+    ).fetchone() if batch_id else None
+    child_status = "pausing" if batch is not None and str(batch["status"]) in {"queued", "running"} else "paused"
+    _update_parent_control_in_connection(
+        connection, workflow_run_id, status="running", control_state="paused",
+        waiting_reason="parent_pause", control_cause="parent_pause",
+        transition_id=transition_id, next_action="resume_workflow",
+        next_action_reason="父任务已暂停，恢复后继续当前子任务。", waiting_for_user=0, paused=1,
+    )
+    # pending 或已终态 child 没有可暂停的执行器，保留其 lifecycle 原样。
+    if str(capture["status"]) in {"pending", *TERMINAL_STATUSES}:
+        return batch_id
+    _set_child_state_in_connection(
+        connection, str(capture["id"]), status=child_status,
+        stage="pause_requested" if child_status == "pausing" else "paused",
+        waiting_reason="child_control", control_cause="parent_pause",
+        transition_id=transition_id, message="父任务已请求安全暂停当前岗位采集。",
+    )
+    return batch_id
+
+
+def parent_resume_child_in_connection(
+    connection: Any, workflow_run_id: str, transition_id: str
+) -> str:
+    """父恢复只解除 parent_pause，不清除其它 child 卡点。"""
+    parent = connection.execute(
+        "SELECT control_state, control_cause, status, paused FROM fj_workflow_runs WHERE id = ?", (workflow_run_id,)
+    ).fetchone()
+    capture = connection.execute(
+        "SELECT * FROM fj_smart_captures WHERE workflow_run_id = ?", (workflow_run_id,)
+    ).fetchone()
+    if parent is None or capture is None:
+        return ""
+    if (
+        str(parent["control_state"] or "") != "paused"
+        or str(parent["control_cause"] or "") != "parent_pause"
+    ):
+        raise AppError(409, "WORKFLOW_NOT_PARENT_PAUSED", "当前父任务不是由 parent pause 造成的暂停。")
+    child_status = str(capture["status"])
+    if child_status == "failed":
+        _update_parent_control_in_connection(
+            connection, workflow_run_id, status="waiting_for_user",
+            control_state="child_failed_waiting_decision", waiting_reason="child_failed",
+            control_cause="child_failure", transition_id=transition_id,
+            next_action="await_child_decision", next_action_reason="子任务执行失败，请选择跳过该子任务继续或结束父任务。",
+            waiting_for_user=1, paused=0,
+        )
+        return ""
+    if child_status == "stopped":
+        _update_parent_control_in_connection(
+            connection, workflow_run_id, status="waiting_for_user",
+            control_state="child_cancelled_waiting_decision", waiting_reason="child_stopped",
+            control_cause="child_user_stop", transition_id=transition_id,
+            next_action="await_child_decision", next_action_reason="子任务已停止，请选择跳过该子任务继续或结束父任务。",
+            waiting_for_user=1, paused=0,
+        )
+        return ""
+    if child_status == "interrupted":
+        _update_parent_control_in_connection(
+            connection, workflow_run_id, status="waiting_for_user",
+            control_state="waiting_child_interrupted",
+            waiting_reason=str(capture["waiting_reason"] or "capture_interrupted"),
+            control_cause="recovery", transition_id=transition_id,
+            next_action="await_child_resume", next_action_reason="子任务执行已中断，请明确恢复后再继续。",
+            waiting_for_user=1, paused=0,
+        )
+        return ""
+    _update_parent_control_in_connection(
+        connection, workflow_run_id, status="running", control_state="active",
+        waiting_reason="", control_cause="recovery", transition_id=transition_id,
+        next_action="continue_workflow", next_action_reason="父任务已恢复。", waiting_for_user=0, paused=0,
+    )
+    if str(capture["status"]) in {"pausing", "paused"} and str(capture["control_cause"] or "") == "parent_pause":
+        _set_child_state_in_connection(
+            connection, str(capture["id"]), status="running", stage="resume_requested",
+            waiting_reason="", control_cause="recovery", transition_id=transition_id,
+            message="父任务已恢复当前岗位采集。",
+        )
+    return str(capture["current_batch_id"] or "")
+
+
+def parent_cancel_child_in_connection(
+    connection: Any, workflow_run_id: str, transition_id: str
+) -> str:
+    """父取消先原子收敛 parent/child，再由提交后的 side effect 停止执行器。"""
+    capture = connection.execute(
+        "SELECT * FROM fj_smart_captures WHERE workflow_run_id = ?", (workflow_run_id,)
+    ).fetchone()
+    _update_parent_control_in_connection(
+        connection, workflow_run_id, status="cancelled", control_state="active",
+        waiting_reason="", control_cause="parent_cancel", transition_id=transition_id,
+        next_action="", next_action_reason="父任务已取消，已获得的数据继续保留。",
+        waiting_for_user=0, paused=0, completed_at=utc_now(),
+    )
+    if capture is None:
+        return ""
+    if str(capture["status"]) in TERMINAL_STATUSES:
+        return ""
+    return _set_child_state_in_connection(
+        connection, str(capture["id"]), status="stopped", stage="stopped",
+        waiting_reason="", control_cause="parent_cancel", transition_id=transition_id,
+        message="父任务已取消，岗位采集已停止。", completed=True,
+    )
+
+
+def child_pause_in_connection(
+    connection: Any, smart_capture_id: str, transition_id: str
+) -> str:
+    """child 自主暂停，同时把 parent 置为 waiting_child_paused。"""
+    capture = connection.execute(
+        "SELECT * FROM fj_smart_captures WHERE id = ?", (smart_capture_id,)
+    ).fetchone()
+    if capture is None:
+        raise AppError(404, "SMART_CAPTURE_NOT_FOUND", "岗位采集任务不存在。")
+    if str(capture["status"]) not in {"running", "pausing"}:
+        raise AppError(409, "SMART_CAPTURE_NOT_PAUSABLE", "当前岗位采集任务不在可暂停状态。")
+    workflow_run_id = str(capture["workflow_run_id"] or "")
+    batch_id = str(capture["current_batch_id"] or "")
+    batch = connection.execute(
+        "SELECT status FROM fj_boss_capture_batches WHERE id = ?", (batch_id,)
+    ).fetchone() if batch_id else None
+    child_status = "pausing" if batch is not None and str(batch["status"]) in {"queued", "running"} else "paused"
+    if workflow_run_id:
+        parent = connection.execute(
+            "SELECT control_state FROM fj_workflow_runs WHERE id = ?", (workflow_run_id,)
+        ).fetchone()
+        if parent is not None and str(parent["control_state"] or "active") != "active":
+            raise AppError(409, "CHILD_PAUSE_BLOCKED_BY_PARENT", "父任务当前已有等待或暂停原因。")
+        _update_parent_control_in_connection(
+            connection, workflow_run_id, status="waiting_for_user",
+            control_state="waiting_child_paused", waiting_reason="child_paused",
+            control_cause="child_self_pause", transition_id=transition_id,
+            next_action="await_child_resume", next_action_reason="子任务已请求暂停，请在子任务恢复后继续。",
+            waiting_for_user=1, paused=0,
+        )
+    _set_child_state_in_connection(
+        connection, smart_capture_id, status=child_status,
+        stage="pause_requested" if child_status == "pausing" else "paused",
+        waiting_reason="child_control", control_cause="child_self_pause",
+        transition_id=transition_id, message="岗位采集子任务已请求暂停。",
+    )
+    return batch_id
+
+
+def child_resume_in_connection(
+    connection: Any, smart_capture_id: str, transition_id: str
+) -> str:
+    """child resume 只解除 child_self_pause 或 recovery。"""
+    capture = connection.execute(
+        "SELECT * FROM fj_smart_captures WHERE id = ?", (smart_capture_id,)
+    ).fetchone()
+    if capture is None:
+        raise AppError(404, "SMART_CAPTURE_NOT_FOUND", "岗位采集任务不存在。")
+    workflow_run_id = str(capture["workflow_run_id"] or "")
+    if workflow_run_id:
+        parent = connection.execute(
+            "SELECT control_state FROM fj_workflow_runs WHERE id = ?", (workflow_run_id,)
+        ).fetchone()
+        if parent is not None and str(parent["control_state"] or "") == "paused":
+            raise AppError(409, "CHILD_RESUME_BLOCKED_BY_PARENT", "父任务仍处于暂停状态，请先恢复父任务。")
+        resumable_from_child = (
+            str(capture["status"]) in {"pausing", "paused"}
+            and str(capture["control_cause"] or "") == "child_self_pause"
+        ) or str(capture["status"]) == "interrupted" or (
+            str(capture["status"]) == "waiting_for_user"
+            and str(capture["waiting_reason"] or "") in {"capture_interrupted", "browser_not_running"}
+        )
+        if not resumable_from_child:
+            raise AppError(409, "CHILD_RESUME_NOT_ALLOWED", "当前子任务没有可恢复的暂停或中断原因。")
+        if parent is not None and str(parent["control_state"] or "") in {"waiting_child_paused", "waiting_child_interrupted"}:
+            _update_parent_control_in_connection(
+                connection, workflow_run_id, status="running", control_state="active",
+                waiting_reason="", control_cause="recovery", transition_id=transition_id,
+                next_action="continue_workflow", next_action_reason="子任务已恢复，父任务可以继续。",
+                waiting_for_user=0, paused=0,
+            )
+    _set_child_state_in_connection(
+        connection, smart_capture_id, status="running", stage="resume_requested",
+        waiting_reason="", control_cause="recovery", transition_id=transition_id,
+        message="岗位采集子任务已恢复。",
+    )
+    return str(capture["current_batch_id"] or "")
+
+
+def child_stop_in_connection(
+    connection: Any, smart_capture_id: str, transition_id: str
+) -> str:
+    """child stop 进入父层人工决策等待，不取消 parent。"""
+    capture = connection.execute(
+        "SELECT * FROM fj_smart_captures WHERE id = ?", (smart_capture_id,)
+    ).fetchone()
+    if capture is None:
+        raise AppError(404, "SMART_CAPTURE_NOT_FOUND", "岗位采集任务不存在。")
+    workflow_run_id = str(capture["workflow_run_id"] or "")
+    if workflow_run_id:
+        _update_parent_control_in_connection(
+            connection, workflow_run_id, status="waiting_for_user",
+            control_state="child_cancelled_waiting_decision", waiting_reason="child_stopped",
+            control_cause="child_user_stop", transition_id=transition_id,
+            next_action="await_child_decision", next_action_reason="子任务已停止，请选择跳过该子任务继续或结束父任务。",
+            waiting_for_user=1, paused=0,
+        )
+    return _set_child_state_in_connection(
+        connection, smart_capture_id, status="stopped", stage="stopped",
+        waiting_reason="", control_cause="child_user_stop", transition_id=transition_id,
+        message="岗位采集子任务已停止，已获得的数据继续保留。", completed=True,
+    )
+
+
 def start_independent_capture(
     db: Database,
     config: AppConfig,
@@ -405,11 +789,28 @@ def pause_smart_capture(
     smart_capture_id: str,
     *,
     sync_workflow: bool = True,
+    transition_id: str | None = None,
 ) -> dict[str, object]:
     capture = get_smart_capture(db, smart_capture_id)
     if str(capture["status"]) in TERMINAL_STATUSES:
         raise AppError(409, "SMART_CAPTURE_NOT_PAUSABLE", "当前岗位采集任务已结束，不能暂停。")
+    if str(capture.get("control_cause") or "") == "child_self_pause" and str(capture["status"]) in {"pausing", "paused"}:
+        return capture
     batch_id = str(capture.get("current_batch_id") or "")
+    transition_id = transition_id or new_id()
+    workflow_run_id = str(capture.get("workflow_run_id") or "")
+    if workflow_run_id and sync_workflow:
+        with db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            batch_id = child_pause_in_connection(connection, smart_capture_id, transition_id)
+        if batch_id:
+            try:
+                task = boss_capture_task_manager.get_task(batch_id)
+                if task.get("status") in {"queued", "running"}:
+                    boss_capture_task_manager.pause_capture(batch_id)
+            except AppError:
+                pass
+        return get_smart_capture(db, smart_capture_id)
     requested_batch_pause = False
     executor_missing = False
     if batch_id:
@@ -427,6 +828,7 @@ def pause_smart_capture(
         stage="pause_requested" if requested_batch_pause else "paused",
         waiting_reason="manual_decision",
         control_cause="user_pause",
+        transition_id=transition_id,
         message=(
             "正在安全暂停当前采集批次。"
             if requested_batch_pause
@@ -435,11 +837,6 @@ def pause_smart_capture(
             else "岗位采集任务已暂停。"
         ),
     )
-    workflow_run_id = str(capture.get("workflow_run_id") or "")
-    if sync_workflow and workflow_run_id:
-        from backend.app.services.fine_job import workflow_runs
-
-        workflow_runs.pause_deep_job_search_run(db, workflow_run_id, sync_capture=False)
     return get_smart_capture(db, smart_capture_id)
 
 
@@ -449,6 +846,7 @@ def resume_smart_capture(
     smart_capture_id: str,
     *,
     sync_workflow: bool = True,
+    transition_id: str | None = None,
 ) -> dict[str, object]:
     capture = get_smart_capture(db, smart_capture_id)
     resumable_waiting = str(capture.get("waiting_reason") or "") in {
@@ -466,6 +864,38 @@ def resume_smart_capture(
         raise AppError(409, "BROWSER_NOT_RUNNING", "FineJob 专用 Chrome 未启动，暂不能继续岗位采集。")
     workflow_run_id = str(capture.get("workflow_run_id") or "")
     batch_id = str(capture.get("current_batch_id") or "")
+    transition_id = transition_id or new_id()
+    if workflow_run_id and sync_workflow:
+        executor_missing = False
+        if batch_id:
+            try:
+                task = boss_capture_task_manager.get_task(batch_id)
+            except AppError:
+                executor_missing = True
+            else:
+                if task.get("status") in {"queued", "running"}:
+                    raise AppError(409, "CAPTURE_PAUSING", "当前采集仍在安全暂停中，请稍后继续。")
+        if executor_missing:
+            with db.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                _set_child_state_in_connection(
+                    connection, smart_capture_id, status="interrupted", stage="interrupted",
+                    waiting_reason="capture_interrupted", control_cause="recovery",
+                    transition_id=transition_id, message="原采集执行进程已中断，请明确恢复后继续。",
+                )
+            return get_smart_capture(db, smart_capture_id)
+        with db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            batch_id = child_resume_in_connection(connection, smart_capture_id, transition_id)
+        if batch_id:
+            try:
+                task = boss_capture_task_manager.get_task(batch_id)
+                pages = max(1, int(task.get("pages") or 1))
+                if str(task.get("stage") or "").endswith("paused"):
+                    boss_capture_task_manager.resume_paused_capture(batch_id, pages=pages)
+            except AppError:
+                pass
+        return get_smart_capture(db, smart_capture_id)
     resumed = False
     executor_missing = False
     if batch_id:
@@ -491,6 +921,7 @@ def resume_smart_capture(
             stage="capturing",
             waiting_reason="",
             control_cause="",
+            transition_id=transition_id,
             message="岗位采集任务已继续。",
         )
     elif not workflow_run_id:
@@ -504,6 +935,7 @@ def resume_smart_capture(
             stage="interrupted",
             waiting_reason="capture_interrupted",
             control_cause="recovery",
+            transition_id=transition_id,
             message="原采集执行进程已中断，正在重新启动当前搜索组合。",
         )
     else:
@@ -514,27 +946,9 @@ def resume_smart_capture(
             stage="resume_requested",
             waiting_reason="",
             control_cause="recovery",
+            transition_id=transition_id,
             message="正在由驾驶舱重新启动中断的采集组合。",
         )
-    if sync_workflow and workflow_run_id:
-        from backend.app.services.fine_job import workflow_runs
-
-        workflow_run = capture.get("workflow_run") or {}
-        workflow_status = str(workflow_run.get("status") or "")
-        workflow_stop_reason = str(workflow_run.get("stop_reason") or "")
-        # 只恢复由采集状态造成的驾驶舱等待，范围或 Context 等待仍保留原有人工处理入口。
-        if bool(workflow_run.get("paused")) or (
-            workflow_status == "waiting_for_user"
-            and workflow_stop_reason in {"capture_interrupted", "browser_not_running", "collection_task_active"}
-        ):
-            workflow_runs.resume_deep_job_search_run(
-                db,
-                config,
-                workflow_run_id,
-                sync_capture=False,
-            )
-        if not resumed:
-            workflow_runs.advance_deep_job_search(db, config, workflow_run_id)
     refreshed = get_smart_capture(db, smart_capture_id)
     if (
         workflow_run_id
@@ -558,6 +972,7 @@ def stop_smart_capture(
     smart_capture_id: str,
     *,
     sync_workflow: bool = True,
+    transition_id: str | None = None,
 ) -> dict[str, object]:
     capture = get_smart_capture(db, smart_capture_id)
     if str(capture["status"]) == "failed":
@@ -567,6 +982,20 @@ def stop_smart_capture(
     if str(capture["status"]) == "stopped":
         return capture
     batch_id = str(capture.get("current_batch_id") or "")
+    workflow_run_id = str(capture.get("workflow_run_id") or "")
+    transition_id = transition_id or new_id()
+    if workflow_run_id and sync_workflow:
+        with db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            batch_id = child_stop_in_connection(connection, smart_capture_id, transition_id)
+        if batch_id:
+            try:
+                task = boss_capture_task_manager.get_task(batch_id)
+                if task.get("status") in {"queued", "running"}:
+                    boss_capture_task_manager.stop_capture(batch_id)
+            except AppError:
+                pass
+        return get_smart_capture(db, smart_capture_id)
     if batch_id:
         try:
             task = boss_capture_task_manager.get_task(batch_id)
@@ -581,14 +1010,10 @@ def stop_smart_capture(
         stage="stopped",
         waiting_reason="",
         control_cause="child_user_stop",
+        transition_id=transition_id,
         message="岗位采集任务已停止，已获得的岗位继续保留。",
         completed=True,
     )
-    workflow_run_id = str(capture.get("workflow_run_id") or "")
-    if sync_workflow and workflow_run_id:
-        from backend.app.services.fine_job import workflow_runs
-
-        workflow_runs.cancel_deep_job_search_run(db, workflow_run_id, sync_capture=False)
     return get_smart_capture(db, smart_capture_id)
 
 
@@ -599,10 +1024,13 @@ def sync_capture_snapshot(db: Database, task: dict[str, object]) -> None:
         return
     with db.connect() as connection:
         parent = connection.execute(
-            "SELECT source, target_count, status FROM fj_smart_captures WHERE id = ?",
+            "SELECT source, target_count, status, control_cause FROM fj_smart_captures WHERE id = ?",
             (smart_capture_id,),
         ).fetchone()
     if parent is None:
+        return
+    if str(parent["status"]) == "cancelled" or str(parent["control_cause"] or "") == "parent_cancel":
+        # 父取消的高优先级结果不接受执行器迟到回调覆盖。
         return
     if str(parent["status"]) in TERMINAL_STATUSES and str(task.get("status") or "") in {"queued", "running"}:
         return
@@ -610,16 +1038,22 @@ def sync_capture_snapshot(db: Database, task: dict[str, object]) -> None:
     stage = str(task.get("stage") or "")
     if status in {"queued", "running"}:
         parent_status = "pausing" if bool(task.get("pause_requested")) else "running"
-        waiting_reason = "manual_decision" if bool(task.get("pause_requested")) else ""
-        control_cause = "user_pause" if bool(task.get("pause_requested")) else ""
+        parent_control = str(parent["control_cause"] or "")
+        waiting_reason = "child_control" if parent_control in {"parent_pause", "child_self_pause"} and bool(task.get("pause_requested")) else "manual_decision" if bool(task.get("pause_requested")) else ""
+        control_cause = parent_control if parent_control in {"parent_pause", "child_self_pause"} and bool(task.get("pause_requested")) else "user_pause" if bool(task.get("pause_requested")) else ""
     elif status == "failed":
         parent_status = "failed"
-        waiting_reason = ""
-        control_cause = ""
+        waiting_reason = "child_failed"
+        control_cause = "child_failure"
+    elif status == "interrupted":
+        parent_status = "interrupted"
+        waiting_reason = str(task.get("waiting_reason") or "capture_interrupted")
+        control_cause = "recovery"
     elif stage.endswith("paused"):
         parent_status = "paused"
-        waiting_reason = "manual_decision"
-        control_cause = "user_pause"
+        parent_control = str(parent["control_cause"] or "")
+        waiting_reason = "child_control" if parent_control in {"parent_pause", "child_self_pause"} else "manual_decision"
+        control_cause = parent_control if parent_control in {"parent_pause", "child_self_pause"} else "user_pause"
     elif stage.endswith("stopped"):
         parent_status = "stopped"
         waiting_reason = ""
@@ -756,6 +1190,7 @@ def get_smart_capture(db: Database, smart_capture_id: str) -> dict[str, object]:
         "waiting_reason": waiting_reason,
         "control_cause": control_cause,
         "state_version": int(data.get("state_version") or 1),
+        "transition_id": str(data.get("transition_id") or ""),
         "capabilities": _capabilities(
             status=status,
             stage=str(data.get("stage") or ""),
@@ -825,6 +1260,7 @@ def _update_capture(
     completed: bool = False,
     waiting_reason: str | None = None,
     control_cause: str | None = None,
+    transition_id: str | None = None,
     current_batch_id: str | None = None,
     progress: dict[str, object] | None = None,
     result_summary: dict[str, object] | None = None,
@@ -834,8 +1270,8 @@ def _update_capture(
         row = connection.execute(
             """
             SELECT status, stage, waiting_reason, control_cause, current_batch_id,
-                   progress_json, result_summary_json, message, error_message,
-                   completed_at, state_version, workflow_run_id
+            progress_json, result_summary_json, message, error_message,
+                   completed_at, state_version, transition_id, workflow_run_id
             FROM fj_smart_captures WHERE id = ?
             """,
             (smart_capture_id,),
@@ -852,7 +1288,11 @@ def _update_capture(
             if control_cause is None
             else control_cause
         )
+        next_transition_id = transition_id or new_id()
         status = _canonical_status(status, next_waiting_reason)
+        # 进程迟到状态或重复回调不得把已确认的 terminal outcome 改成另一种结果。
+        if str(row["status"]) in TERMINAL_STATUSES:
+            return
         next_batch_id = (
             row["current_batch_id"] if current_batch_id is None else current_batch_id
         )
@@ -904,7 +1344,7 @@ def _update_capture(
             SET status = ?, stage = ?, waiting_reason = ?, control_cause = ?,
                 current_batch_id = ?, progress_json = ?, result_summary_json = ?,
                 message = ?, error_message = ?, state_version = ?,
-                updated_at = ?, completed_at = CASE WHEN ? THEN COALESCE(completed_at, ?) ELSE NULL END
+                transition_id = ?, updated_at = ?, completed_at = CASE WHEN ? THEN COALESCE(completed_at, ?) ELSE NULL END
             WHERE id = ?
             """,
             (
@@ -918,6 +1358,7 @@ def _update_capture(
                 message,
                 error_message,
                 state_version,
+                next_transition_id,
                 now,
                 int(completed),
                 now,
@@ -929,17 +1370,39 @@ def _update_capture(
             (smart_capture_id,),
         ).fetchone()
         if updated_row is not None:
-            workflow_children.project_smart_capture_in_connection(
-                connection,
-                updated_row,
-                capabilities=_capabilities(
-                    status=status,
-                    stage=stage,
+            relation = connection.execute(
+                """
+                SELECT id FROM fj_workflow_children
+                WHERE workflow_run_id = ? AND child_type = 'smart_capture' AND child_ref = ?
+                """,
+                (str(updated_row["workflow_run_id"] or ""), smart_capture_id),
+            ).fetchone()
+            if relation is not None and status in {"completed", "stopped", "failed", "interrupted"}:
+                workflow_children.record_child_event_in_connection(
+                    connection,
+                    child_relation_id=str(relation["id"]),
+                    child_type=workflow_children.SMART_CAPTURE_CHILD_TYPE,
+                    child_ref=smart_capture_id,
+                    child_status=status,
+                    transition_id=next_transition_id,
+                    state_version=state_version,
                     waiting_reason=next_waiting_reason,
                     control_cause=next_control_cause,
-                ),
-                now=now,
-            )
+                    result_summary=_load_json(next_result_summary_json),
+                    occurred_at=now,
+                )
+            elif relation is not None:
+                workflow_children.project_smart_capture_in_connection(
+                    connection,
+                    updated_row,
+                    capabilities=_capabilities(
+                        status=status,
+                        stage=stage,
+                        waiting_reason=next_waiting_reason,
+                        control_cause=next_control_cause,
+                    ),
+                    now=now,
+                )
 
 
 def _progress_from_task(task: dict[str, object]) -> dict[str, object]:

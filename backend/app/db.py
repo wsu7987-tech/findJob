@@ -1899,6 +1899,11 @@ CREATE TABLE IF NOT EXISTS fj_workflow_runs (
   paused_from_next_action TEXT NOT NULL DEFAULT '',
   paused_from_next_action_reason TEXT NOT NULL DEFAULT '',
   stop_reason TEXT NOT NULL DEFAULT '',
+  control_state TEXT NOT NULL DEFAULT 'active',
+  waiting_reason TEXT NOT NULL DEFAULT '',
+  control_cause TEXT NOT NULL DEFAULT '',
+  state_version INTEGER NOT NULL DEFAULT 1,
+  transition_id TEXT NOT NULL DEFAULT '',
   codex_session_ref TEXT,
   codex_runtime_id TEXT,
   telemetry_json TEXT NOT NULL DEFAULT '{}',
@@ -1956,6 +1961,7 @@ CREATE TABLE IF NOT EXISTS fj_workflow_children (
   updated_at TEXT NOT NULL,
   state_version INTEGER NOT NULL DEFAULT 1,
   child_state_version INTEGER NOT NULL DEFAULT 0,
+  transition_id TEXT NOT NULL DEFAULT '',
   FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE CASCADE,
   UNIQUE (workflow_run_id, child_type, child_ref),
   CHECK (sequence > 0),
@@ -1967,6 +1973,28 @@ CREATE INDEX IF NOT EXISTS idx_fj_workflow_children_workflow_sequence
   ON fj_workflow_children(workflow_run_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_fj_workflow_children_child_ref
   ON fj_workflow_children(child_type, child_ref);
+
+-- linked child 的终态/中断事件持久化后再由 parent 幂等消费。
+CREATE TABLE IF NOT EXISTS fj_workflow_child_events (
+  event_id TEXT PRIMARY KEY,
+  transition_id TEXT NOT NULL,
+  child_relation_id TEXT NOT NULL,
+  child_type TEXT NOT NULL,
+  child_ref TEXT NOT NULL,
+  child_status TEXT NOT NULL,
+  waiting_reason TEXT NOT NULL DEFAULT '',
+  control_cause TEXT NOT NULL DEFAULT '',
+  result_summary_json TEXT NOT NULL DEFAULT '{}',
+  occurred_at TEXT NOT NULL,
+  state_version INTEGER NOT NULL,
+  consumed_at TEXT,
+  FOREIGN KEY (child_relation_id) REFERENCES fj_workflow_children(id) ON DELETE CASCADE,
+  UNIQUE (child_relation_id, event_id),
+  CHECK (state_version > 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fj_workflow_child_events_relation_version
+  ON fj_workflow_child_events(child_relation_id, state_version);
 
 -- Codex 分析批次独立记录交接状态，避免把 Prompt 提交状态混入岗位分析结果。
 CREATE TABLE IF NOT EXISTS fj_workflow_analysis_handoffs (
@@ -2492,10 +2520,41 @@ class Database:
                 "ALTER TABLE fj_workflow_runs "
                 "ADD COLUMN paused_from_next_action_reason TEXT NOT NULL DEFAULT ''"
             ),
+            "control_state": "ALTER TABLE fj_workflow_runs ADD COLUMN control_state TEXT NOT NULL DEFAULT 'active'",
+            "waiting_reason": "ALTER TABLE fj_workflow_runs ADD COLUMN waiting_reason TEXT NOT NULL DEFAULT ''",
+            "control_cause": "ALTER TABLE fj_workflow_runs ADD COLUMN control_cause TEXT NOT NULL DEFAULT ''",
+            "state_version": "ALTER TABLE fj_workflow_runs ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1",
+            "transition_id": "ALTER TABLE fj_workflow_runs ADD COLUMN transition_id TEXT NOT NULL DEFAULT ''",
         }
         for column, statement in run_migrations.items():
             if column not in run_columns:
                 connection.execute(statement)
+        # 旧 Workflow 只保存 legacy status/paused；首次升级时补齐唯一语义控制状态。
+        connection.execute(
+            """
+            UPDATE fj_workflow_runs
+            SET control_state = CASE
+              WHEN paused = 1 OR status = 'paused' THEN 'paused'
+              WHEN status = 'waiting_for_user' AND stop_reason IN ('capture_interrupted', 'browser_not_running')
+                THEN 'waiting_child_interrupted'
+              WHEN status = 'waiting_for_user' THEN 'waiting_other'
+              ELSE 'active'
+            END,
+            waiting_reason = CASE
+              WHEN status = 'waiting_for_user' THEN COALESCE(NULLIF(stop_reason, ''), 'manual_decision')
+              ELSE COALESCE(waiting_reason, '')
+            END,
+            control_cause = CASE
+              WHEN paused = 1 OR status = 'paused' THEN 'parent_pause'
+              WHEN status = 'waiting_for_user' AND stop_reason IN ('capture_interrupted', 'browser_not_running')
+                THEN 'recovery'
+              WHEN status = 'waiting_for_user' THEN 'manual_decision'
+              ELSE COALESCE(control_cause, '')
+            END
+            WHERE COALESCE(control_state, '') = 'active'
+              AND (paused = 1 OR status IN ('paused', 'waiting_for_user'))
+            """
+        )
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_runs_idempotency_key "
             "ON fj_workflow_runs(idempotency_key) WHERE idempotency_key IS NOT NULL"
@@ -2605,6 +2664,7 @@ class Database:
             "waiting_reason": "ALTER TABLE fj_smart_captures ADD COLUMN waiting_reason TEXT NOT NULL DEFAULT ''",
             "control_cause": "ALTER TABLE fj_smart_captures ADD COLUMN control_cause TEXT NOT NULL DEFAULT ''",
             "state_version": "ALTER TABLE fj_smart_captures ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1",
+            "transition_id": "ALTER TABLE fj_smart_captures ADD COLUMN transition_id TEXT NOT NULL DEFAULT ''",
             "progress_json": "ALTER TABLE fj_smart_captures ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'",
             "result_summary_json": "ALTER TABLE fj_smart_captures ADD COLUMN result_summary_json TEXT NOT NULL DEFAULT '{}'",
             "message": "ALTER TABLE fj_smart_captures ADD COLUMN message TEXT NOT NULL DEFAULT ''",
@@ -2728,6 +2788,7 @@ class Database:
             "completed_at": "ALTER TABLE fj_workflow_children ADD COLUMN completed_at TEXT",
             "state_version": "ALTER TABLE fj_workflow_children ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1",
             "child_state_version": "ALTER TABLE fj_workflow_children ADD COLUMN child_state_version INTEGER NOT NULL DEFAULT 0",
+            "transition_id": "ALTER TABLE fj_workflow_children ADD COLUMN transition_id TEXT NOT NULL DEFAULT ''",
         }
         for column, statement in migrations.items():
             if column not in columns:
@@ -2743,6 +2804,31 @@ class Database:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_fj_workflow_children_child_ref "
             "ON fj_workflow_children(child_type, child_ref)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fj_workflow_child_events (
+              event_id TEXT PRIMARY KEY,
+              transition_id TEXT NOT NULL,
+              child_relation_id TEXT NOT NULL,
+              child_type TEXT NOT NULL,
+              child_ref TEXT NOT NULL,
+              child_status TEXT NOT NULL,
+              waiting_reason TEXT NOT NULL DEFAULT '',
+              control_cause TEXT NOT NULL DEFAULT '',
+              result_summary_json TEXT NOT NULL DEFAULT '{}',
+              occurred_at TEXT NOT NULL,
+              state_version INTEGER NOT NULL,
+              consumed_at TEXT,
+              FOREIGN KEY (child_relation_id) REFERENCES fj_workflow_children(id) ON DELETE CASCADE,
+              UNIQUE (child_relation_id, event_id),
+              CHECK (state_version > 0)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_child_events_relation_version "
+            "ON fj_workflow_child_events(child_relation_id, state_version)"
         )
 
         linked_rows = connection.execute(
@@ -2994,6 +3080,7 @@ class Database:
               waiting_reason TEXT NOT NULL DEFAULT '',
               control_cause TEXT NOT NULL DEFAULT '',
               state_version INTEGER NOT NULL DEFAULT 1,
+              transition_id TEXT NOT NULL DEFAULT '',
               progress_json TEXT NOT NULL DEFAULT '{}',
               result_summary_json TEXT NOT NULL DEFAULT '{}',
               message TEXT NOT NULL DEFAULT '',

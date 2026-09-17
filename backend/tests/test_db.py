@@ -135,8 +135,19 @@ def test_database_initializes_workflow_child_relation_and_create_idempotency(
             row[1]
             for row in connection.execute("PRAGMA index_list(fj_workflow_runs)")
         }
+        event_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(fj_workflow_child_events)")
+        }
 
     assert "idempotency_key" in workflow_columns
+    assert {
+        "control_state",
+        "waiting_reason",
+        "control_cause",
+        "state_version",
+        "transition_id",
+    } <= workflow_columns
     assert {
         "id",
         "workflow_run_id",
@@ -155,7 +166,18 @@ def test_database_initializes_workflow_child_relation_and_create_idempotency(
         "updated_at",
         "state_version",
         "child_state_version",
+        "transition_id",
     } <= child_columns
+    assert {
+        "event_id",
+        "transition_id",
+        "child_relation_id",
+        "child_type",
+        "child_ref",
+        "child_status",
+        "state_version",
+        "consumed_at",
+    } <= event_columns
     assert "idx_fj_workflow_children_identity" in child_indexes
     assert "idx_fj_workflow_runs_idempotency_key" in workflow_indexes
 

@@ -1099,9 +1099,20 @@ def resume_deep_job_search_run(
     workflow_run_id: str,
     *,
     sync_capture: bool = True,
+    transition_id: str | None = None,
 ) -> dict[str, object]:
     """仅在用户确认后恢复中断的采集组合，避免后台静默重复采集。"""
     run = _require_run(db, workflow_run_id)
+    if str(run["control_state"] or "") == "paused" or bool(run["paused"]):
+        transition_id = transition_id or new_id()
+        with db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            batch_id = smart_captures.parent_resume_child_in_connection(
+                connection, workflow_run_id, transition_id
+            )
+        if sync_capture and batch_id:
+            _resume_capture_batch_by_id(batch_id)
+        return get_workflow_run(db, workflow_run_id)
     if sync_capture:
         _resume_current_capture_batch(db, workflow_run_id)
     if bool(run["paused"]):
@@ -1222,6 +1233,29 @@ def _resume_current_capture_batch(db: Database, workflow_run_id: str) -> None:
         )
 
 
+def _pause_capture_batch_by_id(operation_id: str) -> None:
+    """事务提交后才触发采集器暂停，避免外部 side effect 进入身份事务。"""
+    try:
+        capture = boss_capture_task_manager.get_task(operation_id)
+        if capture.get("status") in {"queued", "running"}:
+            boss_capture_task_manager.pause_capture(operation_id)
+    except AppError:
+        return
+
+
+def _resume_capture_batch_by_id(operation_id: str) -> None:
+    """事务提交后恢复已安全暂停的采集批次。"""
+    try:
+        capture = boss_capture_task_manager.get_task(operation_id)
+        if str(capture.get("stage") or "").endswith("paused"):
+            boss_capture_task_manager.resume_paused_capture(
+                operation_id,
+                pages=max(1, int(capture.get("pages") or 1)),
+            )
+    except AppError:
+        return
+
+
 def _capture_batch_is_missing(db: Database, workflow_run_id: str) -> bool:
     operation_id = _get_current_capture_operation_id(db, workflow_run_id)
     if not operation_id:
@@ -1238,24 +1272,24 @@ def pause_deep_job_search_run(
     workflow_run_id: str,
     *,
     sync_capture: bool = True,
+    transition_id: str | None = None,
 ) -> dict[str, object]:
     """暂停 Workflow 自动推进，保留已启动采集和所有已获得成果。"""
     run = _require_run(db, workflow_run_id)
     if run["status"] in {"completed", "completed_with_errors", "cancelled", "failed"}:
         raise AppError(409, "WORKFLOW_NOT_PAUSABLE", "当前 Workflow Run 已结束，不能暂停。")
-    if bool(run["paused"]):
+    if str(run["control_state"] or "") == "paused" and str(run["control_cause"] or "") == "parent_pause":
         return get_workflow_run(db, workflow_run_id)
-    if sync_capture:
-        _pause_current_capture_batch(db, workflow_run_id)
-    _update_run(
-        db,
-        workflow_run_id,
-        paused=1,
-        paused_from_next_action=str(run["next_action"] or "continue_workflow"),
-        paused_from_next_action_reason=str(run["next_action_reason"] or "已暂停 Workflow 自动推进。"),
-        next_action="resume_workflow",
-        next_action_reason="Workflow 已暂停；当前采集与已获得成果会保留，恢复后继续自动推进。",
-    )
+    if str(run["control_state"] or "active") != "active":
+        raise AppError(409, "WORKFLOW_NOT_PAUSABLE", "当前父任务已有等待原因，不能覆盖为暂停状态。")
+    transition_id = transition_id or new_id()
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        batch_id = smart_captures.parent_pause_child_in_connection(
+            connection, workflow_run_id, transition_id
+        )
+    if sync_capture and batch_id:
+        _pause_capture_batch_by_id(batch_id)
     return get_workflow_run(db, workflow_run_id)
 
 
@@ -1264,24 +1298,25 @@ def cancel_deep_job_search_run(
     workflow_run_id: str,
     *,
     sync_capture: bool = True,
+    transition_id: str | None = None,
 ) -> dict[str, object]:
     """停止 Workflow，并在列表采集仍运行时请求已有采集器安全停止。"""
     run = _require_run(db, workflow_run_id)
     if run["status"] in {"completed", "completed_with_errors", "cancelled", "failed"}:
         return get_workflow_run(db, workflow_run_id)
-    if sync_capture:
-        linked_capture = smart_captures.get_by_workflow_run(db, workflow_run_id)
-        if linked_capture is not None and str(linked_capture["status"]) not in {
-            "completed",
-            "stopped",
-            "failed",
-        }:
-            # 父任务取消统一映射为子采集停止，避免 current 槽位遗留为活动状态。
-            smart_captures.stop_smart_capture(
-                db,
-                str(linked_capture["smart_capture_id"]),
-                sync_workflow=False,
-            )
+    transition_id = transition_id or new_id()
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        batch_id = smart_captures.parent_cancel_child_in_connection(
+            connection, workflow_run_id, transition_id
+        )
+    if sync_capture and not batch_id:
+        batch_id = _get_current_capture_operation_id(db, workflow_run_id)
+    if sync_capture and batch_id:
+        try:
+            boss_capture_task_manager.stop_capture(batch_id)
+        except AppError:
+            pass
     with db.connect() as connection:
         active_tasks = connection.execute(
             """
@@ -1292,7 +1327,7 @@ def cancel_deep_job_search_run(
         ).fetchall()
     for task in active_tasks:
         operation_id = str(task["operation_ref_id"] or "")
-        if task["operation_ref_type"] == "capture_task" and operation_id:
+        if task["operation_ref_type"] == "capture_task" and operation_id and operation_id != batch_id:
             try:
                 boss_capture_task_manager.stop_capture(operation_id)
             except AppError:
@@ -1316,20 +1351,97 @@ def cancel_deep_job_search_run(
             """,
             (utc_now(), utc_now(), workflow_run_id),
         )
-    _update_run(
-        db,
-        workflow_run_id,
-        status="cancelled",
-        current_step="cancelled",
-        next_action="",
-        next_action_reason="用户已停止 Workflow；系统不会再创建后续任务。",
-        waiting_for_user=0,
-        paused=0,
-        paused_from_next_action="",
-        paused_from_next_action_reason="",
-        stop_reason="cancelled_by_user",
-        completed_at=utc_now(),
-    )
+    return get_workflow_run(db, workflow_run_id)
+
+
+def handle_child_decision(
+    db: Database,
+    workflow_run_id: str,
+    child_relation_id: str,
+    decision: str,
+    *,
+    transition_id: str | None = None,
+) -> dict[str, object]:
+    """处理 stopped/failed child 的父层 skip/end 决策。"""
+    if decision not in {"skip", "end"}:
+        raise AppError(422, "INVALID_CHILD_DECISION", "子任务决策必须是 skip 或 end。")
+    actual_transition_id = transition_id or new_id()
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        parent = connection.execute(
+            "SELECT * FROM fj_workflow_runs WHERE id = ?", (workflow_run_id,)
+        ).fetchone()
+        relation = connection.execute(
+            """
+            SELECT * FROM fj_workflow_children
+            WHERE id = ? AND workflow_run_id = ?
+            """,
+            (child_relation_id, workflow_run_id),
+        ).fetchone()
+        if parent is None:
+            raise AppError(404, "WORKFLOW_RUN_NOT_FOUND", "Workflow Run 不存在。")
+        if relation is None:
+            raise AppError(404, "WORKFLOW_CHILD_NOT_FOUND", "父任务子关系不存在。")
+        if str(parent["control_state"] or "") not in {
+            "child_cancelled_waiting_decision",
+            "child_failed_waiting_decision",
+        }:
+            raise AppError(409, "CHILD_DECISION_NOT_ALLOWED", "当前父任务没有等待子任务决策。")
+        expected_child_status = (
+            "stopped"
+            if str(parent["control_state"]) == "child_cancelled_waiting_decision"
+            else "failed"
+        )
+        if str(relation["status"]) != expected_child_status:
+            raise AppError(409, "CHILD_DECISION_NOT_ALLOWED", "当前父任务等待的是其他子任务结果。")
+        next_child = connection.execute(
+            """
+            SELECT id FROM fj_workflow_children
+            WHERE workflow_run_id = ? AND sequence > ? AND status = 'pending'
+            ORDER BY sequence LIMIT 1
+            """,
+            (workflow_run_id, int(relation["sequence"])),
+        ).fetchone()
+        now = utc_now()
+        if decision == "end":
+            connection.execute(
+                """
+                UPDATE fj_workflow_runs
+                SET status = 'cancelled', control_state = 'active', waiting_reason = '',
+                    control_cause = 'parent_cancel', transition_id = ?, state_version = state_version + 1,
+                    current_step = 'cancelled', next_action = '', next_action_reason = '父任务已结束。',
+                    waiting_for_user = 0, paused = 0, stop_reason = 'child_decision_end',
+                    completed_at = COALESCE(completed_at, ?), updated_at = ?
+                WHERE id = ?
+                """,
+                (actual_transition_id, now, now, workflow_run_id),
+            )
+        elif next_child is not None:
+            connection.execute(
+                """
+                UPDATE fj_workflow_runs
+                SET status = 'running', control_state = 'active', waiting_reason = '',
+                    control_cause = 'recovery', transition_id = ?, state_version = state_version + 1,
+                    current_step = 'next_child', next_action = 'start_next_child',
+                    next_action_reason = '已跳过当前子任务，等待启动下一个子任务。',
+                    waiting_for_user = 0, paused = 0, stop_reason = 'child_skipped', updated_at = ?
+                WHERE id = ?
+                """,
+                (actual_transition_id, now, workflow_run_id),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE fj_workflow_runs
+                SET status = 'completed', control_state = 'active', waiting_reason = '',
+                    control_cause = 'recovery', transition_id = ?, state_version = state_version + 1,
+                    current_step = 'completed', next_action = '', next_action_reason = '已跳过终止子任务，父任务完成。',
+                    waiting_for_user = 0, paused = 0, stop_reason = 'child_skipped',
+                    completed_at = COALESCE(completed_at, ?), updated_at = ?
+                WHERE id = ?
+                """,
+                (actual_transition_id, now, now, workflow_run_id),
+            )
     return get_workflow_run(db, workflow_run_id)
 
 
@@ -3664,7 +3776,31 @@ def _finish_task(db: Database, task_id: str, status: str, payload: dict[str, Any
 
 
 def _wait_for_user(db: Database, workflow_run_id: str, stop_reason: str, reason: str) -> None:
-    _update_run(db, workflow_run_id, status="waiting_for_user", current_step="waiting_for_user", next_action="await_user_choice", next_action_reason=reason, waiting_for_user=1, stop_reason=stop_reason)
+    if stop_reason in {"capture_interrupted", "browser_not_running"}:
+        control_state = "waiting_child_interrupted"
+        control_cause = "recovery"
+        waiting_reason = stop_reason
+    elif stop_reason in {"child_failed", "child_stopped"}:
+        control_state = "child_failed_waiting_decision" if stop_reason == "child_failed" else "child_cancelled_waiting_decision"
+        control_cause = "child_failure" if stop_reason == "child_failed" else "child_user_stop"
+        waiting_reason = stop_reason
+    else:
+        control_state = "waiting_other"
+        control_cause = "manual_decision"
+        waiting_reason = stop_reason
+    _update_run(
+        db,
+        workflow_run_id,
+        status="waiting_for_user",
+        current_step="waiting_for_user",
+        next_action="await_user_choice",
+        next_action_reason=reason,
+        waiting_for_user=1,
+        stop_reason=stop_reason,
+        control_state=control_state,
+        waiting_reason=waiting_reason,
+        control_cause=control_cause,
+    )
 
 
 def _update_run(db: Database, workflow_run_id: str, **fields: object) -> None:
@@ -3673,6 +3809,8 @@ def _update_run(db: Database, workflow_run_id: str, **fields: object) -> None:
     fields["updated_at"] = utc_now()
     keys = list(fields)
     assignments = ", ".join(f"{key} = ?" for key in keys)
+    if "state_version" not in fields:
+        assignments += ", state_version = state_version + 1"
     with db.connect() as connection:
         connection.execute(f"UPDATE fj_workflow_runs SET {assignments} WHERE id = ?", [*fields.values(), workflow_run_id])
     try:
@@ -3709,7 +3847,7 @@ def _serialize_run(db: Database, row: Any) -> dict[str, object]:
         telemetry = {}
     telemetry["prefetch"] = _get_prefetch_summary(db, str(row["id"]))
     telemetry["search_planner"] = _get_search_planner_summary(db, str(row["id"]))
-    return {"workflow_run_id": row["id"], "workflow_type": row["workflow_type"], "idempotency_key": row["idempotency_key"], "completion_contract": contract, "completion_progress": _completion_progress(db, str(row["id"]), contract), "status": "paused" if bool(row["paused"]) else row["status"], "completed_count": row["completed_count"], "remaining_count": row["remaining_count"], "current_step": row["current_step"], "next_action": row["next_action"], "next_action_reason": row["next_action_reason"], "waiting_for_user": bool(row["waiting_for_user"]), "stop_reason": row["stop_reason"], "codex_session_ref": row["codex_session_ref"], "codex_runtime_id": row["codex_runtime_id"], "telemetry": telemetry, "created_at": row["created_at"], "updated_at": row["updated_at"], "completed_at": row["completed_at"]}
+    return {"workflow_run_id": row["id"], "workflow_type": row["workflow_type"], "idempotency_key": row["idempotency_key"], "completion_contract": contract, "completion_progress": _completion_progress(db, str(row["id"]), contract), "status": "paused" if bool(row["paused"]) else row["status"], "control_state": str(row["control_state"] or "active"), "waiting_reason": str(row["waiting_reason"] or ""), "control_cause": str(row["control_cause"] or ""), "state_version": int(row["state_version"] or 1), "transition_id": str(row["transition_id"] or ""), "completed_count": row["completed_count"], "remaining_count": row["remaining_count"], "current_step": row["current_step"], "next_action": row["next_action"], "next_action_reason": row["next_action_reason"], "waiting_for_user": bool(row["waiting_for_user"]), "stop_reason": row["stop_reason"], "codex_session_ref": row["codex_session_ref"], "codex_runtime_id": row["codex_runtime_id"], "telemetry": telemetry, "created_at": row["created_at"], "updated_at": row["updated_at"], "completed_at": row["completed_at"]}
 
 
 def _get_search_planner_summary(db: Database, workflow_run_id: str) -> dict[str, object]:

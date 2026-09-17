@@ -70,6 +70,14 @@ class WorkflowRunCreateRequest(BaseModel):
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=200)
 
 
+class WorkflowControlRequest(BaseModel):
+    transition_id: str | None = Field(default=None, min_length=1, max_length=160)
+
+
+class WorkflowChildDecisionRequest(WorkflowControlRequest):
+    decision: Literal["skip", "end"]
+
+
 class WorkflowManualAnalysisBatchRequest(BaseModel):
     recommendation_strategy_id: str = Field(min_length=1, max_length=100)
     job_ids: list[str] = Field(min_length=1, max_length=20)

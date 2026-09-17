@@ -15,3 +15,7 @@ class SmartCaptureCreateRequest(BaseModel):
     prefer_current_page: bool = True
     filters: dict[str, str] = Field(default_factory=dict)
     source: Literal["boss_capture"] = "boss_capture"
+
+
+class SmartCaptureControlRequest(BaseModel):
+    transition_id: str | None = Field(default=None, min_length=1, max_length=160)

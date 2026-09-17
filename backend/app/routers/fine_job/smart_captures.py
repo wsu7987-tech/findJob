@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, status
 from backend.app.config import AppConfig
 from backend.app.db import Database
 from backend.app.dependencies import get_config, get_database
-from backend.app.schemas.fine_job.smart_captures import SmartCaptureCreateRequest
+from backend.app.schemas.fine_job.smart_captures import SmartCaptureControlRequest, SmartCaptureCreateRequest
 from backend.app.services.fine_job import smart_captures
 
 
@@ -33,8 +33,15 @@ def get(smart_capture_id: str, db: Database = Depends(get_database)):
 
 
 @router.post("/{smart_capture_id}/pause")
-def pause(smart_capture_id: str, db: Database = Depends(get_database)):
-    return smart_captures.pause_smart_capture(db, smart_capture_id)
+def pause(
+    smart_capture_id: str,
+    payload: SmartCaptureControlRequest | None = None,
+    db: Database = Depends(get_database),
+):
+    return smart_captures.pause_smart_capture(
+        db, smart_capture_id,
+        transition_id=payload.transition_id if payload else None,
+    )
 
 
 @router.post("/{smart_capture_id}/start")
@@ -49,15 +56,20 @@ def start(
 @router.post("/{smart_capture_id}/resume")
 def resume(
     smart_capture_id: str,
+    payload: SmartCaptureControlRequest | None = None,
     config: AppConfig = Depends(get_config),
     db: Database = Depends(get_database),
 ):
-    return smart_captures.resume_smart_capture(db, config, smart_capture_id)
+    return smart_captures.resume_smart_capture(
+        db, config, smart_capture_id,
+        transition_id=payload.transition_id if payload else None,
+    )
 
 
 @router.post("/{smart_capture_id}/retry")
 def retry(
     smart_capture_id: str,
+    payload: SmartCaptureControlRequest | None = None,
     config: AppConfig = Depends(get_config),
     db: Database = Depends(get_database),
 ):
@@ -65,5 +77,12 @@ def retry(
 
 
 @router.post("/{smart_capture_id}/stop")
-def stop(smart_capture_id: str, db: Database = Depends(get_database)):
-    return smart_captures.stop_smart_capture(db, smart_capture_id)
+def stop(
+    smart_capture_id: str,
+    payload: SmartCaptureControlRequest | None = None,
+    db: Database = Depends(get_database),
+):
+    return smart_captures.stop_smart_capture(
+        db, smart_capture_id,
+        transition_id=payload.transition_id if payload else None,
+    )

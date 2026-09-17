@@ -20,6 +20,8 @@ from backend.app.schemas.fine_job.workflow_runs import (
     WorkflowManualAnalysisBatchRequest,
     WorkflowRunCodexSessionRequest,
     WorkflowRunCreateRequest,
+    WorkflowChildDecisionRequest,
+    WorkflowControlRequest,
 )
 from backend.app.services.fine_job import workflow_runs
 from backend.app.services.fine_job.workflow_run_events import workflow_run_event_broker
@@ -111,21 +113,81 @@ def advance(workflow_run_id: str, config: AppConfig = Depends(get_config), db: D
 @router.post("/{workflow_run_id}/resume")
 def resume(
     workflow_run_id: str,
+    payload: WorkflowControlRequest | None = None,
     config: AppConfig = Depends(get_config),
     db: Database = Depends(get_database),
 ):
     workflow_runs.configure_realtime_runtime(db, config)
-    return workflow_runs.resume_deep_job_search_run(db, config, workflow_run_id)
+    return workflow_runs.resume_deep_job_search_run(
+        db, config, workflow_run_id,
+        transition_id=payload.transition_id if payload else None,
+    )
 
 
 @router.post("/{workflow_run_id}/pause")
-def pause(workflow_run_id: str, db: Database = Depends(get_database)):
-    return workflow_runs.pause_deep_job_search_run(db, workflow_run_id)
+def pause(
+    workflow_run_id: str,
+    payload: WorkflowControlRequest | None = None,
+    db: Database = Depends(get_database),
+):
+    return workflow_runs.pause_deep_job_search_run(
+        db, workflow_run_id,
+        transition_id=payload.transition_id if payload else None,
+    )
 
 
 @router.post("/{workflow_run_id}/cancel")
-def cancel(workflow_run_id: str, db: Database = Depends(get_database)):
-    return workflow_runs.cancel_deep_job_search_run(db, workflow_run_id)
+def cancel(
+    workflow_run_id: str,
+    payload: WorkflowControlRequest | None = None,
+    db: Database = Depends(get_database),
+):
+    return workflow_runs.cancel_deep_job_search_run(
+        db, workflow_run_id,
+        transition_id=payload.transition_id if payload else None,
+    )
+
+
+@router.post("/{workflow_run_id}/children/{child_relation_id}/decision")
+def child_decision(
+    workflow_run_id: str,
+    child_relation_id: str,
+    payload: WorkflowChildDecisionRequest,
+    db: Database = Depends(get_database),
+):
+    return workflow_runs.handle_child_decision(
+        db,
+        workflow_run_id,
+        child_relation_id,
+        payload.decision,
+        transition_id=payload.transition_id,
+    )
+
+
+@router.post("/{workflow_run_id}/children/{child_relation_id}/skip")
+def skip_child(
+    workflow_run_id: str,
+    child_relation_id: str,
+    payload: WorkflowControlRequest | None = None,
+    db: Database = Depends(get_database),
+):
+    return workflow_runs.handle_child_decision(
+        db, workflow_run_id, child_relation_id, "skip",
+        transition_id=payload.transition_id if payload else None,
+    )
+
+
+@router.post("/{workflow_run_id}/children/{child_relation_id}/end")
+def end_after_child(
+    workflow_run_id: str,
+    child_relation_id: str,
+    payload: WorkflowControlRequest | None = None,
+    db: Database = Depends(get_database),
+):
+    return workflow_runs.handle_child_decision(
+        db, workflow_run_id, child_relation_id, "end",
+        transition_id=payload.transition_id if payload else None,
+    )
 
 
 @router.get("/{workflow_run_id}/context-snapshot")

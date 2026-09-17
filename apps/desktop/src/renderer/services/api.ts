@@ -1586,6 +1586,20 @@ export const api = {
       { method: "POST" }
     );
   },
+  async decideFineJobWorkflowChild(
+    workflowRunId: string,
+    childRelationId: string,
+    decision: "skip" | "end",
+    transitionId?: string
+  ) {
+    return request<FineJobWorkflowRun>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/children/${encodeURIComponent(childRelationId)}/decision`,
+      {
+        method: "POST",
+        body: JSON.stringify({ decision, ...(transitionId ? { transition_id: transitionId } : {}) })
+      }
+    );
+  },
   async attachFineJobWorkflowCodexSession(
     workflowRunId: string,
     payload: { codex_session_ref: string; codex_runtime_id?: string }

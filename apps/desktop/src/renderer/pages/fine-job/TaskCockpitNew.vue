@@ -34,6 +34,14 @@ const contextSoftBudgetCharacters = ref(12000);
 const workflowStore = useFineJobWorkflowRunStore();
 const router = useRouter();
 const workflowRun = computed(() => workflowStore.currentRun);
+const childDecisionWaiting = computed(() => {
+  const run = workflowRun.value;
+  return Boolean(
+    run
+    && ["child_cancelled_waiting_decision", "child_failed_waiting_decision"].includes(run.control_state)
+    && run.children?.some((item) => item.control_state === run.control_state)
+  );
+});
 
 const selectedStrategy = computed(
   () => strategies.value.find((item) => item.id === selectedStrategyId.value) ?? null
@@ -139,6 +147,14 @@ const cancelRun = async () => {
   if (!workflowRun.value) return;
   try {
     await workflowStore.cancel();
+  } catch (value) {
+    ElMessage.error(value instanceof Error ? value.message : String(value));
+  }
+};
+
+const decideChild = async (decision: "skip" | "end") => {
+  try {
+    await workflowStore.decideChild(decision);
   } catch (value) {
     ElMessage.error(value instanceof Error ? value.message : String(value));
   }
@@ -275,6 +291,16 @@ onMounted(async () => {
             plain
             @click="cancelRun"
           >停止任务</el-button>
+          <el-button
+            v-if="childDecisionWaiting"
+            @click="decideChild('skip')"
+          >跳过该子任务继续</el-button>
+          <el-button
+            v-if="childDecisionWaiting"
+            type="danger"
+            plain
+            @click="decideChild('end')"
+          >结束父任务</el-button>
         </div>
         <el-alert
           v-if="workflowRun"

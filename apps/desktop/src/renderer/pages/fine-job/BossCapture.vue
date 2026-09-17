@@ -158,11 +158,14 @@ const smartControlLoading = ref(false);
 const smartCaptureControlLoading = ref(false);
 const currentSmartCapture = computed(() => {
   const run = smartWorkflowRun.value;
-  if (!run) return null;
+  const child = run?.children?.find((item) => item.child_type === "smart_capture");
+  if (!run || !child?.smart_capture_id) return null;
   return {
     workflow_run_id: run.workflow_run_id,
-    status: run.status,
-    message: run.next_action_reason
+    smart_capture_id: child.smart_capture_id,
+    status: child.status,
+    message: child.waiting_reason || run.next_action_reason,
+    capabilities: child.capabilities
   };
 });
 const selectedJobIds = ref<string[]>([]);
@@ -197,14 +200,14 @@ const smartWorkflowTerminalStatuses = [
   "stopped"
 ];
 const smartCaptureRunning = computed(() =>
-  ["pending", "running", "pausing"].includes(currentSmartCapture.value?.status ?? "")
+  Boolean(currentSmartCapture.value?.capabilities?.pause)
 );
 const smartCaptureResumable = computed(() =>
-  ["paused", "waiting_next_batch", "interrupted"].includes(currentSmartCapture.value?.status ?? "")
+  Boolean(currentSmartCapture.value?.capabilities?.resume)
 );
 const smartCaptureCanStart = computed(() =>
-  !currentSmartCapture.value
-  || smartWorkflowTerminalStatuses.includes(currentSmartCapture.value.status)
+  !smartWorkflowRun.value
+  || smartWorkflowTerminalStatuses.includes(smartWorkflowRun.value.status)
 );
 const smartActiveAnalysisItem = computed(() =>
   smartAnalysisItems.value.find((item) => item.status === "running") ?? null
@@ -875,10 +878,11 @@ const startSmartCapture = async () => {
 };
 
 const pauseCurrentSmartCapture = async () => {
-  if (!smartWorkflowRun.value) return;
+  const capture = currentSmartCapture.value;
+  if (!capture) return;
   try {
     smartCaptureControlLoading.value = true;
-    await workflowStore.pause();
+    await api.pauseFineJobSmartCapture(capture.smart_capture_id);
     await refreshCurrentSmartWorkflow();
     ElMessage.success("正在安全暂停岗位采集任务");
   } catch (errorValue) {
@@ -889,10 +893,11 @@ const pauseCurrentSmartCapture = async () => {
 };
 
 const resumeCurrentSmartCapture = async () => {
-  if (!smartWorkflowRun.value) return;
+  const capture = currentSmartCapture.value;
+  if (!capture) return;
   try {
     smartCaptureControlLoading.value = true;
-    await workflowStore.resume();
+    await api.resumeFineJobSmartCapture(capture.smart_capture_id);
     await refreshCurrentSmartWorkflow();
     ElMessage.success("岗位采集任务已继续");
   } catch (errorValue) {
@@ -903,10 +908,11 @@ const resumeCurrentSmartCapture = async () => {
 };
 
 const stopCurrentSmartCapture = async () => {
-  if (!smartWorkflowRun.value) return;
+  const capture = currentSmartCapture.value;
+  if (!capture) return;
   try {
     smartCaptureControlLoading.value = true;
-    await workflowStore.cancel();
+    await api.stopFineJobSmartCapture(capture.smart_capture_id);
     await refreshCurrentSmartWorkflow();
     ElMessage.success("岗位采集任务已停止");
   } catch (errorValue) {
@@ -1189,6 +1195,11 @@ const syncSmartCaptureTask = async (run: typeof workflowStore.currentRun) => {
     .reverse()
     .find((task) => task.task_type === "deep_job_search" && task.operation_ref_id);
   if (!captureTask?.operation_ref_id) {
+    smartCaptureTask.value = null;
+    return;
+  }
+  // child 已暂停、中断或终态时，旧进程内 BOSS task 不再是状态来源，避免重启后的 stale task ID 触发 404。
+  if (!["running", "pausing"].includes(currentSmartCapture.value?.status ?? "")) {
     smartCaptureTask.value = null;
     return;
   }
