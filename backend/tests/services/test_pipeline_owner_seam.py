@@ -8,7 +8,12 @@ from backend.tests.api.test_fine_job_workflow_runs_api import (
     _prepare_analysis_batch,
 )
 from backend.app.errors import AppError
-from backend.app.services.fine_job import cutover_guard, pipeline_owner, smart_captures
+from backend.app.services.fine_job import (
+    cutover_guard,
+    pipeline_owner,
+    pipeline_repository,
+    smart_captures,
+)
 from backend.app.services.fine_job import workflow_runs
 
 
@@ -72,6 +77,81 @@ def test_smart_capture_database_row_resolves_execution_owner(test_db) -> None:
         test_db, str(capture["smart_capture_id"])
     )
     assert pipeline_owner.validate_smart_capture_snapshot_contract(snapshot) == snapshot
+
+
+def test_independent_pipeline_repository_crud_uses_smart_capture_owner(test_db) -> None:
+    capture = smart_captures.create_smart_capture(
+        test_db,
+        source="boss_capture",
+        workflow_run_id=None,
+        search_config={"allowed_search_keywords": ["Python"], "allowed_cities": ["上海"]},
+        execution_config={"candidate_target_count": 2},
+    )
+    capture_id = str(capture["smart_capture_id"])
+    repository = pipeline_repository.PipelineRepository.for_smart_capture(test_db, capture_id)
+
+    task_id = repository.insert_owned(
+        "fj_workflow_tasks",
+        {
+            "task_type": "deep_job_search_analysis",
+            "status": "pending",
+            "payload_json": '{"job_id":"job-independent"}',
+            "result_json": "{}",
+            "created_at": "2026-09-19T00:00:00Z",
+            "updated_at": "2026-09-19T00:00:00Z",
+        },
+    )
+    repository.update_owned(
+        "fj_workflow_tasks",
+        task_id,
+        {"status": "succeeded", "result_json": '{"decision":"review"}'},
+    )
+
+    row = repository.get_row("fj_workflow_tasks", task_id)
+    assert row is not None
+    assert row["smart_capture_id"] == capture_id
+    assert row["workflow_run_id"] is None
+    assert repository.list_tasks("deep_job_search_analysis")[0]["id"] == task_id
+
+    batch_id = "batch-independent"
+    repository.insert_owned(
+        "fj_workflow_analysis_handoffs",
+        {
+            "analysis_batch_id": batch_id,
+            "status": "claimed",
+            "attempt_status": "claimed",
+            "codex_session_ref": "session-independent",
+            "claimed_at": "2026-09-19T00:00:00Z",
+        },
+    )
+    handoffs = repository.list_rows("fj_workflow_analysis_handoffs")
+    assert [row["analysis_batch_id"] for row in handoffs] == [batch_id]
+    repository.update_owned(
+        "fj_workflow_analysis_handoffs",
+        batch_id,
+        {"attempt_status": "released"},
+    )
+    assert repository.get_row("fj_workflow_analysis_handoffs", batch_id)["smart_capture_id"] == capture_id
+
+    with pytest.raises(AppError) as error:
+        repository.insert_owned(
+            "fj_workflow_tasks",
+            {"task_type": "deep_job_search", "workflow_run_id": "other-workflow"},
+        )
+    assert error.value.error_category == "WORKFLOW_PARENT_LINK_MISMATCH"
+
+
+def test_legacy_pipeline_read_adapter_is_explicit_and_read_only(test_db) -> None:
+    adapter = pipeline_repository.LegacyPipelineReadAdapter.for_workflow_run(
+        test_db, "legacy-workflow-run"
+    )
+
+    assert adapter.scope.history_only is True
+    assert adapter.scope.column == "workflow_run_id"
+    assert adapter.list_tasks() == []
+    with pytest.raises(AppError) as error:
+        adapter.insert_owned("fj_workflow_tasks", {"task_type": "legacy"})
+    assert error.value.error_category == "LEGACY_READ_ONLY"
 
 
 def test_snapshot_contract_rejects_workflow_only_identity() -> None:

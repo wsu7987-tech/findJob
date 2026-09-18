@@ -15,6 +15,7 @@ from backend.app.services.fine_job.collection_capacity import (
     get_active_collection_task as get_active_collection_capacity_task,
 )
 from backend.app.services.fine_job import smart_captures
+from backend.app.services.fine_job import pipeline_repository
 from backend.app.services.fine_job import workflow_children
 from backend.app.services.fine_job import cutover_guard
 from backend.app.services.fine_job.workflow_run_events import workflow_run_event_broker
@@ -311,53 +312,8 @@ def _create_workflow_identity_in_connection(
             now,
         ),
     )
-    # 先写父层 baseline task，再由同一事务创建 linked Smart Capture identity。
-    keyword = requested_keywords[0]
-    city = requested_cities[0]
-    combination_id = new_id()
-    filters: dict[str, str] = {}
-    connection.execute(
-        """
-        INSERT INTO fj_workflow_search_combinations (
-          id, workflow_run_id, keyword, city, platform_filters_json,
-          identity_json, status, sequence, transition_action, transition_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 1, 'SWITCH_COMBINATION', 'baseline')
-        """,
-        (
-            combination_id,
-            workflow_run_id,
-            keyword,
-            city,
-            _dump(filters),
-            combination_identity(keyword, city, filters),
-        ),
-    )
-    task_id = new_id()
-    connection.execute(
-        """
-        INSERT INTO fj_workflow_tasks (
-          id, workflow_run_id, task_type, payload_json, result_json, created_at, updated_at
-        ) VALUES (?, ?, 'deep_job_search', ?, '{}', ?, ?)
-        """,
-        (
-            task_id,
-            workflow_run_id,
-            _dump({
-                "keyword": keyword,
-                "city": city,
-                "platform_filters": filters,
-                "search_combination_id": combination_id,
-                "is_baseline": True,
-                "depth": 0,
-                "low_yield_streak": 0,
-                "low_novelty_streak": 0,
-                "low_qualified_yield_streak": 0,
-            }),
-            now,
-            now,
-        ),
-    )
-    smart_captures.create_smart_capture_in_connection(
+    # 先创建 Smart Capture owner，后续所有 Pipeline 新记录都显式绑定该 owner。
+    smart_capture_id = smart_captures.create_smart_capture_in_connection(
         connection,
         db,
         source="task_cockpit",
@@ -382,6 +338,102 @@ def _create_workflow_identity_in_connection(
             }
         ),
     )
+    # 先写父层 baseline task，再由同一事务创建 linked Smart Capture identity。
+    keyword = requested_keywords[0]
+    city = requested_cities[0]
+    combination_id = new_id()
+    filters: dict[str, str] = {}
+    connection.execute(
+        """
+        INSERT INTO fj_workflow_search_combinations (
+          id, workflow_run_id, smart_capture_id, keyword, city, platform_filters_json,
+          identity_json, status, sequence, transition_action, transition_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 1, 'SWITCH_COMBINATION', 'baseline')
+        """,
+        (
+            combination_id,
+            workflow_run_id,
+            smart_capture_id,
+            keyword,
+            city,
+            _dump(filters),
+            combination_identity(keyword, city, filters),
+        ),
+    )
+    task_id = new_id()
+    connection.execute(
+        """
+        INSERT INTO fj_workflow_tasks (
+          id, workflow_run_id, smart_capture_id, task_type, payload_json, result_json, created_at, updated_at
+        ) VALUES (?, ?, ?, 'deep_job_search', ?, '{}', ?, ?)
+        """,
+        (
+            task_id,
+            workflow_run_id,
+            smart_capture_id,
+            _dump({
+                "keyword": keyword,
+                "city": city,
+                "platform_filters": filters,
+                "search_combination_id": combination_id,
+                "is_baseline": True,
+                "depth": 0,
+                "low_yield_streak": 0,
+                "low_novelty_streak": 0,
+                "low_qualified_yield_streak": 0,
+            }),
+            now,
+            now,
+        ),
+    )
+
+
+def _smart_capture_id_for_workflow(db: Database, workflow_run_id: str) -> str:
+    """新业务写入必须先解析 Smart Capture owner，缺失时明确报错。"""
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT id FROM fj_smart_captures WHERE workflow_run_id = ? ORDER BY created_at, id LIMIT 1",
+            (workflow_run_id,),
+        ).fetchone()
+    if row is None:
+        raise AppError(500, "SMART_CAPTURE_OWNER_MISSING", "新 Pipeline 写入缺少 Smart Capture owner。")
+    return str(row["id"])
+
+
+def _backfill_linked_pipeline_rows(
+    db: Database, workflow_run_id: str, smart_capture_id: str
+) -> None:
+    """仅对唯一 linked owner 可确认的旧行做原地回填。"""
+    owner_tables = (
+        "fj_workflow_tasks",
+        "fj_workflow_job_discoveries",
+        "fj_workflow_search_combinations",
+        "fj_workflow_context_snapshots",
+        "fj_workflow_analysis_handoffs",
+        "fj_workflow_prefetch_batches",
+        "fj_workflow_prefetch_items",
+        "fj_workflow_candidate_reservations",
+        "fj_workflow_evaluation_feedback",
+        "fj_codex_sessions",
+    )
+    with db.connect() as connection:
+        for table in owner_tables:
+            connection.execute(
+                f"UPDATE {table} SET smart_capture_id = ? WHERE workflow_run_id = ? AND smart_capture_id IS NULL",
+                (smart_capture_id, workflow_run_id),
+            )
+
+
+def _pipeline_scope_for_workflow(db: Database, workflow_run_id: str) -> tuple[str, str]:
+    """当前 linked 数据按 Smart Capture 读；无法回填的历史行才按 Workflow 只读。"""
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT id FROM fj_smart_captures WHERE workflow_run_id = ? ORDER BY created_at, id LIMIT 1",
+            (workflow_run_id,),
+        ).fetchone()
+    if row is not None:
+        return "smart_capture_id", str(row["id"])
+    return "workflow_run_id", workflow_run_id
 
 
 def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: str) -> dict[str, object]:
@@ -485,9 +537,16 @@ def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: st
 
 def get_workflow_run(db: Database, workflow_run_id: str) -> dict[str, object]:
     run = _require_run(db, workflow_run_id)
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
-        tasks = connection.execute("SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? ORDER BY created_at", (workflow_run_id,)).fetchall()
-        snapshots = connection.execute("SELECT * FROM fj_workflow_context_snapshots WHERE workflow_run_id = ? ORDER BY created_at", (workflow_run_id,)).fetchall()
+        tasks = connection.execute(
+            f"SELECT * FROM fj_workflow_tasks WHERE {owner_column} = ? ORDER BY created_at",
+            (owner_id,),
+        ).fetchall()
+        snapshots = connection.execute(
+            f"SELECT * FROM fj_workflow_context_snapshots WHERE {owner_column} = ? ORDER BY created_at",
+            (owner_id,),
+        ).fetchall()
     return {
         **_serialize_run(db, run),
         "progress": _get_run_progress(db, workflow_run_id),
@@ -544,15 +603,16 @@ def assert_collection_start_allowed(db: Database, *, requested_kind: str) -> Non
 def list_workflow_capture_jobs(db: Database, workflow_run_id: str) -> dict[str, object]:
     """返回整个智能采集 Run 已保存的岗位，供岗位采集列表汇总展示。"""
     _require_run(db, workflow_run_id)
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         rows = connection.execute(
-            """
+            f"""
             SELECT DISTINCT job_id
             FROM fj_workflow_job_discoveries
-            WHERE workflow_run_id = ?
+            WHERE {owner_column} = ?
             ORDER BY discovered_at ASC
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchall()
 
     items_by_id: dict[str, dict[str, object]] = {}
@@ -567,14 +627,14 @@ def list_workflow_capture_jobs(db: Database, workflow_run_id: str) -> dict[str, 
     # 当前批次尚未写入 Workflow Discovery 时，直接补入采集任务内存快照。
     with db.connect() as connection:
         task_rows = connection.execute(
-            """
+            f"""
             SELECT operation_ref_id
             FROM fj_workflow_tasks
-            WHERE workflow_run_id = ? AND task_type = 'deep_job_search'
+            WHERE {owner_column} = ? AND task_type = 'deep_job_search'
               AND operation_ref_type = 'capture_task' AND operation_ref_id IS NOT NULL
             ORDER BY created_at ASC
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchall()
     for task_row in task_rows:
         try:
@@ -595,8 +655,17 @@ def list_workflow_capture_jobs(db: Database, workflow_run_id: str) -> dict[str, 
 
 
 def get_context_snapshot(db: Database, workflow_run_id: str, channel: str = "deep_job_search") -> dict[str, object]:
-    with db.connect() as connection:
-        row = connection.execute("SELECT * FROM fj_workflow_context_snapshots WHERE workflow_run_id = ? AND channel = ?", (workflow_run_id, channel)).fetchone()
+    linked_capture = smart_captures.get_by_workflow_run(db, workflow_run_id)
+    repository = (
+        pipeline_repository.PipelineRepository.for_smart_capture(
+            db, str(linked_capture["smart_capture_id"])
+        )
+        if linked_capture is not None
+        else pipeline_repository.LegacyPipelineReadAdapter.for_workflow_run(
+            db, workflow_run_id
+        )
+    )
+    row = repository.get_context_snapshot(channel)
     if row is None:
         raise AppError(404, "CONTEXT_SNAPSHOT_NOT_FOUND", "本轮上下文快照不存在。")
     return _serialize_snapshot(row)
@@ -606,32 +675,33 @@ def list_workflow_analysis_items(
     db: Database, workflow_run_id: str, analysis_batch_id: str | None = None
 ) -> dict[str, object]:
     _require_run(db, workflow_run_id)
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         rows = connection.execute(
-            """
+            f"""
             SELECT * FROM fj_workflow_tasks
-            WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis'
+            WHERE {owner_column} = ? AND task_type = 'deep_job_search_analysis'
             ORDER BY created_at
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchall()
         discoveries = connection.execute(
-            """
+            f"""
             SELECT d.*, j.title, j.company_name, j.salary, j.location, j.detail_status,
                    j.payload_json
             FROM fj_workflow_job_discoveries d
             JOIN fj_boss_jobs j ON j.id = d.job_id
-            WHERE d.workflow_run_id = ?
+            WHERE d.{owner_column} = ?
             ORDER BY d.discovered_at, d.job_id
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchall()
         feedback_rows = connection.execute(
-            """
+            f"""
             SELECT * FROM fj_workflow_evaluation_feedback
-            WHERE workflow_run_id = ? ORDER BY created_at DESC
+            WHERE {owner_column} = ? ORDER BY created_at DESC
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchall()
     discoveries_by_job = {str(row["job_id"]): row for row in discoveries}
     feedback_by_task: dict[str, list[dict[str, object]]] = {}
@@ -661,14 +731,15 @@ def save_workflow_analysis_feedback(
     payload: dict[str, object],
 ) -> dict[str, object]:
     """保存用户对本条评估的反馈，不自动改变任何正式策略。"""
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     _require_run(db, workflow_run_id)
     with db.connect() as connection:
         item = connection.execute(
             """
             SELECT result_json FROM fj_workflow_tasks
-            WHERE id = ? AND workflow_run_id = ? AND task_type = 'deep_job_search_analysis'
+            WHERE id = ? AND smart_capture_id = ? AND task_type = 'deep_job_search_analysis'
             """,
-            (workflow_task_id, workflow_run_id),
+            (workflow_task_id, smart_capture_id),
         ).fetchone()
     if item is None:
         raise AppError(404, "WORKFLOW_ANALYSIS_ITEM_NOT_FOUND", "Workflow 分析 Item 不存在。")
@@ -678,12 +749,13 @@ def save_workflow_analysis_feedback(
         connection.execute(
             """
             INSERT INTO fj_workflow_evaluation_feedback (
-              id, workflow_run_id, workflow_task_id, evaluation_id, sentiment, reason, note, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              id, workflow_run_id, smart_capture_id, workflow_task_id, evaluation_id, sentiment, reason, note, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 feedback_id,
                 workflow_run_id,
+                smart_capture_id,
                 workflow_task_id,
                 str(result.get("evaluation_id") or "") or None,
                 str(payload["sentiment"]),
@@ -715,13 +787,14 @@ def get_workflow_analysis_item_context(
     db: Database, workflow_run_id: str, workflow_task_id: str
 ) -> dict[str, object]:
     run = _require_run(db, workflow_run_id)
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         item = connection.execute(
             """
             SELECT * FROM fj_workflow_tasks
-            WHERE id = ? AND workflow_run_id = ? AND task_type = 'deep_job_search_analysis'
+            WHERE id = ? AND smart_capture_id = ? AND task_type = 'deep_job_search_analysis'
             """,
-            (workflow_task_id, workflow_run_id),
+            (workflow_task_id, smart_capture_id),
         ).fetchone()
     if item is None:
         raise AppError(404, "WORKFLOW_ANALYSIS_ITEM_NOT_FOUND", "Workflow 分析 Item 不存在。")
@@ -786,10 +859,11 @@ def record_workflow_analysis_result(
     if decision not in {"recommend", "review", "reject"}:
         raise AppError(422, "VALIDATION_FAILED", "Workflow 分析结论无效。")
     run = _require_run(db, workflow_run_id)
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         item = connection.execute(
-            "SELECT * FROM fj_workflow_tasks WHERE id = ? AND workflow_run_id = ? AND task_type = 'deep_job_search_analysis'",
-            (workflow_task_id, workflow_run_id),
+            "SELECT * FROM fj_workflow_tasks WHERE id = ? AND smart_capture_id = ? AND task_type = 'deep_job_search_analysis'",
+            (workflow_task_id, smart_capture_id),
         ).fetchone()
     if item is None:
         raise AppError(404, "WORKFLOW_ANALYSIS_ITEM_NOT_FOUND", "Workflow 分析 Item 不存在。")
@@ -899,6 +973,7 @@ def claim_workflow_analysis_handoff(
     retry_handoff_attempt_id: str | None = None,
 ) -> dict[str, object]:
     """原子占用当前分析批次；占用本身不改变岗位分析 Item 的业务状态。"""
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     run = _require_run(db, workflow_run_id)
     if run["status"] != "waiting_codex":
         raise AppError(409, "WORKFLOW_NOT_READY_FOR_CODEX", "当前 Workflow 不在等待 Codex 分析状态。")
@@ -920,8 +995,8 @@ def claim_workflow_analysis_handoff(
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         rows = connection.execute(
-            "SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis' ORDER BY created_at",
-            (workflow_run_id,),
+            "SELECT * FROM fj_workflow_tasks WHERE smart_capture_id = ? AND task_type = 'deep_job_search_analysis' ORDER BY created_at",
+            (smart_capture_id,),
         ).fetchall()
         pending = [
             row for row in rows
@@ -930,8 +1005,8 @@ def claim_workflow_analysis_handoff(
         if not pending:
             raise AppError(409, "WORKFLOW_ANALYSIS_BATCH_NOT_READY", "当前分析批次已被处理或交接。")
         existing = connection.execute(
-            "SELECT * FROM fj_workflow_analysis_handoffs WHERE workflow_run_id = ? AND analysis_batch_id = ?",
-            (workflow_run_id, batch_id),
+            "SELECT * FROM fj_workflow_analysis_handoffs WHERE smart_capture_id = ? AND analysis_batch_id = ?",
+            (smart_capture_id, batch_id),
         ).fetchone()
         if existing is not None:
             existing_attempt_status = str(existing["attempt_status"] or "claimed")
@@ -946,21 +1021,21 @@ def claim_workflow_analysis_handoff(
             connection.execute(
                 """
                 INSERT INTO fj_workflow_analysis_handoffs (
-                  workflow_run_id, analysis_batch_id, status, handoff_attempt_id, attempt_status,
+                  workflow_run_id, smart_capture_id, analysis_batch_id, status, handoff_attempt_id, attempt_status,
                   codex_session_ref, codex_runtime_id, claimed_at
-                ) VALUES (?, ?, 'claimed', ?, 'claimed', ?, ?, ?)
+                ) VALUES (?, ?, ?, 'claimed', ?, 'claimed', ?, ?, ?)
                 """,
-                (workflow_run_id, batch_id, attempt_id, codex_session_ref, codex_runtime_id or "", now),
+                (workflow_run_id, smart_capture_id, batch_id, attempt_id, codex_session_ref, codex_runtime_id or "", now),
             )
         else:
             connection.execute(
-                """
+                f"""
                 UPDATE fj_workflow_analysis_handoffs
                 SET status = 'claimed', handoff_attempt_id = ?, attempt_status = 'claimed',
                     codex_session_ref = ?, codex_runtime_id = ?, claimed_at = ?, submitted_at = NULL,
                     prompt_written_at = NULL, started_at = NULL, released_at = NULL, completed_at = NULL,
                     recovered_at = ?, recovery_reason = ?
-                WHERE workflow_run_id = ? AND analysis_batch_id = ?
+                WHERE smart_capture_id = ? AND analysis_batch_id = ?
                 """,
                 (
                     attempt_id,
@@ -969,7 +1044,7 @@ def claim_workflow_analysis_handoff(
                     now,
                     now if is_retry else None,
                     "start_ack_timeout_retry" if is_retry else "",
-                    workflow_run_id,
+                    smart_capture_id,
                     batch_id,
                 ),
             )
@@ -993,11 +1068,12 @@ def mark_workflow_analysis_handoff_prompt_written(
     codex_session_ref: str,
 ) -> dict[str, object]:
     """记录 Prompt 已写入终端；业务开始仍由 Codex ACK 决定。"""
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         handoff = connection.execute(
-            "SELECT * FROM fj_workflow_analysis_handoffs WHERE workflow_run_id = ? AND analysis_batch_id = ?",
-            (workflow_run_id, analysis_batch_id),
+            "SELECT * FROM fj_workflow_analysis_handoffs WHERE smart_capture_id = ? AND analysis_batch_id = ?",
+            (smart_capture_id, analysis_batch_id),
         ).fetchone()
         if (
             handoff is None
@@ -1010,9 +1086,9 @@ def mark_workflow_analysis_handoff_prompt_written(
                 """
                 UPDATE fj_workflow_analysis_handoffs
                 SET status = 'submitted', attempt_status = 'prompt_written', submitted_at = ?, prompt_written_at = ?
-                WHERE workflow_run_id = ? AND analysis_batch_id = ?
+                WHERE smart_capture_id = ? AND analysis_batch_id = ?
                 """,
-                (utc_now(), utc_now(), workflow_run_id, analysis_batch_id),
+                (utc_now(), utc_now(), smart_capture_id, analysis_batch_id),
             )
         elif handoff["attempt_status"] not in {"prompt_written", "started"}:
             raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_STALE", "当前 Codex 交接已失效，不能确认 Prompt 写入。")
@@ -1033,11 +1109,12 @@ def release_workflow_analysis_handoff(
     release_reason: str | None = None,
 ) -> dict[str, object]:
     """按 transport 失败或用户完整重试释放当前交接尝试。"""
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         handoff = connection.execute(
-            "SELECT * FROM fj_workflow_analysis_handoffs WHERE workflow_run_id = ? AND analysis_batch_id = ?",
-            (workflow_run_id, analysis_batch_id),
+            "SELECT * FROM fj_workflow_analysis_handoffs WHERE smart_capture_id = ? AND analysis_batch_id = ?",
+            (smart_capture_id, analysis_batch_id),
         ).fetchone()
         if (
             handoff is None
@@ -1052,9 +1129,9 @@ def release_workflow_analysis_handoff(
             """
             UPDATE fj_workflow_analysis_handoffs
             SET status = 'released', attempt_status = 'released', released_at = ?, recovery_reason = ?
-            WHERE workflow_run_id = ? AND analysis_batch_id = ?
+            WHERE smart_capture_id = ? AND analysis_batch_id = ?
             """,
-            (utc_now(), release_reason or "transport_failure", workflow_run_id, analysis_batch_id),
+            (utc_now(), release_reason or "transport_failure", smart_capture_id, analysis_batch_id),
         )
     return get_workflow_run(db, workflow_run_id)
 
@@ -1067,11 +1144,12 @@ def ack_workflow_analysis_batch_started(
     config: AppConfig | None = None,
 ) -> dict[str, object]:
     """仅由当前有效交接尝试确认 Codex 已开始处理分析批次。"""
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         handoff = connection.execute(
-            "SELECT * FROM fj_workflow_analysis_handoffs WHERE workflow_run_id = ? AND analysis_batch_id = ?",
-            (workflow_run_id, analysis_batch_id),
+            "SELECT * FROM fj_workflow_analysis_handoffs WHERE smart_capture_id = ? AND analysis_batch_id = ?",
+            (smart_capture_id, analysis_batch_id),
         ).fetchone()
         if handoff is None or str(handoff["handoff_attempt_id"] or "") != handoff_attempt_id:
             raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_STALE", "当前 Codex 交接尝试已失效，不能确认开始。")
@@ -1081,8 +1159,8 @@ def ack_workflow_analysis_batch_started(
         if attempt_status != "prompt_written":
             raise AppError(409, "WORKFLOW_ANALYSIS_HANDOFF_NOT_READY", "Prompt 尚未写入或当前交接已结束，不能确认开始。")
         rows = connection.execute(
-            "SELECT status, payload_json FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis'",
-            (workflow_run_id,),
+            "SELECT status, payload_json FROM fj_workflow_tasks WHERE smart_capture_id = ? AND task_type = 'deep_job_search_analysis'",
+            (smart_capture_id,),
         ).fetchall()
         has_active_item = any(
             _analysis_batch_id_from_payload(_load(row["payload_json"], {}), workflow_run_id) == analysis_batch_id
@@ -1095,9 +1173,9 @@ def ack_workflow_analysis_batch_started(
             """
             UPDATE fj_workflow_analysis_handoffs
             SET status = 'submitted', attempt_status = 'started', started_at = ?
-            WHERE workflow_run_id = ? AND analysis_batch_id = ? AND handoff_attempt_id = ?
+            WHERE smart_capture_id = ? AND analysis_batch_id = ? AND handoff_attempt_id = ?
             """,
-            (utc_now(), workflow_run_id, analysis_batch_id, handoff_attempt_id),
+            (utc_now(), smart_capture_id, analysis_batch_id, handoff_attempt_id),
         )
     _update_run(
         db,
@@ -1136,16 +1214,17 @@ def resume_deep_job_search_run(
         _resume_current_capture_batch(db, workflow_run_id)
     if bool(run["paused"]):
         if _capture_batch_is_missing(db, workflow_run_id):
+            smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
             with db.connect() as connection:
                 connection.execute(
                     """
                     UPDATE fj_workflow_tasks
                     SET status = 'pending', operation_ref_type = NULL, operation_ref_id = NULL,
                         updated_at = ?
-                    WHERE workflow_run_id = ? AND task_type = 'deep_job_search'
+                    WHERE smart_capture_id = ? AND task_type = 'deep_job_search'
                       AND status IN ('running', 'waiting_for_user')
                     """,
-                    (utc_now(), workflow_run_id),
+                    (utc_now(), smart_capture_id),
                 )
             _update_run(
                 db,
@@ -1185,15 +1264,16 @@ def resume_deep_job_search_run(
         return _continue_after_analysis_batch(db, config, workflow_run_id)
     if stop_reason not in {"capture_interrupted", "browser_not_running", "collection_task_active"}:
         raise AppError(409, "WORKFLOW_NOT_RESUMABLE", "当前等待原因需要先调整任务范围或上下文，不能直接恢复。")
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         connection.execute(
             """
             UPDATE fj_workflow_tasks
             SET status = 'pending', operation_ref_type = NULL, operation_ref_id = NULL,
                 updated_at = ?
-            WHERE workflow_run_id = ? AND status = 'waiting_for_user'
+            WHERE smart_capture_id = ? AND status = 'waiting_for_user'
             """,
-            (utc_now(), workflow_run_id),
+            (utc_now(), smart_capture_id),
         )
     _update_run(
         db,
@@ -1210,16 +1290,17 @@ def resume_deep_job_search_run(
 
 def _get_current_capture_operation_id(db: Database, workflow_run_id: str) -> str:
     """读取既有智能采集子任务当前绑定的批次，不创建额外任务身份。"""
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         row = connection.execute(
             """
             SELECT operation_ref_id
             FROM fj_workflow_tasks
-            WHERE workflow_run_id = ? AND task_type = 'deep_job_search'
+            WHERE smart_capture_id = ? AND task_type = 'deep_job_search'
               AND operation_ref_type = 'capture_task' AND operation_ref_id IS NOT NULL
             ORDER BY updated_at DESC, created_at DESC LIMIT 1
             """,
-            (workflow_run_id,),
+            (smart_capture_id,),
         ).fetchone()
     return str(row["operation_ref_id"] or "") if row is not None else ""
 
@@ -1336,13 +1417,14 @@ def cancel_deep_job_search_run(
             boss_capture_task_manager.stop_capture(batch_id)
         except AppError:
             pass
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         active_tasks = connection.execute(
             """
             SELECT * FROM fj_workflow_tasks
-            WHERE workflow_run_id = ? AND status IN ('pending', 'running', 'waiting_for_user')
+            WHERE smart_capture_id = ? AND status IN ('pending', 'running', 'waiting_for_user')
             """,
-            (workflow_run_id,),
+            (smart_capture_id,),
         ).fetchall()
     for task in active_tasks:
         operation_id = str(task["operation_ref_id"] or "")
@@ -1358,17 +1440,17 @@ def cancel_deep_job_search_run(
             """
             UPDATE fj_workflow_tasks
             SET status = 'skipped', updated_at = ?, completed_at = COALESCE(completed_at, ?)
-            WHERE workflow_run_id = ? AND status IN ('pending', 'running', 'waiting_for_user')
+            WHERE smart_capture_id = ? AND status IN ('pending', 'running', 'waiting_for_user')
             """,
-            (utc_now(), utc_now(), workflow_run_id),
+            (utc_now(), utc_now(), smart_capture_id),
         )
         connection.execute(
             """
             UPDATE fj_workflow_candidate_reservations
             SET status = 'cancelled', released_at = ?, terminal_at = ?
-            WHERE workflow_run_id = ? AND status = 'reserved'
+            WHERE smart_capture_id = ? AND status = 'reserved'
             """,
-            (utc_now(), utc_now(), workflow_run_id),
+            (utc_now(), utc_now(), smart_capture_id),
         )
     return get_workflow_run(db, workflow_run_id)
 
@@ -1471,6 +1553,7 @@ def _record_batch(
     capture: dict[str, object],
     contract: dict[str, Any],
 ) -> dict[str, object]:
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     strategy = get_filter_strategy(db, str(contract["selected_strategy_ids"]["filter_strategy_id"]))
     results = evaluate_filter_strategy(list(capture.get("jobs") or []), strategy)
     _jobs, results = apply_filter_exclusions(db, strategy, list(capture.get("jobs") or []), results)
@@ -1497,16 +1580,17 @@ def _record_batch(
                 continue
             is_duplicate = bool(job.get("is_previously_collected") or job.get("processing_state") == "duplicate")
             filter_result = result_by_id.get(source_job_id, {})
-            first = connection.execute("SELECT 1 FROM fj_workflow_job_discoveries WHERE workflow_run_id = ? AND job_id = ? LIMIT 1", (workflow_run_id, job_id)).fetchone() is None
+            first = connection.execute("SELECT 1 FROM fj_workflow_job_discoveries WHERE smart_capture_id = ? AND job_id = ? LIMIT 1", (smart_capture_id, job_id)).fetchone() is None
             connection.execute(
                 """INSERT OR IGNORE INTO fj_workflow_job_discoveries (
-                    id, workflow_run_id, task_id, job_id, search_keyword, city, search_combination_json,
+                    id, workflow_run_id, smart_capture_id, task_id, job_id, search_keyword, city, search_combination_json,
                     scroll_depth, discovered_at, is_run_first_discovery, is_historical_duplicate,
                     is_filter_candidate
-                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     new_id(),
                     workflow_run_id,
+                    smart_capture_id,
                     task["id"],
                     job_id,
                     payload["keyword"],
@@ -1650,9 +1734,10 @@ def _decide_next_step(
         now = utc_now()
         with db.connect() as connection:
             next_task_id = new_id()
+            smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
             connection.execute(
-                "INSERT INTO fj_workflow_tasks (id, workflow_run_id, task_type, status, payload_json, operation_ref_type, operation_ref_id, created_at, updated_at) VALUES (?, ?, 'deep_job_search', 'running', ?, 'capture_task', ?, ?, ?)",
-                (next_task_id, workflow_run_id, _dump(payload), str(continued["id"]), now, now),
+                "INSERT INTO fj_workflow_tasks (id, workflow_run_id, smart_capture_id, task_type, status, payload_json, operation_ref_type, operation_ref_id, created_at, updated_at) VALUES (?, ?, ?, 'deep_job_search', 'running', ?, 'capture_task', ?, ?, ?)",
+                (next_task_id, workflow_run_id, smart_capture_id, _dump(payload), str(continued["id"]), now, now),
             )
         _update_run(db, workflow_run_id, status="running", current_step="searching", next_action="continue_scroll", next_action_reason="候选池尚未达到目标，当前组合仍有增量搜索预算。")
         return get_workflow_run(db, workflow_run_id)
@@ -1730,34 +1815,36 @@ def _ensure_search_combination_for_task(
     payload: dict[str, object],
 ) -> str:
     """为旧版任务补建组合记录，保证升级后的 discovery 也能追踪来源。"""
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     keyword = str(payload.get("keyword") or "")
     city = str(payload.get("city") or "")
     filters = canonicalize_platform_filters(payload.get("platform_filters"))
     identity = combination_identity(keyword, city, filters)
     with db.connect() as connection:
         existing = connection.execute(
-            "SELECT id FROM fj_workflow_search_combinations WHERE workflow_run_id = ? AND identity_json = ?",
-            (workflow_run_id, identity),
+            "SELECT id FROM fj_workflow_search_combinations WHERE smart_capture_id = ? AND identity_json = ?",
+            (smart_capture_id, identity),
         ).fetchone()
         if existing is not None:
             return str(existing["id"])
         sequence = int(
             connection.execute(
-                "SELECT COALESCE(MAX(sequence), 0) FROM fj_workflow_search_combinations WHERE workflow_run_id = ?",
-                (workflow_run_id,),
+                "SELECT COALESCE(MAX(sequence), 0) FROM fj_workflow_search_combinations WHERE smart_capture_id = ?",
+                (smart_capture_id,),
             ).fetchone()[0]
         )
         combination_id = new_id()
         connection.execute(
             """
             INSERT INTO fj_workflow_search_combinations (
-              id, workflow_run_id, keyword, city, platform_filters_json,
+              id, workflow_run_id, smart_capture_id, keyword, city, platform_filters_json,
               identity_json, status, sequence, transition_action, transition_reason
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, 'SWITCH_COMBINATION', 'legacy_task_backfill')
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'SWITCH_COMBINATION', 'legacy_task_backfill')
             """,
             (
                 combination_id,
                 workflow_run_id,
+                smart_capture_id,
                 keyword,
                 city,
                 _dump(filters),
@@ -1775,14 +1862,15 @@ def _mark_search_combination_started(
 ) -> None:
     if not combination_id:
         return
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         connection.execute(
             """
             UPDATE fj_workflow_search_combinations
             SET status = 'running', started_at = COALESCE(started_at, ?)
-            WHERE id = ? AND workflow_run_id = ? AND status IN ('pending', 'running')
+            WHERE id = ? AND smart_capture_id = ? AND status IN ('pending', 'running')
             """,
-            (utc_now(), combination_id, workflow_run_id),
+            (utc_now(), combination_id, smart_capture_id),
         )
 
 
@@ -1868,6 +1956,7 @@ def _historical_duplicate_distribution(
     city: str,
 ) -> dict[str, dict[str, int]]:
     """统计当前 Scope 历史重复岗位在可映射维度上的分布。"""
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         rows = connection.execute(
             """
@@ -1875,12 +1964,12 @@ def _historical_duplicate_distribution(
                    j.experience, j.degree, j.salary
             FROM fj_workflow_job_discoveries d
             JOIN fj_boss_jobs j ON j.id = d.job_id
-            WHERE d.workflow_run_id = ?
+            WHERE d.smart_capture_id = ?
               AND d.search_keyword = ?
               AND d.city = ?
               AND d.is_historical_duplicate = 1
             """,
-            (workflow_run_id, keyword, city),
+            (smart_capture_id, keyword, city),
         ).fetchall()
     columns = {
         "company_scale": "company_scale",
@@ -1915,15 +2004,16 @@ def _list_combination_filters(
     keyword: str,
     city: str,
 ) -> list[dict[str, str]]:
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         rows = connection.execute(
             """
             SELECT platform_filters_json
             FROM fj_workflow_search_combinations
-            WHERE workflow_run_id = ? AND keyword = ? AND city = ?
+            WHERE smart_capture_id = ? AND keyword = ? AND city = ?
             ORDER BY sequence
             """,
-            (workflow_run_id, keyword, city),
+            (smart_capture_id, keyword, city),
         ).fetchall()
     return [
         canonicalize_platform_filters(_load(row["platform_filters_json"], {}))
@@ -1939,6 +2029,7 @@ def _save_planner_decision(
 ) -> None:
     if not combination_id:
         return
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     evidence = decision.evidence or {}
     with db.connect() as connection:
         connection.execute(
@@ -1947,7 +2038,7 @@ def _save_planner_decision(
             SET transition_reason = CASE WHEN ? <> '' THEN ? ELSE transition_reason END,
                 selected_axis = CASE WHEN ? <> '' THEN ? ELSE selected_axis END,
                 evidence_json = ?
-            WHERE id = ? AND workflow_run_id = ?
+            WHERE id = ? AND smart_capture_id = ?
             """,
             (
                 decision.switch_reason,
@@ -1995,17 +2086,18 @@ def _create_search_combination_task(
 ) -> dict[str, str] | None:
     filters = canonicalize_platform_filters(platform_filters)
     identity = combination_identity(keyword, city, filters)
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         existing = connection.execute(
-            "SELECT id, status FROM fj_workflow_search_combinations WHERE workflow_run_id = ? AND identity_json = ?",
-            (workflow_run_id, identity),
+            "SELECT id, status FROM fj_workflow_search_combinations WHERE smart_capture_id = ? AND identity_json = ?",
+            (smart_capture_id, identity),
         ).fetchone()
         if existing is not None:
             return None
         sequence = int(
             connection.execute(
-                "SELECT COALESCE(MAX(sequence), 0) FROM fj_workflow_search_combinations WHERE workflow_run_id = ?",
-                (workflow_run_id,),
+                "SELECT COALESCE(MAX(sequence), 0) FROM fj_workflow_search_combinations WHERE smart_capture_id = ?",
+                (smart_capture_id,),
             ).fetchone()[0]
         )
         combination_id = new_id()
@@ -2013,14 +2105,15 @@ def _create_search_combination_task(
         connection.execute(
             """
             INSERT INTO fj_workflow_search_combinations (
-              id, workflow_run_id, keyword, city, platform_filters_json,
+              id, workflow_run_id, smart_capture_id, keyword, city, platform_filters_json,
               identity_json, status, sequence, parent_combination_id,
               transition_action, transition_reason, selected_axis, evidence_json
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
             """,
             (
                 combination_id,
                 workflow_run_id,
+                smart_capture_id,
                 keyword,
                 city,
                 _dump(filters),
@@ -2037,12 +2130,13 @@ def _create_search_combination_task(
         connection.execute(
             """
             INSERT INTO fj_workflow_tasks (
-              id, workflow_run_id, task_type, payload_json, result_json, created_at, updated_at
-            ) VALUES (?, ?, 'deep_job_search', ?, '{}', ?, ?)
+              id, workflow_run_id, smart_capture_id, task_type, payload_json, result_json, created_at, updated_at
+            ) VALUES (?, ?, ?, 'deep_job_search', ?, '{}', ?, ?)
             """,
             (
                 task_id,
                 workflow_run_id,
+                smart_capture_id,
                 _dump({
                     "keyword": keyword,
                     "city": city,
@@ -2105,11 +2199,13 @@ def _create_jd_tasks(
     candidate_job_ids: list[str] | None = None,
 ) -> int:
     """按稳定发现顺序选择尚未处理的候选，创建一个小批次 JD 任务。"""
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
+    _backfill_linked_pipeline_rows(db, workflow_run_id, smart_capture_id)
     run = _require_run(db, workflow_run_id)
     contract = _load(run["completion_contract_json"], {})
     jd_target = min(int(_analysis_policy(contract)["analysis_batch_size"]), candidate_target)
     scope_clause = ""
-    scope_values: list[object] = [workflow_run_id]
+    scope_values: list[object] = [smart_capture_id]
     if candidate_job_ids is not None:
         if not candidate_job_ids:
             return 0
@@ -2121,13 +2217,13 @@ def _create_jd_tasks(
             f"""
             SELECT d.job_id
             FROM fj_workflow_job_discoveries d
-            WHERE d.workflow_run_id = ?
+            WHERE d.smart_capture_id = ?
               AND d.is_run_first_discovery = 1
               AND d.is_historical_duplicate = 0
               AND d.is_filter_candidate = 1
               AND NOT EXISTS (
                 SELECT 1 FROM fj_workflow_tasks t
-                WHERE t.workflow_run_id = d.workflow_run_id
+                WHERE t.smart_capture_id = d.smart_capture_id
                   AND t.task_type IN ('deep_job_search_jd', 'deep_job_search_analysis')
                   AND json_extract(t.payload_json, '$.job_id') = d.job_id
               )
@@ -2140,7 +2236,7 @@ def _create_jd_tasks(
                 SELECT 1
                 FROM fj_workflow_prefetch_items pi
                 JOIN fj_workflow_prefetch_batches pb ON pb.id = pi.prefetch_batch_id
-                WHERE pi.workflow_run_id = d.workflow_run_id
+                WHERE pi.smart_capture_id = d.smart_capture_id
                   AND pi.job_id = d.job_id
                   AND pb.status IN ('preparing', 'ready', 'failed')
                   AND pi.status IN ('pending', 'collecting', 'ready', 'failed')
@@ -2159,18 +2255,18 @@ def _create_jd_tasks(
             connection.execute(
                 """
                 INSERT INTO fj_workflow_candidate_reservations (
-                  id, workflow_run_id, job_id, owner_type, owner_id, status, created_at
-                ) VALUES (?, ?, ?, 'formal_jd', ?, 'reserved', ?)
+                  id, workflow_run_id, smart_capture_id, job_id, owner_type, owner_id, status, created_at
+                ) VALUES (?, ?, ?, ?, 'formal_jd', ?, 'reserved', ?)
                 """,
-                (new_id(), workflow_run_id, job_id, task_id, now),
+                (new_id(), workflow_run_id, smart_capture_id, job_id, task_id, now),
             )
             connection.execute(
                 """
                 INSERT INTO fj_workflow_tasks (
-                  id, workflow_run_id, task_type, payload_json, result_json, created_at, updated_at
-                ) VALUES (?, ?, 'deep_job_search_jd', ?, '{}', ?, ?)
+                  id, workflow_run_id, smart_capture_id, task_type, payload_json, result_json, created_at, updated_at
+                ) VALUES (?, ?, ?, 'deep_job_search_jd', ?, '{}', ?, ?)
                 """,
-                (task_id, workflow_run_id, _dump({"job_id": job_id, "jd_batch_id": batch_id}), now, now),
+                (task_id, workflow_run_id, smart_capture_id, _dump({"job_id": job_id, "jd_batch_id": batch_id}), now, now),
             )
     if not candidates:
         return 0
@@ -2250,10 +2346,11 @@ def _advance_jd_collection(
 def _finish_jd_collection(
     db: Database, config: AppConfig, workflow_run_id: str, contract: dict[str, Any]
 ) -> None:
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         rows = connection.execute(
-            "SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_jd' ORDER BY created_at",
-            (workflow_run_id,),
+            "SELECT * FROM fj_workflow_tasks WHERE smart_capture_id = ? AND task_type = 'deep_job_search_jd' ORDER BY created_at",
+            (smart_capture_id,),
         ).fetchall()
     succeeded = [row for row in rows if row["status"] == "succeeded" and not _analysis_exists_for_job(db, workflow_run_id, str(_load(row["payload_json"], {}).get("job_id") or ""))]
     if succeeded:
@@ -2285,6 +2382,7 @@ def _create_analysis_tasks(
     jd_rows: list[Any],
     contract: dict[str, Any],
 ) -> None:
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     job_ids = [str(_load(row["payload_json"], {}).get("job_id") or "") for row in jd_rows]
     snapshot = _create_candidate_analysis_snapshot(db, workflow_run_id, contract)
     if snapshot["status"] == "blocked":
@@ -2302,28 +2400,29 @@ def _create_analysis_tasks(
                 """
                 UPDATE fj_workflow_candidate_reservations
                 SET status = 'released', released_at = ?, terminal_at = ?
-                WHERE workflow_run_id = ? AND owner_type = 'formal_jd'
+                WHERE smart_capture_id = ? AND owner_type = 'formal_jd'
                   AND owner_id = ? AND job_id = ? AND status = 'reserved'
                 """,
-                (now, now, workflow_run_id, str(jd_row["id"]), job_id),
+                (now, now, smart_capture_id, str(jd_row["id"]), job_id),
             )
             connection.execute(
                 """
                 INSERT INTO fj_workflow_candidate_reservations (
-                  id, workflow_run_id, job_id, owner_type, owner_id, status, created_at
-                ) VALUES (?, ?, ?, 'formal_analysis', ?, 'reserved', ?)
+                  id, workflow_run_id, smart_capture_id, job_id, owner_type, owner_id, status, created_at
+                ) VALUES (?, ?, ?, ?, 'formal_analysis', ?, 'reserved', ?)
                 """,
-                (new_id(), workflow_run_id, job_id, analysis_task_id, now),
+                (new_id(), workflow_run_id, smart_capture_id, job_id, analysis_task_id, now),
             )
             connection.execute(
                 """
                 INSERT INTO fj_workflow_tasks (
-                  id, workflow_run_id, task_type, payload_json, result_json, created_at, updated_at
-                ) VALUES (?, ?, 'deep_job_search_analysis', ?, '{}', ?, ?)
+                  id, workflow_run_id, smart_capture_id, task_type, payload_json, result_json, created_at, updated_at
+                ) VALUES (?, ?, ?, 'deep_job_search_analysis', ?, '{}', ?, ?)
                 """,
                 (
                     analysis_task_id,
                     workflow_run_id,
+                    smart_capture_id,
                     _dump({
                         "job_id": job_id,
                         "jd_task_id": jd_row["id"],
@@ -2355,6 +2454,7 @@ def create_manual_analysis_batch(
     codex_reasoning_effort: str | None = None,
 ) -> dict[str, object]:
     """将候选列表中选中的岗位接入已有 Codex 分析批次。"""
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     run = _require_run(db, workflow_run_id)
     contract = _load(run["completion_contract_json"], {})
     filter_strategy_id = str((contract.get("selected_strategy_ids") or {}).get("filter_strategy_id") or "")
@@ -2421,20 +2521,21 @@ def create_manual_analysis_batch(
             connection.execute(
                 """
                 INSERT INTO fj_workflow_candidate_reservations (
-                  id, workflow_run_id, job_id, owner_type, owner_id, status, created_at
-                ) VALUES (?, ?, ?, 'formal_analysis', ?, 'reserved', ?)
+                  id, workflow_run_id, smart_capture_id, job_id, owner_type, owner_id, status, created_at
+                ) VALUES (?, ?, ?, ?, 'formal_analysis', ?, 'reserved', ?)
                 """,
-                (new_id(), workflow_run_id, job_id, task_id, now),
+                (new_id(), workflow_run_id, smart_capture_id, job_id, task_id, now),
             )
             connection.execute(
                 """
                 INSERT INTO fj_workflow_tasks (
-                  id, workflow_run_id, task_type, status, payload_json, result_json, created_at, updated_at
-                ) VALUES (?, ?, 'deep_job_search_analysis', 'pending', ?, '{}', ?, ?)
+                  id, workflow_run_id, smart_capture_id, task_type, status, payload_json, result_json, created_at, updated_at
+                ) VALUES (?, ?, ?, 'deep_job_search_analysis', 'pending', ?, '{}', ?, ?)
                 """,
                 (
                     task_id,
                     workflow_run_id,
+                    smart_capture_id,
                     _dump({"job_id": job_id, "analysis_batch_id": analysis_batch_id, "manual_batch": True}),
                     now,
                     now,
@@ -2454,15 +2555,16 @@ def create_manual_analysis_batch(
 
 
 def _get_prefetch_summary(db: Database, workflow_run_id: str) -> dict[str, object]:
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         batch = connection.execute(
             """
             SELECT * FROM fj_workflow_prefetch_batches
-            WHERE workflow_run_id = ?
+            WHERE smart_capture_id = ?
             ORDER BY created_at DESC
             LIMIT 1
             """,
-            (workflow_run_id,),
+            (smart_capture_id,),
         ).fetchone()
         if batch is None:
             return {
@@ -2506,16 +2608,17 @@ def _get_prefetch_summary(db: Database, workflow_run_id: str) -> dict[str, objec
 
 
 def _prefetch_source_batch_id(db: Database, workflow_run_id: str) -> str:
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         handoff = connection.execute(
             """
             SELECT analysis_batch_id
             FROM fj_workflow_analysis_handoffs
-            WHERE workflow_run_id = ? AND attempt_status = 'started'
+            WHERE smart_capture_id = ? AND attempt_status = 'started'
             ORDER BY started_at DESC
             LIMIT 1
             """,
-            (workflow_run_id,),
+            (smart_capture_id,),
         ).fetchone()
         if handoff is not None:
             return str(handoff["analysis_batch_id"])
@@ -2523,11 +2626,11 @@ def _prefetch_source_batch_id(db: Database, workflow_run_id: str) -> str:
             """
             SELECT source_analysis_batch_id
             FROM fj_workflow_prefetch_batches
-            WHERE workflow_run_id = ? AND status IN ('preparing', 'ready')
+            WHERE smart_capture_id = ? AND status IN ('preparing', 'ready')
             ORDER BY created_at DESC
             LIMIT 1
             """,
-            (workflow_run_id,),
+            (smart_capture_id,),
         ).fetchone()
     return str(batch["source_analysis_batch_id"]) if batch is not None else ""
 
@@ -2538,6 +2641,7 @@ def _ensure_prefetch_batch(
     workflow_run_id: str,
     source_analysis_batch_id: str,
 ) -> str | None:
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     run = _require_run(db, workflow_run_id)
     if bool(run["paused"]) or run["status"] in {
         "completed", "completed_with_errors", "cancelled", "failed"
@@ -2555,9 +2659,9 @@ def _ensure_prefetch_batch(
         existing = connection.execute(
             """
             SELECT id FROM fj_workflow_prefetch_batches
-            WHERE workflow_run_id = ? AND source_analysis_batch_id = ?
+            WHERE smart_capture_id = ? AND source_analysis_batch_id = ?
             """,
-            (workflow_run_id, source_analysis_batch_id),
+            (smart_capture_id, source_analysis_batch_id),
         ).fetchone()
         if existing is not None:
             return str(existing["id"])
@@ -2568,13 +2672,13 @@ def _ensure_prefetch_batch(
             SELECT d.job_id, j.detail_status
             FROM fj_workflow_job_discoveries d
             JOIN fj_boss_jobs j ON j.id = d.job_id
-            WHERE d.workflow_run_id = ?
+            WHERE d.smart_capture_id = ?
               AND d.is_run_first_discovery = 1
               AND d.is_historical_duplicate = 0
               AND d.is_filter_candidate = 1
               AND NOT EXISTS (
                 SELECT 1 FROM fj_workflow_tasks t
-                WHERE t.workflow_run_id = d.workflow_run_id
+                WHERE t.smart_capture_id = d.smart_capture_id
                   AND t.task_type IN ('deep_job_search_jd', 'deep_job_search_analysis')
                   AND json_extract(t.payload_json, '$.job_id') = d.job_id
               )
@@ -2586,19 +2690,20 @@ def _ensure_prefetch_batch(
             ORDER BY d.discovered_at ASC, d.job_id ASC
             LIMIT ?
             """,
-            (workflow_run_id, target_count),
+            (smart_capture_id, target_count),
         ).fetchall()
         status = "preparing" if candidates else "failed"
         connection.execute(
             """
             INSERT INTO fj_workflow_prefetch_batches (
-              id, workflow_run_id, source_analysis_batch_id, target_count, status,
+              id, workflow_run_id, smart_capture_id, source_analysis_batch_id, target_count, status,
               failure_reason, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 batch_id,
                 workflow_run_id,
+                smart_capture_id,
                 source_analysis_batch_id,
                 target_count,
                 status,
@@ -2614,13 +2719,14 @@ def _ensure_prefetch_batch(
             connection.execute(
                 """
                 INSERT INTO fj_workflow_prefetch_items (
-                  id, workflow_run_id, prefetch_batch_id, job_id, status,
+                  id, workflow_run_id, smart_capture_id, prefetch_batch_id, job_id, status,
                   lifecycle_status, detail_status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'preparing', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 'preparing', ?, ?, ?)
                 """,
                 (
                     item_id,
                     workflow_run_id,
+                    smart_capture_id,
                     batch_id,
                     job_id,
                     "ready" if detail_status == "completed" else "pending",
@@ -2632,10 +2738,10 @@ def _ensure_prefetch_batch(
             connection.execute(
                 """
                 INSERT INTO fj_workflow_candidate_reservations (
-                  id, workflow_run_id, job_id, owner_type, owner_id, status, created_at
-                ) VALUES (?, ?, ?, 'prefetch', ?, 'reserved', ?)
+                  id, workflow_run_id, smart_capture_id, job_id, owner_type, owner_id, status, created_at
+                ) VALUES (?, ?, ?, ?, 'prefetch', ?, 'reserved', ?)
                 """,
-                (new_id(), workflow_run_id, job_id, item_id, now),
+                (new_id(), workflow_run_id, smart_capture_id, job_id, item_id, now),
             )
             if detail_status == "completed":
                 connection.execute(
@@ -2858,23 +2964,24 @@ def _finish_prefetch_item(
                 """
                 UPDATE fj_workflow_candidate_reservations
                 SET status = 'failed', released_at = ?, terminal_at = ?
-                WHERE workflow_run_id = ? AND owner_type = 'prefetch'
+                WHERE smart_capture_id = ? AND owner_type = 'prefetch'
                   AND owner_id = ? AND status = 'reserved'
                 """,
-                (now, now, item["workflow_run_id"], item["id"]),
+                (now, now, item["smart_capture_id"], item["id"]),
             )
 
 
 def _prefetch_batch_state(db: Database, workflow_run_id: str) -> tuple[str, Any | None]:
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         batch = connection.execute(
             """
             SELECT * FROM fj_workflow_prefetch_batches
-            WHERE workflow_run_id = ? AND status IN ('preparing', 'ready', 'failed')
+            WHERE smart_capture_id = ? AND status IN ('preparing', 'ready', 'failed')
             ORDER BY created_at DESC
             LIMIT 1
             """,
-            (workflow_run_id,),
+            (smart_capture_id,),
         ).fetchone()
         if batch is None:
             return "none", None
@@ -2897,17 +3004,18 @@ def _prefetch_batch_state(db: Database, workflow_run_id: str) -> tuple[str, Any 
 
 
 def _completion_target_reached_in_connection(
-    connection: Any, workflow_run_id: str, contract: dict[str, Any]
+    connection: Any, smart_capture_id: str, contract: dict[str, Any]
 ) -> bool:
     rows = connection.execute(
         """
         SELECT json_extract(payload_json, '$.job_id') AS job_id,
                json_extract(result_json, '$.decision') AS decision
         FROM fj_workflow_tasks
-        WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis'
+        WHERE smart_capture_id = ?
+          AND task_type = 'deep_job_search_analysis'
           AND status = 'succeeded'
         """,
-        (workflow_run_id,),
+        (smart_capture_id,),
     ).fetchall()
     decisions: dict[str, set[str]] = {"recommend": set(), "review": set()}
     for row in rows:
@@ -2930,6 +3038,7 @@ def _completion_target_reached_in_connection(
 def _promote_ready_prefetch(
     db: Database, workflow_run_id: str, contract: dict[str, Any]
 ) -> str:
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     state, batch = _prefetch_batch_state(db, workflow_run_id)
     if state == "waiting":
         return "waiting"
@@ -2956,7 +3065,7 @@ def _promote_ready_prefetch(
         if locked_batch is None or str(locked_batch["status"]) != "ready":
             return "none"
         if _completion_target_reached_in_connection(
-            connection, workflow_run_id, contract
+            connection, smart_capture_id, contract
         ) and not _analysis_policy(contract)["analyze_all_candidates"]:
             abandoned_at = utc_now()
             connection.execute(
@@ -2971,12 +3080,12 @@ def _promote_ready_prefetch(
                 """
                 UPDATE fj_workflow_candidate_reservations
                 SET status = 'abandoned', released_at = ?, terminal_at = ?
-                WHERE workflow_run_id = ? AND owner_type = 'prefetch'
+                WHERE smart_capture_id = ? AND owner_type = 'prefetch'
                   AND owner_id IN (
                     SELECT id FROM fj_workflow_prefetch_items WHERE prefetch_batch_id = ?
                   ) AND status = 'reserved'
                 """,
-                (abandoned_at, abandoned_at, workflow_run_id, batch["id"]),
+                (abandoned_at, abandoned_at, smart_capture_id, batch["id"]),
             )
             connection.execute(
                 """
@@ -3011,10 +3120,10 @@ def _promote_ready_prefetch(
             reservation = connection.execute(
                 """
                 SELECT id FROM fj_workflow_candidate_reservations
-                WHERE workflow_run_id = ? AND owner_type = 'prefetch'
+                WHERE smart_capture_id = ? AND owner_type = 'prefetch'
                   AND owner_id = ? AND job_id = ? AND status = 'reserved'
                 """,
-                (workflow_run_id, item["id"], item["job_id"]),
+                (smart_capture_id, item["id"], item["job_id"]),
             ).fetchone()
             if reservation is None:
                 return "none"
@@ -3023,12 +3132,13 @@ def _promote_ready_prefetch(
             connection.execute(
                 """
                 INSERT INTO fj_workflow_tasks (
-                  id, workflow_run_id, task_type, payload_json, result_json, created_at, updated_at
-                ) VALUES (?, ?, 'deep_job_search_analysis', ?, '{}', ?, ?)
+                  id, workflow_run_id, smart_capture_id, task_type, payload_json, result_json, created_at, updated_at
+                ) VALUES (?, ?, ?, 'deep_job_search_analysis', ?, '{}', ?, ?)
                 """,
                 (
                     task_id,
                     workflow_run_id,
+                    smart_capture_id,
                     _dump({
                         "job_id": str(item["job_id"]),
                         "jd_task_id": str(item["id"]),
@@ -3051,18 +3161,18 @@ def _promote_ready_prefetch(
                 """
                 UPDATE fj_workflow_candidate_reservations
                 SET status = 'promoted', released_at = ?, terminal_at = ?
-                WHERE workflow_run_id = ? AND owner_type = 'prefetch'
+                WHERE smart_capture_id = ? AND owner_type = 'prefetch'
                   AND owner_id = ? AND status = 'reserved'
                 """,
-                (now, now, workflow_run_id, item["id"]),
+                (now, now, smart_capture_id, item["id"]),
             )
             connection.execute(
                 """
                 INSERT INTO fj_workflow_candidate_reservations (
-                  id, workflow_run_id, job_id, owner_type, owner_id, status, created_at
-                ) VALUES (?, ?, ?, 'formal_analysis', ?, 'reserved', ?)
+                  id, workflow_run_id, smart_capture_id, job_id, owner_type, owner_id, status, created_at
+                ) VALUES (?, ?, ?, ?, 'formal_analysis', ?, 'reserved', ?)
                 """,
-                (new_id(), workflow_run_id, item["job_id"], task_id, now),
+                (new_id(), workflow_run_id, smart_capture_id, item["job_id"], task_id, now),
             )
         connection.execute(
             """
@@ -3141,29 +3251,31 @@ def _release_candidate_reservation(
 ) -> None:
     if not job_id:
         return
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     now = utc_now()
     with db.connect() as connection:
         connection.execute(
             """
             UPDATE fj_workflow_candidate_reservations
             SET status = ?, released_at = ?, terminal_at = ?
-            WHERE workflow_run_id = ? AND owner_type = ? AND owner_id = ?
+            WHERE smart_capture_id = ? AND owner_type = ? AND owner_id = ?
               AND job_id = ? AND status = 'reserved'
             """,
-            (status, now, now, workflow_run_id, owner_type, owner_id, job_id),
+            (status, now, now, smart_capture_id, owner_type, owner_id, job_id),
         )
 
 
 def _abandon_prefetch_batches(db: Database, workflow_run_id: str) -> None:
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     now = utc_now()
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         batches = connection.execute(
             """
             SELECT id FROM fj_workflow_prefetch_batches
-            WHERE workflow_run_id = ? AND status <> 'promoted'
+            WHERE smart_capture_id = ? AND status <> 'promoted'
             """,
-            (workflow_run_id,),
+            (smart_capture_id,),
         ).fetchall()
         for batch in batches:
             connection.execute(
@@ -3178,12 +3290,12 @@ def _abandon_prefetch_batches(db: Database, workflow_run_id: str) -> None:
                 """
                 UPDATE fj_workflow_candidate_reservations
                 SET status = 'abandoned', released_at = ?, terminal_at = ?
-                WHERE workflow_run_id = ? AND owner_type = 'prefetch'
+                WHERE smart_capture_id = ? AND owner_type = 'prefetch'
                   AND owner_id IN (
                     SELECT id FROM fj_workflow_prefetch_items WHERE prefetch_batch_id = ?
                   ) AND status = 'reserved'
                 """,
-                (now, now, workflow_run_id, batch["id"]),
+                (now, now, smart_capture_id, batch["id"]),
             )
             connection.execute(
                 """
@@ -3196,15 +3308,16 @@ def _abandon_prefetch_batches(db: Database, workflow_run_id: str) -> None:
 
 
 def _cancel_prefetch_batches(db: Database, workflow_run_id: str) -> None:
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     now = utc_now()
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         batches = connection.execute(
             """
             SELECT id FROM fj_workflow_prefetch_batches
-            WHERE workflow_run_id = ? AND status <> 'promoted'
+            WHERE smart_capture_id = ? AND status <> 'promoted'
             """,
-            (workflow_run_id,),
+            (smart_capture_id,),
         ).fetchall()
         for batch in batches:
             connection.execute(
@@ -3219,12 +3332,12 @@ def _cancel_prefetch_batches(db: Database, workflow_run_id: str) -> None:
                 """
                 UPDATE fj_workflow_candidate_reservations
                 SET status = 'cancelled', released_at = ?, terminal_at = ?
-                WHERE workflow_run_id = ? AND owner_type = 'prefetch'
+                WHERE smart_capture_id = ? AND owner_type = 'prefetch'
                   AND owner_id IN (
                     SELECT id FROM fj_workflow_prefetch_items WHERE prefetch_batch_id = ?
                   ) AND status = 'reserved'
                 """,
-                (now, now, workflow_run_id, batch["id"]),
+                (now, now, smart_capture_id, batch["id"]),
             )
             connection.execute(
                 """
@@ -3239,6 +3352,7 @@ def _cancel_prefetch_batches(db: Database, workflow_run_id: str) -> None:
 def _create_candidate_analysis_snapshot(
     db: Database, workflow_run_id: str, contract: dict[str, Any]
 ) -> dict[str, object]:
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     recommendation_strategy = _require_workflow_recommendation_strategy(
         db,
         recommendation_strategy_id=str(contract["selected_strategy_ids"]["recommendation_strategy_id"]),
@@ -3283,11 +3397,11 @@ def _create_candidate_analysis_snapshot(
         connection.execute(
             """
             INSERT INTO fj_workflow_context_snapshots (
-              id, workflow_run_id, channel, snapshot_json, context_characters,
+              id, workflow_run_id, smart_capture_id, channel, snapshot_json, context_characters,
               estimated_tokens, soft_budget_characters, hard_budget_characters,
               status, blocker_reason, created_at
-            ) VALUES (?, ?, 'candidate_analysis', ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(workflow_run_id, channel) DO UPDATE SET
+            ) VALUES (?, ?, ?, 'candidate_analysis', ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO UPDATE SET
               snapshot_json = excluded.snapshot_json,
               context_characters = excluded.context_characters,
               estimated_tokens = excluded.estimated_tokens,
@@ -3297,7 +3411,7 @@ def _create_candidate_analysis_snapshot(
               blocker_reason = excluded.blocker_reason,
               created_at = excluded.created_at
             """,
-            (new_id(), workflow_run_id, _dump({"sections": sections}), characters, _estimate_tokens(characters), soft_budget, HARD_CONTEXT_BUDGET, status, blocker, now),
+            (new_id(), workflow_run_id, smart_capture_id, _dump({"sections": sections}), characters, _estimate_tokens(characters), soft_budget, HARD_CONTEXT_BUDGET, status, blocker, now),
         )
     return get_context_snapshot(db, workflow_run_id, "candidate_analysis")
 
@@ -3310,6 +3424,7 @@ def _create_search_context_snapshot(
     contract: dict[str, Any],
     soft_budget: int,
 ) -> dict[str, object]:
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     sections = [
         _section("task_goal", "shared_base", {"recommend_target": contract["recommend_target"], "review_target": contract.get("review_target"), "target_mode": contract.get("target_mode"), "source_policy": contract["source_policy"], "keywords": contract["allowed_search_keywords"], "cities": contract["allowed_cities"]}, "workflow_run", 1, True, ""),
         _section("filter_strategy", "task_channel", strategy, "filter_strategy", int(strategy.get("strategy_version") or 1), True, ""),
@@ -3326,7 +3441,7 @@ def _create_search_context_snapshot(
     blocker = "上下文超过本轮软预算，请裁剪后重试。" if status == "blocked" else ""
     now = utc_now()
     with db.connect() as connection:
-        connection.execute("INSERT INTO fj_workflow_context_snapshots (id, workflow_run_id, channel, snapshot_json, context_characters, estimated_tokens, soft_budget_characters, hard_budget_characters, status, blocker_reason, created_at) VALUES (?, ?, 'deep_job_search', ?, ?, ?, ?, ?, ?, ?, ?)", (new_id(), workflow_run_id, _dump({"sections": sections}), characters, _estimate_tokens(characters), soft_budget, HARD_CONTEXT_BUDGET, status, blocker, now))
+        connection.execute("INSERT INTO fj_workflow_context_snapshots (id, workflow_run_id, smart_capture_id, channel, snapshot_json, context_characters, estimated_tokens, soft_budget_characters, hard_budget_characters, status, blocker_reason, created_at) VALUES (?, ?, ?, 'deep_job_search', ?, ?, ?, ?, ?, ?, ?, ?)", (new_id(), workflow_run_id, smart_capture_id, _dump({"sections": sections}), characters, _estimate_tokens(characters), soft_budget, HARD_CONTEXT_BUDGET, status, blocker, now))
     return get_context_snapshot(db, workflow_run_id)
 
 
@@ -3408,6 +3523,7 @@ def _save_context_snapshot(
     sections: list[dict[str, object]],
     soft_budget: int,
 ) -> dict[str, object]:
+    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     characters = sum(int(item["character_count"]) for item in sections if item["included"])
     status = "blocked" if characters > soft_budget else "ready"
     blocker = "上下文超过本轮软预算，请先缩小本轮范围后继续。" if status == "blocked" else ""
@@ -3416,11 +3532,11 @@ def _save_context_snapshot(
         connection.execute(
             """
             INSERT INTO fj_workflow_context_snapshots (
-              id, workflow_run_id, channel, snapshot_json, context_characters,
+              id, workflow_run_id, smart_capture_id, channel, snapshot_json, context_characters,
               estimated_tokens, soft_budget_characters, hard_budget_characters,
               status, blocker_reason, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(workflow_run_id, channel) DO UPDATE SET
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO UPDATE SET
               snapshot_json = excluded.snapshot_json,
               context_characters = excluded.context_characters,
               estimated_tokens = excluded.estimated_tokens,
@@ -3430,44 +3546,48 @@ def _save_context_snapshot(
               blocker_reason = excluded.blocker_reason,
               created_at = excluded.created_at
             """,
-            (new_id(), workflow_run_id, channel, _dump({"sections": sections}), characters, _estimate_tokens(characters), soft_budget, HARD_CONTEXT_BUDGET, status, blocker, now),
+            (new_id(), workflow_run_id, smart_capture_id, channel, _dump({"sections": sections}), characters, _estimate_tokens(characters), soft_budget, HARD_CONTEXT_BUDGET, status, blocker, now),
         )
     return get_context_snapshot(db, workflow_run_id, channel)
 
 
 def _next_task(db: Database, workflow_run_id: str):
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         return connection.execute(
-            """
+            f"""
             SELECT t.*
             FROM fj_workflow_tasks t
             LEFT JOIN fj_workflow_search_combinations c
               ON c.id = json_extract(t.payload_json, '$.search_combination_id')
-            WHERE t.workflow_run_id = ? AND t.task_type = 'deep_job_search'
+            WHERE t.{owner_column} = ? AND t.task_type = 'deep_job_search'
               AND t.status IN ('pending', 'running')
             ORDER BY CASE t.status WHEN 'running' THEN 0 ELSE 1 END,
                      COALESCE(c.sequence, 0), t.created_at
             LIMIT 1
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchone()
 
 
 def _next_jd_task(db: Database, workflow_run_id: str):
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
-        return connection.execute("SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_jd' AND status IN ('pending', 'running') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, created_at LIMIT 1", (workflow_run_id,)).fetchone()
+        return connection.execute(f"SELECT * FROM fj_workflow_tasks WHERE {owner_column} = ? AND task_type = 'deep_job_search_jd' AND status IN ('pending', 'running') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, created_at LIMIT 1", (owner_id,)).fetchone()
 
 
 def _next_analysis_task(db: Database, workflow_run_id: str):
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
-        return connection.execute("SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis' AND status IN ('pending', 'running') ORDER BY created_at LIMIT 1", (workflow_run_id,)).fetchone()
+        return connection.execute(f"SELECT * FROM fj_workflow_tasks WHERE {owner_column} = ? AND task_type = 'deep_job_search_analysis' AND status IN ('pending', 'running') ORDER BY created_at LIMIT 1", (owner_id,)).fetchone()
 
 
 def _analysis_exists_for_job(db: Database, workflow_run_id: str, job_id: str) -> bool:
     if not job_id:
         return True
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
-        return connection.execute("SELECT 1 FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis' AND json_extract(payload_json, '$.job_id') = ? LIMIT 1", (workflow_run_id, job_id)).fetchone() is not None
+        return connection.execute(f"SELECT 1 FROM fj_workflow_tasks WHERE {owner_column} = ? AND task_type = 'deep_job_search_analysis' AND json_extract(payload_json, '$.job_id') = ? LIMIT 1", (owner_id, job_id)).fetchone() is not None
 
 
 def _analysis_policy(contract: dict[str, Any]) -> dict[str, Any]:
@@ -3487,13 +3607,14 @@ def _execution_policy_after_analysis_batch(contract: dict[str, Any]) -> str:
 
 
 def _completion_counts(db: Database, workflow_run_id: str) -> dict[str, int]:
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         rows = connection.execute(
-            """
+            f"""
             SELECT payload_json, result_json FROM fj_workflow_tasks
-            WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis' AND status = 'succeeded'
+            WHERE {owner_column} = ? AND task_type = 'deep_job_search_analysis' AND status = 'succeeded'
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchall()
     counts = {"recommend": 0, "review": 0}
     seen: dict[str, set[str]] = {"recommend": set(), "review": set()}
@@ -3541,10 +3662,11 @@ def _completion_progress(
 
 
 def _is_analysis_batch_complete(db: Database, workflow_run_id: str, analysis_batch_id: str) -> bool:
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         rows = connection.execute(
-            "SELECT payload_json, status FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis'",
-            (workflow_run_id,),
+            f"SELECT payload_json, status FROM fj_workflow_tasks WHERE {owner_column} = ? AND task_type = 'deep_job_search_analysis'",
+            (owner_id,),
         ).fetchall()
     return not any(
         _analysis_batch_id_from_payload(_load(row["payload_json"], {}), workflow_run_id) == analysis_batch_id
@@ -3555,34 +3677,35 @@ def _is_analysis_batch_complete(db: Database, workflow_run_id: str, analysis_bat
 
 def _skip_pending_analysis_items(db: Database, workflow_run_id: str) -> None:
     """完成目标后不再要求 Codex 保存当前批剩余 Item。"""
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         rows = connection.execute(
-            """
+            f"""
             SELECT id, json_extract(payload_json, '$.job_id') AS job_id
             FROM fj_workflow_tasks
-            WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis'
+            WHERE {owner_column} = ? AND task_type = 'deep_job_search_analysis'
               AND status = 'pending'
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchall()
         connection.execute(
-            """
+            f"""
             UPDATE fj_workflow_tasks
             SET status = 'skipped', completed_at = ?, updated_at = ?
-            WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis' AND status = 'pending'
+            WHERE {owner_column} = ? AND task_type = 'deep_job_search_analysis' AND status = 'pending'
             """,
-            (utc_now(), utc_now(), workflow_run_id),
+            (utc_now(), utc_now(), owner_id),
         )
         now = utc_now()
         for row in rows:
             connection.execute(
-                """
+                f"""
                 UPDATE fj_workflow_candidate_reservations
                 SET status = 'released', released_at = ?, terminal_at = ?
-                WHERE workflow_run_id = ? AND owner_type = 'formal_analysis'
+                WHERE {owner_column} = ? AND owner_type = 'formal_analysis'
                   AND owner_id = ? AND status = 'reserved'
                 """,
-                (now, now, workflow_run_id, str(row["id"])),
+                (now, now, owner_id, str(row["id"])),
             )
 
 
@@ -3592,15 +3715,16 @@ def _freeze_candidate_pool(
     existing = contract.get("frozen_candidate_pool")
     if isinstance(existing, dict):
         return contract
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         rows = connection.execute(
-            """
+            f"""
             SELECT DISTINCT job_id FROM fj_workflow_job_discoveries
-            WHERE workflow_run_id = ? AND is_run_first_discovery = 1
+            WHERE {owner_column} = ? AND is_run_first_discovery = 1
               AND is_historical_duplicate = 0 AND is_filter_candidate = 1
             ORDER BY discovered_at ASC, job_id ASC
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchall()
     # 冻结命中的候选集合，后续只在该集合内补 JD 与 Analysis Batch。
     contract["frozen_candidate_pool"] = {
@@ -3720,22 +3844,25 @@ def _resume_search_or_wait(db: Database, config: AppConfig, workflow_run_id: str
 
 
 def _refresh_counts(db: Database, workflow_run_id: str) -> None:
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
+    if owner_column == "smart_capture_id":
+        _backfill_linked_pipeline_rows(db, workflow_run_id, owner_id)
     with db.connect() as connection:
-        fresh = int(connection.execute("SELECT COUNT(DISTINCT d.job_id) FROM fj_workflow_job_discoveries d WHERE d.workflow_run_id = ? AND d.is_run_first_discovery = 1 AND d.is_historical_duplicate = 0 AND d.is_filter_candidate = 1", (workflow_run_id,)).fetchone()[0])
+        fresh = int(connection.execute(f"SELECT COUNT(DISTINCT d.job_id) FROM fj_workflow_job_discoveries d WHERE d.{owner_column} = ? AND d.is_run_first_discovery = 1 AND d.is_historical_duplicate = 0 AND d.is_filter_candidate = 1", (owner_id,)).fetchone()[0])
         run = _require_run(db, workflow_run_id)
         contract = _load(run["completion_contract_json"], {})
         target = int(contract.get("recommend_target") or contract.get("target_count") or 0)
-        completed = int(connection.execute("SELECT COUNT(DISTINCT json_extract(result_json, '$.job_id')) FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis' AND status = 'succeeded' AND json_extract(result_json, '$.decision') = 'recommend'", (workflow_run_id,)).fetchone()[0])
-        available = int(connection.execute("""SELECT COUNT(DISTINCT d.job_id) FROM fj_workflow_job_discoveries d WHERE d.workflow_run_id = ? AND d.is_run_first_discovery = 1 AND d.is_historical_duplicate = 0 AND d.is_filter_candidate = 1 AND NOT EXISTS (SELECT 1 FROM fj_workflow_tasks t WHERE t.workflow_run_id = d.workflow_run_id AND t.task_type IN ('deep_job_search_jd', 'deep_job_search_analysis') AND json_extract(t.payload_json, '$.job_id') = d.job_id)""", (workflow_run_id,)).fetchone()[0])
+        completed = int(connection.execute(f"SELECT COUNT(DISTINCT json_extract(result_json, '$.job_id')) FROM fj_workflow_tasks WHERE {owner_column} = ? AND task_type = 'deep_job_search_analysis' AND status = 'succeeded' AND json_extract(result_json, '$.decision') = 'recommend'", (owner_id,)).fetchone()[0])
+        available = int(connection.execute(f"""SELECT COUNT(DISTINCT d.job_id) FROM fj_workflow_job_discoveries d WHERE d.{owner_column} = ? AND d.is_run_first_discovery = 1 AND d.is_historical_duplicate = 0 AND d.is_filter_candidate = 1 AND NOT EXISTS (SELECT 1 FROM fj_workflow_tasks t WHERE t.{owner_column} = d.{owner_column} AND t.task_type IN ('deep_job_search_jd', 'deep_job_search_analysis') AND json_extract(t.payload_json, '$.job_id') = d.job_id)""", (owner_id,)).fetchone()[0])
         telemetry = _load(run["telemetry_json"], {})
         telemetry["fresh_candidates"] = fresh
         telemetry["available_fresh_candidates"] = available
         completion_counts = _completion_counts(db, workflow_run_id)
         telemetry["recommend_count"] = completion_counts["recommend"]
         telemetry["review_count"] = completion_counts["review"]
-        telemetry["search_batches"] = int(connection.execute("SELECT COUNT(*) FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search'", (workflow_run_id,)).fetchone()[0])
+        telemetry["search_batches"] = int(connection.execute(f"SELECT COUNT(*) FROM fj_workflow_tasks WHERE {owner_column} = ? AND task_type = 'deep_job_search'", (owner_id,)).fetchone()[0])
         metrics_row = connection.execute(
-            """
+            f"""
             SELECT
               COALESCE(SUM(jobs_seen), 0) AS jobs_seen,
               COALESCE(SUM(run_fresh_jobs), 0) AS run_fresh_jobs,
@@ -3747,9 +3874,9 @@ def _refresh_counts(db: Database, workflow_run_id: str) -> None:
               COALESCE(SUM(qualified_fresh_jobs), 0) AS qualified_fresh_jobs,
               COALESCE(SUM(candidate_jobs), 0) AS candidate_jobs
             FROM fj_workflow_search_combinations
-            WHERE workflow_run_id = ?
+            WHERE {owner_column} = ?
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchone()
         jobs_seen = int(metrics_row["jobs_seen"] or 0)
         run_fresh_jobs = int(metrics_row["run_fresh_jobs"] or 0)
@@ -3870,23 +3997,24 @@ def _serialize_run(db: Database, row: Any) -> dict[str, object]:
 
 
 def _get_search_planner_summary(db: Database, workflow_run_id: str) -> dict[str, object]:
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         row = connection.execute(
-            """
+            f"""
             SELECT * FROM fj_workflow_search_combinations
-            WHERE workflow_run_id = ?
+            WHERE {owner_column} = ?
             ORDER BY sequence DESC
             LIMIT 1
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchone()
         pending = connection.execute(
-            """
+            f"""
             SELECT COUNT(*) AS amount
             FROM fj_workflow_search_combinations
-            WHERE workflow_run_id = ? AND status IN ('pending', 'running')
+            WHERE {owner_column} = ? AND status IN ('pending', 'running')
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchone()
     if row is None:
         return {
@@ -3965,10 +4093,11 @@ def _require_analysis_batch_started(
     db: Database, workflow_run_id: str, analysis_batch_id: str
 ) -> None:
     """正式保存分析结果前确认当前批次已收到 Codex 的开始 ACK。"""
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         handoff = connection.execute(
-            "SELECT attempt_status FROM fj_workflow_analysis_handoffs WHERE workflow_run_id = ? AND analysis_batch_id = ?",
-            (workflow_run_id, analysis_batch_id),
+            f"SELECT attempt_status FROM fj_workflow_analysis_handoffs WHERE {owner_column} = ? AND analysis_batch_id = ?",
+            (owner_id, analysis_batch_id),
         ).fetchone()
     # 旧的直接服务调用没有创建 handoff 记录，保持其既有兼容行为；
     # 一旦存在交接记录，正式保存必须等待当前 attempt 的 ACK。
@@ -3977,10 +4106,11 @@ def _require_analysis_batch_started(
 
 
 def _get_analysis_handoff_summary(db: Database, workflow_run_id: str) -> dict[str, object]:
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         rows = connection.execute(
-            "SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis' ORDER BY created_at",
-            (workflow_run_id,),
+            f"SELECT * FROM fj_workflow_tasks WHERE {owner_column} = ? AND task_type = 'deep_job_search_analysis' ORDER BY created_at",
+            (owner_id,),
         ).fetchall()
     batches: dict[str, list[Any]] = {}
     for row in rows:
@@ -4015,8 +4145,8 @@ def _get_analysis_handoff_summary(db: Database, workflow_run_id: str) -> dict[st
     counts = {status: sum(row["status"] == status for row in batch_rows) for status in ("pending", "running", "succeeded")}
     with db.connect() as connection:
         handoff = connection.execute(
-            "SELECT * FROM fj_workflow_analysis_handoffs WHERE workflow_run_id = ? AND analysis_batch_id = ?",
-            (workflow_run_id, active_batch_id),
+            f"SELECT * FROM fj_workflow_analysis_handoffs WHERE {owner_column} = ? AND analysis_batch_id = ?",
+            (owner_id, active_batch_id),
         ).fetchone()
     handoff_status = str(handoff["status"]) if handoff is not None else "none"
     attempt_status = str(handoff["attempt_status"] or "claimed") if handoff is not None else "none"
@@ -4051,10 +4181,11 @@ def _get_analysis_handoff_summary(db: Database, workflow_run_id: str) -> dict[st
 def _complete_analysis_handoff_if_finished(
     db: Database, workflow_run_id: str, analysis_batch_id: str
 ) -> None:
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         rows = connection.execute(
-            "SELECT * FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis'",
-            (workflow_run_id,),
+            f"SELECT * FROM fj_workflow_tasks WHERE {owner_column} = ? AND task_type = 'deep_job_search_analysis'",
+            (owner_id,),
         ).fetchall()
         unfinished = any(
             _analysis_batch_id(row, workflow_run_id) == analysis_batch_id
@@ -4063,41 +4194,42 @@ def _complete_analysis_handoff_if_finished(
         )
         if not unfinished:
             connection.execute(
-                """
+                f"""
                 UPDATE fj_workflow_analysis_handoffs
                 SET status = 'completed', attempt_status = 'completed', completed_at = ?
-                WHERE workflow_run_id = ? AND analysis_batch_id = ? AND attempt_status IN ('claimed', 'prompt_written', 'started')
+                WHERE {owner_column} = ? AND analysis_batch_id = ? AND attempt_status IN ('claimed', 'prompt_written', 'started')
                 """,
-                (utc_now(), workflow_run_id, analysis_batch_id),
+                (utc_now(), owner_id, analysis_batch_id),
             )
 
 
 def _get_run_progress(db: Database, workflow_run_id: str) -> dict[str, object]:
     """从 Run 的持久化任务与 discovery 记录生成业务过程快照。"""
+    owner_column, owner_id = _pipeline_scope_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         search_task = connection.execute(
-            """
+            f"""
             SELECT * FROM fj_workflow_tasks
-            WHERE workflow_run_id = ? AND task_type = 'deep_job_search'
+            WHERE {owner_column} = ? AND task_type = 'deep_job_search'
             ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, updated_at DESC, created_at DESC
             LIMIT 1
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchone()
         discovery = connection.execute(
-            """
+            f"""
             SELECT
               COUNT(*) AS jobs_seen,
               COALESCE(SUM(CASE WHEN is_run_first_discovery = 1 AND is_historical_duplicate = 0 THEN 1 ELSE 0 END), 0) AS fresh_jobs,
               COALESCE(SUM(CASE WHEN is_historical_duplicate = 1 THEN 1 ELSE 0 END), 0) AS historical_duplicates,
               COALESCE(SUM(CASE WHEN is_run_first_discovery = 1 AND is_historical_duplicate = 0 AND is_filter_candidate = 1 THEN 1 ELSE 0 END), 0) AS candidates
             FROM fj_workflow_job_discoveries
-            WHERE workflow_run_id = ?
+            WHERE {owner_column} = ?
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchone()
         combination_metrics = connection.execute(
-            """
+            f"""
             SELECT
               COUNT(*) AS combination_count,
               COALESCE(SUM(jobs_seen), 0) AS jobs_seen,
@@ -4110,28 +4242,28 @@ def _get_run_progress(db: Database, workflow_run_id: str) -> dict[str, object]:
               COALESCE(SUM(qualified_fresh_jobs), 0) AS qualified_fresh_jobs,
               COALESCE(SUM(candidate_jobs), 0) AS candidate_jobs
             FROM fj_workflow_search_combinations
-            WHERE workflow_run_id = ?
+            WHERE {owner_column} = ?
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchone()
         jd = connection.execute(
-            """
+            f"""
             SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS completed
             FROM fj_workflow_tasks
-            WHERE workflow_run_id = ? AND task_type = 'deep_job_search_jd'
+            WHERE {owner_column} = ? AND task_type = 'deep_job_search_jd'
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchone()
         analysis_rows = connection.execute(
-            """
+            f"""
             SELECT result_json FROM fj_workflow_tasks
-            WHERE workflow_run_id = ? AND task_type = 'deep_job_search_analysis' AND status = 'succeeded'
+            WHERE {owner_column} = ? AND task_type = 'deep_job_search_analysis' AND status = 'succeeded'
             """,
-            (workflow_run_id,),
+            (owner_id,),
         ).fetchall()
         batch_count = int(connection.execute(
-            "SELECT COUNT(*) FROM fj_workflow_tasks WHERE workflow_run_id = ? AND task_type = 'deep_job_search'",
-            (workflow_run_id,),
+            f"SELECT COUNT(*) FROM fj_workflow_tasks WHERE {owner_column} = ? AND task_type = 'deep_job_search'",
+            (owner_id,),
         ).fetchone()[0])
     task_payload = _load(search_task["payload_json"], {}) if search_task is not None else {}
     task_result = _load(search_task["result_json"], {}) if search_task is not None else {}
