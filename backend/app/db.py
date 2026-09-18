@@ -2452,6 +2452,7 @@ class Database:
             self._ensure_job_progress_schema(connection)
             self._ensure_workflow_run_schema(connection)
             self._ensure_smart_capture_schema(connection)
+            self._ensure_pipeline_owner_schema(connection)
             self._ensure_workflow_children_schema(connection)
             # 兼容升级只从可靠旧事实追加事件，并按完整事件流重放 shadow Pipeline。
             from backend.app.services.fine_job.job_activity import migrate_legacy_job_activity
@@ -2873,6 +2874,494 @@ class Database:
                     max(1, int(row["state_version"] or 1)),
                 ),
             )
+
+    def _ensure_pipeline_owner_schema(self, connection: sqlite3.Connection) -> None:
+        """把 Pipeline 的新业务 owner 迁移到 Smart Capture，同时保留 Workflow 历史链接。"""
+        # Codex session 没有 Workflow-only 约束，直接补充可选 owner 字段即可。
+        session_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(fj_codex_sessions)")
+        }
+        session_migrations = {
+            "smart_capture_id": (
+                "ALTER TABLE fj_codex_sessions ADD COLUMN smart_capture_id TEXT"
+            ),
+            "workflow_run_id": (
+                "ALTER TABLE fj_codex_sessions ADD COLUMN workflow_run_id TEXT"
+            ),
+            "analysis_batch_id": (
+                "ALTER TABLE fj_codex_sessions ADD COLUMN analysis_batch_id TEXT"
+            ),
+            "handoff_attempt_id": (
+                "ALTER TABLE fj_codex_sessions ADD COLUMN handoff_attempt_id TEXT"
+            ),
+        }
+        for column, statement in session_migrations.items():
+            if column not in session_columns:
+                connection.execute(statement)
+
+        table_definitions = {
+            "fj_codex_sessions": """
+                CREATE TABLE fj_codex_sessions (
+                  id TEXT PRIMARY KEY,
+                  smart_capture_id TEXT,
+                  workflow_run_id TEXT,
+                  analysis_batch_id TEXT,
+                  handoff_attempt_id TEXT,
+                  status TEXT NOT NULL DEFAULT 'stopped',
+                  started_at TEXT,
+                  exited_at TEXT,
+                  exit_reason TEXT NOT NULL DEFAULT '',
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  FOREIGN KEY (smart_capture_id) REFERENCES fj_smart_captures(id) ON DELETE SET NULL,
+                  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE SET NULL,
+                  CHECK (status IN ('stopped', 'starting', 'running', 'interrupting', 'exited', 'failed'))
+                )
+            """,
+            "fj_workflow_tasks": """
+                CREATE TABLE fj_workflow_tasks (
+                  id TEXT PRIMARY KEY,
+                  workflow_run_id TEXT,
+                  smart_capture_id TEXT,
+                  task_type TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'pending',
+                  payload_json TEXT NOT NULL DEFAULT '{}',
+                  result_json TEXT NOT NULL DEFAULT '{}',
+                  operation_ref_type TEXT,
+                  operation_ref_id TEXT,
+                  retryable INTEGER NOT NULL DEFAULT 1,
+                  started_at TEXT,
+                  completed_at TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE SET NULL,
+                  FOREIGN KEY (smart_capture_id) REFERENCES fj_smart_captures(id) ON DELETE CASCADE,
+                  CHECK (workflow_run_id IS NOT NULL OR smart_capture_id IS NOT NULL),
+                  CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'skipped', 'waiting_for_user')),
+                  CHECK (retryable IN (0, 1))
+                )
+            """,
+            "fj_workflow_job_discoveries": """
+                CREATE TABLE fj_workflow_job_discoveries (
+                  id TEXT PRIMARY KEY,
+                  workflow_run_id TEXT,
+                  smart_capture_id TEXT,
+                  task_id TEXT NOT NULL,
+                  job_id TEXT NOT NULL,
+                  search_keyword TEXT NOT NULL,
+                  city TEXT NOT NULL,
+                  search_combination_json TEXT NOT NULL DEFAULT '{}',
+                  scroll_depth INTEGER NOT NULL DEFAULT 0,
+                  discovered_at TEXT NOT NULL,
+                  is_run_first_discovery INTEGER NOT NULL DEFAULT 0,
+                  is_historical_duplicate INTEGER NOT NULL DEFAULT 0,
+                  is_filter_candidate INTEGER NOT NULL DEFAULT 0,
+                  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE SET NULL,
+                  FOREIGN KEY (smart_capture_id) REFERENCES fj_smart_captures(id) ON DELETE CASCADE,
+                  FOREIGN KEY (task_id) REFERENCES fj_workflow_tasks(id) ON DELETE CASCADE,
+                  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+                  CHECK (workflow_run_id IS NOT NULL OR smart_capture_id IS NOT NULL),
+                  CHECK (is_run_first_discovery IN (0, 1)),
+                  CHECK (is_historical_duplicate IN (0, 1)),
+                  CHECK (is_filter_candidate IN (0, 1))
+                )
+            """,
+            "fj_workflow_search_combinations": """
+                CREATE TABLE fj_workflow_search_combinations (
+                  id TEXT PRIMARY KEY,
+                  workflow_run_id TEXT,
+                  smart_capture_id TEXT,
+                  keyword TEXT NOT NULL,
+                  city TEXT NOT NULL,
+                  platform_filters_json TEXT NOT NULL DEFAULT '{}',
+                  identity_json TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'pending',
+                  sequence INTEGER NOT NULL DEFAULT 0,
+                  parent_combination_id TEXT,
+                  transition_action TEXT NOT NULL DEFAULT 'SWITCH_COMBINATION',
+                  transition_reason TEXT NOT NULL DEFAULT '',
+                  selected_axis TEXT NOT NULL DEFAULT '',
+                  evidence_json TEXT NOT NULL DEFAULT '{}',
+                  batch_count INTEGER NOT NULL DEFAULT 0,
+                  pages_seen INTEGER NOT NULL DEFAULT 0,
+                  jobs_seen INTEGER NOT NULL DEFAULT 0,
+                  run_fresh_jobs INTEGER NOT NULL DEFAULT 0,
+                  historical_duplicates INTEGER NOT NULL DEFAULT 0,
+                  cooldown_excluded INTEGER NOT NULL DEFAULT 0,
+                  strategy_pass INTEGER NOT NULL DEFAULT 0,
+                  strategy_review INTEGER NOT NULL DEFAULT 0,
+                  strategy_reject INTEGER NOT NULL DEFAULT 0,
+                  qualified_fresh_jobs INTEGER NOT NULL DEFAULT 0,
+                  candidate_jobs INTEGER NOT NULL DEFAULT 0,
+                  novelty_yield REAL NOT NULL DEFAULT 0,
+                  qualified_novelty_yield REAL NOT NULL DEFAULT 0,
+                  duplicate_rate REAL NOT NULL DEFAULT 0,
+                  low_novelty_streak INTEGER NOT NULL DEFAULT 0,
+                  low_qualified_yield_streak INTEGER NOT NULL DEFAULT 0,
+                  started_at TEXT,
+                  completed_at TEXT,
+                  stop_reason TEXT NOT NULL DEFAULT '',
+                  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE SET NULL,
+                  FOREIGN KEY (smart_capture_id) REFERENCES fj_smart_captures(id) ON DELETE CASCADE,
+                  FOREIGN KEY (parent_combination_id) REFERENCES fj_workflow_search_combinations(id) ON DELETE SET NULL,
+                  CHECK (workflow_run_id IS NOT NULL OR smart_capture_id IS NOT NULL),
+                  CHECK (status IN ('pending', 'running', 'exhausted', 'completed', 'skipped', 'failed')),
+                  CHECK (transition_action IN ('ADD_FILTER', 'REMOVE_FILTER', 'REPLACE_FILTER', 'SWITCH_COMBINATION'))
+                )
+            """,
+            "fj_workflow_context_snapshots": """
+                CREATE TABLE fj_workflow_context_snapshots (
+                  id TEXT PRIMARY KEY,
+                  workflow_run_id TEXT,
+                  smart_capture_id TEXT,
+                  channel TEXT NOT NULL,
+                  snapshot_json TEXT NOT NULL DEFAULT '{}',
+                  context_characters INTEGER NOT NULL DEFAULT 0,
+                  estimated_tokens INTEGER NOT NULL DEFAULT 0,
+                  soft_budget_characters INTEGER NOT NULL DEFAULT 0,
+                  hard_budget_characters INTEGER NOT NULL DEFAULT 1000000,
+                  status TEXT NOT NULL DEFAULT 'ready',
+                  blocker_reason TEXT NOT NULL DEFAULT '',
+                  created_at TEXT NOT NULL,
+                  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE SET NULL,
+                  FOREIGN KEY (smart_capture_id) REFERENCES fj_smart_captures(id) ON DELETE CASCADE,
+                  UNIQUE (workflow_run_id, channel),
+                  CHECK (workflow_run_id IS NOT NULL OR smart_capture_id IS NOT NULL),
+                  CHECK (status IN ('ready', 'blocked'))
+                )
+            """,
+            "fj_workflow_analysis_handoffs": """
+                CREATE TABLE fj_workflow_analysis_handoffs (
+                  workflow_run_id TEXT,
+                  smart_capture_id TEXT,
+                  analysis_batch_id TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'claimed',
+                  handoff_attempt_id TEXT NOT NULL DEFAULT '',
+                  attempt_status TEXT NOT NULL DEFAULT 'claimed',
+                  codex_session_ref TEXT NOT NULL,
+                  codex_runtime_id TEXT NOT NULL DEFAULT '',
+                  claimed_at TEXT NOT NULL,
+                  submitted_at TEXT,
+                  prompt_written_at TEXT,
+                  started_at TEXT,
+                  released_at TEXT,
+                  completed_at TEXT,
+                  recovered_at TEXT,
+                  recovery_reason TEXT NOT NULL DEFAULT '',
+                  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE SET NULL,
+                  FOREIGN KEY (smart_capture_id) REFERENCES fj_smart_captures(id) ON DELETE CASCADE,
+                  CHECK (workflow_run_id IS NOT NULL OR smart_capture_id IS NOT NULL),
+                  CHECK (status IN ('claimed', 'submitted', 'released', 'completed'))
+                )
+            """,
+            "fj_workflow_prefetch_batches": """
+                CREATE TABLE fj_workflow_prefetch_batches (
+                  id TEXT PRIMARY KEY,
+                  workflow_run_id TEXT,
+                  smart_capture_id TEXT,
+                  source_analysis_batch_id TEXT NOT NULL,
+                  target_count INTEGER NOT NULL DEFAULT 0,
+                  status TEXT NOT NULL DEFAULT 'preparing',
+                  failure_reason TEXT NOT NULL DEFAULT '',
+                  created_at TEXT NOT NULL,
+                  started_at TEXT,
+                  completed_at TEXT,
+                  promoted_at TEXT,
+                  abandoned_at TEXT,
+                  updated_at TEXT NOT NULL,
+                  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE SET NULL,
+                  FOREIGN KEY (smart_capture_id) REFERENCES fj_smart_captures(id) ON DELETE CASCADE,
+                  CHECK (workflow_run_id IS NOT NULL OR smart_capture_id IS NOT NULL),
+                  CHECK (status IN ('preparing', 'ready', 'promoted', 'abandoned', 'cancelled', 'failed'))
+                )
+            """,
+            "fj_workflow_prefetch_items": """
+                CREATE TABLE fj_workflow_prefetch_items (
+                  id TEXT PRIMARY KEY,
+                  workflow_run_id TEXT,
+                  smart_capture_id TEXT,
+                  prefetch_batch_id TEXT NOT NULL,
+                  job_id TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'pending',
+                  lifecycle_status TEXT NOT NULL DEFAULT 'preparing',
+                  detail_status TEXT NOT NULL DEFAULT 'not_collected',
+                  operation_ref_type TEXT,
+                  operation_ref_id TEXT,
+                  error_message TEXT NOT NULL DEFAULT '',
+                  created_at TEXT NOT NULL,
+                  started_at TEXT,
+                  completed_at TEXT,
+                  promoted_at TEXT,
+                  abandoned_at TEXT,
+                  updated_at TEXT NOT NULL,
+                  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE SET NULL,
+                  FOREIGN KEY (smart_capture_id) REFERENCES fj_smart_captures(id) ON DELETE CASCADE,
+                  FOREIGN KEY (prefetch_batch_id) REFERENCES fj_workflow_prefetch_batches(id) ON DELETE CASCADE,
+                  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+                  CHECK (workflow_run_id IS NOT NULL OR smart_capture_id IS NOT NULL),
+                  CHECK (status IN ('pending', 'collecting', 'ready', 'failed')),
+                  CHECK (lifecycle_status IN ('preparing', 'ready', 'promoted', 'abandoned', 'cancelled')),
+                  CHECK (detail_status IN ('not_collected', 'queued', 'collecting', 'completed', 'failed'))
+                )
+            """,
+            "fj_workflow_candidate_reservations": """
+                CREATE TABLE fj_workflow_candidate_reservations (
+                  id TEXT PRIMARY KEY,
+                  workflow_run_id TEXT,
+                  smart_capture_id TEXT,
+                  job_id TEXT NOT NULL,
+                  owner_type TEXT NOT NULL,
+                  owner_id TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'reserved',
+                  created_at TEXT NOT NULL,
+                  released_at TEXT,
+                  terminal_at TEXT,
+                  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE SET NULL,
+                  FOREIGN KEY (smart_capture_id) REFERENCES fj_smart_captures(id) ON DELETE CASCADE,
+                  FOREIGN KEY (job_id) REFERENCES fj_boss_jobs(id) ON DELETE CASCADE,
+                  CHECK (workflow_run_id IS NOT NULL OR smart_capture_id IS NOT NULL),
+                  CHECK (owner_type IN ('formal_jd', 'formal_analysis', 'prefetch')),
+                  CHECK (status IN ('reserved', 'promoted', 'released', 'abandoned', 'cancelled', 'failed'))
+                )
+            """,
+            "fj_workflow_evaluation_feedback": """
+                CREATE TABLE fj_workflow_evaluation_feedback (
+                  id TEXT PRIMARY KEY,
+                  workflow_run_id TEXT,
+                  smart_capture_id TEXT,
+                  workflow_task_id TEXT,
+                  evaluation_id TEXT,
+                  sentiment TEXT NOT NULL,
+                  reason TEXT,
+                  note TEXT NOT NULL DEFAULT '',
+                  created_at TEXT NOT NULL,
+                  FOREIGN KEY (workflow_run_id) REFERENCES fj_workflow_runs(id) ON DELETE SET NULL,
+                  FOREIGN KEY (smart_capture_id) REFERENCES fj_smart_captures(id) ON DELETE CASCADE,
+                  FOREIGN KEY (workflow_task_id) REFERENCES fj_workflow_tasks(id) ON DELETE SET NULL,
+                  FOREIGN KEY (evaluation_id) REFERENCES fj_job_evaluations(id) ON DELETE SET NULL,
+                  CHECK (workflow_run_id IS NOT NULL OR smart_capture_id IS NOT NULL),
+                  CHECK (sentiment IN ('expected', 'unexpected'))
+                )
+            """,
+        }
+        rebuild_order = [
+            "fj_codex_sessions",
+            "fj_workflow_tasks",
+            "fj_workflow_job_discoveries",
+            "fj_workflow_search_combinations",
+            "fj_workflow_context_snapshots",
+            "fj_workflow_analysis_handoffs",
+            "fj_workflow_prefetch_batches",
+            "fj_workflow_prefetch_items",
+            "fj_workflow_candidate_reservations",
+            "fj_workflow_evaluation_feedback",
+        ]
+        for table_name in rebuild_order:
+            needs_rebuild = self._pipeline_owner_table_needs_rebuild(connection, table_name)
+            if table_name == "fj_codex_sessions":
+                foreign_keys = connection.execute(
+                    "PRAGMA foreign_key_list(fj_codex_sessions)"
+                ).fetchall()
+                needs_rebuild = needs_rebuild or not any(
+                    row["from"] == "smart_capture_id" for row in foreign_keys
+                )
+            if needs_rebuild:
+                self._rebuild_pipeline_owner_table(
+                    connection,
+                    table_name,
+                    table_definitions[table_name],
+                )
+
+        # 旧 linked 记录只在能由 Workflow Run 精确对应 Smart Capture 时回填 owner。
+        owner_tables = [
+            "fj_workflow_tasks",
+            "fj_workflow_job_discoveries",
+            "fj_workflow_search_combinations",
+            "fj_workflow_context_snapshots",
+            "fj_workflow_analysis_handoffs",
+            "fj_workflow_prefetch_batches",
+            "fj_workflow_prefetch_items",
+            "fj_workflow_candidate_reservations",
+            "fj_workflow_evaluation_feedback",
+        ]
+        for table_name in owner_tables:
+            connection.execute(
+                f"""
+                UPDATE {self._quote_sql_identifier(table_name)}
+                SET smart_capture_id = (
+                  SELECT id FROM fj_smart_captures
+                  WHERE workflow_run_id = {self._quote_sql_identifier(table_name)}.workflow_run_id
+                  ORDER BY created_at, id
+                  LIMIT 1
+                )
+                WHERE smart_capture_id IS NULL AND workflow_run_id IS NOT NULL
+                """
+            )
+        connection.execute(
+            """
+            UPDATE fj_workflow_prefetch_items
+            SET smart_capture_id = (
+              SELECT smart_capture_id FROM fj_workflow_prefetch_batches
+              WHERE id = fj_workflow_prefetch_items.prefetch_batch_id
+            )
+            WHERE smart_capture_id IS NULL
+              AND prefetch_batch_id IS NOT NULL
+            """
+        )
+        connection.execute(
+            """
+            UPDATE fj_codex_sessions
+            SET smart_capture_id = (
+                  SELECT h.smart_capture_id
+                  FROM fj_workflow_analysis_handoffs h
+                  WHERE h.codex_session_ref = fj_codex_sessions.id
+                    AND h.smart_capture_id IS NOT NULL
+                  ORDER BY h.claimed_at DESC
+                  LIMIT 1
+                ),
+                workflow_run_id = (
+                  SELECT h.workflow_run_id
+                  FROM fj_workflow_analysis_handoffs h
+                  WHERE h.codex_session_ref = fj_codex_sessions.id
+                    AND h.workflow_run_id IS NOT NULL
+                  ORDER BY h.claimed_at DESC
+                  LIMIT 1
+                )
+            WHERE smart_capture_id IS NULL AND workflow_run_id IS NULL
+            """
+        )
+
+        # 每类 owner 都有独立索引；active reservation 继续保持 job_id 全局唯一。
+        indexes = [
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_job_discoveries_workflow_identity ON fj_workflow_job_discoveries(workflow_run_id, task_id, job_id) WHERE workflow_run_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_job_discoveries_smart_identity ON fj_workflow_job_discoveries(smart_capture_id, task_id, job_id) WHERE smart_capture_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_job_discoveries_job ON fj_workflow_job_discoveries(job_id, discovered_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_tasks_smart_capture_status ON fj_workflow_tasks(smart_capture_id, status, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_job_discoveries_smart_capture ON fj_workflow_job_discoveries(smart_capture_id, discovered_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_tasks_run_status ON fj_workflow_tasks(workflow_run_id, status, created_at)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_search_combinations_workflow_identity ON fj_workflow_search_combinations(workflow_run_id, identity_json) WHERE workflow_run_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_search_combinations_smart_identity ON fj_workflow_search_combinations(smart_capture_id, identity_json) WHERE smart_capture_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_search_combinations_run_sequence ON fj_workflow_search_combinations(workflow_run_id, sequence)",
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_search_combinations_scope_status ON fj_workflow_search_combinations(workflow_run_id, keyword, city, status)",
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_search_combinations_smart_sequence ON fj_workflow_search_combinations(smart_capture_id, sequence)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_context_snapshots_smart_channel ON fj_workflow_context_snapshots(smart_capture_id, channel) WHERE smart_capture_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_context_snapshots_workflow_channel ON fj_workflow_context_snapshots(workflow_run_id, channel) WHERE workflow_run_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_analysis_handoffs_smart_batch ON fj_workflow_analysis_handoffs(smart_capture_id, analysis_batch_id) WHERE smart_capture_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_analysis_handoffs_workflow_batch ON fj_workflow_analysis_handoffs(workflow_run_id, analysis_batch_id) WHERE workflow_run_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_prefetch_batches_smart_source ON fj_workflow_prefetch_batches(smart_capture_id, source_analysis_batch_id) WHERE smart_capture_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_prefetch_batches_workflow_source ON fj_workflow_prefetch_batches(workflow_run_id, source_analysis_batch_id) WHERE workflow_run_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_prefetch_batches_run_status ON fj_workflow_prefetch_batches(workflow_run_id, status, created_at)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_prefetch_items_batch_job ON fj_workflow_prefetch_items(prefetch_batch_id, job_id)",
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_prefetch_items_batch_status ON fj_workflow_prefetch_items(prefetch_batch_id, status, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_prefetch_items_smart_status ON fj_workflow_prefetch_items(smart_capture_id, status, created_at)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_candidate_reservations_workflow_owner_job ON fj_workflow_candidate_reservations(workflow_run_id, owner_type, owner_id, job_id) WHERE workflow_run_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_candidate_reservations_owner_job ON fj_workflow_candidate_reservations(smart_capture_id, owner_type, owner_id, job_id) WHERE smart_capture_id IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_candidate_reservations_active ON fj_workflow_candidate_reservations(job_id) WHERE status = 'reserved'",
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_candidate_reservations_run_status ON fj_workflow_candidate_reservations(workflow_run_id, status, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_candidate_reservations_smart_status ON fj_workflow_candidate_reservations(smart_capture_id, status, created_at)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fj_workflow_candidate_reservations_owner_job_legacy ON fj_workflow_candidate_reservations(owner_type, owner_id, job_id)",
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_evaluation_feedback_task ON fj_workflow_evaluation_feedback(workflow_task_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_fj_workflow_evaluation_feedback_smart_task ON fj_workflow_evaluation_feedback(smart_capture_id, workflow_task_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_fj_codex_sessions_updated_at ON fj_codex_sessions(updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_fj_codex_sessions_smart_capture ON fj_codex_sessions(smart_capture_id, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_fj_codex_sessions_workflow_run ON fj_codex_sessions(workflow_run_id, updated_at DESC)",
+        ]
+        for statement in indexes:
+            connection.execute(statement)
+
+    @staticmethod
+    def _pipeline_owner_table_needs_rebuild(
+        connection: sqlite3.Connection,
+        table_name: str,
+    ) -> bool:
+        columns = connection.execute(
+            f"PRAGMA table_info({Database._quote_sql_identifier(table_name)})"
+        ).fetchall()
+        column_names = {str(row["name"]) for row in columns}
+        if "smart_capture_id" not in column_names or "workflow_run_id" not in column_names:
+            return True
+
+        # 部分迁移可能已经补过列，但没有补齐 owner 外键；这种状态必须继续重建，
+        # 否则 independent 记录看似可写，实际无法验证 Smart Capture owner 的引用完整性。
+        foreign_keys = connection.execute(
+            f"PRAGMA foreign_key_list({Database._quote_sql_identifier(table_name)})"
+        ).fetchall()
+        required_foreign_keys = {
+            ("smart_capture_id", "fj_smart_captures"),
+            ("workflow_run_id", "fj_workflow_runs"),
+        }
+        actual_foreign_keys = {
+            (str(row["from"]), str(row["table"])) for row in foreign_keys
+        }
+        if not required_foreign_keys <= actual_foreign_keys:
+            return True
+
+        workflow_column = next(
+            row for row in columns if str(row["name"]) == "workflow_run_id"
+        )
+        if int(workflow_column["notnull"] or 0) == 1:
+            return True
+        if table_name == "fj_workflow_analysis_handoffs":
+            return any(
+                str(row["name"]) == "workflow_run_id" and int(row["pk"] or 0) > 0
+                for row in columns
+            )
+        return False
+
+    def _rebuild_pipeline_owner_table(
+        self,
+        connection: sqlite3.Connection,
+        table_name: str,
+        create_sql: str,
+    ) -> None:
+        """用可为空的 parent link 重建旧表，避免 ALTER COLUMN 留下 Workflow-only 约束。"""
+        quoted_table = self._quote_sql_identifier(table_name)
+        legacy_table = f"{table_name}__pipeline_owner_legacy"
+        quoted_legacy = self._quote_sql_identifier(legacy_table)
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (legacy_table,),
+        ).fetchone() is not None:
+            legacy_table = f"{table_name}__pipeline_owner_legacy_{uuid4().hex[:8]}"
+            quoted_legacy = self._quote_sql_identifier(legacy_table)
+
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("PRAGMA legacy_alter_table = ON")
+        try:
+            connection.execute(f"ALTER TABLE {quoted_table} RENAME TO {quoted_legacy}")
+            old_indexes = connection.execute(
+                f"PRAGMA index_list({quoted_legacy})"
+            ).fetchall()
+            for index in old_indexes:
+                index_name = str(index["name"])
+                if not index_name.startswith("sqlite_autoindex_"):
+                    connection.execute(
+                        f"DROP INDEX IF EXISTS {self._quote_sql_identifier(index_name)}"
+                    )
+            connection.execute(create_sql)
+            old_columns = {
+                str(row["name"])
+                for row in connection.execute(f"PRAGMA table_info({quoted_legacy})")
+            }
+            new_columns = [
+                str(row["name"])
+                for row in connection.execute(f"PRAGMA table_info({quoted_table})")
+            ]
+            copied_columns = [column for column in new_columns if column in old_columns]
+            if copied_columns:
+                columns_sql = ", ".join(
+                    self._quote_sql_identifier(column) for column in copied_columns
+                )
+                connection.execute(
+                    f"INSERT INTO {quoted_table} ({columns_sql}) "
+                    f"SELECT {columns_sql} FROM {quoted_legacy}"
+                )
+            connection.execute(f"DROP TABLE {quoted_legacy}")
+            connection.commit()
+        finally:
+            connection.execute("PRAGMA legacy_alter_table = OFF")
+            connection.execute("PRAGMA foreign_keys = ON")
 
     @staticmethod
     def _list_smart_capture_legacy_tables(
