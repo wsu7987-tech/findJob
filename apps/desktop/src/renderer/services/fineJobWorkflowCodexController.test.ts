@@ -3,7 +3,10 @@ import { describe, expect, it, vi } from "vitest";
 import type { FineJobWorkflowRun } from "@/types";
 import { api } from "./api";
 
-import { createFineJobWorkflowCodexController } from "./fineJobWorkflowCodexController";
+import {
+  createFineJobWorkflowCodexController,
+  WorkflowControllerCutoverError
+} from "./fineJobWorkflowCodexController";
 
 const waitingRun = (): FineJobWorkflowRun => ({
   workflow_run_id: "workflow-run-away-from-cockpit",
@@ -88,5 +91,21 @@ describe("fineJobWorkflowCodexController", () => {
 
     expect(advance).toHaveBeenCalledWith(run.workflow_run_id);
     advance.mockRestore();
+  });
+
+  it("Cutover 后拒绝用 latest Workflow fallback 驱动旧 live controller", async () => {
+    const getLatestRun = vi.fn().mockResolvedValue(waitingRun());
+    const controller = createFineJobWorkflowCodexController({
+      getLatestRun,
+      workflowStore: { setRun: vi.fn() },
+      codexStore: {
+        load: vi.fn().mockResolvedValue(undefined), status: "idle", runtimeId: null, sessionRef: null,
+        startWorkflow: vi.fn()
+      },
+      executionAuthority: "smart_capture"
+    });
+
+    await expect(controller.tick()).rejects.toBeInstanceOf(WorkflowControllerCutoverError);
+    expect(getLatestRun).not.toHaveBeenCalled();
   });
 });

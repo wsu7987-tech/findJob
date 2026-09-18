@@ -16,6 +16,7 @@ from backend.app.services.fine_job.collection_capacity import (
 )
 from backend.app.services.fine_job import smart_captures
 from backend.app.services.fine_job import workflow_children
+from backend.app.services.fine_job import cutover_guard
 from backend.app.services.fine_job.workflow_run_events import workflow_run_event_broker
 from backend.app.services.fine_job.boss_capture_history import get_capture_history_job
 from backend.app.services.fine_job.boss_scraper.service import BossCaptureRequest, boss_scraper_service
@@ -54,14 +55,27 @@ def configure_realtime_runtime(db: Database, config: AppConfig) -> None:
 
 def _on_capture_task_updated(capture: dict[str, object]) -> None:
     """将采集器进度转换为 Workflow 快照事件，并在结束时继续编排。"""
+    capture_id = str(capture.get("id") or "")
+    if not capture_id:
+        return
+    smart_capture_id = str(capture.get("smart_capture_id") or "")
+    is_smart_capture_callback = bool(smart_capture_id) or str(
+        capture.get("capture_source") or ""
+    ) == "smart"
+    if is_smart_capture_callback:
+        # 旧 callback 是 Cutover 后必须关闭的 live 入口，先经过 guard 再读取运行时。
+        cutover_guard.get_runtime_cutover_guard().observe_legacy_capture_callback(
+            capture_id=capture_id
+        )
+    if smart_capture_id and str(capture.get("status") or "") in {"completed", "stopped", "failed"}:
+        cutover_guard.get_runtime_cutover_guard().release_live_start(
+            child_ref=smart_capture_id
+        )
     with _realtime_runtime_lock:
         runtime = _realtime_runtime
     if runtime is None:
         return
     db, config = runtime
-    capture_id = str(capture.get("id") or "")
-    if not capture_id:
-        return
     with db.connect() as connection:
         rows = connection.execute(
             """
@@ -92,6 +106,9 @@ def _on_capture_task_updated(capture: dict[str, object]) -> None:
 
 def _advance_after_capture_finished(db: Database, config: AppConfig, workflow_run_id: str) -> None:
     """采集结束后由后端继续推进，页面只订阅状态。"""
+    cutover_guard.get_runtime_cutover_guard().assert_workflow_live_allowed(
+        operation="capture finished advance"
+    )
     try:
         snapshot = advance_deep_job_search(db, config, workflow_run_id)
         workflow_run_event_broker.publish(workflow_run_id, snapshot)
@@ -197,7 +214,6 @@ def create_deep_job_search_run(
             "combination_safety_limit": int(payload.get("search_combination_safety_limit") or 24),
         },
         "analysis_policy": {
-            "enabled": delivery_target_enabled,
             "analyze_all_candidates": bool(payload.get("analyze_all_candidates")),
             "stop_after_current_batch": bool(payload.get("stop_after_current_batch")),
             "analysis_batch_size": int(payload.get("analysis_batch_size") or payload.get("jd_batch_size") or 5),
@@ -370,6 +386,9 @@ def _create_workflow_identity_in_connection(
 
 def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: str) -> dict[str, object]:
     """推进一个采集批次；Codex 只在候选池准备完成后参与。"""
+    cutover_guard.get_runtime_cutover_guard().assert_workflow_live_allowed(
+        operation="advance_deep_job_search"
+    )
     run = _require_run(db, workflow_run_id)
     if bool(run["paused"]):
         _advance_prefetch(db, config, workflow_run_id, allow_start=False)

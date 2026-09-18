@@ -14,6 +14,8 @@ from backend.app.services.fine_job.collection_capacity import (
     recover_collection_capacity,
 )
 from backend.app.services.fine_job import workflow_children
+from backend.app.services.fine_job import pipeline_owner
+from backend.app.services.fine_job import cutover_guard
 from backend.app.services.fine_job.boss_scraper.service import (
     BossCaptureRequest,
     boss_scraper_service,
@@ -40,6 +42,10 @@ def _on_capture_task_updated(capture: dict[str, object]) -> None:
     smart_capture_id = str(capture.get("smart_capture_id") or "")
     if not isinstance(db, Database) or not smart_capture_id:
         return
+    if str(capture.get("status") or "") in {"completed", "stopped", "failed"}:
+        cutover_guard.get_runtime_cutover_guard().release_live_start(
+            child_ref=smart_capture_id
+        )
     try:
         sync_capture_snapshot(db, capture)
     except Exception:
@@ -692,7 +698,13 @@ def start_smart_capture(
     if str(capture["status"]) != "pending":
         raise AppError(409, "SMART_CAPTURE_NOT_STARTABLE", "当前岗位采集任务不在待启动状态。")
     payload = dict(capture.get("search_config") or {})
-    return _start_new_batch(db, config, smart_capture_id, payload)
+    return _start_new_batch(
+        db,
+        config,
+        smart_capture_id,
+        payload,
+        requested_authority=cutover_guard.ExecutionAuthority.SMART_CAPTURE,
+    )
 
 
 def retry_smart_capture(
@@ -712,6 +724,7 @@ def retry_smart_capture(
         config,
         smart_capture_id,
         dict(capture.get("search_config") or {}),
+        requested_authority=cutover_guard.ExecutionAuthority.SMART_CAPTURE,
     )
 
 
@@ -725,7 +738,13 @@ def start_linked_capture_batch(
     capture = get_smart_capture(db, smart_capture_id)
     if not str(capture.get("workflow_run_id") or ""):
         raise AppError(409, "SMART_CAPTURE_NOT_LINKED", "当前岗位采集任务没有关联驾驶舱任务。")
-    return _start_new_batch(db, config, smart_capture_id, payload)
+    return _start_new_batch(
+        db,
+        config,
+        smart_capture_id,
+        payload,
+        requested_authority=cutover_guard.ExecutionAuthority.WORKFLOW_PIPELINE,
+    )
 
 
 def bind_batch(db: Database, smart_capture_id: str, batch_id: str) -> None:
@@ -1175,7 +1194,7 @@ def get_smart_capture(db: Database, smart_capture_id: str) -> dict[str, object]:
     if status == "waiting_next_batch" and waiting_reason in LEGACY_MANUAL_WAITING_REASONS:
         # 旧数据读取时统一到人工阻塞的 canonical lifecycle。
         status = "waiting_for_user"
-    return {
+    snapshot = {
         "smart_capture_id": str(data["id"]),
         "source": str(data["source"]),
         "workflow_run_id": workflow_run_id or None,
@@ -1209,6 +1228,7 @@ def get_smart_capture(db: Database, smart_capture_id: str) -> dict[str, object]:
         "jobs": list(jobs_by_id.values()),
         "workflow_run": workflow_run,
     }
+    return pipeline_owner.validate_smart_capture_snapshot_contract(snapshot)
 
 
 def _start_new_batch(
@@ -1216,6 +1236,8 @@ def _start_new_batch(
     config: AppConfig,
     smart_capture_id: str,
     payload: dict[str, Any],
+    *,
+    requested_authority: cutover_guard.ExecutionAuthority | None = None,
 ) -> dict[str, object]:
     # pending/recovery 启动仍需经过统一执行容量检查，防止 custom 在两次请求间插入。
     assert_collection_start_allowed(db, requested_kind="smart")
@@ -1228,24 +1250,53 @@ def _start_new_batch(
     if not keyword or not city:
         raise AppError(422, "VALIDATION_FAILED", "岗位采集任务缺少搜索词或城市。")
     capture = get_smart_capture(db, smart_capture_id)
-    task = boss_capture_task_manager.start_capture(
-        BossCaptureRequest(
-            keyword=keyword,
-            city=city,
-            pages=max(1, min(10, int(payload.get("pages") or payload.get("min_depth") or 1))),
-            filters=dict(payload.get("filters") or {}),
-            include_details=bool(payload.get("include_details", False)),
-            prefer_current_page=bool(payload.get("prefer_current_page", True)),
-            force_search_navigation=bool(payload.get("force_search_navigation", False)),
-            filter_strategy_id=str(payload.get("filter_strategy_id") or "") or None,
-            capture_source="smart",
-            workflow_run_id=str(capture.get("workflow_run_id") or "") or None,
-            smart_capture_id=smart_capture_id,
-        ),
-        output_dir=config.output_root / "fine-job" / "boss-capture",
-        db=db,
+    owner = pipeline_owner.get_pipeline_owner(db, smart_capture_id)
+    authority = requested_authority or (
+        cutover_guard.ExecutionAuthority.WORKFLOW_PIPELINE
+        if owner.is_linked
+        else cutover_guard.ExecutionAuthority.SMART_CAPTURE
     )
-    bind_batch(db, smart_capture_id, str(task["id"]))
+    runtime_guard = cutover_guard.get_runtime_cutover_guard()
+    runtime_guard.claim_live_start(
+        child_ref=owner.identity,
+        requested_authority=authority,
+        production_authority=(
+            cutover_guard.ExecutionAuthority.WORKFLOW_PIPELINE
+            if owner.is_linked and runtime_guard.phase == cutover_guard.CutoverPhase.PRE_CUTOVER
+            else cutover_guard.ExecutionAuthority.SMART_CAPTURE
+        ),
+        allow_independent=owner.is_independent,
+    )
+    started_task: dict[str, object] | None = None
+    try:
+        started_task = boss_capture_task_manager.start_capture(
+            BossCaptureRequest(
+                keyword=keyword,
+                city=city,
+                pages=max(1, min(10, int(payload.get("pages") or payload.get("min_depth") or 1))),
+                filters=dict(payload.get("filters") or {}),
+                include_details=bool(payload.get("include_details", False)),
+                prefer_current_page=bool(payload.get("prefer_current_page", True)),
+                force_search_navigation=bool(payload.get("force_search_navigation", False)),
+                filter_strategy_id=str(payload.get("filter_strategy_id") or "") or None,
+                capture_source="smart",
+                workflow_run_id=owner.workflow_run_id,
+                smart_capture_id=owner.identity,
+            ),
+            output_dir=config.output_root / "fine-job" / "boss-capture",
+            db=db,
+        )
+        bind_batch(db, smart_capture_id, str(started_task["id"]))
+    except Exception:
+        if started_task is None:
+            runtime_guard.release_live_start(child_ref=owner.identity)
+        else:
+            # 绑定失败时先请求停止已创建的执行器，避免释放启动占用后重复启动同一 child。
+            try:
+                boss_capture_task_manager.stop_capture(str(started_task["id"]))
+            except Exception:
+                runtime_guard.release_live_start(child_ref=owner.identity)
+        raise
     return get_smart_capture(db, smart_capture_id)
 
 

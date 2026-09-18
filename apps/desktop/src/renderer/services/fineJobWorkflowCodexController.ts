@@ -19,9 +19,25 @@ type ControllerDependencies = {
   getLatestRun: () => Promise<FineJobWorkflowRun | null>;
   workflowStore: WorkflowRunStore;
   codexStore: CodexStore;
+  executionAuthority?: "workflow_legacy" | "smart_capture";
   isActive?: () => boolean;
   intervalMs?: number;
   handoffDependencies?: Parameters<typeof triggerWorkflowCodexHandoff>[3];
+};
+
+export class WorkflowControllerCutoverError extends Error {
+  constructor() {
+    super("Cutover 后 App-level Workflow controller 不能驱动 live Pipeline。");
+    this.name = "WorkflowControllerCutoverError";
+  }
+}
+
+export const assertWorkflowControllerAuthority = (
+  executionAuthority: ControllerDependencies["executionAuthority"] = "workflow_legacy"
+) => {
+  if (executionAuthority === "smart_capture") {
+    throw new WorkflowControllerCutoverError();
+  }
 };
 
 const needsPrefetchProgress = (run: FineJobWorkflowRun) => {
@@ -37,6 +53,8 @@ export const createFineJobWorkflowCodexController = (dependencies: ControllerDep
   let polling = false;
 
   const tick = async () => {
+    // Cutover 后旧 controller 只能停止，不能借 latest Workflow fallback 继续执行。
+    assertWorkflowControllerAuthority(dependencies.executionAuthority);
     // 控制器只在当前 Workflow 已明确进入运行流程后访问后端。
     if (polling || (dependencies.isActive && !dependencies.isActive())) return;
     polling = true;
