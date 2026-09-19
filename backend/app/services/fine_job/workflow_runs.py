@@ -15,6 +15,7 @@ from backend.app.services.fine_job.collection_capacity import (
     get_active_collection_task as get_active_collection_capacity_task,
 )
 from backend.app.services.fine_job import smart_captures
+from backend.app.services.fine_job import smart_capture_engine
 from backend.app.services.fine_job import pipeline_repository
 from backend.app.services.fine_job import workflow_children
 from backend.app.services.fine_job import cutover_guard
@@ -1553,98 +1554,19 @@ def _record_batch(
     capture: dict[str, object],
     contract: dict[str, Any],
 ) -> dict[str, object]:
-    smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
-    strategy = get_filter_strategy(db, str(contract["selected_strategy_ids"]["filter_strategy_id"]))
-    results = evaluate_filter_strategy(list(capture.get("jobs") or []), strategy)
-    _jobs, results = apply_filter_exclusions(db, strategy, list(capture.get("jobs") or []), results)
-    boss_capture_task_manager.apply_filter_results(str(capture["id"]), results)
-    result_by_id = {str(item["job_id"]): item for item in results}
-    payload = _load(task["payload_json"], {})
-    combination_id = str(payload.get("search_combination_id") or "")
-    if not combination_id:
-        combination_id = _ensure_search_combination_for_task(
-            db,
-            workflow_run_id,
-            payload,
-        )
-        payload["search_combination_id"] = combination_id
-    platform_filters = canonicalize_platform_filters(payload.get("platform_filters"))
-    metrics = build_metrics_for_window(list(capture.get("jobs") or []), results)
-    planner_policy = contract.get("planner_policy") if isinstance(contract.get("planner_policy"), dict) else {}
-    now = utc_now()
-    with db.connect() as connection:
-        for job in capture.get("jobs") or []:
-            job_id = str(job.get("history_record_id") or "")
-            source_job_id = str(job.get("job_id") or "")
-            if not job_id or not source_job_id:
-                continue
-            is_duplicate = bool(job.get("is_previously_collected") or job.get("processing_state") == "duplicate")
-            filter_result = result_by_id.get(source_job_id, {})
-            first = connection.execute("SELECT 1 FROM fj_workflow_job_discoveries WHERE smart_capture_id = ? AND job_id = ? LIMIT 1", (smart_capture_id, job_id)).fetchone() is None
-            connection.execute(
-                """INSERT OR IGNORE INTO fj_workflow_job_discoveries (
-                    id, workflow_run_id, smart_capture_id, task_id, job_id, search_keyword, city, search_combination_json,
-                    scroll_depth, discovered_at, is_run_first_discovery, is_historical_duplicate,
-                    is_filter_candidate
-                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    new_id(),
-                    workflow_run_id,
-                    smart_capture_id,
-                    task["id"],
-                    job_id,
-                    payload["keyword"],
-                    payload["city"],
-                    _dump({
-                        "search_combination_id": combination_id,
-                        "platform_filters": platform_filters,
-                        "filter_strategy_id": strategy["id"],
-                    }),
-                    int(capture.get("total_pages_loaded") or 0),
-                    now,
-                    int(first),
-                    int(is_duplicate),
-                    int(filter_result.get("status") in {"pass", "review"}),
-                ),
-            )
-    payload["depth"] = int(capture.get("total_pages_loaded") or payload.get("depth") or 0)
-    low_novelty_streak, low_qualified_yield_streak = _update_search_combination_metrics(
+    # linked Workflow 仅负责后半段编排，Search/Candidate/BOSS 规则由共享 Engine 统一维护。
+    metrics_dict = smart_capture_engine.process_completed_batch(
         db,
-        combination_id,
-        metrics,
-        pages_seen=max(
-            0,
-            int(capture.get("total_pages_loaded") or 0)
-            - int(_load(task["payload_json"], {}).get("depth") or 0),
+        _smart_capture_id_for_workflow(db, workflow_run_id),
+        capture,
+        planner_policy=(
+            contract.get("planner_policy")
+            if isinstance(contract.get("planner_policy"), dict)
+            else {}
         ),
-        low_novelty_threshold=float(planner_policy.get("low_novelty_threshold") or 0.25),
-        low_qualified_yield_threshold=float(planner_policy.get("low_qualified_yield_threshold") or 0.15),
-    )
-    metrics_dict = metrics.as_dict()
-    metrics_dict["low_novelty_streak"] = low_novelty_streak
-    metrics_dict["low_qualified_yield_streak"] = low_qualified_yield_streak
-    payload["low_yield_streak"] = low_novelty_streak
-    payload["low_novelty_streak"] = low_novelty_streak
-    payload["low_qualified_yield_streak"] = low_qualified_yield_streak
-    _finish_task(
-        db,
-        task["id"],
-        "succeeded",
-        payload,
-        {
-            "new_jobs": metrics.run_fresh_jobs,
-            "duplicates": metrics.historical_duplicates,
-            "new_candidates": metrics.candidate_jobs,
-            "historical_duplicates": metrics.historical_duplicates,
-            "cooldown_excluded": metrics.cooldown_excluded,
-            "strategy_pass": metrics.strategy_pass,
-            "strategy_review": metrics.strategy_review,
-            "strategy_reject": metrics.strategy_reject,
-            "qualified_fresh_jobs": metrics.qualified_fresh_jobs,
-            "candidate_jobs": metrics.candidate_jobs,
-            "metrics": metrics_dict,
-            "capture_task_id": capture["id"],
-        },
+        filter_strategy_id=str(
+            (contract.get("selected_strategy_ids") or {}).get("filter_strategy_id") or ""
+        ),
     )
     _refresh_counts(db, workflow_run_id)
     return metrics_dict
@@ -2047,7 +1969,7 @@ def _save_planner_decision(
                 decision.selected_axis,
                 _dump(evidence),
                 combination_id,
-                workflow_run_id,
+                smart_capture_id,
             ),
         )
 

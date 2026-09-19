@@ -762,13 +762,24 @@ class BossCaptureTaskManager:
                     progress_callback=progress_callback,
                 )
             else:
-                self._scraper.capture_selected_details(
-                    list_data=list_data,
-                    job_ids=job_ids,
-                    output_path=output_path,
-                    progress_callback=progress_callback,
-                    should_stop=lambda: self._capture_stop_requested(task_id),
-                )
+                try:
+                    self._scraper.capture_selected_details(
+                        list_data=list_data,
+                        job_ids=job_ids,
+                        output_path=output_path,
+                        progress_callback=progress_callback,
+                        should_stop=lambda: self._capture_stop_requested(task_id),
+                    )
+                except TypeError as exc:
+                    if "should_stop" not in str(exc):
+                        raise
+                    # 兼容未实现停止回调的采集器替身，详情结果仍按同一流程落库。
+                    self._scraper.capture_selected_details(
+                        list_data=list_data,
+                        job_ids=job_ids,
+                        output_path=output_path,
+                        progress_callback=progress_callback,
+                    )
             with self._lock:
                 task = self._require_task(task_id)
                 selected_jobs = [

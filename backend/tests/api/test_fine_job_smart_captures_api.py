@@ -6,9 +6,13 @@ import pytest
 
 from backend.app.errors import AppError
 from backend.app.services.fine_job import smart_captures
+from backend.app.services.fine_job import smart_capture_engine
 from backend.app.services.fine_job import workflow_children
 from backend.app.services.fine_job import workflow_runs
-from backend.app.services.fine_job.boss_capture_history import create_capture_batch
+from backend.app.services.fine_job.boss_capture_history import (
+    create_capture_batch,
+    record_capture_jobs,
+)
 from backend.app.services.fine_job.boss_scraper.service import BossBrowserStatus
 
 
@@ -137,6 +141,72 @@ def test_independent_smart_capture_does_not_create_hidden_child_relation(test_db
         ).fetchone()["count"]
 
     assert relation_count == 0
+
+
+def test_owner_neutral_engine_persists_candidate_pool_once_for_independent_capture(
+    test_db,
+) -> None:
+    capture = _create_capture(test_db)
+    capture_id = str(capture["smart_capture_id"])
+    batch_id = "engine-batch-independent"
+    create_capture_batch(
+        test_db,
+        capture_id=batch_id,
+        smart_capture_id=capture_id,
+        keyword="Python",
+        city="上海",
+        pages=1,
+        auto_details=False,
+        created_at="2026-09-19T00:00:00Z",
+        capture_source="smart",
+    )
+    persisted = record_capture_jobs(
+        test_db,
+        capture_id=batch_id,
+        search_keyword="Python",
+        jobs=[{"job_id": "engine-job-1", "title": "Python 工程师", "boss_name": "测试公司"}],
+    )
+    batch = {
+        "id": batch_id,
+        "keyword": "Python",
+        "city": "上海",
+        "total_pages_loaded": 1,
+        "jobs": persisted,
+    }
+
+    smart_capture_engine.process_completed_batch(test_db, capture_id, batch)
+    smart_capture_engine.process_completed_batch(test_db, capture_id, batch)
+
+    continued_jobs = record_capture_jobs(
+        test_db,
+        capture_id=batch_id,
+        search_keyword="Python",
+        jobs=[
+            {"job_id": "engine-job-1", "title": "Python 工程师", "boss_name": "测试公司"},
+            {"job_id": "engine-job-2", "title": "高级 Python 工程师", "boss_name": "测试公司"},
+        ],
+    )
+    smart_capture_engine.process_completed_batch(
+        test_db,
+        capture_id,
+        {
+            **batch,
+            "total_pages_loaded": 2,
+            "jobs": continued_jobs,
+        },
+    )
+
+    snapshot = smart_captures.get_smart_capture(test_db, capture_id)
+    assert len(snapshot["search_combinations"]) == 1
+    assert sorted(job["source_job_id"] for job in snapshot["candidate_pool"]) == [
+        "engine-job-1",
+        "engine-job-2",
+    ]
+    with test_db.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) AS count FROM fj_workflow_job_discoveries WHERE smart_capture_id = ?",
+            (capture_id,),
+        ).fetchone()["count"] == 2
 
 
 def test_linked_parent_and_child_roll_back_together_when_relation_insert_fails(

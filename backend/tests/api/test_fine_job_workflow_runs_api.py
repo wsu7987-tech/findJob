@@ -493,6 +493,12 @@ def test_fresh_only_count_excludes_historical_discoveries_and_records_source(
     search_combination = json.loads(discovery["search_combination_json"])
     assert search_combination["search_combination_id"] == search_task["payload"]["search_combination_id"]
     assert search_combination["platform_filters"] == {}
+    linked_capture = smart_captures.get_smart_capture(
+        test_db, run["children"][0]["smart_capture_id"]
+    )
+    assert [job["source_job_id"] for job in linked_capture["candidate_pool"]] == [
+        "source-job-1"
+    ]
     assert refreshed["telemetry"]["fresh_candidates"] == 1
     assert refreshed["progress"]["current_keyword"] == "AI Agent"
     assert refreshed["progress"]["current_city"] == "广州"

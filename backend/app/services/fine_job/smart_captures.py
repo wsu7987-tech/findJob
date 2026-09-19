@@ -16,6 +16,7 @@ from backend.app.services.fine_job.collection_capacity import (
 from backend.app.services.fine_job import workflow_children
 from backend.app.services.fine_job import pipeline_owner
 from backend.app.services.fine_job import cutover_guard
+from backend.app.services.fine_job import smart_capture_engine
 from backend.app.services.fine_job.boss_scraper.service import (
     BossCaptureRequest,
     boss_scraper_service,
@@ -42,6 +43,18 @@ def _on_capture_task_updated(capture: dict[str, object]) -> None:
     smart_capture_id = str(capture.get("smart_capture_id") or "")
     if not isinstance(db, Database) or not smart_capture_id:
         return
+    # linked 与 independent 在 BOSS 批次结束后都由同一 Engine 写入候选池。
+    stage = str(capture.get("stage") or "")
+    if (
+        str(capture.get("status") or "") == "completed"
+        and not stage.endswith("paused")
+        and not stage.endswith("stopped")
+    ):
+        try:
+            smart_capture_engine.process_completed_batch(db, smart_capture_id, capture)
+        except Exception:
+            # 进度快照仍需可读，失败批次由对应的恢复/历史路径继续处理。
+            pass
     if str(capture.get("status") or "") in {"completed", "stopped", "failed"}:
         cutover_guard.get_runtime_cutover_guard().release_live_start(
             child_ref=smart_capture_id
@@ -747,7 +760,14 @@ def start_linked_capture_batch(
     )
 
 
-def bind_batch(db: Database, smart_capture_id: str, batch_id: str) -> None:
+def bind_batch(
+    db: Database,
+    smart_capture_id: str,
+    batch_id: str,
+    *,
+    search_task: dict[str, str] | None = None,
+    search_payload: dict[str, object] | None = None,
+) -> None:
     now = utc_now()
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -796,6 +816,14 @@ def bind_batch(db: Database, smart_capture_id: str, batch_id: str) -> None:
                 ),
                 now=now,
             )
+    if search_task is not None:
+        smart_capture_engine.bind_capture_task(
+            db,
+            smart_capture_id=smart_capture_id,
+            task_id=search_task["task_id"],
+            batch_id=batch_id,
+            payload=search_payload or {},
+        )
     try:
         sync_capture_snapshot(db, boss_capture_task_manager.get_task(batch_id))
     except AppError:
@@ -1060,6 +1088,10 @@ def sync_capture_snapshot(db: Database, task: dict[str, object]) -> None:
         parent_control = str(parent["control_cause"] or "")
         waiting_reason = "child_control" if parent_control in {"parent_pause", "child_self_pause"} and bool(task.get("pause_requested")) else "manual_decision" if bool(task.get("pause_requested")) else ""
         control_cause = parent_control if parent_control in {"parent_pause", "child_self_pause"} and bool(task.get("pause_requested")) else "user_pause" if bool(task.get("pause_requested")) else ""
+    elif status == "failed" and _is_browser_interruption(task):
+        parent_status = "interrupted"
+        waiting_reason = "browser_not_running"
+        control_cause = "recovery"
     elif status == "failed":
         parent_status = "failed"
         waiting_reason = "child_failed"
@@ -1079,10 +1111,11 @@ def sync_capture_snapshot(db: Database, task: dict[str, object]) -> None:
         control_cause = "child_user_stop"
     else:
         is_linked_workflow_capture = str(parent["source"]) == "task_cockpit"
+        candidate_count = smart_capture_engine.count_candidates(db, smart_capture_id)
         reached_independent_target = (
             not is_linked_workflow_capture
             and int(parent["target_count"] or 0) > 0
-            and int(task.get("jobs_collected") or len(task.get("jobs") or []))
+            and candidate_count
             >= int(parent["target_count"])
         )
         # 驾驶舱的单个子批次结束后，Workflow 仍可能暂停或进入下一组合。
@@ -1224,6 +1257,9 @@ def get_smart_capture(db: Database, smart_capture_id: str) -> dict[str, object]:
         "updated_at": str(data["updated_at"]),
         "completed_at": data.get("completed_at"),
         "batches": [dict(batch) for batch in batches],
+        # Search/Candidate 结果从 Smart Capture owner 读取，供两个入口使用同一快照。
+        "search_combinations": smart_capture_engine.list_search_combinations(db, smart_capture_id),
+        "candidate_pool": smart_capture_engine.list_candidate_pool(db, smart_capture_id),
         "current_batch": current_task or (dict(batches[-1]) if batches else None),
         "jobs": list(jobs_by_id.values()),
         "workflow_run": workflow_run,
@@ -1267,8 +1303,14 @@ def _start_new_batch(
         ),
         allow_independent=owner.is_independent,
     )
+    search_task: dict[str, str] | None = None
     started_task: dict[str, object] | None = None
     try:
+        search_task = smart_capture_engine.prepare_search_execution(
+            db,
+            smart_capture_id,
+            payload,
+        )
         started_task = boss_capture_task_manager.start_capture(
             BossCaptureRequest(
                 keyword=keyword,
@@ -1286,7 +1328,13 @@ def _start_new_batch(
             output_dir=config.output_root / "fine-job" / "boss-capture",
             db=db,
         )
-        bind_batch(db, smart_capture_id, str(started_task["id"]))
+        bind_batch(
+            db,
+            smart_capture_id,
+            str(started_task["id"]),
+            search_task=search_task,
+            search_payload=payload,
+        )
     except Exception:
         if started_task is None:
             runtime_guard.release_live_start(child_ref=owner.identity)
@@ -1465,6 +1513,15 @@ def _progress_from_task(task: dict[str, object]) -> dict[str, object]:
         "details_completed": int(task.get("details_completed") or 0),
         "details_failed": int(task.get("details_failed") or 0),
     }
+
+
+def _is_browser_interruption(task: dict[str, object]) -> bool:
+    """将浏览器执行器丢失归入可恢复中断，而不是 hard failure。"""
+    message = " ".join(
+        str(task.get(key) or "").lower()
+        for key in ("error_message", "message", "stage")
+    )
+    return any(marker in message for marker in ("browser", "cdp", "chrome", "target closed"))
 
 
 def _result_summary_from_task(task: dict[str, object]) -> dict[str, object]:

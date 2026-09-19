@@ -172,8 +172,12 @@ def strategy_platform_options(strategy: Mapping[str, object]) -> dict[str, list[
             labels = map_monthly_salary_to_boss_buckets(strategy)
         else:
             configured = [str(value).strip() for value in strategy.get(strategy_key, []) or []]
-            source = configured or list(_MAP_BY_AXIS[axis])
-            labels = [label for label in source if label in _MAP_BY_AXIS[axis] and label != "不限"]
+            if axis == "company_industry" and not configured:
+                # 公司行业未配置时不自动扩展平台行业筛选范围。
+                labels = []
+            else:
+                source = configured or list(_MAP_BY_AXIS[axis])
+                labels = [label for label in source if label in _MAP_BY_AXIS[axis] and label != "不限"]
         codes = [str(_MAP_BY_AXIS[axis][label]) for label in labels]
         if codes:
             options[axis] = codes

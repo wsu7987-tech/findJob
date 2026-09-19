@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from backend.tests.api.test_fine_job_workflow_runs_api import (
@@ -44,6 +46,35 @@ def test_owner_context_supports_linked_and_independent_identity() -> None:
     assert independent.identity == "capture-independent"
     assert independent.is_independent is True
     assert independent.workflow_run_id is None
+
+
+def test_linked_planner_decision_updates_smart_capture_owner(configured_client, test_db) -> None:
+    run = _create_run(configured_client)
+    with test_db.connect() as connection:
+        combination_id = connection.execute(
+            "SELECT id FROM fj_workflow_search_combinations WHERE workflow_run_id = ?",
+            (run["workflow_run_id"],),
+        ).fetchone()["id"]
+
+    workflow_runs._save_planner_decision(
+        test_db,
+        run["workflow_run_id"],
+        str(combination_id),
+        SimpleNamespace(
+            switch_reason="扩大经验范围",
+            selected_axis="experience",
+            evidence={"reason": "low_yield"},
+        ),
+    )
+
+    with test_db.connect() as connection:
+        row = connection.execute(
+            "SELECT transition_reason, selected_axis, evidence_json FROM fj_workflow_search_combinations WHERE id = ?",
+            (str(combination_id),),
+        ).fetchone()
+    assert row["transition_reason"] == "扩大经验范围"
+    assert row["selected_axis"] == "experience"
+    assert row["evidence_json"] == '{"reason":"low_yield"}'
 
 
 def test_history_context_is_read_only_and_never_becomes_pipeline_owner() -> None:
