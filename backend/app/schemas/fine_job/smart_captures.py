@@ -14,8 +14,70 @@ class SmartCaptureCreateRequest(BaseModel):
     include_details: bool = False
     prefer_current_page: bool = True
     filters: dict[str, str] = Field(default_factory=dict)
+    delivery_target_enabled: bool = False
+    analysis_guidance: str = Field(default="", max_length=4000)
+    codex_model: str | None = Field(default=None, min_length=1, max_length=128)
+    codex_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
+    context_soft_budget_characters: int = Field(default=12000, ge=1000, le=200000)
     source: Literal["boss_capture"] = "boss_capture"
 
 
 class SmartCaptureControlRequest(BaseModel):
     transition_id: str | None = Field(default=None, min_length=1, max_length=160)
+
+
+class SmartCaptureManualAnalysisBatchRequest(BaseModel):
+    recommendation_strategy_id: str | None = Field(default=None, min_length=1, max_length=100)
+    job_ids: list[str] = Field(min_length=1, max_length=20)
+    analysis_batch_size: int = Field(default=5, ge=1, le=20)
+    codex_model: str | None = Field(default=None, min_length=1, max_length=128)
+    codex_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
+
+
+class SmartCaptureCodexSessionRequest(BaseModel):
+    codex_session_ref: str = Field(min_length=1, max_length=200)
+    codex_runtime_id: str | None = Field(default=None, max_length=200)
+    analysis_batch_id: str | None = Field(default=None, max_length=100)
+
+
+class SmartCaptureHandoffClaimRequest(SmartCaptureCodexSessionRequest):
+    handoff_kind: Literal["initial", "next"] = "initial"
+    retry_handoff_attempt_id: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+class SmartCaptureHandoffRequest(BaseModel):
+    analysis_batch_id: str = Field(min_length=1, max_length=100)
+    handoff_attempt_id: str = Field(min_length=1, max_length=100)
+    codex_session_ref: str = Field(min_length=1, max_length=200)
+    release_reason: Literal["transport_failure", "full_retry"] | None = None
+
+
+class SmartCaptureHandoffStartAckRequest(BaseModel):
+    analysis_batch_id: str = Field(min_length=1, max_length=100)
+    handoff_attempt_id: str = Field(min_length=1, max_length=100)
+
+
+class SmartCaptureAnalysisGuidanceUpdateRequest(BaseModel):
+    analysis_guidance: str = Field(max_length=4000)
+
+
+class SmartCaptureAnalysisFeedbackRequest(BaseModel):
+    sentiment: Literal["expected", "unexpected"]
+    reason: str | None = Field(default=None, max_length=100)
+    note: str = Field(default="", max_length=1000)
+
+
+class SmartCaptureAnalysisSaveRequest(BaseModel):
+    decision: Literal["recommend", "review", "reject"]
+    confidence: float = Field(default=0, ge=0, le=1)
+    summary: str = Field(default="", max_length=2000)
+    reasons: list[str] = Field(default_factory=list, max_length=30)
+    risks: list[str] = Field(default_factory=list, max_length=30)
+    strengths: list[str] = Field(default_factory=list, max_length=30)
+    gaps: list[str] = Field(default_factory=list, max_length=30)
+    hard_requirements: list[object] = Field(default_factory=list, max_length=30)
+    match_dimensions: dict[str, object] = Field(default_factory=dict)
+    missing_information: list[str] = Field(default_factory=list, max_length=30)
+    jd_evidence: list[str] = Field(default_factory=list, max_length=30)
+    candidate_evidence: list[str] = Field(default_factory=list, max_length=30)
+    evaluation_id: str | None = Field(default=None, max_length=200)

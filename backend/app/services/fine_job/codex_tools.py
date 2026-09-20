@@ -59,7 +59,13 @@ from backend.app.services.fine_job.filter_exclusions import (
     record_job_event,
 )
 from backend.app.services.fine_job.job_applications import set_job_application
-from backend.app.services.fine_job import job_hunt_analysis, job_hunt_refresh, workflow_runs
+from backend.app.services.fine_job import (
+    job_hunt_analysis,
+    job_hunt_refresh,
+    smart_capture_domain,
+    smart_captures,
+    workflow_runs,
+)
 from backend.app.utils import new_id, utc_now
 
 
@@ -72,6 +78,17 @@ CORE_TOOLS = (
     "finejob.list_workflow_analysis_items",
     "finejob.get_workflow_analysis_item_context",
     "finejob.save_workflow_analysis_item",
+    "finejob.get_smart_capture_state",
+    "finejob.get_smart_capture_context",
+    "finejob.ack_smart_capture_analysis_batch_started",
+    "finejob.list_smart_capture_analysis_items",
+    "finejob.get_smart_capture_analysis_item_context",
+    "finejob.save_smart_capture_analysis_item",
+    "finejob.attach_smart_capture_codex_session",
+    "finejob.claim_smart_capture_analysis_handoff",
+    "finejob.mark_smart_capture_analysis_prompt_written",
+    "finejob.release_smart_capture_analysis_handoff",
+    "finejob.retry_smart_capture_analysis_handoff",
     "finejob.list_job_hunt_refresh_items",
     "finejob.refresh_job_hunt_chat_batch",
     "finejob.refresh_job_hunt_chat_messages",
@@ -186,6 +203,17 @@ class CodexToolService:
             "finejob.list_workflow_analysis_items": self.list_workflow_analysis_items,
             "finejob.get_workflow_analysis_item_context": self.get_workflow_analysis_item_context,
             "finejob.save_workflow_analysis_item": self.save_workflow_analysis_item,
+            "finejob.get_smart_capture_state": self.get_smart_capture_state,
+            "finejob.get_smart_capture_context": self.get_smart_capture_context,
+            "finejob.ack_smart_capture_analysis_batch_started": self.ack_smart_capture_analysis_batch_started,
+            "finejob.list_smart_capture_analysis_items": self.list_smart_capture_analysis_items,
+            "finejob.get_smart_capture_analysis_item_context": self.get_smart_capture_analysis_item_context,
+            "finejob.save_smart_capture_analysis_item": self.save_smart_capture_analysis_item,
+            "finejob.attach_smart_capture_codex_session": self.attach_smart_capture_codex_session,
+            "finejob.claim_smart_capture_analysis_handoff": self.claim_smart_capture_analysis_handoff,
+            "finejob.mark_smart_capture_analysis_prompt_written": self.mark_smart_capture_analysis_prompt_written,
+            "finejob.release_smart_capture_analysis_handoff": self.release_smart_capture_analysis_handoff,
+            "finejob.retry_smart_capture_analysis_handoff": self.retry_smart_capture_analysis_handoff,
             "finejob.list_job_strategies": self.list_job_strategies,
             "finejob.get_job_evaluation_context": self.get_job_evaluation_context,
             "finejob.start_job_capture": self.start_job_capture,
@@ -590,6 +618,143 @@ class CodexToolService:
             terminal=True,
             message="Workflow Item 分析已保存，并已按正式 recommend 结果更新 Run 进度。",
         )
+
+    def get_smart_capture_state(self, arguments: dict[str, Any]) -> dict[str, object]:
+        smart_capture_id = str(arguments.get("smart_capture_id") or "").strip()
+        data = smart_captures.get_smart_capture(self.db, smart_capture_id)
+        return _result(
+            result_type="data",
+            status=str(data["status"]),
+            resource=_resource("smart_capture", smart_capture_id, int(data["state_version"])),
+            data=data,
+            terminal=str(data["status"]) in smart_captures.TERMINAL_STATUSES,
+        )
+
+    def get_smart_capture_context(self, arguments: dict[str, Any]) -> dict[str, object]:
+        smart_capture_id = str(arguments.get("smart_capture_id") or "").strip()
+        channel = str(arguments.get("channel") or "deep_job_search").strip()
+        data = smart_capture_domain.get_context_snapshot(self.db, smart_capture_id, channel)
+        return _result(
+            result_type="data",
+            status=str(data["status"]),
+            resource=_resource("smart_capture_context", str(data["context_snapshot_id"])),
+            data=data,
+            terminal=True,
+        )
+
+    def ack_smart_capture_analysis_batch_started(self, arguments: dict[str, Any]) -> dict[str, object]:
+        smart_capture_id = str(arguments.get("smart_capture_id") or "").strip()
+        analysis_batch_id = str(arguments.get("analysis_batch_id") or "").strip()
+        handoff_attempt_id = str(arguments.get("handoff_attempt_id") or "").strip()
+        data = smart_capture_domain.ack_started(
+            self.db, self.config, smart_capture_id, analysis_batch_id, handoff_attempt_id
+        )
+        return _result(
+            result_type="data",
+            status=str(data.get("status") or "succeeded"),
+            resource=_resource("smart_capture", smart_capture_id),
+            data=data,
+            terminal=True,
+        )
+
+    def list_smart_capture_analysis_items(self, arguments: dict[str, Any]) -> dict[str, object]:
+        smart_capture_id = str(arguments.get("smart_capture_id") or "").strip()
+        batch_id = str(arguments.get("analysis_batch_id") or "").strip() or None
+        data = smart_capture_domain.list_analysis_items(self.db, smart_capture_id, batch_id)
+        return _result(
+            result_type="data",
+            status="succeeded",
+            resource=_resource("smart_capture", smart_capture_id),
+            data=data,
+            terminal=True,
+        )
+
+    def get_smart_capture_analysis_item_context(self, arguments: dict[str, Any]) -> dict[str, object]:
+        smart_capture_id = str(arguments.get("smart_capture_id") or "").strip()
+        task_id = str(arguments.get("workflow_task_id") or arguments.get("analysis_item_id") or "").strip()
+        data = smart_capture_domain.get_analysis_item_context(self.db, smart_capture_id, task_id)
+        return _result(
+            result_type="data",
+            status="succeeded",
+            resource=_resource("smart_capture_analysis_item", task_id),
+            data=data,
+            terminal=True,
+        )
+
+    def save_smart_capture_analysis_item(self, arguments: dict[str, Any]) -> dict[str, object]:
+        smart_capture_id = str(arguments.get("smart_capture_id") or "").strip()
+        task_id = str(arguments.get("workflow_task_id") or arguments.get("analysis_item_id") or "").strip()
+        data = smart_capture_domain.save_analysis_item(
+            self.db,
+            self.config,
+            smart_capture_id,
+            task_id,
+            arguments,
+        )
+        return _result(
+            result_type="data",
+            status=str(data.get("status") or "succeeded"),
+            resource=_resource("smart_capture_analysis_item", task_id),
+            data=data,
+            terminal=True,
+        )
+
+    def attach_smart_capture_codex_session(self, arguments: dict[str, Any]) -> dict[str, object]:
+        smart_capture_id = str(arguments.get("smart_capture_id") or "").strip()
+        data = smart_capture_domain.attach_codex_session(
+            self.db,
+            smart_capture_id,
+            str(arguments.get("codex_session_ref") or "").strip(),
+            str(arguments.get("codex_runtime_id") or "").strip() or None,
+            str(arguments.get("analysis_batch_id") or "").strip() or None,
+        )
+        return _result(result_type="data", status=str(data.get("status") or "running"), resource=_resource("smart_capture", smart_capture_id), data=data, terminal=True)
+
+    def claim_smart_capture_analysis_handoff(self, arguments: dict[str, Any]) -> dict[str, object]:
+        smart_capture_id = str(arguments.get("smart_capture_id") or "").strip()
+        data = smart_capture_domain.claim_handoff(
+            self.db,
+            smart_capture_id,
+            codex_session_ref=str(arguments.get("codex_session_ref") or "").strip(),
+            codex_runtime_id=str(arguments.get("codex_runtime_id") or "").strip() or None,
+            handoff_kind=str(arguments.get("handoff_kind") or "initial"),
+            retry_handoff_attempt_id=str(arguments.get("retry_handoff_attempt_id") or "").strip() or None,
+        )
+        return _result(result_type="data", status=str(data.get("status") or "succeeded"), resource=_resource("smart_capture", smart_capture_id), data=data, terminal=True)
+
+    def mark_smart_capture_analysis_prompt_written(self, arguments: dict[str, Any]) -> dict[str, object]:
+        data = smart_capture_domain.prompt_written(
+            self.db,
+            str(arguments.get("smart_capture_id") or "").strip(),
+            str(arguments.get("analysis_batch_id") or "").strip(),
+            str(arguments.get("handoff_attempt_id") or "").strip(),
+            str(arguments.get("codex_session_ref") or "").strip(),
+        )
+        return _result(result_type="data", status=str(data.get("status") or "succeeded"), data=data, terminal=True)
+
+    def release_smart_capture_analysis_handoff(self, arguments: dict[str, Any]) -> dict[str, object]:
+        smart_capture_id = str(arguments.get("smart_capture_id") or "").strip()
+        data = smart_capture_domain.release_handoff(
+            self.db,
+            smart_capture_id,
+            str(arguments.get("analysis_batch_id") or "").strip(),
+            str(arguments.get("handoff_attempt_id") or "").strip(),
+            str(arguments.get("codex_session_ref") or "").strip(),
+            str(arguments.get("release_reason") or "").strip() or None,
+        )
+        return _result(result_type="data", status=str(data.get("status") or "succeeded"), resource=_resource("smart_capture", smart_capture_id), data=data, terminal=True)
+
+    def retry_smart_capture_analysis_handoff(self, arguments: dict[str, Any]) -> dict[str, object]:
+        smart_capture_id = str(arguments.get("smart_capture_id") or "").strip()
+        data = smart_capture_domain.retry_handoff(
+            self.db,
+            smart_capture_id,
+            str(arguments.get("analysis_batch_id") or "").strip(),
+            str(arguments.get("handoff_attempt_id") or "").strip(),
+            str(arguments.get("codex_session_ref") or "").strip(),
+            str(arguments.get("codex_runtime_id") or "").strip() or None,
+        )
+        return _result(result_type="data", status=str(data.get("status") or "succeeded"), resource=_resource("smart_capture", smart_capture_id), data=data, terminal=True)
 
     def list_companies(self, arguments: dict[str, Any]) -> dict[str, object]:
         data = companies.list_companies(

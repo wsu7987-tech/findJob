@@ -214,6 +214,123 @@ async def save_workflow_analysis_item(
     return await _invoke("save_workflow_analysis_item", locals())
 
 
+@server.tool(name="finejob.get_smart_capture_state", structured_output=True)
+async def get_smart_capture_state(smart_capture_id: str) -> dict[str, Any]:
+    """读取 Smart Capture 当前状态、能力、进度和结果摘要。"""
+    return await _invoke("get_smart_capture_state", locals())
+
+
+@server.tool(name="finejob.get_smart_capture_context", structured_output=True)
+async def get_smart_capture_context(
+    smart_capture_id: str,
+    channel: str = "deep_job_search",
+) -> dict[str, Any]:
+    """按 Smart Capture identity 读取指定 Context 快照。"""
+    return await _invoke("get_smart_capture_context", locals())
+
+
+@server.tool(name="finejob.ack_smart_capture_analysis_batch_started", structured_output=True)
+async def ack_smart_capture_analysis_batch_started(
+    smart_capture_id: str,
+    analysis_batch_id: str,
+    handoff_attempt_id: str,
+) -> dict[str, Any]:
+    """确认当前 Smart Capture 分析批次已由 Codex 开始处理。"""
+    return await _invoke("ack_smart_capture_analysis_batch_started", locals())
+
+
+@server.tool(name="finejob.list_smart_capture_analysis_items", structured_output=True)
+async def list_smart_capture_analysis_items(
+    smart_capture_id: str,
+    analysis_batch_id: str | None = None,
+) -> dict[str, Any]:
+    """读取 Smart Capture 分析批次中的岗位 Item。"""
+    return await _invoke("list_smart_capture_analysis_items", locals())
+
+
+@server.tool(name="finejob.get_smart_capture_analysis_item_context", structured_output=True)
+async def get_smart_capture_analysis_item_context(
+    smart_capture_id: str,
+    workflow_task_id: str,
+) -> dict[str, Any]:
+    """按 Smart Capture identity 读取单个岗位分析上下文。"""
+    return await _invoke("get_smart_capture_analysis_item_context", locals())
+
+
+@server.tool(name="finejob.save_smart_capture_analysis_item", structured_output=True)
+async def save_smart_capture_analysis_item(
+    smart_capture_id: str,
+    workflow_task_id: str,
+    decision: str,
+    confidence: float = 0,
+    summary: str = "",
+    reasons: list[str] | None = None,
+    risks: list[str] | None = None,
+    strengths: list[str] | None = None,
+    gaps: list[str] | None = None,
+) -> dict[str, Any]:
+    """保存 Smart Capture 岗位分析结果，不要求 Workflow Run ID。"""
+    return await _invoke("save_smart_capture_analysis_item", locals())
+
+
+@server.tool(name="finejob.attach_smart_capture_codex_session", structured_output=True)
+async def attach_smart_capture_codex_session(
+    smart_capture_id: str,
+    codex_session_ref: str,
+    codex_runtime_id: str | None = None,
+    analysis_batch_id: str | None = None,
+) -> dict[str, Any]:
+    """把 Codex 会话绑定到 Smart Capture 分析域。"""
+    return await _invoke("attach_smart_capture_codex_session", locals())
+
+
+@server.tool(name="finejob.claim_smart_capture_analysis_handoff", structured_output=True)
+async def claim_smart_capture_analysis_handoff(
+    smart_capture_id: str,
+    codex_session_ref: str,
+    handoff_kind: str = "initial",
+    codex_runtime_id: str | None = None,
+    retry_handoff_attempt_id: str | None = None,
+) -> dict[str, Any]:
+    """原子 claim Smart Capture 的当前 Analysis handoff。"""
+    return await _invoke("claim_smart_capture_analysis_handoff", locals())
+
+
+@server.tool(name="finejob.mark_smart_capture_analysis_prompt_written", structured_output=True)
+async def mark_smart_capture_analysis_prompt_written(
+    smart_capture_id: str,
+    analysis_batch_id: str,
+    handoff_attempt_id: str,
+    codex_session_ref: str,
+) -> dict[str, Any]:
+    """记录 Smart Capture Analysis Prompt 已写入 Codex。"""
+    return await _invoke("mark_smart_capture_analysis_prompt_written", locals())
+
+
+@server.tool(name="finejob.release_smart_capture_analysis_handoff", structured_output=True)
+async def release_smart_capture_analysis_handoff(
+    smart_capture_id: str,
+    analysis_batch_id: str,
+    handoff_attempt_id: str,
+    codex_session_ref: str,
+    release_reason: str | None = None,
+) -> dict[str, Any]:
+    """释放 Smart Capture Analysis 的当前 transport handoff。"""
+    return await _invoke("release_smart_capture_analysis_handoff", locals())
+
+
+@server.tool(name="finejob.retry_smart_capture_analysis_handoff", structured_output=True)
+async def retry_smart_capture_analysis_handoff(
+    smart_capture_id: str,
+    analysis_batch_id: str,
+    handoff_attempt_id: str,
+    codex_session_ref: str,
+    codex_runtime_id: str | None = None,
+) -> dict[str, Any]:
+    """重试已释放或失效的 Smart Capture Analysis handoff。"""
+    return await _invoke("retry_smart_capture_analysis_handoff", locals())
+
+
 @server.tool(name="finejob.list_job_hunt_refresh_items", structured_output=True)
 async def list_job_hunt_refresh_items(run_id: str, item_type: str) -> dict[str, Any]:
     """读取指定步骤中未完成、中断遗留或可重试的 Run Item。"""
