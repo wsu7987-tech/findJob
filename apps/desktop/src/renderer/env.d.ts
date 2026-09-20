@@ -91,6 +91,18 @@ declare global {
         sessionRef: string | null;
         workflowSessionMode?: "live_reused" | "resumed_explicit" | "new_from_workflow_state";
       }>;
+      startSmartCaptureCodex: (launch: {
+        cols?: number;
+        rows?: number;
+        model: string;
+        reasoningEffort: string;
+        sessionRef?: string;
+      }) => Promise<{
+        status: string;
+        runtimeId: string | null;
+        sessionRef: string | null;
+        smartCaptureSessionMode?: "live_reused" | "resumed_explicit" | "new_from_smart_capture_state";
+      }>;
       getCodexState: () => Promise<{
         status: string;
         runtimeId: string | null;

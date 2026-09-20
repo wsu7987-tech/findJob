@@ -1,7 +1,11 @@
-import type { FineJobWorkflowRun } from "@/types";
+import type { FineJobSmartCaptureAnalysisSnapshot, FineJobWorkflowRun } from "@/types";
 
 import { api } from "./api";
-import { triggerWorkflowCodexHandoff } from "./workflowCodexHandoff";
+import {
+  isAutoSmartCaptureCodexHandoffReady,
+  triggerSmartCaptureCodexHandoff,
+  triggerWorkflowCodexHandoff
+} from "./workflowCodexHandoff";
 
 type WorkflowRunStore = {
   setRun: (run: FineJobWorkflowRun | null) => FineJobWorkflowRun | null;
@@ -99,3 +103,60 @@ export const startFineJobWorkflowCodexController = (dependencies: Omit<Controlle
     ...dependencies,
     getLatestRun: async () => (await api.getLatestFineJobWorkflowRun()).workflow_run
   });
+
+type SmartCaptureControllerDependencies = {
+  codexStore: Parameters<typeof triggerSmartCaptureCodexHandoff>[1];
+  isActive?: () => boolean;
+  intervalMs?: number;
+  getCurrentSmartCapture?: () => Promise<{ smart_capture: Awaited<ReturnType<typeof api.getFineJobSmartCapture>> | null }>;
+  getAnalysisSnapshot?: (smartCaptureId: string) => Promise<FineJobSmartCaptureAnalysisSnapshot>;
+  handoffDependencies?: Parameters<typeof triggerSmartCaptureCodexHandoff>[3];
+};
+
+export const createFineJobSmartCaptureCodexController = (
+  dependencies: SmartCaptureControllerDependencies
+) => {
+  let timer: ReturnType<typeof setInterval> | null = null;
+  let polling = false;
+
+  const tick = async () => {
+    if (polling || (dependencies.isActive && !dependencies.isActive())) return;
+    polling = true;
+    try {
+      const current = await (dependencies.getCurrentSmartCapture
+        ? dependencies.getCurrentSmartCapture()
+        : api.getCurrentFineJobSmartCapture());
+      const capture = current.smart_capture;
+      if (!capture || ["completed", "stopped", "failed"].includes(capture.status)) return;
+      const snapshot = await (dependencies.getAnalysisSnapshot
+        ? dependencies.getAnalysisSnapshot(capture.smart_capture_id)
+        : api.getFineJobSmartCaptureAnalysisSnapshot(capture.smart_capture_id));
+      if (!isAutoSmartCaptureCodexHandoffReady(snapshot)) return;
+      await triggerSmartCaptureCodexHandoff(snapshot, dependencies.codexStore, "auto", dependencies.handoffDependencies);
+    } finally {
+      polling = false;
+    }
+  };
+
+  const start = () => {
+    if (timer) return;
+    void tick().catch(() => undefined);
+    timer = setInterval(() => { void tick().catch(() => undefined); }, dependencies.intervalMs ?? 1_200);
+  };
+
+  const stop = () => {
+    if (!timer) return;
+    clearInterval(timer);
+    timer = null;
+  };
+
+  return { start, stop, tick };
+};
+
+export const startFineJobSmartCaptureCodexController = (
+  dependencies: Omit<SmartCaptureControllerDependencies, "getCurrentSmartCapture" | "getAnalysisSnapshot">
+) => createFineJobSmartCaptureCodexController({
+  ...dependencies,
+  getCurrentSmartCapture: () => api.getCurrentFineJobSmartCapture(),
+  getAnalysisSnapshot: (smartCaptureId) => api.getFineJobSmartCaptureAnalysisSnapshot(smartCaptureId)
+});

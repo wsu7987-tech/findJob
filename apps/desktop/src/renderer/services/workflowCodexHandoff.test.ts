@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
-import type { FineJobWorkflowRun } from "@/types";
+import type { FineJobSmartCaptureAnalysisSnapshot, FineJobWorkflowRun } from "@/types";
 
 import {
   resubmitWorkflowCodexSubmit,
   retryWorkflowCodexHandoff,
-  triggerWorkflowCodexHandoff
+  triggerWorkflowCodexHandoff,
+  triggerSmartCaptureCodexHandoff
 } from "./workflowCodexHandoff";
 
 const run = (updates: Partial<FineJobWorkflowRun> = {}): FineJobWorkflowRun => ({
@@ -70,6 +71,46 @@ const codexStore = (sessionRef = "runtime:workflow-runtime-1") => ({
   runtimeId: null,
   sessionRef: null,
   startWorkflow: vi.fn().mockResolvedValue({ runtimeId: "runtime-1", sessionRef })
+});
+
+const smartSnapshot = (): FineJobSmartCaptureAnalysisSnapshot => ({
+  smart_capture_id: "smart-capture-independent-1",
+  workflow_run_id: null,
+  status: "waiting_for_user",
+  analysis_batch_id: "analysis-batch-1",
+  items: [{ status: "pending", payload: { codex_model: "gpt-5.6-luna", codex_reasoning_effort: "high" } } as never],
+  handoff: {
+    analysis_batch_id: "analysis-batch-1",
+    pending_item_count: 1,
+    running_item_count: 0,
+    succeeded_item_count: 0,
+    handoff_status: "none",
+    attempt_status: "none",
+    needs_initial_codex_handoff: true,
+    needs_next_batch_handoff: false
+  },
+  smart_capture: {
+    smart_capture_id: "smart-capture-independent-1",
+    source: "boss_capture",
+    workflow_run_id: null,
+    status: "waiting_for_user",
+    search_config: {},
+    execution_config: {
+      analysis: { codex_model: "gpt-5.6-luna", codex_reasoning_effort: "high", handoff: "auto" }
+    },
+    stage: "waiting_codex",
+    waiting_reason: "codex",
+    control_cause: "",
+    state_version: 2,
+    capabilities: { start: false, pause: false, resume: false, retry: false, stop: true },
+    progress: {},
+    result_summary: {},
+    message: "",
+    created_at: "",
+    updated_at: "",
+    batches: [],
+    jobs: []
+  }
 });
 
 describe("workflowCodexHandoff", () => {
@@ -215,5 +256,84 @@ describe("workflowCodexHandoff", () => {
     });
     expect(handoffDependencies.client.claimFineJobWorkflowAnalysisHandoff).toHaveBeenCalledTimes(1);
     expect(handoffDependencies.transport.submitWorkflowCodexPrompt).toHaveBeenCalledWith(expect.stringContaining("handoff_attempt_id=attempt-2"));
+  });
+
+  it("independent Smart Capture 使用 smart_capture_id 完成 attach、claim、Prompt transport", async () => {
+    const source = smartSnapshot();
+    const client = {
+      getFineJobSmartCaptureAnalysisSnapshot: vi.fn().mockResolvedValue(source),
+      attachFineJobSmartCaptureCodexSession: vi.fn().mockResolvedValue(source.smart_capture),
+      claimFineJobSmartCaptureAnalysisHandoff: vi.fn().mockResolvedValue({
+        ...source,
+        handoff: { ...source.handoff!, attempt_status: "claimed", handoff_attempt_id: "attempt-smart-1" }
+      }),
+      markFineJobSmartCaptureAnalysisHandoffPromptWritten: vi.fn().mockResolvedValue({
+        ...source,
+        handoff: { ...source.handoff!, attempt_status: "prompt_written", handoff_attempt_id: "attempt-smart-1" }
+      }),
+      releaseFineJobSmartCaptureAnalysisHandoff: vi.fn().mockResolvedValue(source.smart_capture)
+    };
+    const transport = { submitSmartCaptureCodexPrompt: vi.fn().mockResolvedValue(true) };
+    const codex = {
+      status: "idle",
+      runtimeId: null,
+      sessionRef: null,
+      startSmartCapture: vi.fn().mockResolvedValue({ runtimeId: "runtime-smart-1", sessionRef: "runtime:smart-1" })
+    };
+
+    const result = await triggerSmartCaptureCodexHandoff(source, codex, "manual", { client, transport });
+
+    expect(result.status).toBe("submitted");
+    expect(client.attachFineJobSmartCaptureCodexSession).toHaveBeenCalledWith("smart-capture-independent-1", expect.objectContaining({
+      analysis_batch_id: "analysis-batch-1"
+    }));
+    expect(client.claimFineJobSmartCaptureAnalysisHandoff).toHaveBeenCalledWith("smart-capture-independent-1", expect.objectContaining({
+      handoff_kind: "initial"
+    }));
+    expect(transport.submitSmartCaptureCodexPrompt).toHaveBeenCalledWith(expect.stringContaining("smart_capture_id=smart-capture-independent-1"));
+    expect(transport.submitSmartCaptureCodexPrompt).not.toHaveBeenCalledWith(expect.stringContaining("workflow_run_id="));
+  });
+
+  it("linked Smart Capture 复用同一 transport，父 Workflow 仅保留导航关联", async () => {
+    const base = smartSnapshot();
+    const source: FineJobSmartCaptureAnalysisSnapshot = {
+      ...base,
+      workflow_run_id: "workflow-parent-1",
+      smart_capture: {
+        ...base.smart_capture,
+        source: "task_cockpit",
+        workflow_run_id: "workflow-parent-1"
+      }
+    };
+    const client = {
+      getFineJobSmartCaptureAnalysisSnapshot: vi.fn().mockResolvedValue(source),
+      attachFineJobSmartCaptureCodexSession: vi.fn().mockResolvedValue(source.smart_capture),
+      claimFineJobSmartCaptureAnalysisHandoff: vi.fn().mockResolvedValue({
+        ...source,
+        handoff: { ...source.handoff!, attempt_status: "claimed", handoff_attempt_id: "attempt-smart-linked-1" }
+      }),
+      markFineJobSmartCaptureAnalysisHandoffPromptWritten: vi.fn().mockResolvedValue(source),
+      releaseFineJobSmartCaptureAnalysisHandoff: vi.fn().mockResolvedValue(source.smart_capture)
+    };
+    const transport = { submitSmartCaptureCodexPrompt: vi.fn().mockResolvedValue(true) };
+    const codex = {
+      status: "idle",
+      runtimeId: null,
+      sessionRef: null,
+      startSmartCapture: vi.fn().mockResolvedValue({ runtimeId: "runtime-smart-linked-1", sessionRef: "runtime:smart-linked-1" })
+    };
+
+    await triggerSmartCaptureCodexHandoff(source, codex, "manual", { client, transport });
+
+    expect(client.claimFineJobSmartCaptureAnalysisHandoff).toHaveBeenCalledWith(
+      "smart-capture-independent-1",
+      expect.objectContaining({ handoff_kind: "initial" })
+    );
+    expect(transport.submitSmartCaptureCodexPrompt).toHaveBeenCalledWith(
+      expect.stringContaining("smart_capture_id=smart-capture-independent-1")
+    );
+    expect(transport.submitSmartCaptureCodexPrompt).not.toHaveBeenCalledWith(
+      expect.stringContaining("workflow-parent-1")
+    );
   });
 });

@@ -10,6 +10,9 @@ import { useFineJobPlatformSessionsStore } from "@/stores/fineJobPlatformSession
 import { useFineJobStrategiesStore } from "@/stores/fineJobStrategies";
 import { useFineJobWorkflowRunStore } from "@/stores/fineJobWorkflowRun";
 import {
+  resubmitSmartCaptureCodexSubmit,
+  retrySmartCaptureCodexHandoff,
+  triggerSmartCaptureCodexHandoff,
   resubmitWorkflowCodexSubmit,
   retryWorkflowCodexHandoff,
   triggerWorkflowCodexHandoff
@@ -1096,7 +1099,16 @@ const saveSmartAnalysisFeedback = async (
 const openSmartWorkflowCodex = async (action: "submit" | "continue" | "view") => {
   const run = smartWorkflowRun.value;
   if (!run) return;
+  const smartCaptureId = currentSmartCapture.value?.smart_capture_id;
   if (action !== "view") {
+    if (smartCaptureId) {
+      const snapshot = await api.getFineJobSmartCaptureAnalysisSnapshot(smartCaptureId);
+      const result = await triggerSmartCaptureCodexHandoff(snapshot, codexStore, "manual");
+      result.status === "submitted"
+        ? ElMessage.success(result.message)
+        : ElMessage.warning(result.message);
+      return;
+    }
     const result = await triggerWorkflowCodexHandoff(run, codexStore, "manual");
     workflowStore.setRun(result.run);
     result.status === "submitted"
@@ -1107,8 +1119,8 @@ const openSmartWorkflowCodex = async (action: "submit" | "continue" | "view") =>
   await router.push({
     name: "fine-job-codex",
     query: {
-      task: "deep-job-search",
-      workflow_run_id: run.workflow_run_id,
+      task: smartCaptureId ? "smart-capture-analysis" : "deep-job-search",
+      ...(smartCaptureId ? { smart_capture_id: smartCaptureId, parent_workflow_run_id: run.workflow_run_id } : { workflow_run_id: run.workflow_run_id }),
       workflow_action: action
     }
   });
@@ -1117,6 +1129,15 @@ const openSmartWorkflowCodex = async (action: "submit" | "continue" | "view") =>
 const resubmitSmartWorkflowCodex = async () => {
   const run = smartWorkflowRun.value;
   if (!run) return;
+  const smartCaptureId = currentSmartCapture.value?.smart_capture_id;
+  if (smartCaptureId) {
+    const snapshot = await api.getFineJobSmartCaptureAnalysisSnapshot(smartCaptureId);
+    const result = await resubmitSmartCaptureCodexSubmit(snapshot, codexStore);
+    result.status === "enter_submitted"
+      ? ElMessage.success(result.message)
+      : ElMessage.warning(result.message);
+    return;
+  }
   const result = await resubmitWorkflowCodexSubmit(run, codexStore);
   workflowStore.setRun(result.run);
   result.status === "enter_submitted"
@@ -1127,6 +1148,15 @@ const resubmitSmartWorkflowCodex = async () => {
 const retrySmartWorkflowCodex = async () => {
   const run = smartWorkflowRun.value;
   if (!run) return;
+  const smartCaptureId = currentSmartCapture.value?.smart_capture_id;
+  if (smartCaptureId) {
+    const snapshot = await api.getFineJobSmartCaptureAnalysisSnapshot(smartCaptureId);
+    const result = await retrySmartCaptureCodexHandoff(snapshot, codexStore);
+    result.status === "submitted"
+      ? ElMessage.success(result.message)
+      : ElMessage.warning(result.message);
+    return;
+  }
   const result = await retryWorkflowCodexHandoff(run, codexStore);
   workflowStore.setRun(result.run);
   result.status === "submitted"
@@ -1149,6 +1179,23 @@ const createManualCodexBatch = async () => {
     return;
   }
   try {
+    const smartCaptureId = currentSmartCapture.value?.smart_capture_id;
+    if (smartCaptureId) {
+      const snapshot = await api.createFineJobSmartCaptureManualAnalysisBatch(smartCaptureId, {
+        recommendation_strategy_id: strategyId,
+        job_ids: selectedWorkflowJobIds.value,
+        analysis_batch_size: smartAnalysisBatchSize.value,
+        codex_model: smartCodexModel.value || undefined,
+        codex_reasoning_effort: smartCodexReasoningEffort.value
+      });
+      const result = await triggerSmartCaptureCodexHandoff(snapshot, codexStore, "manual");
+      if (result.status === "submitted") {
+        ElMessage.success("已将选中岗位交给 Codex 批量生成建议");
+      } else {
+        ElMessage.warning(result.message);
+      }
+      return;
+    }
     const run = await api.createFineJobWorkflowManualAnalysisBatch(smartWorkflowRun.value.workflow_run_id, {
       recommendation_strategy_id: strategyId,
       job_ids: selectedWorkflowJobIds.value,

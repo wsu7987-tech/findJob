@@ -100,6 +100,24 @@ export const useFineJobCodexStore = defineStore("fine-job-codex", () => {
     return state;
   };
 
+  const startSmartCapture = async (launch: {
+    cols: number;
+    rows: number;
+    model: string;
+    reasoningEffort: string;
+    sessionRef?: string;
+  }) => {
+    const bridge = getCodexBridge();
+    if (!bridge?.startSmartCaptureCodex) {
+      throw new Error("当前桌面端不支持按 Smart Capture Session 启动 Codex。");
+    }
+    const state = await bridge.startSmartCaptureCodex(launch);
+    status.value = state.status as FineJobCodexSessionStatus;
+    runtimeId.value = state.runtimeId;
+    sessionRef.value = state.sessionRef;
+    return state;
+  };
+
   const startTransportDebug = async (cols: number, rows: number, candidateId: string) => {
     const bridge = getCodexBridge();
     if (!bridge?.startTransportDebugCodex) {
@@ -146,6 +164,7 @@ export const useFineJobCodexStore = defineStore("fine-job-codex", () => {
     load,
     start,
     startWorkflow,
+    startSmartCapture,
     startTransportDebug,
     savePermissions,
     decide

@@ -82,7 +82,25 @@ description: 通过 FineJob MCP 编排可组合的求职业务节点，完成岗
 - 推进建议只保存为 `attention_status` / recommendation，不创建正式待执行任务。
 - 回复草稿只保存和展示，不发送，不创建发送动作，不调用 BOSS 发送接口。
 
-## deep_job_search Workflow
+## Smart Capture Analysis Workflow
+
+当任务资源包含 `smart_capture_id` 时，`smart_capture_id` 是当前 Analysis/Codex 业务 identity；`workflow_run_id` 只用于 linked 父任务导航或历史查看，independent 任务不要求也不生成 Workflow Run。
+
+1. 调用 `finejob.get_smart_capture_state(smart_capture_id)`，确认当前 `status`、`stage`、`waiting_reason`、`state_version` 与 capabilities。
+2. 当前 handoff 提供 `analysis_batch_id` 和 `handoff_attempt_id` 后，第一步调用 `finejob.ack_smart_capture_analysis_batch_started`；ACK 成功前不要读取或保存当前批次 Item。
+3. 调用 `finejob.get_smart_capture_context(smart_capture_id, channel="candidate_analysis")` 一次，随后调用 `finejob.list_smart_capture_analysis_items(smart_capture_id, analysis_batch_id)`，只处理该批次 `pending` 或 `running` 的 Item。
+4. 对每个 Item 调用 `finejob.get_smart_capture_analysis_item_context(smart_capture_id, workflow_task_id)`。上下文只用于当前岗位，不混用其他 Smart Capture 或历史 Workflow Run 的材料。
+5. 生成 `recommend`、`review` 或 `reject` 后，调用 `finejob.save_smart_capture_analysis_item(smart_capture_id, workflow_task_id, ...)` 保存正式结果；不要通过旧 Workflow 保存工具替代。
+6. 每次保存后重新读取 Smart Capture 状态和当前批次 Item。当前批次完成后等待后端下一批；Smart Capture 为 `completed`、`stopped`、`failed` 或明确人工等待时结束。
+
+约束：
+
+- 以 Smart Capture 正式保存的唯一结果计数，不以候选池数量、终端文字或尝试次数计数。
+- `failed` 是终态，不对同一 Smart Capture 重试；可恢复中断按工具返回的合法 recovery/retry 能力处理。
+- independent Smart Capture 不产生 parent orchestration event；linked Smart Capture 的父级结果由后端消费，Skill 不调用通用 Workflow `advance` 拼接父子一致性。
+- completed Smart Capture 的 Manual Analysis 是后处理，不回滚 Smart Capture lifecycle，也不重新启动自动 Engine。
+
+## deep_job_search Workflow（历史兼容）
 
 当任务资源为 `deep_job_search` Workflow Run 时，严格以 Run 的状态和 Completion Contract 为准：
 

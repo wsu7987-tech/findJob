@@ -709,6 +709,8 @@ def _handoff_summary(db: Database, smart_capture_id: str, rows: list[Any]) -> di
         "handoff_status": str(handoff["status"]) if handoff is not None else "none",
         "handoff_attempt_id": str(handoff["handoff_attempt_id"]) if handoff is not None else None,
         "attempt_status": str(handoff["attempt_status"]) if handoff is not None else "none",
+        "codex_session_ref": str(handoff["codex_session_ref"]) if handoff is not None else None,
+        "codex_runtime_id": str(handoff["codex_runtime_id"]) if handoff is not None else None,
     }
 
 

@@ -394,6 +394,36 @@ export interface FineJobSmartCapture {
   workflow_run?: FineJobWorkflowRun | null;
 }
 
+export interface FineJobSmartCaptureHandoff {
+  analysis_batch_id: string;
+  pending_item_count: number;
+  running_item_count: number;
+  succeeded_item_count: number;
+  handoff_status: "none" | "claimed" | "submitted" | "released" | "completed";
+  handoff_attempt_id?: string | null;
+  attempt_status: "none" | "claimed" | "prompt_written" | "started" | "released" | "completed";
+  codex_session_ref?: string | null;
+  needs_initial_codex_handoff?: boolean;
+  needs_next_batch_handoff?: boolean;
+  codex_processing?: boolean;
+  analysis_batch_complete?: boolean;
+  recovery_available?: boolean;
+  awaiting_start_ack?: boolean;
+  start_ack_timed_out?: boolean;
+  retry_available?: boolean;
+  start_ack_timeout_seconds?: number;
+}
+
+export interface FineJobSmartCaptureAnalysisSnapshot {
+  smart_capture_id: string;
+  workflow_run_id: string | null;
+  status: FineJobSmartCaptureStatus;
+  analysis_batch_id: string;
+  items: FineJobWorkflowAnalysisItem[];
+  handoff?: FineJobSmartCaptureHandoff;
+  smart_capture: FineJobSmartCapture;
+}
+
 export interface FineJobBossDetailSuggestionResponse {
   selected_job_ids: string[];
   task: FineJobBossCaptureTask;

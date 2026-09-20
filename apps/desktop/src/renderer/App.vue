@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch, watchEffect } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watchEffect } from "vue";
 import { RouterView, useRoute } from "vue-router";
 
 import AppShell from "@/components/AppShell.vue";
@@ -8,35 +8,19 @@ import SettingsDrawer from "@/components/SettingsDrawer.vue";
 import { useConfigStore } from "@/stores/config";
 import { useFineJobBossExecutorStore } from "@/stores/fineJobBossExecutor";
 import { useFineJobCodexStore } from "@/stores/fineJobCodex";
-import { useFineJobWorkflowRunStore } from "@/stores/fineJobWorkflowRun";
 import { useNoticesStore } from "@/stores/notices";
-import { startFineJobWorkflowCodexController } from "@/services/fineJobWorkflowCodexController";
+import { startFineJobSmartCaptureCodexController } from "@/services/fineJobWorkflowCodexController";
 
 const noticesStore = useNoticesStore();
 const configStore = useConfigStore();
 const executorStore = useFineJobBossExecutorStore();
 const codexStore = useFineJobCodexStore();
-const workflowRunStore = useFineJobWorkflowRunStore();
 const settingsOpen = ref(false);
 const notices = computed(() => noticesStore.items);
 const isShelllessRoute = computed(() => false);
 const route = useRoute();
 const showCodexTerminal = computed(() => route.name === "fine-job-codex");
-const workflowCodexController = startFineJobWorkflowCodexController({
-  workflowStore: workflowRunStore,
-  codexStore,
-  isActive: () => workflowRunStore.pollingActive
-});
-
-watch(
-  () => workflowRunStore.pollingActive,
-  (active) => {
-    // Codex 交接控制器跟随任务轮询生命周期启停，不在应用启动时接管历史任务。
-    if (active) workflowCodexController.start();
-    else workflowCodexController.stop();
-  },
-  { immediate: true }
-);
+const smartCaptureCodexController = startFineJobSmartCaptureCodexController({ codexStore });
 
 watchEffect(() => {
   if (typeof document === "undefined") {
@@ -47,7 +31,7 @@ watchEffect(() => {
 });
 
 onBeforeUnmount(() => {
-  workflowCodexController.stop();
+  smartCaptureCodexController.stop();
   if (typeof document === "undefined") {
     return;
   }
@@ -56,6 +40,8 @@ onBeforeUnmount(() => {
 });
 
 onMounted(() => {
+  // 自动交接只读取 current Smart Capture，不通过 latest Workflow 或 advance 推动业务 Pipeline。
+  smartCaptureCodexController.start();
   void configStore.probeGenerationCapabilities();
   // 桌面端启动时主动确认一次插件连接状态。
   void executorStore.testHeartbeat().catch(() => undefined);

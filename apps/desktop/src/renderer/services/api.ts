@@ -103,6 +103,7 @@
   FineJobActiveCollectionTask,
   FineJobWorkflowRun,
   FineJobSmartCapture,
+  FineJobSmartCaptureAnalysisSnapshot,
   FineJobCompanyEnvelope,
   FineJobCompanyListEnvelope,
   FineJobCompanyType,
@@ -1463,6 +1464,172 @@ export const api = {
   async getCurrentFineJobSmartCapture() {
     return request<{ smart_capture: FineJobSmartCapture | null }>(
       "/api/fine-job/smart-captures/current"
+    );
+  },
+  async getFineJobSmartCapture(smartCaptureId: string) {
+    return request<FineJobSmartCapture>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}`
+    );
+  },
+  async getFineJobSmartCaptureAnalysisSnapshot(smartCaptureId: string) {
+    const [smartCapture, analysis] = await Promise.all([
+      api.getFineJobSmartCapture(smartCaptureId),
+      api.listFineJobSmartCaptureAnalysisItems(smartCaptureId)
+    ]);
+    return {
+      smart_capture_id: smartCapture.smart_capture_id,
+      workflow_run_id: smartCapture.workflow_run_id ?? analysis.workflow_run_id ?? null,
+      status: smartCapture.status,
+      analysis_batch_id: analysis.analysis_batch_id,
+      items: analysis.items,
+      handoff: analysis.handoff ?? analysis.analysis_handoff,
+      smart_capture: smartCapture
+    } satisfies FineJobSmartCaptureAnalysisSnapshot;
+  },
+  async getFineJobSmartCaptureContextSnapshot(smartCaptureId: string, channel = "deep_job_search") {
+    return request<Record<string, unknown>>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/context-snapshot?channel=${encodeURIComponent(channel)}`
+    );
+  },
+  async listFineJobSmartCaptureAnalysisItems(smartCaptureId: string, analysisBatchId?: string) {
+    const query = analysisBatchId ? `?analysis_batch_id=${encodeURIComponent(analysisBatchId)}` : "";
+    return request<{
+      smart_capture_id?: string;
+      workflow_run_id?: string | null;
+      analysis_batch_id: string;
+      handoff?: FineJobSmartCaptureAnalysisSnapshot["handoff"];
+      analysis_handoff?: FineJobSmartCaptureAnalysisSnapshot["handoff"];
+      items: FineJobSmartCaptureAnalysisSnapshot["items"];
+    }>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/analysis-items${query}`
+    );
+  },
+  async createFineJobSmartCaptureManualAnalysisBatch(
+    smartCaptureId: string,
+    payload: {
+      recommendation_strategy_id?: string;
+      job_ids: string[];
+      analysis_batch_size?: number;
+      codex_model?: string;
+      codex_reasoning_effort?: "minimal" | "low" | "medium" | "high" | "xhigh";
+    }
+  ) {
+    return request<FineJobSmartCaptureAnalysisSnapshot>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/analysis-batches`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
+  async getFineJobSmartCaptureAnalysisItemContext(smartCaptureId: string, workflowTaskId: string) {
+    return request<Record<string, unknown>>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/analysis-items/${encodeURIComponent(workflowTaskId)}/context`
+    );
+  },
+  async saveFineJobSmartCaptureAnalysisFeedback(
+    smartCaptureId: string,
+    workflowTaskId: string,
+    payload: { sentiment: "expected" | "unexpected"; reason?: string; note?: string }
+  ) {
+    return request<Record<string, string>>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/analysis-items/${encodeURIComponent(workflowTaskId)}/feedback`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
+  async saveFineJobSmartCaptureAnalysisItem(
+    smartCaptureId: string,
+    workflowTaskId: string,
+    payload: {
+      decision: "recommend" | "review" | "reject";
+      confidence?: number;
+      summary?: string;
+      reasons?: string[];
+      risks?: string[];
+      strengths?: string[];
+      gaps?: string[];
+      hard_requirements?: object[];
+      match_dimensions?: Record<string, unknown>;
+      missing_information?: string[];
+      jd_evidence?: string[];
+      candidate_evidence?: string[];
+      evaluation_id?: string;
+    }
+  ) {
+    return request<FineJobSmartCaptureAnalysisSnapshot>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/analysis-items/${encodeURIComponent(workflowTaskId)}/save`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
+  async updateFineJobSmartCaptureAnalysisGuidance(smartCaptureId: string, analysisGuidance: string) {
+    return request<FineJobSmartCapture>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/analysis-guidance`,
+      { method: "PATCH", body: JSON.stringify({ analysis_guidance: analysisGuidance }) }
+    );
+  },
+  async attachFineJobSmartCaptureCodexSession(
+    smartCaptureId: string,
+    payload: { codex_session_ref: string; codex_runtime_id?: string; analysis_batch_id?: string }
+  ) {
+    return request<FineJobSmartCapture>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/codex-session`,
+      { method: "PATCH", body: JSON.stringify(payload) }
+    );
+  },
+  async claimFineJobSmartCaptureAnalysisHandoff(
+    smartCaptureId: string,
+    payload: {
+      codex_session_ref: string;
+      codex_runtime_id?: string;
+      handoff_kind: "initial" | "next";
+      retry_handoff_attempt_id?: string;
+    }
+  ) {
+    return request<Record<string, unknown>>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/analysis-handoff/claim`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
+  async markFineJobSmartCaptureAnalysisHandoffPromptWritten(
+    smartCaptureId: string,
+    payload: { analysis_batch_id: string; handoff_attempt_id: string; codex_session_ref: string }
+  ) {
+    return request<Record<string, unknown>>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/analysis-handoff/prompt-written`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
+  async ackFineJobSmartCaptureAnalysisBatchStarted(
+    smartCaptureId: string,
+    payload: { analysis_batch_id: string; handoff_attempt_id: string }
+  ) {
+    return request<Record<string, unknown>>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/analysis-handoff/ack-started`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
+  async releaseFineJobSmartCaptureAnalysisHandoff(
+    smartCaptureId: string,
+    payload: {
+      analysis_batch_id: string;
+      handoff_attempt_id: string;
+      codex_session_ref: string;
+      release_reason?: "transport_failure" | "full_retry";
+    }
+  ) {
+    return request<Record<string, unknown>>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/analysis-handoff/release`,
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+  },
+  async retryFineJobSmartCaptureAnalysisHandoff(
+    smartCaptureId: string,
+    payload: {
+      analysis_batch_id: string;
+      handoff_attempt_id: string;
+      codex_session_ref: string;
+    }
+  ) {
+    return request<Record<string, unknown>>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/analysis-handoff/retry`,
+      { method: "POST", body: JSON.stringify(payload) }
     );
   },
   async createFineJobSmartCapture(payload: {

@@ -16,6 +16,7 @@ const route = useRoute();
 const router = useRouter();
 
 const isWorkflowTask = computed(() => route.query.task === "deep-job-search");
+const isSmartCaptureTask = computed(() => route.query.task === "smart-capture-analysis" || Boolean(route.query.smart_capture_id));
 
 const showClipboardMessage = (successMessage: string, failureMessage: string, success: boolean) => {
   copyMessage.value = success ? successMessage : failureMessage;
@@ -51,6 +52,10 @@ const paste = async () => {
 const clearTerminal = () => terminal.value?.clear();
 
 const returnToTaskCockpit = async () => {
+  if (isSmartCaptureTask.value) {
+    await router.push({ name: "fine-job-capture" });
+    return;
+  }
   const workflowRunId = String(route.query.workflow_run_id || "").trim();
   if (!workflowRunId) return;
   await router.push({
@@ -92,7 +97,9 @@ watch(
     <div class="terminal-toolbar">
       <span class="secondary-text">拖动选择文本后可按 Ctrl/Cmd+C 复制</span>
       <div class="card-actions">
-        <el-button v-if="isWorkflowTask" @click="returnToTaskCockpit">返回任务驾驶舱</el-button>
+        <el-button v-if="isWorkflowTask || isSmartCaptureTask" @click="returnToTaskCockpit">
+          {{ isSmartCaptureTask ? "返回岗位采集" : "返回任务驾驶舱" }}
+        </el-button>
         <span v-if="copyMessage" class="secondary-text">{{ copyMessage }}</span>
         <el-button :disabled="!terminal" @click="paste">粘贴</el-button>
         <el-button :disabled="!terminal" @click="clearTerminal">Clear</el-button>

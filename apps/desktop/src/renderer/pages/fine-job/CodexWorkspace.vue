@@ -6,6 +6,9 @@ import { api } from "@/services/api";
 import { useCodexTerminalState } from "@/services/codex-terminal-state";
 import { getCodexBridge } from "@/services/desktop-bridge";
 import {
+  resubmitSmartCaptureCodexSubmit,
+  retrySmartCaptureCodexHandoff,
+  triggerSmartCaptureCodexHandoff,
   resubmitWorkflowCodexSubmit,
   retryWorkflowCodexHandoff,
   triggerWorkflowCodexHandoff
@@ -13,7 +16,7 @@ import {
 import { useFineJobCodexStore } from "@/stores/fineJobCodex";
 import { useFineJobStrategiesStore } from "@/stores/fineJobStrategies";
 import { useFineJobWorkflowRunStore } from "@/stores/fineJobWorkflowRun";
-import type { FineJobCodexPermissions } from "@/types";
+import type { FineJobCodexPermissions, FineJobSmartCaptureAnalysisSnapshot } from "@/types";
 
 const store = useFineJobCodexStore();
 const workflowStore = useFineJobWorkflowRunStore();
@@ -75,7 +78,7 @@ const start = async (resume = false) => {
 const applyTransportDebugInfo = (info: {
   binding: string;
   keySequence: string;
-  sessionMode: "workflow" | "transport_debug" | null;
+  sessionMode: "workflow" | "smart_capture" | "transport_debug" | null;
   candidates: Array<{ id: string; binding: string; keySequence: string }>;
 }) => {
   transportDebugBinding.value = info.binding;
@@ -225,10 +228,24 @@ const submitProfileAnalysisTask = async () => {
 const deepJobSearchTask = () => {
   const query = route?.query ?? {};
   if (query.task !== "deep-job-search") return null;
+  if (String(query.smart_capture_id || "").trim()) return null;
   const workflowRunId = String(query.workflow_run_id || "").trim();
   const action = String(query.workflow_action || "").trim();
   if (!workflowRunId || (action !== "submit" && action !== "continue" && action !== "view")) return null;
   return { workflowRunId, action };
+};
+
+const smartCaptureTask = () => {
+  const query = route?.query ?? {};
+  if (query.task !== "smart-capture-analysis" && !String(query.smart_capture_id || "").trim()) return null;
+  const smartCaptureId = String(query.smart_capture_id || "").trim();
+  const action = String(query.workflow_action || "").trim();
+  if (!smartCaptureId || (action !== "submit" && action !== "continue" && action !== "view")) return null;
+  return {
+    smartCaptureId,
+    action,
+    parentWorkflowRunId: String(query.parent_workflow_run_id || query.workflow_run_id || "").trim()
+  };
 };
 
 const updateWorkflowHandoffControls = (run: Awaited<ReturnType<typeof workflowStore.refresh>> | null | undefined) => {
@@ -307,6 +324,75 @@ const retryWorkflowAnalysis = async () => {
   }
 };
 
+const updateSmartCaptureHandoffControls = (snapshot: FineJobSmartCaptureAnalysisSnapshot) => {
+  const handoff = snapshot.handoff;
+  workflowRetryAvailable.value = Boolean(handoff?.attempt_status === "prompt_written" && handoff.retry_available !== false);
+  workflowResubmitAvailable.value = Boolean(
+    handoff?.attempt_status === "prompt_written"
+      && handoff.codex_session_ref === store.sessionRef
+      && isRunning.value
+  );
+};
+
+const submitSmartCaptureTask = async (requestedAction?: "submit" | "continue") => {
+  const task = smartCaptureTask();
+  if (!task) return;
+  const action = requestedAction ?? task.action;
+  try {
+    const snapshot = await api.getFineJobSmartCaptureAnalysisSnapshot(task.smartCaptureId);
+    updateSmartCaptureHandoffControls(snapshot);
+    if (action === "view") {
+      workflowAnalysisMessage.value = isRunning.value && snapshot.handoff?.codex_session_ref === store.sessionRef
+        ? "已进入当前 Smart Capture 的 Codex 分析会话。"
+        : "当前 Smart Capture 没有可查看的存活 Codex 会话。";
+      return;
+    }
+    workflowAnalysisMessage.value = "正在交接当前 Smart Capture Analysis Batch……";
+    const result = await triggerSmartCaptureCodexHandoff(snapshot, store, "manual");
+    updateSmartCaptureHandoffControls(result.snapshot);
+    workflowAnalysisMessage.value = result.message;
+    if (result.status === "submitted") {
+      await router.replace({
+        name: "fine-job-codex",
+        query: {
+          task: "smart-capture-analysis",
+          smart_capture_id: task.smartCaptureId,
+          ...(task.parentWorkflowRunId ? { parent_workflow_run_id: task.parentWorkflowRunId } : {}),
+          workflow_action: "view"
+        }
+      });
+    }
+  } catch (error) {
+    workflowAnalysisMessage.value = `Smart Capture 分析任务提交失败：${error instanceof Error ? error.message : String(error)}`;
+  }
+};
+
+const resubmitSmartCaptureAnalysis = async () => {
+  const task = smartCaptureTask();
+  if (!task) return;
+  try {
+    const snapshot = await api.getFineJobSmartCaptureAnalysisSnapshot(task.smartCaptureId);
+    const result = await resubmitSmartCaptureCodexSubmit(snapshot, store);
+    updateSmartCaptureHandoffControls(result.snapshot);
+    workflowAnalysisMessage.value = result.message;
+  } catch (error) {
+    workflowAnalysisMessage.value = `Smart Capture 再次提交失败：${error instanceof Error ? error.message : String(error)}`;
+  }
+};
+
+const retrySmartCaptureAnalysis = async () => {
+  const task = smartCaptureTask();
+  if (!task) return;
+  try {
+    const snapshot = await api.getFineJobSmartCaptureAnalysisSnapshot(task.smartCaptureId);
+    const result = await retrySmartCaptureCodexHandoff(snapshot, store);
+    updateSmartCaptureHandoffControls(result.snapshot);
+    workflowAnalysisMessage.value = result.message;
+  } catch (error) {
+    workflowAnalysisMessage.value = `Smart Capture 重新交接失败：${error instanceof Error ? error.message : String(error)}`;
+  }
+};
+
 const submitQuickTask = async (taskType: "filter" | "recommendation") => {
   const bridge = getCodexBridge();
   if (!bridge?.submitCodexPrompt) {
@@ -364,6 +450,7 @@ onMounted(async () => {
   recommendationTaskStrategyId.value = enabledRecommendationStrategies.value[0]?.id ?? null;
   await submitProfileAnalysisTask();
   await submitDeepJobSearchTask();
+  await submitSmartCaptureTask();
   if (SHOW_TRANSPORT_DEBUG) await loadTransportDebugInfo();
 });
 </script>
@@ -379,7 +466,7 @@ onMounted(async () => {
       <div class="card-actions">
         <el-tag :type="isRunning ? 'success' : 'info'">{{ store.status }}</el-tag>
         <el-button :disabled="isRunning" type="primary" @click="start(false)">新建会话</el-button>
-        <el-button v-if="!deepJobSearchTask()" :disabled="isRunning" @click="start(true)">恢复最近会话</el-button>
+        <el-button v-if="!deepJobSearchTask() && !smartCaptureTask()" :disabled="isRunning" @click="start(true)">恢复最近会话</el-button>
         <el-button :disabled="!isRunning" @click="interrupt">中断</el-button>
         <el-button :disabled="!isRunning" @click="stop">结束</el-button>
       </div>
@@ -413,10 +500,31 @@ onMounted(async () => {
       @click="retryWorkflowAnalysis"
       >重新交接</el-button>
     </div>
+    <div v-if="smartCaptureTask() && (workflowResubmitAvailable || workflowRetryAvailable)" class="card-actions">
+      <el-button
+        v-if="workflowResubmitAvailable"
+        data-testid="resubmit-smart-capture-analysis"
+        @click="resubmitSmartCaptureAnalysis"
+      >再次提交</el-button>
+      <el-button
+        v-if="workflowRetryAvailable"
+        type="warning"
+        data-testid="retry-smart-capture-analysis"
+        @click="retrySmartCaptureAnalysis"
+      >重新交接</el-button>
+    </div>
     <el-alert
       v-if="deepJobSearchTask()"
       :title="`当前 Workflow Run：${deepJobSearchTask()?.workflowRunId}`"
       description="业务执行进度请在任务驾驶舱查看；本页保留 Codex 的实际执行过程。"
+      type="info"
+      :closable="false"
+      show-icon
+    />
+    <el-alert
+      v-if="smartCaptureTask()"
+      :title="`当前 Smart Capture：${smartCaptureTask()?.smartCaptureId}`"
+      :description="smartCaptureTask()?.parentWorkflowRunId ? `父 Workflow（仅导航）：${smartCaptureTask()?.parentWorkflowRunId}` : '独立 Smart Capture，不依赖 Workflow Run。'"
       type="info"
       :closable="false"
       show-icon

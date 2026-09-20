@@ -14,10 +14,13 @@ describe("registerCodexIpc", () => {
       start: vi.fn(async () => ({ status: "running", runtimeId: "run-1", sessionRef: "runtime:run-1" })),
       resume: vi.fn(async () => ({ status: "running", runtimeId: "run-1", sessionRef: "runtime:run-1" })),
       startWorkflow: vi.fn(async () => ({ status: "running", runtimeId: "run-1", sessionRef: "runtime:run-1" })),
+      startSmartCapture: vi.fn(async () => ({ status: "running", runtimeId: "smart-run-1", sessionRef: "runtime:smart-run-1" })),
       startTransportDebug: vi.fn(async () => ({ status: "running", runtimeId: "debug-1", sessionRef: "runtime:debug-1" })),
       write: vi.fn(),
       submitWorkflowPrompt: vi.fn(async () => true),
       submitWorkflowKey: vi.fn(async () => true),
+      submitSmartCapturePrompt: vi.fn(async () => true),
+      submitSmartCaptureKey: vi.fn(async () => true),
       writeTransportDebugPrompt: vi.fn(async () => true),
       submitTransportDebugKey: vi.fn(async () => true),
       submitEnter: vi.fn(async () => true),
@@ -42,6 +45,12 @@ describe("registerCodexIpc", () => {
     expect(controller.startWorkflow).toHaveBeenCalledWith({
       model: "gpt-5.6-luna", reasoningEffort: "high", sessionRef: "session-1"
     });
+    await handlers.get("codex:start-smart-capture")?.({}, {
+      model: "gpt-5.6-luna", reasoningEffort: "high", sessionRef: "smart-session-1"
+    });
+    expect(controller.startSmartCapture).toHaveBeenCalledWith({
+      model: "gpt-5.6-luna", reasoningEffort: "high", sessionRef: "smart-session-1"
+    });
     expect(handlers.get("codex:state")?.({})).toEqual({
       status: "idle",
       runtimeId: null,
@@ -51,8 +60,12 @@ describe("registerCodexIpc", () => {
     expect(controller.submitEnter).toHaveBeenCalledTimes(1);
     await expect(handlers.get("codex:submit-workflow-prompt")?.({}, "workflow prompt")).resolves.toBe(true);
     await expect(handlers.get("codex:submit-workflow-key")?.({})).resolves.toBe(true);
+    await expect(handlers.get("codex:submit-smart-capture-prompt")?.({}, "smart prompt")).resolves.toBe(true);
+    await expect(handlers.get("codex:submit-smart-capture-key")?.({})).resolves.toBe(true);
     expect(controller.submitWorkflowPrompt).toHaveBeenCalledWith("workflow prompt");
     expect(controller.submitWorkflowKey).toHaveBeenCalledTimes(1);
+    expect(controller.submitSmartCapturePrompt).toHaveBeenCalledWith("smart prompt");
+    expect(controller.submitSmartCaptureKey).toHaveBeenCalledTimes(1);
     await expect(handlers.get("codex:start-transport-debug")?.({}, { cols: 100, rows: 30, candidateId: "ctrl-y" })).resolves.toEqual({
       status: "running", runtimeId: "debug-1", sessionRef: "runtime:debug-1"
     });

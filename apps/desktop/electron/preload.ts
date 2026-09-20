@@ -113,6 +113,18 @@ const desktopBridge = {
     sessionRef: string | null;
     workflowSessionMode?: "live_reused" | "resumed_explicit" | "new_from_workflow_state";
   }>,
+  startSmartCaptureCodex: (launch: {
+    cols?: number;
+    rows?: number;
+    model: string;
+    reasoningEffort: string;
+    sessionRef?: string;
+  }) => ipcRenderer.invoke("codex:start-smart-capture", launch) as Promise<{
+    status: string;
+    runtimeId: string | null;
+    sessionRef: string | null;
+    smartCaptureSessionMode?: "live_reused" | "resumed_explicit" | "new_from_smart_capture_state";
+  }>,
   startTransportDebugCodex: (options?: { cols?: number; rows?: number; candidateId?: string }) =>
     ipcRenderer.invoke("codex:start-transport-debug", options) as Promise<{
       status: string;
@@ -131,6 +143,10 @@ const desktopBridge = {
   submitWorkflowCodexPrompt: (prompt: string) =>
     ipcRenderer.invoke("codex:submit-workflow-prompt", prompt) as Promise<boolean>,
   submitWorkflowCodexKey: () => ipcRenderer.invoke("codex:submit-workflow-key") as Promise<boolean>,
+  submitSmartCaptureCodexPrompt: (prompt: string) =>
+    ipcRenderer.invoke("codex:submit-smart-capture-prompt", prompt) as Promise<boolean>,
+  submitSmartCaptureCodexKey: () =>
+    ipcRenderer.invoke("codex:submit-smart-capture-key") as Promise<boolean>,
   writeTransportDebugPrompt: (prompt: string) =>
     ipcRenderer.invoke("codex:write-transport-debug-prompt", prompt) as Promise<boolean>,
   submitTransportDebugPrompt: (prompt: string) =>
@@ -141,7 +157,7 @@ const desktopBridge = {
     ipcRenderer.invoke("codex:transport-debug-info") as Promise<{
       binding: string;
       keySequence: string;
-      sessionMode: "workflow" | "transport_debug" | null;
+      sessionMode: "workflow" | "smart_capture" | "transport_debug" | null;
       candidates: Array<{ id: string; binding: string; keySequence: string }>;
     } | null>,
   submitCodexEnter: () => ipcRenderer.invoke("codex:submit-enter") as Promise<boolean>,

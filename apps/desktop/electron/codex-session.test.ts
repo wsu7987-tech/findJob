@@ -233,3 +233,18 @@ describe("Workflow Prompt transport", () => {
     );
   });
 });
+
+describe("Smart Capture Prompt transport", () => {
+  it("使用独立的 Smart Capture composer 通道，不要求 Workflow Session", async () => {
+    const { controller, terminal } = createSessionController();
+    const launch = await controller.startSmartCapture({ model: "gpt-5.6-luna", reasoningEffort: "high" });
+
+    expect(launch.smartCaptureSessionMode).toBe("new_from_smart_capture_state");
+    expect(launch.workflowSessionMode).toBeUndefined();
+
+    await expect(controller.submitSmartCapturePrompt("smart capture prompt")).resolves.toBe(true);
+    expect(terminal.write).toHaveBeenNthCalledWith(1, "smart capture prompt");
+    expect(terminal.write).toHaveBeenNthCalledWith(2, FINEJOB_WORKFLOW_COMPOSER_SUBMIT_SEQUENCE);
+    await expect(controller.submitSmartCaptureKey()).resolves.toBe(true);
+  });
+});

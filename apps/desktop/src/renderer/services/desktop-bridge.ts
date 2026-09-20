@@ -76,6 +76,18 @@ type DesktopBridgeShape = {
     sessionRef: string | null;
     workflowSessionMode?: "live_reused" | "resumed_explicit" | "new_from_workflow_state";
   }>;
+  startSmartCaptureCodex?: (launch: {
+    cols?: number;
+    rows?: number;
+    model: string;
+    reasoningEffort: string;
+    sessionRef?: string;
+  }) => Promise<{
+    status: string;
+    runtimeId: string | null;
+    sessionRef: string | null;
+    smartCaptureSessionMode?: "live_reused" | "resumed_explicit" | "new_from_smart_capture_state";
+  }>;
   startTransportDebugCodex?: (options?: { cols?: number; rows?: number; candidateId?: string }) => Promise<{
     status: string;
     runtimeId: string | null;
@@ -90,13 +102,15 @@ type DesktopBridgeShape = {
   submitCodexPrompt?: (prompt: string) => Promise<boolean>;
   submitWorkflowCodexPrompt?: (prompt: string) => Promise<boolean>;
   submitWorkflowCodexKey?: () => Promise<boolean>;
+  submitSmartCaptureCodexPrompt?: (prompt: string) => Promise<boolean>;
+  submitSmartCaptureCodexKey?: () => Promise<boolean>;
   writeTransportDebugPrompt?: (prompt: string) => Promise<boolean>;
   submitTransportDebugPrompt?: (prompt: string) => Promise<boolean>;
   submitTransportDebugKey?: () => Promise<boolean>;
   getCodexTransportDebugInfo?: () => Promise<{
     binding: string;
     keySequence: string;
-    sessionMode: "workflow" | "transport_debug" | null;
+    sessionMode: "workflow" | "smart_capture" | "transport_debug" | null;
     candidates: Array<{ id: string; binding: string; keySequence: string }>;
   } | null>;
   submitCodexEnter?: () => Promise<boolean>;

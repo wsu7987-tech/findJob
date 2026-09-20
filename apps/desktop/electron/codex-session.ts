@@ -38,7 +38,7 @@ const FINEJOB_WORKFLOW_COMPOSER_SUBMIT = {
   keySequenceDisplay: FINEJOB_WORKFLOW_COMPOSER_SUBMIT_SEQUENCE_DISPLAY
 };
 
-type DedicatedComposerMode = "workflow" | "transport_debug" | null;
+type DedicatedComposerMode = "workflow" | "smart_capture" | "transport_debug" | null;
 
 const stripTerminalControlSequences = (value: string) =>
   value
@@ -82,7 +82,16 @@ export interface CodexWorkflowLaunchOptions {
   sessionRef?: string;
 }
 
+export interface CodexSmartCaptureLaunchOptions {
+  cols?: number;
+  rows?: number;
+  model: string;
+  reasoningEffort: string;
+  sessionRef?: string;
+}
+
 export type WorkflowSessionMode = "live_reused" | "resumed_explicit" | "new_from_workflow_state";
+export type SmartCaptureSessionMode = "live_reused" | "resumed_explicit" | "new_from_smart_capture_state";
 
 type KeymapConfigValue = string | string[];
 
@@ -247,7 +256,7 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
     resume: boolean,
     cols = 120,
     rows = 36,
-    workflow?: Pick<CodexWorkflowLaunchOptions, "model" | "reasoningEffort" | "sessionRef">,
+    managedTask?: Pick<CodexWorkflowLaunchOptions, "model" | "reasoningEffort" | "sessionRef">,
     requestedComposerMode: DedicatedComposerMode = null,
     requestedComposerSubmit: {
       binding: string;
@@ -262,21 +271,26 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
         }
         return { status, runtimeId, sessionRef };
       }
-      if (!workflow || workflow.sessionRef === sessionRef) {
-        if (workflow && dedicatedComposerMode !== "workflow") {
-          throw new Error("当前 Codex 会话不是 Workflow 会话，结束后再切换。");
+      if (!managedTask || managedTask.sessionRef === sessionRef) {
+        if (managedTask && requestedComposerMode && dedicatedComposerMode !== requestedComposerMode) {
+          throw new Error("当前 Codex 会话属于其他托管任务，结束后再切换。");
         }
         return {
           status,
           runtimeId,
           sessionRef,
-          workflowSessionMode: workflow ? "live_reused" satisfies WorkflowSessionMode : undefined
+          workflowSessionMode: requestedComposerMode === "workflow"
+            ? "live_reused" satisfies WorkflowSessionMode
+            : undefined,
+          smartCaptureSessionMode: requestedComposerMode === "smart_capture"
+            ? "live_reused" satisfies SmartCaptureSessionMode
+            : undefined
         };
       }
-      throw new Error("当前 Codex 会话属于其他 Workflow，结束后再切换。");
+      throw new Error("当前 Codex 会话属于其他托管任务，结束后再切换。");
     }
-    if (workflow && resume) {
-      throw new Error("Workflow 只能按明确 Session ID 恢复，不能恢复最近会话。");
+    if (managedTask && resume) {
+      throw new Error("托管任务只能按明确 Session ID 恢复，不能恢复最近会话。");
     }
     setStatus("starting");
     recentOutput = "";
@@ -285,20 +299,20 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
       const codexPath = await options.getCodexPath();
       runtimeId = runtime.run_id;
       runtimeToken = runtime.token;
-      // runtime: 前缀只表示本地 Workflow 绑定，无法证明它是可由 CLI 恢复的线程 ID。
-      const resumableSessionId = isResumableCodexSessionId(workflow?.sessionRef)
-        ? workflow!.sessionRef!
+      // runtime: 前缀只表示本地托管任务绑定，无法证明它是可由 CLI 恢复的线程 ID。
+      const resumableSessionId = isResumableCodexSessionId(managedTask?.sessionRef)
+        ? managedTask!.sessionRef!
         : undefined;
       sessionRef = resumableSessionId ?? `runtime:${runtime.run_id}`;
       const tuiWorkspace = writeManagedWorkspace(options);
-      // Workflow 只恢复已验证的明确 UUID，通用恢复最近会话不会进入该分支。
+      // 托管任务只恢复已验证的明确 UUID，通用恢复最近会话不会进入该分支。
       const args = buildCodexInteractiveArgs({
         tuiWorkspace,
         resumeSessionRef: resume ? "--last" : (
           resumableSessionId
         ),
-        model: workflow?.model,
-        reasoningEffort: workflow?.reasoningEffort,
+        model: managedTask?.model,
+        reasoningEffort: managedTask?.reasoningEffort,
         workflowComposerSubmitBinding: requestedComposerSubmit?.binding,
         managedComposerSubmitBinding: requestedComposerMode === null ? "enter" : undefined,
         keymapOverrides: requestedComposerMode === "transport_debug"
@@ -374,8 +388,11 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
         status,
         runtimeId,
         sessionRef,
-        workflowSessionMode: workflow
+        workflowSessionMode: requestedComposerMode === "workflow"
           ? (resumableSessionId ? "resumed_explicit" : "new_from_workflow_state") satisfies WorkflowSessionMode
+          : undefined,
+        smartCaptureSessionMode: requestedComposerMode === "smart_capture"
+          ? (resumableSessionId ? "resumed_explicit" : "new_from_smart_capture_state") satisfies SmartCaptureSessionMode
           : undefined
       };
     } catch (error) {
@@ -407,6 +424,8 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
     resume: (cols?: number, rows?: number) => start(true, cols, rows),
     startWorkflow: (launch: CodexWorkflowLaunchOptions) =>
       start(false, launch.cols, launch.rows, launch, "workflow", FINEJOB_WORKFLOW_COMPOSER_SUBMIT),
+    startSmartCapture: (launch: CodexSmartCaptureLaunchOptions) =>
+      start(false, launch.cols, launch.rows, launch, "smart_capture", FINEJOB_WORKFLOW_COMPOSER_SUBMIT),
     startTransportDebug: (cols?: number, rows?: number, candidateId?: string) => {
       const candidate = FINEJOB_TRANSPORT_DEBUG_SUBMIT_CANDIDATES.find((item) => item.id === candidateId)
         ?? FINEJOB_TRANSPORT_DEBUG_SUBMIT_CANDIDATES[0];
@@ -426,6 +445,15 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
     },
     async submitWorkflowKey() {
       if (!terminal || status !== "running" || dedicatedComposerMode !== "workflow" || !dedicatedComposerSubmit) return false;
+      terminal.write(dedicatedComposerSubmit.keySequence);
+      return true;
+    },
+    async submitSmartCapturePrompt(prompt: string) {
+      if (!dedicatedComposerSubmit || dedicatedComposerMode !== "smart_capture") return false;
+      return submitPromptWithKey(prompt, dedicatedComposerSubmit.keySequence);
+    },
+    async submitSmartCaptureKey() {
+      if (!terminal || status !== "running" || dedicatedComposerMode !== "smart_capture" || !dedicatedComposerSubmit) return false;
       terminal.write(dedicatedComposerSubmit.keySequence);
       return true;
     },

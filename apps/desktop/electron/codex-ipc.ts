@@ -10,11 +10,20 @@ interface CodexController {
     reasoningEffort: string;
     sessionRef?: string;
   }) => Promise<unknown>;
+  startSmartCapture?: (launch: {
+    cols?: number;
+    rows?: number;
+    model: string;
+    reasoningEffort: string;
+    sessionRef?: string;
+  }) => Promise<unknown>;
   startTransportDebug?: (cols?: number, rows?: number, candidateId?: string) => Promise<unknown>;
   write: (data: string) => void;
   submitPrompt?: (prompt: string) => Promise<boolean>;
   submitWorkflowPrompt?: (prompt: string) => Promise<boolean>;
   submitWorkflowKey?: () => Promise<boolean>;
+  submitSmartCapturePrompt?: (prompt: string) => Promise<boolean>;
+  submitSmartCaptureKey?: () => Promise<boolean>;
   writeTransportDebugPrompt?: (prompt: string) => Promise<boolean>;
   submitTransportDebugPrompt?: (prompt: string) => Promise<boolean>;
   submitTransportDebugKey?: () => Promise<boolean>;
@@ -44,6 +53,13 @@ export const registerCodexIpc = (
     reasoningEffort: string;
     sessionRef?: string;
   }) => controller.startWorkflow(launch));
+  ipcMain.handle("codex:start-smart-capture", (_event, launch: {
+    cols?: number;
+    rows?: number;
+    model: string;
+    reasoningEffort: string;
+    sessionRef?: string;
+  }) => controller.startSmartCapture?.(launch) ?? false);
   ipcMain.handle("codex:start-transport-debug", (_event, options?: { cols?: number; rows?: number; candidateId?: string }) =>
     controller.startTransportDebug?.(options?.cols, options?.rows, options?.candidateId) ?? false
   );
@@ -62,6 +78,11 @@ export const registerCodexIpc = (
     return controller.submitWorkflowPrompt(prompt);
   });
   ipcMain.handle("codex:submit-workflow-key", () => controller.submitWorkflowKey?.() ?? false);
+  ipcMain.handle("codex:submit-smart-capture-prompt", (_event, prompt: string) => {
+    if (typeof prompt !== "string" || !controller.submitSmartCapturePrompt) return false;
+    return controller.submitSmartCapturePrompt(prompt);
+  });
+  ipcMain.handle("codex:submit-smart-capture-key", () => controller.submitSmartCaptureKey?.() ?? false);
   ipcMain.handle("codex:write-transport-debug-prompt", (_event, prompt: string) => {
     if (typeof prompt !== "string" || !controller.writeTransportDebugPrompt) return false;
     return controller.writeTransportDebugPrompt(prompt);
