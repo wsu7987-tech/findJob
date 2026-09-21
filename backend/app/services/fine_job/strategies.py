@@ -161,6 +161,25 @@ def get_recommendation_strategy(db: Database, strategy_id: str) -> dict[str, obj
     return _serialize_recommendation(row)
 
 
+def require_recommendation_strategy(
+    db: Database, *, recommendation_strategy_id: str, filter_strategy_id: str
+) -> dict[str, object]:
+    """校验投递策略与岗位筛选策略的关联及候选人资料完整性。"""
+    strategy = get_recommendation_strategy(db, recommendation_strategy_id)
+    if not strategy.get("enabled"):
+        raise AppError(409, "RECOMMENDATION_STRATEGY_DISABLED", "建议投递策略当前未启用。")
+    if str(strategy.get("filter_strategy_id") or "") != filter_strategy_id:
+        raise AppError(422, "RECOMMENDATION_FILTER_MISMATCH", "建议投递策略必须关联本轮选择的岗位筛选策略。")
+    resume_version_id = str(strategy.get("resume_version_id") or "")
+    profile_id = str(strategy.get("candidate_profile_id") or "")
+    if not resume_version_id or not profile_id:
+        raise AppError(422, "RECOMMENDATION_PROFILE_REQUIRED", "建议投递策略必须关联候选人档案和具体简历。")
+    resume_version = profile_store.get_resume_version(db, resume_version_id)
+    if str(resume_version.get("profile_id") or "") != profile_id:
+        raise AppError(409, "RECOMMENDATION_PROFILE_MISMATCH", "建议投递策略的候选人档案与具体简历不一致。")
+    return strategy
+
+
 def save_recommendation_strategy(
     db: Database,
     payload: FineJobRecommendationStrategyPayload,

@@ -33,7 +33,7 @@ from backend.app.services.fine_job.adaptive_search_planner import (
 )
 from backend.app.services.fine_job.filter_exclusions import apply_filter_exclusions
 from backend.app.services.fine_job.job_evaluation import evaluate_filter_strategy
-from backend.app.services.fine_job import profile_store, profile_v3
+from backend.app.services.fine_job import profile_store, profile_v3, strategies
 from backend.app.services.fine_job.profile_context import get_profile_context
 from backend.app.services.fine_job.strategies import (
     get_filter_strategy,
@@ -322,11 +322,10 @@ def _create_workflow_identity_in_connection(
         source="task_cockpit",
         workflow_run_id=workflow_run_id,
         search_config={
+            **payload,
             "allowed_search_keywords": requested_keywords,
             "allowed_cities": requested_cities,
-            "pages": min_depth,
-            "include_details": False,
-            "prefer_current_page": True,
+            "pages": int(payload.get("pages") or min_depth),
             "filter_strategy_id": filter_strategy_id,
         },
         target_count=candidate_target,
@@ -3423,19 +3422,11 @@ def _compact_recommendation_strategy(strategy: dict[str, object]) -> dict[str, o
 def _require_workflow_recommendation_strategy(
     db: Database, *, recommendation_strategy_id: str, filter_strategy_id: str
 ) -> dict[str, object]:
-    strategy = get_recommendation_strategy(db, recommendation_strategy_id)
-    if not strategy.get("enabled"):
-        raise AppError(409, "RECOMMENDATION_STRATEGY_DISABLED", "建议投递策略当前未启用。")
-    if str(strategy.get("filter_strategy_id") or "") != filter_strategy_id:
-        raise AppError(422, "RECOMMENDATION_FILTER_MISMATCH", "建议投递策略必须关联本轮选择的岗位筛选策略。")
-    resume_version_id = str(strategy.get("resume_version_id") or "")
-    profile_id = str(strategy.get("candidate_profile_id") or "")
-    if not resume_version_id or not profile_id:
-        raise AppError(422, "RECOMMENDATION_PROFILE_REQUIRED", "建议投递策略必须关联候选人档案和具体简历。")
-    resume_version = profile_store.get_resume_version(db, resume_version_id)
-    if str(resume_version.get("profile_id") or "") != profile_id:
-        raise AppError(409, "RECOMMENDATION_PROFILE_MISMATCH", "建议投递策略的候选人档案与具体简历不一致。")
-    return strategy
+    return strategies.require_recommendation_strategy(
+        db,
+        recommendation_strategy_id=recommendation_strategy_id,
+        filter_strategy_id=filter_strategy_id,
+    )
 
 
 def _compact_job_for_analysis(job: dict[str, object]) -> dict[str, object]:

@@ -9,6 +9,7 @@ import { useFineJobCodexStore } from "@/stores/fineJobCodex";
 import { useFineJobPlatformSessionsStore } from "@/stores/fineJobPlatformSessions";
 import { useFineJobStrategiesStore } from "@/stores/fineJobStrategies";
 import { useFineJobWorkflowRunStore } from "@/stores/fineJobWorkflowRun";
+import SmartCaptureConfigForm from "@/components/fine-job/SmartCaptureConfigForm.vue";
 import {
   resubmitSmartCaptureCodexSubmit,
   retrySmartCaptureCodexHandoff,
@@ -21,9 +22,15 @@ import type {
   FineJobBossCapturedJob,
   FineJobBossCaptureTask,
   FineJobWorkflowAnalysisItem,
-  FineJobWorkflowContextSnapshot
+  FineJobWorkflowContextSnapshot,
+  FineJobSmartCapture
 } from "@/types";
 import { ApiError, api } from "@/services/api";
+import {
+  toSmartCaptureRequest,
+  validateSmartCaptureExecutionConfig,
+  type SmartCaptureExecutionConfig
+} from "@/services/smartCaptureExecutionConfig";
 
 const captureStore = useFineJobBossCaptureStore();
 const executorStore = useFineJobBossExecutorStore();
@@ -143,6 +150,10 @@ const smartAnalysisBatchSize = ref(5);
 const smartAfterAnalysisBatch = ref<"auto_continue" | "wait_for_user">("auto_continue");
 const smartCodexHandoff = ref<"auto" | "manual">("auto");
 const smartContextSoftBudgetCharacters = ref(12000);
+const smartMinDepth = ref(1);
+const smartScrollBatchSize = ref(3);
+const smartMaxDepth = ref(20);
+const smartLowYieldStreakLimit = ref(3);
 const smartContextChannel = ref("deep_job_search");
 const smartContextSnapshot = ref<FineJobWorkflowContextSnapshot | null>(null);
 const smartWorkflowRunId = ref("");
@@ -159,16 +170,27 @@ const smartAnalysisDetailOpen = ref(false);
 const smartFeedbackReason = ref("technical_direction");
 const smartControlLoading = ref(false);
 const smartCaptureControlLoading = ref(false);
+const independentSmartCapture = ref<FineJobSmartCapture | null>(null);
 const currentSmartCapture = computed(() => {
   const run = smartWorkflowRun.value;
   const child = run?.children?.find((item) => item.child_type === "smart_capture");
-  if (!run || !child?.smart_capture_id) return null;
+  if (run && child?.smart_capture_id) {
+    return {
+      workflow_run_id: run.workflow_run_id,
+      smart_capture_id: child.smart_capture_id,
+      status: child.status,
+      message: child.waiting_reason || run.next_action_reason,
+      capabilities: child.capabilities
+    };
+  }
+  const independent = independentSmartCapture.value;
+  if (!independent) return null;
   return {
-    workflow_run_id: run.workflow_run_id,
-    smart_capture_id: child.smart_capture_id,
-    status: child.status,
-    message: child.waiting_reason || run.next_action_reason,
-    capabilities: child.capabilities
+    workflow_run_id: null,
+    smart_capture_id: independent.smart_capture_id,
+    status: independent.status,
+    message: independent.message,
+    capabilities: independent.capabilities
   };
 });
 const selectedJobIds = ref<string[]>([]);
@@ -209,8 +231,8 @@ const smartCaptureResumable = computed(() =>
   Boolean(currentSmartCapture.value?.capabilities?.resume)
 );
 const smartCaptureCanStart = computed(() =>
-  !smartWorkflowRun.value
-  || smartWorkflowTerminalStatuses.includes(smartWorkflowRun.value.status)
+  (!smartWorkflowRun.value || smartWorkflowTerminalStatuses.includes(smartWorkflowRun.value.status))
+  && (!independentSmartCapture.value || smartWorkflowTerminalStatuses.includes(independentSmartCapture.value.status))
 );
 const smartActiveAnalysisItem = computed(() =>
   smartAnalysisItems.value.find((item) => item.status === "running") ?? null
@@ -375,7 +397,11 @@ const mergeDisplayJobs = (...sources: FineJobBossCapturedJob[][]) => {
 const workflowDisplayJobs = computed(() => {
   // 智能采集只合并自身的专用快照，避免带入自定义采集任务的岗位。
   if (currentSmartCapture.value) {
-    return mergeDisplayJobs(smartWorkflowJobs.value, smartCaptureTask.value?.jobs ?? []);
+    return mergeDisplayJobs(
+      smartWorkflowJobs.value,
+      smartCaptureTask.value?.jobs ?? [],
+      independentSmartCapture.value?.jobs ?? []
+    );
   }
   return captureStore.task?.jobs ?? [];
 });
@@ -413,6 +439,67 @@ const selectedBossFilters = computed<Record<string, string>>(() => {
   addMultiValue("stage", bossFilters.stage);
   return filters;
 });
+
+const smartExecutionConfig = computed<SmartCaptureExecutionConfig>({
+  get: () => ({
+    filter_strategy_id: smartFilterStrategyId.value || "",
+    allowed_search_keywords: [...smartSelectedKeywords.value],
+    allowed_cities: [...smartSelectedCities.value],
+    filters: { ...selectedBossFilters.value },
+    candidate_target_count: smartCandidateTargetCount.value,
+    pages: form.pages,
+    include_details: form.includeDetails,
+    prefer_current_page: form.preferCurrentPage,
+    delivery_target_enabled: smartDeliveryTargetEnabled.value,
+    recommendation_strategy_id: smartRecommendationStrategyId.value || "",
+    recommend_target: smartRecommendTarget.value,
+    review_target_enabled: smartEnableReviewTarget.value,
+    review_target: smartReviewTarget.value,
+    target_mode: smartTargetMode.value,
+    analyze_all_candidates: smartAnalyzeAllCandidates.value,
+    stop_after_current_batch: smartStopAfterCurrentBatch.value,
+    analysis_batch_size: smartAnalysisBatchSize.value,
+    execution_policy_after_analysis_batch: smartAfterAnalysisBatch.value,
+    execution_policy_codex_handoff: smartCodexHandoff.value,
+    analysis_guidance: smartAnalysisGuidance.value,
+    codex_model: smartCodexModel.value,
+    codex_reasoning_effort: smartCodexReasoningEffort.value,
+    context_soft_budget_characters: smartContextSoftBudgetCharacters.value,
+    min_depth: smartMinDepth.value,
+    scroll_batch_size: smartScrollBatchSize.value,
+    max_depth: smartMaxDepth.value,
+    low_yield_streak_limit: smartLowYieldStreakLimit.value
+  }),
+  set: (value) => {
+    smartFilterStrategyId.value = value.filter_strategy_id || null;
+    smartSelectedKeywords.value = [...value.allowed_search_keywords];
+    smartSelectedCities.value = [...value.allowed_cities];
+    smartCandidateTargetCount.value = value.candidate_target_count;
+    form.pages = value.pages;
+    form.includeDetails = value.include_details;
+    form.preferCurrentPage = value.prefer_current_page;
+    smartDeliveryTargetEnabled.value = value.delivery_target_enabled;
+    smartRecommendationStrategyId.value = value.recommendation_strategy_id || null;
+    smartRecommendTarget.value = value.recommend_target;
+    smartEnableReviewTarget.value = value.review_target_enabled;
+    smartReviewTarget.value = value.review_target;
+    smartTargetMode.value = value.target_mode;
+    smartAnalyzeAllCandidates.value = value.analyze_all_candidates;
+    smartStopAfterCurrentBatch.value = value.stop_after_current_batch;
+    smartAnalysisBatchSize.value = value.analysis_batch_size;
+    smartAfterAnalysisBatch.value = value.execution_policy_after_analysis_batch;
+    smartCodexHandoff.value = value.execution_policy_codex_handoff;
+    smartAnalysisGuidance.value = value.analysis_guidance;
+    smartCodexModel.value = value.codex_model;
+    smartCodexReasoningEffort.value = value.codex_reasoning_effort;
+    smartContextSoftBudgetCharacters.value = value.context_soft_budget_characters;
+    smartMinDepth.value = value.min_depth;
+    smartScrollBatchSize.value = value.scroll_batch_size;
+    smartMaxDepth.value = value.max_depth;
+    smartLowYieldStreakLimit.value = value.low_yield_streak_limit;
+  }
+});
+const smartConfigValidation = computed(() => validateSmartCaptureExecutionConfig(smartExecutionConfig.value));
 
 const browserStateLabel = computed(() => {
   if (!captureStore.status?.running) return "未启动";
@@ -840,38 +927,18 @@ const ensureCollectionStartAvailable = async (targetLabel: string) => {
 };
 
 const startSmartCapture = async () => {
-  const strategy = selectedSmartFilterStrategy.value;
-  if (!strategy?.id || !smartSelectedKeywords.value.length || !smartSelectedCities.value.length) {
-    ElMessage.warning("请先完成岗位筛选策略、搜索词和城市选择");
+  const config = smartExecutionConfig.value;
+  const validation = smartConfigValidation.value;
+  if (!validation.isValid) {
+    ElMessage.warning(Object.values(validation.errors).join("；"));
     return;
   }
   try {
     if (!await ensureCollectionStartAvailable("智能采集")) return;
     smartCaptureControlLoading.value = true;
-    const run = await workflowStore.create({
-      filter_strategy_id: strategy.id,
-      delivery_target_enabled: smartDeliveryTargetEnabled.value,
-      recommendation_strategy_id: smartDeliveryTargetEnabled.value
-        ? smartRecommendationStrategyId.value || undefined
-        : undefined,
-      codex_model: smartDeliveryTargetEnabled.value ? smartCodexModel.value || undefined : undefined,
-      codex_reasoning_effort: smartDeliveryTargetEnabled.value ? smartCodexReasoningEffort.value : undefined,
-      analysis_guidance: smartAnalysisGuidance.value,
-      recommend_target: smartDeliveryTargetEnabled.value ? smartRecommendTarget.value : undefined,
-      review_target: smartDeliveryTargetEnabled.value && smartEnableReviewTarget.value ? smartReviewTarget.value : undefined,
-      target_mode: smartTargetMode.value,
-      analyze_all_candidates: smartAnalyzeAllCandidates.value,
-      stop_after_current_batch: smartStopAfterCurrentBatch.value,
-      analysis_batch_size: smartAnalysisBatchSize.value,
-      execution_policy_after_analysis_batch: smartAfterAnalysisBatch.value,
-      execution_policy_codex_handoff: smartCodexHandoff.value,
-      candidate_target_count: smartCandidateTargetCount.value,
-      allowed_search_keywords: smartSelectedKeywords.value,
-      allowed_cities: smartSelectedCities.value,
-      min_depth: form.pages,
-      context_soft_budget_characters: smartContextSoftBudgetCharacters.value
-    }, "boss_capture");
-    await applyCurrentSmartWorkflow(run);
+    independentSmartCapture.value = await api.createFineJobSmartCapture(
+      toSmartCaptureRequest(config)
+    );
     ElMessage.success("智能采集任务已启动");
   } catch (errorValue) {
     await showCollectionStartBlocked(errorValue, "智能采集");
@@ -885,7 +952,11 @@ const pauseCurrentSmartCapture = async () => {
   if (!capture) return;
   try {
     smartCaptureControlLoading.value = true;
-    await api.pauseFineJobSmartCapture(capture.smart_capture_id);
+    if (independentSmartCapture.value?.smart_capture_id === capture.smart_capture_id && !smartWorkflowRun.value) {
+      independentSmartCapture.value = await api.pauseFineJobSmartCapture(capture.smart_capture_id);
+    } else {
+      await api.pauseFineJobSmartCapture(capture.smart_capture_id);
+    }
     await refreshCurrentSmartWorkflow();
     ElMessage.success("正在安全暂停岗位采集任务");
   } catch (errorValue) {
@@ -900,7 +971,11 @@ const resumeCurrentSmartCapture = async () => {
   if (!capture) return;
   try {
     smartCaptureControlLoading.value = true;
-    await api.resumeFineJobSmartCapture(capture.smart_capture_id);
+    if (independentSmartCapture.value?.smart_capture_id === capture.smart_capture_id && !smartWorkflowRun.value) {
+      independentSmartCapture.value = await api.resumeFineJobSmartCapture(capture.smart_capture_id);
+    } else {
+      await api.resumeFineJobSmartCapture(capture.smart_capture_id);
+    }
     await refreshCurrentSmartWorkflow();
     ElMessage.success("岗位采集任务已继续");
   } catch (errorValue) {
@@ -915,7 +990,11 @@ const stopCurrentSmartCapture = async () => {
   if (!capture) return;
   try {
     smartCaptureControlLoading.value = true;
-    await api.stopFineJobSmartCapture(capture.smart_capture_id);
+    if (independentSmartCapture.value?.smart_capture_id === capture.smart_capture_id && !smartWorkflowRun.value) {
+      independentSmartCapture.value = await api.stopFineJobSmartCapture(capture.smart_capture_id);
+    } else {
+      await api.stopFineJobSmartCapture(capture.smart_capture_id);
+    }
     await refreshCurrentSmartWorkflow();
     ElMessage.success("岗位采集任务已停止");
   } catch (errorValue) {
@@ -1749,107 +1828,13 @@ function formatDuration(seconds: number) {
             </div>
             <span class="secondary-text">按岗位筛选策略准备搜索范围，再交给现有采集流程执行。</span>
           </div>
-          <el-form label-position="top" class="intent-form">
-            <div class="form-grid">
-              <el-form-item label="岗位筛选策略">
-                <el-select v-model="smartFilterStrategyId" placeholder="选择岗位筛选策略" @change="syncSmartStrategyScope">
-                  <el-option v-for="item in strategiesStore.filters" :key="item.id" :label="item.name" :value="item.id" />
-                </el-select>
-              </el-form-item>
-              <el-form-item label="采集目标岗位数">
-                <el-input-number v-model="smartCandidateTargetCount" :min="1" :max="500" />
-                <p class="secondary-text">用于确定本轮希望形成的岗位候选范围。</p>
-              </el-form-item>
-            </div>
-            <el-form-item label="本轮搜索词（从策略中选择）">
-              <el-checkbox-group v-model="smartSelectedKeywords">
-                <el-checkbox v-for="keyword in selectedSmartFilterStrategy?.search_keywords ?? []" :key="keyword" :label="keyword">
-                  {{ keyword }}
-                </el-checkbox>
-              </el-checkbox-group>
-              <p v-if="!selectedSmartFilterStrategy?.search_keywords?.length" class="secondary-text">当前策略没有可用搜索词。</p>
-            </el-form-item>
-            <el-form-item label="本轮城市（从策略中选择）">
-              <el-checkbox-group v-model="smartSelectedCities">
-                <el-checkbox v-for="city in selectedSmartFilterStrategy?.cities ?? []" :key="city" :label="city">
-                  {{ city }}
-                </el-checkbox>
-              </el-checkbox-group>
-              <p v-if="!selectedSmartFilterStrategy?.cities?.length" class="secondary-text">当前策略没有可用城市。</p>
-            </el-form-item>
-            <el-form-item label="本 Run 临时分析指导（可选）">
-              <el-input v-model="smartAnalysisGuidance" type="textarea" :rows="3" placeholder="只影响本 Run 的后续分析，不修改长期正式策略" />
-            </el-form-item>
-            <el-form-item label="本轮 Context 软预算（字符）">
-              <el-input-number v-model="smartContextSoftBudgetCharacters" :min="1000" :max="200000" :step="1000" />
-              <p class="secondary-text">超出预算时，本 Run 会暂停并显示原因；该设置在建立新 Run 时生效。</p>
-            </el-form-item>
-            <el-form-item label="投递目标">
-              <el-switch v-model="smartDeliveryTargetEnabled" active-text="采集后自动交给 Codex 分析" inactive-text="采集完成后等待手动选择" />
-            </el-form-item>
-            <template v-if="smartDeliveryTargetEnabled">
-              <div class="form-grid">
-                <el-form-item label="建议投递策略">
-                  <el-select v-model="smartRecommendationStrategyId" placeholder="选择建议投递策略">
-                    <el-option v-for="item in strategiesStore.recommendations" :key="item.id" :label="item.name" :value="item.id" />
-                  </el-select>
-                </el-form-item>
-                <el-form-item label="Recommend 目标">
-                  <el-input-number v-model="smartRecommendTarget" :min="1" :max="100" />
-                </el-form-item>
-                <el-form-item label="Review 目标（可选）">
-                  <div class="inline-form-control">
-                    <el-switch v-model="smartEnableReviewTarget" active-text="计入目标" inactive-text="不计入目标" />
-                    <el-input-number v-if="smartEnableReviewTarget" v-model="smartReviewTarget" :min="1" :max="100" />
-                  </div>
-                </el-form-item>
-                <el-form-item label="目标达成模式">
-                  <el-select v-model="smartTargetMode">
-                    <el-option label="全部目标达到" value="all" />
-                    <el-option label="任一目标达到" value="any" />
-                  </el-select>
-                </el-form-item>
-                <el-form-item label="Codex 模型">
-                  <el-select v-model="smartCodexModel" filterable allow-create placeholder="选择或输入 Codex 模型">
-                    <el-option v-for="item in smartCodexModels" :key="item.id" :label="item.label || item.id" :value="item.id" />
-                  </el-select>
-                  <div v-if="smartCodexModelLoadError" class="secondary-text">{{ smartCodexModelLoadError }}</div>
-                </el-form-item>
-                <el-form-item label="推理强度">
-                  <el-select v-model="smartCodexReasoningEffort">
-                    <el-option label="minimal" value="minimal" />
-                    <el-option label="low" value="low" />
-                    <el-option label="medium" value="medium" />
-                    <el-option label="high" value="high" />
-                    <el-option label="xhigh" value="xhigh" />
-                  </el-select>
-                </el-form-item>
-                <el-form-item label="分析批次大小">
-                  <el-input-number v-model="smartAnalysisBatchSize" :min="1" :max="20" />
-                </el-form-item>
-                <el-form-item label="批次完成后">
-                  <el-select v-model="smartAfterAnalysisBatch">
-                    <el-option label="自动继续下一批" value="auto_continue" />
-                    <el-option label="等待我继续" value="wait_for_user" />
-                  </el-select>
-                </el-form-item>
-                <el-form-item label="Codex 交接">
-                  <el-select v-model="smartCodexHandoff">
-                    <el-option label="自动交接" value="auto" />
-                    <el-option label="等待手动交接" value="manual" />
-                  </el-select>
-                </el-form-item>
-              </div>
-              <div class="capture-options">
-                <el-switch v-model="smartAnalyzeAllCandidates" />
-                <span>达到投递目标后继续分析已形成的候选岗位</span>
-              </div>
-              <div class="capture-options">
-                <el-switch v-model="smartStopAfterCurrentBatch" />
-                <span>当前 Codex 批次完成后等待我继续</span>
-              </div>
-            </template>
-          </el-form>
+          <SmartCaptureConfigForm
+            v-model="smartExecutionConfig"
+            :filter-strategies="strategiesStore.filters"
+            :recommendation-strategies="strategiesStore.recommendations"
+            :codex-models="smartCodexModels"
+            :codex-model-load-error="smartCodexModelLoadError"
+          />
           <div class="capture-config-summary">
             <span>搜索词 {{ smartSelectedKeywords.length }} 个</span>
             <span>城市 {{ smartSelectedCities.length }} 个</span>
@@ -2111,20 +2096,20 @@ function formatDuration(seconds: number) {
     <section v-if="captureProgressVisible" class="page-panel capture-progress-panel">
       <div class="panel-title-row">
         <div><p class="panel-eyebrow">Progress</p><h2>采集进度</h2></div>
-        <el-tag :type="captureStore.task.status === 'failed' ? 'danger' : 'warning'">
-          {{ captureStore.task.status === "failed" ? "失败" : "进行中" }}
+        <el-tag :type="captureStore.task?.status === 'failed' ? 'danger' : 'warning'">
+          {{ captureStore.task?.status === "failed" ? "失败" : "进行中" }}
         </el-tag>
       </div>
-      <el-progress :percentage="progressPercentage" :status="captureStore.task.status === 'failed' ? 'exception' : undefined" />
-      <p>{{ captureStore.task.message }}</p>
+      <el-progress :percentage="progressPercentage" :status="captureStore.task?.status === 'failed' ? 'exception' : undefined" />
+      <p>{{ captureStore.task?.message }}</p>
       <div class="capture-metrics">
-        <span>岗位 {{ captureStore.task.jobs_collected }}</span>
-        <span>详情完成 {{ captureStore.task.details_completed }}</span>
-        <span>详情失败 {{ captureStore.task.details_failed }}</span>
+        <span>岗位 {{ captureStore.task?.jobs_collected }}</span>
+        <span>详情完成 {{ captureStore.task?.details_completed }}</span>
+        <span>详情失败 {{ captureStore.task?.details_failed }}</span>
         <span>预计剩余 {{ remainingEstimate }}</span>
       </div>
-      <p v-if="captureStore.task.current_job" class="secondary-text">
-        当前岗位：{{ captureStore.task.current_job.title }} / {{ captureStore.task.current_job.company }}
+      <p v-if="captureStore.task?.current_job" class="secondary-text">
+        当前岗位：{{ captureStore.task?.current_job?.title }} / {{ captureStore.task?.current_job?.company }}
       </p>
     </section>
 

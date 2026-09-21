@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
 from backend.app.config import AppConfig
@@ -17,6 +18,10 @@ from backend.app.services.fine_job import workflow_children
 from backend.app.services.fine_job import pipeline_owner
 from backend.app.services.fine_job import cutover_guard
 from backend.app.services.fine_job import smart_capture_engine
+from backend.app.services.fine_job import strategies
+from backend.app.schemas.fine_job.smart_capture_execution_config import (
+    execution_config_validation_errors,
+)
 from backend.app.services.fine_job.boss_scraper.service import (
     BossCaptureRequest,
     boss_scraper_service,
@@ -325,7 +330,13 @@ def create_smart_capture_in_connection(
             source,
             workflow_run_id,
             json.dumps(search_config, ensure_ascii=False),
-            json.dumps(execution_config or search_config, ensure_ascii=False, sort_keys=True),
+            json.dumps(
+                execution_config
+                if execution_config is not None
+                else _build_execution_config(search_config),
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
             target_count,
             "岗位采集任务已创建，等待启动首个批次。",
             now,
@@ -770,6 +781,7 @@ def start_independent_capture(
     payload: dict[str, Any],
 ) -> dict[str, object]:
     """从岗位采集页创建不关联 Workflow Run 的任务并启动首批采集。"""
+    _validate_execution_config_for_start(db, payload)
     assert_collection_start_allowed(db, requested_kind="smart")
     if get_active_smart_capture(db) is not None:
         raise AppError(409, "COLLECTION_TASK_ACTIVE", "当前岗位采集任务尚未结束，请先暂停后继续或停止当前任务。")
@@ -1706,10 +1718,13 @@ def _build_execution_config(payload: dict[str, Any]) -> dict[str, object]:
             "cities": list(payload.get("allowed_cities") or []),
             "pages": int(payload.get("pages") or payload.get("min_depth") or 1),
             "filters": dict(payload.get("filters") or {}),
+            "include_details": bool(payload.get("include_details", False)),
+            "prefer_current_page": bool(payload.get("prefer_current_page", True)),
         },
         "candidate_target_count": int(payload.get("candidate_target_count") or 0) or None,
         "delivery_target": {
             "enabled": bool(payload.get("delivery_target_enabled", False)),
+            "recommendation_strategy_id": str(payload.get("recommendation_strategy_id") or ""),
             "recommend_target": payload.get("recommend_target") or payload.get("target_count"),
             "review_target": payload.get("review_target"),
             "target_mode": str(payload.get("target_mode") or "all"),
@@ -1724,15 +1739,35 @@ def _build_execution_config(payload: dict[str, Any]) -> dict[str, object]:
             "codex_reasoning_effort": str(payload.get("codex_reasoning_effort") or ""),
             "guidance": str(payload.get("analysis_guidance") or ""),
             "handoff": str(payload.get("execution_policy_codex_handoff") or "auto"),
+            "after_analysis_batch": str(payload.get("execution_policy_after_analysis_batch") or "auto_continue"),
+            "analyze_all_candidates": bool(payload.get("analyze_all_candidates", False)),
+            "stop_after_current_batch": bool(payload.get("stop_after_current_batch", False)),
+            "batch_size": int(payload.get("analysis_batch_size") or payload.get("jd_batch_size") or 5),
         },
         "context_budget": int(payload.get("context_soft_budget_characters") or 12000),
         "stop_policy": {
             "min_depth": int(payload.get("min_depth") or payload.get("pages") or 1),
             "scroll_batch_size": int(payload.get("scroll_batch_size") or 3),
-            "max_depth": int(payload.get("max_depth") or payload.get("pages") or 1),
+            "max_depth": int(payload.get("max_depth") or 20),
             "low_yield_streak_limit": int(payload.get("low_yield_streak_limit") or 3),
+            "stop_after_current_batch": bool(payload.get("stop_after_current_batch", False)),
         },
     }
+
+
+def _validate_execution_config_for_start(
+    db: Database, payload: Mapping[str, Any] | dict[str, Any]
+) -> None:
+    """在独立入口再次执行与 Workflow 入口相同的条件校验。"""
+    errors = execution_config_validation_errors(payload)
+    if errors:
+        raise AppError(422, "VALIDATION_FAILED", "；".join(errors))
+    if bool(payload.get("delivery_target_enabled", False)):
+        strategies.require_recommendation_strategy(
+            db,
+            recommendation_strategy_id=str(payload.get("recommendation_strategy_id") or ""),
+            filter_strategy_id=str(payload.get("filter_strategy_id") or ""),
+        )
 
 
 def _load_json(value: str) -> dict[str, Any]:

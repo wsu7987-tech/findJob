@@ -4,6 +4,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from backend.app.schemas.fine_job.smart_capture_execution_config import (
+    execution_config_validation_errors,
+)
+
 
 class DeepJobSearchConfig(BaseModel):
     filter_strategy_id: str = Field(min_length=1, max_length=100)
@@ -26,6 +30,11 @@ class DeepJobSearchConfig(BaseModel):
     candidate_target_count: int | None = Field(default=None, ge=1, le=500)
     allowed_search_keywords: list[str] = Field(min_length=1, max_length=50)
     allowed_cities: list[str] = Field(min_length=1, max_length=20)
+    # 这些采集参数必须随父任务请求传入 Smart Capture，避免模型归一化时丢失。
+    filters: dict[str, str] = Field(default_factory=dict)
+    pages: int = Field(default=1, ge=1, le=10)
+    include_details: bool = False
+    prefer_current_page: bool = True
     source_policy: Literal["fresh_only"] = "fresh_only"
     allow_historical_jobs: bool = False
     min_depth: int = Field(default=5, ge=1, le=100)
@@ -42,16 +51,11 @@ class DeepJobSearchConfig(BaseModel):
 
     @model_validator(mode="after")
     def normalize_recommend_target(self) -> "DeepJobSearchConfig":
-        if self.delivery_target_enabled and (
-            not self.recommendation_strategy_id
-            or not self.codex_model
-            or not self.codex_reasoning_effort
-        ):
-            raise ValueError("开启投递目标时必须填写建议投递策略和 Codex 配置。")
+        errors = execution_config_validation_errors(self.model_dump())
+        if errors:
+            raise ValueError("；".join(errors))
         if not self.delivery_target_enabled:
             return self
-        if self.recommend_target is None and self.target_count is None:
-            raise ValueError("recommend_target 为必填字段。")
         if (
             self.recommend_target is not None
             and self.target_count is not None

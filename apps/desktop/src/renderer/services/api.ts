@@ -159,6 +159,7 @@ import type {
   WebSessionProfileUpdateRequest
 } from "../types";
 import { mapApiError } from "./contract";
+import type { SmartCaptureExecutionConfigRequest } from "./smartCaptureExecutionConfig";
 
 export class ApiError extends Error {
   readonly statusCode: number;
@@ -1632,16 +1633,7 @@ export const api = {
       { method: "POST", body: JSON.stringify(payload) }
     );
   },
-  async createFineJobSmartCapture(payload: {
-    filter_strategy_id: string;
-    allowed_search_keywords: string[];
-    allowed_cities: string[];
-    candidate_target_count: number;
-    pages?: number;
-    include_details?: boolean;
-    prefer_current_page?: boolean;
-    filters?: Record<string, string>;
-  }) {
+  async createFineJobSmartCapture(payload: SmartCaptureExecutionConfigRequest) {
     return request<FineJobSmartCapture>("/api/fine-job/smart-captures", {
       method: "POST",
       body: JSON.stringify(payload)
@@ -1677,33 +1669,11 @@ export const api = {
       { method: "POST" }
     );
   },
-  async createFineJobDeepJobSearchRun(payload: {
-    filter_strategy_id: string;
-    delivery_target_enabled?: boolean;
-    recommendation_strategy_id?: string;
-    codex_model?: string;
-    codex_reasoning_effort?: "minimal" | "low" | "medium" | "high" | "xhigh";
-    analysis_guidance?: string;
-    recommend_target?: number;
-    review_target?: number;
-    target_mode?: "any" | "all";
-    analyze_all_candidates?: boolean;
-    stop_after_current_batch?: boolean;
-    analysis_batch_size?: number;
-    execution_policy_after_analysis_batch?: "auto_continue" | "wait_for_user";
-    execution_policy_codex_handoff?: "auto" | "manual";
-    candidate_target_count?: number;
-    allowed_search_keywords: string[];
-    allowed_cities: string[];
-    min_depth?: number;
-    scroll_batch_size?: number;
-    max_depth?: number;
-    low_yield_streak_limit?: number;
-    low_novelty_threshold?: number;
-    low_qualified_yield_threshold?: number;
-    search_combination_safety_limit?: number;
-    context_soft_budget_characters?: number;
-  }, createdFrom: "task_cockpit" | "boss_capture" = "task_cockpit", idempotencyKey?: string) {
+  async createFineJobDeepJobSearchRun(
+    payload: SmartCaptureExecutionConfigRequest,
+    createdFrom: "task_cockpit" | "boss_capture" = "task_cockpit",
+    idempotencyKey?: string
+  ) {
     return request<FineJobWorkflowRun>("/api/fine-job/workflow-runs", {
       method: "POST",
       body: JSON.stringify({

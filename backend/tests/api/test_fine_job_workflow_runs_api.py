@@ -176,7 +176,13 @@ def test_independent_active_capture_rejects_cockpit_without_orphan_parent(
 
 
 def test_create_workflow_run_exposes_real_search_context_snapshot(configured_client) -> None:
-    run = _create_run(configured_client)
+    run = _create_run(
+        configured_client,
+        filters={"experience": "104", "degree": "203"},
+        pages=2,
+        include_details=True,
+        prefer_current_page=False,
+    )
 
     assert run["status"] == "pending"
     assert len(run["children"]) == 1
@@ -190,6 +196,12 @@ def test_create_workflow_run_exposes_real_search_context_snapshot(configured_cli
     ).json()
     assert smart_capture["workflow_run_id"] == run["workflow_run_id"]
     assert smart_capture["execution_config"]["search"]["filter_strategy_id"]
+    assert smart_capture["execution_config"]["search"]["filters"] == {
+        "experience": "104", "degree": "203"
+    }
+    assert smart_capture["execution_config"]["search"]["pages"] == 2
+    assert smart_capture["execution_config"]["search"]["include_details"] is True
+    assert smart_capture["execution_config"]["search"]["prefer_current_page"] is False
     assert smart_capture["execution_config"]["analysis"]["codex_model"] == "gpt-5.6-luna"
     assert configured_client.get(
         f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/children"

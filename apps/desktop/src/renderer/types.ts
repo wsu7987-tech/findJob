@@ -2561,6 +2561,7 @@ export interface FineJobWorkflowChild {
 export interface FineJobWorkflowRun {
   workflow_run_id: string;
   workflow_type: "deep_job_search";
+  updated_at?: string;
   idempotency_key?: string | null;
   capture_jobs?: FineJobBossCapturedJob[];
   status: string;
