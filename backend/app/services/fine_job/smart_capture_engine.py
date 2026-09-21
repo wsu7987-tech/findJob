@@ -1346,7 +1346,8 @@ def advance_completed_batch(
     candidate_count = count_candidates(db, smart_capture_id)
     target_count = int(snapshot.get("target_count") or 0)
     exhausted = not bool(capture_task.get("has_more"))
-    if not delivery_enabled and (exhausted or (target_count > 0 and candidate_count >= target_count)):
+    # OFF 模式仅以候选目标为完成条件；搜索耗尽仍保留为可恢复的系统等待。
+    if not delivery_enabled and target_count > 0 and candidate_count >= target_count:
         smart_captures._update_capture(
             db,
             smart_capture_id,
@@ -1358,7 +1359,7 @@ def advance_completed_batch(
             result_summary={
                 "candidate_count": candidate_count,
                 "last_batch_id": str(capture_task.get("id") or ""),
-                "completion_reason": "candidate_target_reached" if target_count and candidate_count >= target_count else "search_exhausted",
+                "completion_reason": "candidate_target_reached",
             },
             completed=True,
         )

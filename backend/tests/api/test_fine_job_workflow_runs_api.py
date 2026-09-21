@@ -2055,6 +2055,151 @@ def test_cutover_starts_linked_child_once_and_consumes_completion_outcome(
     assert completed["children"][0]["result_summary"] == {"candidate_count": 4}
 
 
+def test_completion_event_duplicate_and_old_version_do_not_rewrite_parent(
+    configured_client, test_db
+) -> None:
+    run = _create_run(configured_client, delivery_target_enabled=False)
+    child = run["children"][0]
+    smart_captures._update_capture(
+        test_db,
+        child["smart_capture_id"],
+        status="completed",
+        stage="completed",
+        waiting_reason="",
+        control_cause="",
+        transition_id="completion-event-1",
+        message="候选目标已达到",
+        result_summary={"candidate_count": 2},
+        completed=True,
+    )
+    completed = configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}"
+    ).json()
+    with test_db.connect() as connection:
+        relation = connection.execute(
+            "SELECT state_version, child_state_version FROM fj_workflow_children WHERE id = ?",
+            (child["child_relation_id"],),
+        ).fetchone()
+        event_id = connection.execute(
+            "SELECT event_id FROM fj_workflow_child_events WHERE child_relation_id = ?",
+            (child["child_relation_id"],),
+        ).fetchone()["event_id"]
+        current_child_version = int(relation["child_state_version"])
+        current_relation_version = int(relation["state_version"])
+        assert workflow_children.consume_child_event_in_connection(connection, event_id) == "stale"
+        assert workflow_children.record_child_event_in_connection(
+            connection,
+            child_relation_id=child["child_relation_id"],
+            child_type="smart_capture",
+            child_ref=child["smart_capture_id"],
+            child_status="completed",
+            transition_id="completion-event-old-version",
+            state_version=current_child_version,
+            result_summary={"candidate_count": 999},
+            event_id="completion-event-old-version-id",
+        ) == "completion-event-old-version-id"
+        assert workflow_children.record_child_event_in_connection(
+            connection,
+            child_relation_id=child["child_relation_id"],
+            child_type="smart_capture",
+            child_ref=child["smart_capture_id"],
+            child_status="completed",
+            transition_id="completion-event-late-version",
+            state_version=current_child_version + 1,
+            result_summary={"candidate_count": 1000},
+            event_id="completion-event-late-version-id",
+        ) == "completion-event-late-version-id"
+        refreshed_relation = connection.execute(
+            "SELECT state_version, child_state_version, result_summary_json FROM fj_workflow_children WHERE id = ?",
+            (child["child_relation_id"],),
+        ).fetchone()
+        assert int(refreshed_relation["state_version"]) == current_relation_version
+        assert int(refreshed_relation["child_state_version"]) == current_child_version
+        assert json.loads(refreshed_relation["result_summary_json"]) == {"candidate_count": 2}
+    final = configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}"
+    ).json()
+    assert final["status"] == completed["status"] == "completed"
+    assert final["state_version"] == completed["state_version"]
+    assert final["children"][0]["result_summary"] == {"candidate_count": 2}
+
+
+def test_off_candidate_target_completes_linked_child_and_parent(configured_client, test_db) -> None:
+    run = _create_run(
+        configured_client,
+        delivery_target_enabled=False,
+        candidate_target_count=2,
+    )
+    child = run["children"][0]
+    smart_capture_id = str(child["smart_capture_id"])
+    batch_id = "off-completion-linked-batch"
+    now = utc_now()
+    create_capture_batch(
+        test_db,
+        capture_id=batch_id,
+        smart_capture_id=smart_capture_id,
+        keyword="AI Agent",
+        city="广州",
+        pages=1,
+        auto_details=False,
+        created_at=now,
+        capture_source="smart",
+    )
+    jobs = record_capture_jobs(
+        test_db,
+        capture_id=batch_id,
+        search_keyword="AI Agent",
+        jobs=[
+            {"job_id": f"off-completion-job-{index}", "title": f"AI Agent 工程师 {index}"}
+            for index in range(2)
+        ],
+        collected_at=now,
+    )
+    with test_db.connect() as connection:
+        for job in jobs:
+            connection.execute(
+                """
+                INSERT INTO fj_workflow_job_discoveries (
+                  id, workflow_run_id, smart_capture_id, task_id, job_id,
+                  search_keyword, city, search_combination_json, scroll_depth,
+                  discovered_at, is_run_first_discovery, is_historical_duplicate,
+                  is_filter_candidate
+                ) VALUES (?, ?, ?, ?, ?, 'AI Agent', '广州', '{}', 1, ?, 1, 0, 1)
+                """,
+                (
+                    new_id(),
+                    run["workflow_run_id"],
+                    smart_capture_id,
+                    run["tasks"][0]["workflow_task_id"],
+                    job["history_record_id"],
+                    now,
+                ),
+            )
+        connection.execute(
+            "UPDATE fj_smart_captures SET status = 'running', stage = 'capturing' WHERE id = ?",
+            (smart_capture_id,),
+        )
+
+    smart_capture_engine.advance_completed_batch(
+        test_db,
+        smart_capture_id,
+        {"id": batch_id, "has_more": True},
+    )
+
+    capture = smart_captures.get_smart_capture(test_db, smart_capture_id)
+    parent = configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}"
+    ).json()
+    assert capture["status"] == "completed"
+    assert capture["result_summary"] == {
+        "candidate_count": 2,
+        "completion_reason": "candidate_target_reached",
+        "last_batch_id": batch_id,
+    }
+    assert parent["status"] == "completed"
+    assert parent["children"][0]["result_summary"] == capture["result_summary"]
+
+
 def test_cutover_linked_child_uses_smart_capture_engine_for_first_analysis_batch(
     configured_client, test_db
 ) -> None:
@@ -2137,6 +2282,7 @@ def test_cutover_linked_child_uses_smart_capture_engine_for_first_analysis_batch
     snapshot = smart_captures.get_smart_capture(test_db, smart_capture_id)
     assert snapshot["status"] == "running"
     assert snapshot["stage"] == "waiting_codex"
+    assert snapshot["result_summary"]["candidate_count"] == 2
     with test_db.connect() as connection:
         analysis = connection.execute(
             "SELECT smart_capture_id, workflow_run_id, status FROM fj_workflow_tasks WHERE smart_capture_id = ? AND task_type = 'deep_job_search_analysis'",

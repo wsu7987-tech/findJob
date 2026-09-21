@@ -131,6 +131,42 @@ def test_terminal_smart_capture_allows_next_create_and_replaces_current(test_db)
     assert current["smart_capture_id"] != first["smart_capture_id"]
 
 
+def test_terminal_capture_ignores_late_batch_callback(test_db) -> None:
+    capture = _create_capture(test_db, status="completed")
+    smart_capture_id = str(capture["smart_capture_id"])
+    with test_db.connect() as connection:
+        before_tasks = connection.execute(
+            "SELECT COUNT(*) AS count FROM fj_workflow_tasks WHERE smart_capture_id = ?",
+            (smart_capture_id,),
+        ).fetchone()["count"]
+        before_discoveries = connection.execute(
+            "SELECT COUNT(*) AS count FROM fj_workflow_job_discoveries WHERE smart_capture_id = ?",
+            (smart_capture_id,),
+        ).fetchone()["count"]
+
+    smart_captures._on_capture_task_updated(
+        {
+            "_db": test_db,
+            "id": "late-terminal-batch",
+            "smart_capture_id": smart_capture_id,
+            "capture_source": "smart",
+            "status": "completed",
+            "stage": "completed",
+            "jobs": [{"job_id": "late-job", "title": "迟到岗位"}],
+        }
+    )
+
+    with test_db.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) AS count FROM fj_workflow_tasks WHERE smart_capture_id = ?",
+            (smart_capture_id,),
+        ).fetchone()["count"] == before_tasks
+        assert connection.execute(
+            "SELECT COUNT(*) AS count FROM fj_workflow_job_discoveries WHERE smart_capture_id = ?",
+            (smart_capture_id,),
+        ).fetchone()["count"] == before_discoveries
+
+
 def test_independent_smart_capture_does_not_create_hidden_child_relation(test_db) -> None:
     capture = _create_capture(test_db)
 
@@ -207,6 +243,99 @@ def test_owner_neutral_engine_persists_candidate_pool_once_for_independent_captu
             "SELECT COUNT(*) AS count FROM fj_workflow_job_discoveries WHERE smart_capture_id = ?",
             (capture_id,),
         ).fetchone()["count"] == 2
+
+
+def test_off_candidate_target_completes_independent_capture(test_db) -> None:
+    capture = _create_capture(test_db, capture_id="off-independent-capture")
+    smart_capture_id = str(capture["smart_capture_id"])
+    batch_id = "off-independent-batch"
+    create_capture_batch(
+        test_db,
+        capture_id=batch_id,
+        smart_capture_id=smart_capture_id,
+        keyword="Python",
+        city="上海",
+        pages=1,
+        auto_details=False,
+        created_at="2026-09-22T00:00:00Z",
+        capture_source="smart",
+    )
+    jobs = record_capture_jobs(
+        test_db,
+        capture_id=batch_id,
+        search_keyword="Python",
+        jobs=[
+            {"job_id": f"off-independent-job-{index}", "title": f"Python 工程师 {index}"}
+            for index in range(15)
+        ],
+    )
+    smart_capture_engine.process_completed_batch(
+        test_db,
+        smart_capture_id,
+        {"id": batch_id, "keyword": "Python", "city": "上海", "jobs": jobs},
+    )
+    smart_capture_engine.advance_completed_batch(
+        test_db,
+        smart_capture_id,
+        {"id": batch_id, "has_more": True},
+    )
+
+    snapshot = smart_captures.get_smart_capture(test_db, smart_capture_id)
+    assert snapshot["status"] == "completed"
+    assert snapshot["result_summary"] == {
+        "candidate_count": 15,
+        "completion_reason": "candidate_target_reached",
+        "last_batch_id": batch_id,
+    }
+    with test_db.connect() as connection:
+        relation_count = connection.execute(
+            "SELECT COUNT(*) AS count FROM fj_workflow_children WHERE child_ref = ?",
+            (smart_capture_id,),
+        ).fetchone()["count"]
+    assert relation_count == 0
+
+
+def test_off_exhausted_batch_below_target_keeps_independent_capture_open(test_db) -> None:
+    capture = _create_capture(test_db)
+    smart_capture_id = str(capture["smart_capture_id"])
+    batch_id = "off-exhausted-batch"
+    create_capture_batch(
+        test_db,
+        capture_id=batch_id,
+        smart_capture_id=smart_capture_id,
+        keyword="Python",
+        city="上海",
+        pages=1,
+        auto_details=False,
+        created_at="2026-09-22T00:00:00Z",
+        capture_source="smart",
+    )
+    jobs = record_capture_jobs(
+        test_db,
+        capture_id=batch_id,
+        search_keyword="Python",
+        jobs=[{"job_id": "off-exhausted-job", "title": "Python 工程师"}],
+    )
+
+    smart_captures._on_capture_task_updated(
+        {
+            "_db": test_db,
+            "id": batch_id,
+            "smart_capture_id": smart_capture_id,
+            "capture_source": "smart",
+            "status": "completed",
+            "stage": "completed",
+            "keyword": "Python",
+            "city": "上海",
+            "has_more": False,
+            "jobs": jobs,
+        }
+    )
+
+    snapshot = smart_captures.get_smart_capture(test_db, smart_capture_id)
+    assert snapshot["status"] == "waiting_next_batch"
+    assert snapshot["result_summary"]["candidate_count"] == 1
+    assert snapshot["result_summary"]["search_exhausted"] is True
 
 
 def test_linked_parent_and_child_roll_back_together_when_relation_insert_fails(
@@ -429,7 +558,7 @@ def test_snapshot_state_version_increments_for_observable_change_only(test_db) -
     )
     smart_captures.sync_capture_snapshot(test_db, task)
     finished = smart_captures.get_smart_capture(test_db, capture_id)
-    assert finished["status"] == "completed"
+    assert finished["status"] == "waiting_next_batch"
     assert finished["state_version"] > second["state_version"]
 
 

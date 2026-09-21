@@ -43,6 +43,17 @@ def _on_capture_task_updated(capture: dict[str, object]) -> None:
     smart_capture_id = str(capture.get("smart_capture_id") or "")
     if not isinstance(db, Database) or not smart_capture_id:
         return
+    with db.connect() as connection:
+        parent = connection.execute(
+            "SELECT status FROM fj_smart_captures WHERE id = ?",
+            (smart_capture_id,),
+        ).fetchone()
+    if parent is not None and str(parent["status"]) in TERMINAL_STATUSES:
+        # 终态后的迟到批次回调只释放启动占用，不再进入自动 Engine。
+        cutover_guard.get_runtime_cutover_guard().release_live_start(
+            child_ref=smart_capture_id
+        )
+        return
     # JD/Prefetch 详情是 Smart Capture 内部单元，其终态只接续 Pipeline，不释放 child 启动权。
     if str(capture.get("pipeline_unit_type") or "") in {"formal_jd", "prefetch"}:
         try:
@@ -1183,7 +1194,7 @@ def sync_capture_snapshot(db: Database, task: dict[str, object]) -> None:
         return
     with db.connect() as connection:
         parent = connection.execute(
-            "SELECT source, target_count, status, control_cause, execution_config_json FROM fj_smart_captures WHERE id = ?",
+            "SELECT status, control_cause FROM fj_smart_captures WHERE id = ?",
             (smart_capture_id,),
         ).fetchone()
     if parent is None:
@@ -1222,28 +1233,9 @@ def sync_capture_snapshot(db: Database, task: dict[str, object]) -> None:
         waiting_reason = ""
         control_cause = "child_user_stop"
     else:
-        is_linked_workflow_capture = str(parent["source"]) == "task_cockpit"
-        execution_config = _load_json(str(parent["execution_config_json"] or "{}"))
-        delivery_target = execution_config.get("delivery_target")
-        delivery_enabled = bool(delivery_target.get("enabled")) if isinstance(delivery_target, dict) else False
-        candidate_count = smart_capture_engine.count_candidates(db, smart_capture_id)
-        reached_independent_target = (
-            not is_linked_workflow_capture
-            and not delivery_enabled
-            and int(parent["target_count"] or 0) > 0
-            and candidate_count
-            >= int(parent["target_count"])
-        )
-        # 驾驶舱的单个子批次结束后，Workflow 仍可能暂停或进入下一组合。
-        # 只有 Workflow 自身完成时才允许关联 Smart Capture 释放 current 槽位。
-        parent_status = (
-            "waiting_next_batch"
-            if is_linked_workflow_capture or delivery_enabled
-            else "completed"
-            if reached_independent_target or not bool(task.get("has_more"))
-            else "waiting_next_batch"
-        )
-        waiting_reason = "" if parent_status == "completed" else "next_batch"
+        # 批次快照只记录系统等待；OFF/ON 的完成条件统一交给 Engine 判定。
+        parent_status = "waiting_next_batch"
+        waiting_reason = "next_batch"
         control_cause = ""
     _update_capture(
         db,

@@ -470,13 +470,16 @@ def ack_started(
         expected={"prompt_written", "started"}, updates={"status": "submitted", "attempt_status": "started", "started_at": utc_now()},
         check_session=False, idempotent_attempt_statuses={"started"},
     )
-    output_root = Path(getattr(config, "output_root", Path.cwd()))
-    smart_capture_engine.start_prefetch_after_handoff(
-        db,
-        smart_capture_id,
-        analysis_batch_id,
-        output_root / "fine-job" / "boss-capture",
-    )
+    capture = smart_captures.get_smart_capture(db, smart_capture_id)
+    # OFF completed 后的人工分析属于后处理，只确认 handoff，不重启自动 Prefetch。
+    if str(capture["status"]) not in TERMINAL_STATUSES:
+        output_root = Path(getattr(config, "output_root", Path.cwd()))
+        smart_capture_engine.start_prefetch_after_handoff(
+            db,
+            smart_capture_id,
+            analysis_batch_id,
+            output_root / "fine-job" / "boss-capture",
+        )
     return _domain_snapshot(db, smart_capture_id, analysis_batch_id, handoff=True)
 
 
