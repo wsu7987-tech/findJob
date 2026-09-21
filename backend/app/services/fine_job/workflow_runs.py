@@ -19,6 +19,7 @@ from backend.app.services.fine_job import smart_capture_engine
 from backend.app.services.fine_job import pipeline_repository
 from backend.app.services.fine_job import workflow_children
 from backend.app.services.fine_job import cutover_guard
+from backend.app.services.fine_job import child_adapter
 from backend.app.services.fine_job.workflow_run_events import workflow_run_event_broker
 from backend.app.services.fine_job.boss_capture_history import get_capture_history_job
 from backend.app.services.fine_job.boss_scraper.service import BossCaptureRequest, boss_scraper_service
@@ -65,10 +66,11 @@ def _on_capture_task_updated(capture: dict[str, object]) -> None:
         capture.get("capture_source") or ""
     ) == "smart"
     if is_smart_capture_callback:
-        # 旧 callback 是 Cutover 后必须关闭的 live 入口，先经过 guard 再读取运行时。
+        # 旧 callback 只能被记录并阻断，Smart Capture listener 负责整个 child Engine。
         cutover_guard.get_runtime_cutover_guard().observe_legacy_capture_callback(
             capture_id=capture_id
         )
+        return
     if smart_capture_id and str(capture.get("status") or "") in {"completed", "stopped", "failed"}:
         cutover_guard.get_runtime_cutover_guard().release_live_start(
             child_ref=smart_capture_id
@@ -857,6 +859,9 @@ def record_workflow_analysis_result(
     evaluation_id: str,
     evaluation: dict[str, object],
 ) -> dict[str, object]:
+    cutover_guard.get_runtime_cutover_guard().assert_workflow_live_allowed(
+        operation="legacy Workflow analysis result"
+    )
     if decision not in {"recommend", "review", "reject"}:
         raise AppError(422, "VALIDATION_FAILED", "Workflow 分析结论无效。")
     run = _require_run(db, workflow_run_id)
@@ -1145,6 +1150,9 @@ def ack_workflow_analysis_batch_started(
     config: AppConfig | None = None,
 ) -> dict[str, object]:
     """仅由当前有效交接尝试确认 Codex 已开始处理分析批次。"""
+    cutover_guard.get_runtime_cutover_guard().assert_workflow_live_allowed(
+        operation="legacy Workflow analysis start ACK"
+    )
     smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -1250,6 +1258,8 @@ def resume_deep_job_search_run(
             paused_from_next_action="",
             paused_from_next_action_reason="",
         )
+        if cutover_guard.get_runtime_cutover_guard().phase == cutover_guard.CutoverPhase.POST_CUTOVER:
+            return get_workflow_run(db, workflow_run_id)
         _advance_prefetch(db, config, workflow_run_id)
         refreshed = _require_run(db, workflow_run_id)
         if (
@@ -1317,6 +1327,19 @@ def _pause_current_capture_batch(db: Database, workflow_run_id: str) -> None:
     except AppError:
         # 执行器已结束时仅暂停后续编排，已持久化结果继续保留。
         return
+
+
+def start_linked_child(
+    db: Database, config: AppConfig, workflow_run_id: str, child_relation_id: str
+) -> dict[str, object]:
+    """父编排通过 ChildAdapter 启动 pending child，不越层操作 Pipeline 单元。"""
+    relation = workflow_children.get_workflow_child(db, workflow_run_id, child_relation_id)
+    if relation is None:
+        raise AppError(404, "WORKFLOW_CHILD_NOT_FOUND", "父任务子项不存在。")
+    if str(relation["status"]) != "pending":
+        raise AppError(409, "WORKFLOW_CHILD_NOT_STARTABLE", "当前子任务不在待启动状态。")
+    child_adapter.start(db, config, str(relation["child_type"]), str(relation["child_ref"]))
+    return get_workflow_run(db, workflow_run_id)
 
 
 def _resume_current_capture_batch(db: Database, workflow_run_id: str) -> None:
@@ -2376,6 +2399,9 @@ def create_manual_analysis_batch(
     codex_reasoning_effort: str | None = None,
 ) -> dict[str, object]:
     """将候选列表中选中的岗位接入已有 Codex 分析批次。"""
+    cutover_guard.get_runtime_cutover_guard().assert_workflow_live_allowed(
+        operation="legacy Workflow manual analysis batch"
+    )
     smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
     run = _require_run(db, workflow_run_id)
     contract = _load(run["completion_contract_json"], {})

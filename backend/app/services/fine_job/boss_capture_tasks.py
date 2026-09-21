@@ -58,6 +58,7 @@ class BossCaptureTaskManager:
             }
             # 监听器需要用任务所属数据库同步 Smart Capture，公开轮询快照不携带该内部引用。
             snapshot["_db"] = task.get("_db")
+            snapshot["_output_dir"] = task.get("_output_dir")
             listeners = list(self._listeners)
         for listener in listeners:
             try:
@@ -365,6 +366,11 @@ class BossCaptureTaskManager:
         *,
         output_dir: Path,
         db: Database,
+        capture_source: str = "custom",
+        workflow_run_id: str | None = None,
+        smart_capture_id: str | None = None,
+        pipeline_unit_type: str | None = None,
+        pipeline_unit_id: str | None = None,
     ) -> dict[str, object]:
         """为历史岗位创建独立详情任务，不新增采集批次或岗位采集次数。"""
         task_id = new_id()
@@ -386,7 +392,11 @@ class BossCaptureTaskManager:
         task: dict[str, object] = {
             "id": task_id,
             "status": "queued",
-            "capture_source": "custom",
+            "capture_source": capture_source,
+            "workflow_run_id": workflow_run_id,
+            "smart_capture_id": smart_capture_id,
+            "pipeline_unit_type": pipeline_unit_type,
+            "pipeline_unit_id": pipeline_unit_id,
             "stage": "details_queued",
             "message": "历史岗位详情任务已创建，正在等待执行。",
             "keyword": str(job.get("title") or ""),

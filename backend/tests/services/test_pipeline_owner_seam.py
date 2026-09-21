@@ -21,7 +21,7 @@ from backend.app.services.fine_job import workflow_runs
 
 @pytest.fixture(autouse=True)
 def reset_runtime_cutover_guard():
-    cutover_guard.reset_runtime_cutover_guard()
+    cutover_guard.configure_runtime_cutover_phase(cutover_guard.CutoverPhase.PRE_CUTOVER)
     yield
     cutover_guard.reset_runtime_cutover_guard()
 
@@ -385,6 +385,11 @@ def test_workflow_legacy_callback_is_rejected_after_cutover(monkeypatch) -> None
 def test_production_start_seam_rejects_second_start_for_one_independent_child(
     configured_client, test_db, monkeypatch
 ) -> None:
+    monkeypatch.setattr(
+        smart_captures.boss_scraper_service,
+        "get_browser_status",
+        lambda: SimpleNamespace(running=True),
+    )
     capture = smart_captures.create_smart_capture(
         test_db,
         source="boss_capture",
@@ -423,6 +428,11 @@ def test_production_start_seam_rejects_second_start_for_one_independent_child(
 def test_start_seam_stops_executor_when_batch_binding_fails(
     configured_client, test_db, monkeypatch
 ) -> None:
+    monkeypatch.setattr(
+        smart_captures.boss_scraper_service,
+        "get_browser_status",
+        lambda: SimpleNamespace(running=True),
+    )
     capture = smart_captures.create_smart_capture(
         test_db,
         source="boss_capture",
@@ -514,6 +524,17 @@ def test_cutover_guard_rejects_legacy_live_callback_after_cutover() -> None:
 
     assert error.value.error_category == "WORKFLOW_LIVE_EXECUTION_DISABLED"
     assert guard.legacy_callback_invocations == 1
+
+
+def test_cutover_guard_rejects_legacy_analysis_progression_after_cutover(test_db) -> None:
+    cutover_guard.configure_runtime_cutover_phase(cutover_guard.CutoverPhase.POST_CUTOVER)
+
+    with pytest.raises(AppError) as error:
+        workflow_runs.ack_workflow_analysis_batch_started(
+            test_db, "workflow-1", "batch-1", "attempt-1"
+        )
+
+    assert error.value.error_category == "WORKFLOW_LIVE_EXECUTION_DISABLED"
 
 
 def test_pre_cutover_smart_capture_seam_cannot_become_linked_live_authority() -> None:

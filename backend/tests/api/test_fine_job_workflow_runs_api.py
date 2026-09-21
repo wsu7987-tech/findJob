@@ -16,6 +16,16 @@ from backend.app.services.fine_job.codex_tools import CodexToolService
 from backend.app.errors import AppError
 from backend.app.utils import new_id, utc_now
 from backend.app.services.fine_job import workflow_children
+from backend.app.services.fine_job import child_adapter
+from backend.app.services.fine_job import cutover_guard
+from backend.app.services.fine_job import smart_capture_engine
+
+
+@pytest.fixture(autouse=True)
+def reset_runtime_cutover_phase():
+    cutover_guard.configure_runtime_cutover_phase(cutover_guard.CutoverPhase.PRE_CUTOVER)
+    yield
+    cutover_guard.reset_runtime_cutover_guard()
 
 
 def _strategy_payload(**updates):
@@ -1999,3 +2009,139 @@ def test_duplicate_child_event_and_late_cancel_event_do_not_rewrite_parent(
     ).json()
     assert final["status"] == "cancelled"
     assert final["control_state"] == "active"
+
+
+def test_cutover_starts_linked_child_once_and_consumes_completion_outcome(
+    configured_client, test_db, monkeypatch
+) -> None:
+    cutover_guard.configure_runtime_cutover_phase(cutover_guard.CutoverPhase.POST_CUTOVER)
+    run = _create_run(configured_client, delivery_target_enabled=False)
+    child = run["children"][0]
+    calls: list[tuple[str, str]] = []
+
+    def start_child(_db, _config, child_type: str, child_ref: str):
+        calls.append((child_type, child_ref))
+        return {"smart_capture_id": child_ref, "status": "running"}
+
+    monkeypatch.setattr(child_adapter, "start", start_child)
+    started = configured_client.post(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}/children/{child['child_relation_id']}/start"
+    )
+    assert started.status_code == 200
+    assert calls == [("smart_capture", child["smart_capture_id"])]
+
+    with pytest.raises(AppError) as advance_error:
+        workflow_runs.advance_deep_job_search(
+            test_db, configured_client.app.state.config, run["workflow_run_id"]
+        )
+    assert advance_error.value.error_category == "WORKFLOW_LIVE_EXECUTION_DISABLED"
+
+    smart_captures._update_capture(
+        test_db,
+        child["smart_capture_id"],
+        status="completed",
+        stage="completed",
+        waiting_reason="",
+        control_cause="",
+        transition_id="cutover-completed-1",
+        message="岗位采集已完成",
+        result_summary={"candidate_count": 4},
+        completed=True,
+    )
+    completed = configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}"
+    ).json()
+    assert completed["status"] == "completed"
+    assert completed["children"][0]["result_summary"] == {"candidate_count": 4}
+
+
+def test_cutover_linked_child_uses_smart_capture_engine_for_first_analysis_batch(
+    configured_client, test_db
+) -> None:
+    run = _create_run(
+        configured_client,
+        delivery_target_enabled=True,
+        recommend_target=2,
+        candidate_target_count=2,
+        analysis_batch_size=1,
+    )
+    smart_capture_id = str(run["children"][0]["smart_capture_id"])
+    search_task_id = str(run["tasks"][0]["workflow_task_id"])
+    batch_id = "cutover-linked-engine-batch"
+    now = utc_now()
+    create_capture_batch(
+        test_db,
+        capture_id=batch_id,
+        smart_capture_id=smart_capture_id,
+        keyword="AI Agent",
+        city="广州",
+        pages=1,
+        auto_details=False,
+        created_at=now,
+        capture_source="smart",
+    )
+    jobs = record_capture_jobs(
+        test_db,
+        capture_id=batch_id,
+        search_keyword="AI Agent",
+        jobs=[
+            {
+                "job_id": f"cutover-linked-job-{index}",
+                "title": f"AI Agent 工程师 {index}",
+                "company_name": f"候选公司 {index}",
+                "location": "广州",
+                "detail_status": "completed",
+                "detail": {"job_description": f"当前岗位 JD {index}"},
+            }
+            for index in range(2)
+        ],
+        collected_at=now,
+    )
+    with test_db.connect() as connection:
+        for job in jobs:
+            connection.execute(
+                """
+                INSERT INTO fj_workflow_job_discoveries (
+                  id, workflow_run_id, smart_capture_id, task_id, job_id,
+                  search_keyword, city, search_combination_json, scroll_depth,
+                  discovered_at, is_run_first_discovery, is_historical_duplicate,
+                  is_filter_candidate
+                ) VALUES (?, ?, ?, ?, ?, 'AI Agent', '广州', '{}', 1, ?, 1, 0, 1)
+                """,
+                (
+                    new_id(),
+                    run["workflow_run_id"],
+                    smart_capture_id,
+                    search_task_id,
+                    job["history_record_id"],
+                    utc_now(),
+                ),
+            )
+        connection.execute(
+            "UPDATE fj_smart_captures SET status = 'running', stage = 'capturing' WHERE id = ?",
+            (smart_capture_id,),
+        )
+
+    smart_capture_engine.advance_completed_batch(
+        test_db,
+        smart_capture_id,
+        {
+            "id": batch_id,
+            "has_more": False,
+            "_output_dir": configured_client.app.state.config.output_root
+            / "fine-job"
+            / "boss-capture",
+        },
+    )
+
+    snapshot = smart_captures.get_smart_capture(test_db, smart_capture_id)
+    assert snapshot["status"] == "running"
+    assert snapshot["stage"] == "waiting_codex"
+    with test_db.connect() as connection:
+        analysis = connection.execute(
+            "SELECT smart_capture_id, workflow_run_id, status FROM fj_workflow_tasks WHERE smart_capture_id = ? AND task_type = 'deep_job_search_analysis'",
+            (smart_capture_id,),
+        ).fetchall()
+    assert len(analysis) == 1
+    assert str(analysis[0]["workflow_run_id"]) == str(run["workflow_run_id"])
+    assert str(analysis[0]["status"]) == "pending"

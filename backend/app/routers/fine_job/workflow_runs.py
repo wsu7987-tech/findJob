@@ -110,6 +110,16 @@ def advance(workflow_run_id: str, config: AppConfig = Depends(get_config), db: D
     return workflow_runs.advance_deep_job_search(db, config, workflow_run_id)
 
 
+@router.post("/{workflow_run_id}/children/{child_relation_id}/start")
+def start_child(
+    workflow_run_id: str,
+    child_relation_id: str,
+    config: AppConfig = Depends(get_config),
+    db: Database = Depends(get_database),
+):
+    return workflow_runs.start_linked_child(db, config, workflow_run_id, child_relation_id)
+
+
 @router.post("/{workflow_run_id}/resume")
 def resume(
     workflow_run_id: str,

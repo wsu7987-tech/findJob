@@ -44,14 +44,6 @@ export const assertWorkflowControllerAuthority = (
   }
 };
 
-const needsPrefetchProgress = (run: FineJobWorkflowRun) => {
-  const prefetch = run.telemetry?.prefetch;
-  return Boolean(
-    run.analysis_handoff?.attempt_status === "started"
-      || (prefetch && ["preparing", "ready"].includes(String(prefetch.status)))
-  );
-};
-
 export const createFineJobWorkflowCodexController = (dependencies: ControllerDependencies) => {
   let timer: ReturnType<typeof setInterval> | null = null;
   let polling = false;
@@ -65,11 +57,7 @@ export const createFineJobWorkflowCodexController = (dependencies: ControllerDep
     try {
       const run = await dependencies.getLatestRun();
       if (!run || (dependencies.isActive && !dependencies.isActive())) return;
-      let refreshed = run;
-      // Codex ACK started 后由同一 App-level 轮询驱动旁路 JD，后端仍保持当前正式 Run 状态。
-      if (needsPrefetchProgress(run)) {
-        refreshed = await api.advanceFineJobWorkflowRun(run.workflow_run_id);
-      }
+      const refreshed = run;
       if (dependencies.isActive && !dependencies.isActive()) return;
       dependencies.workflowStore.setRun(refreshed);
       // 只检查当前已 ready 的 Analysis Batch，不推进 JD 或其他 Workflow Step。

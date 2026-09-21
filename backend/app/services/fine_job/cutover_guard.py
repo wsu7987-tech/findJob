@@ -101,7 +101,8 @@ class CutoverGuard:
             self._live_children.pop(child_ref, None)
 
 
-_runtime_guard = CutoverGuard()
+# Task 09 后生产默认由 Smart Capture 执行；测试可显式切回迁移前阶段验证旧链特征。
+_runtime_guard = CutoverGuard(phase=CutoverPhase.POST_CUTOVER)
 
 
 def get_runtime_cutover_guard() -> CutoverGuard:
@@ -113,8 +114,8 @@ def configure_runtime_cutover_phase(phase: CutoverPhase) -> None:
 
 
 def reset_runtime_cutover_guard() -> None:
-    """测试和应用重载使用同一默认前置阶段。"""
-    _runtime_guard.phase = CutoverPhase.PRE_CUTOVER
+    """测试和应用重载恢复 Task 09 后的生产执行权。"""
+    _runtime_guard.phase = CutoverPhase.POST_CUTOVER
     _runtime_guard.legacy_callback_invocations = 0
     with _runtime_guard._lock:
         _runtime_guard._live_children.clear()

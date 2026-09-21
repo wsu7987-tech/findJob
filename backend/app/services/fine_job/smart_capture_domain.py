@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
 from typing import Any
 
 from backend.app.config import AppConfig
 from backend.app.db import Database
 from backend.app.errors import AppError
-from backend.app.services.fine_job import pipeline_repository, smart_captures, workflow_runs
+from backend.app.services.fine_job import (
+    pipeline_repository,
+    smart_capture_engine,
+    smart_captures,
+    workflow_runs,
+)
 from backend.app.services.fine_job.boss_capture_history import get_capture_history_job
 from backend.app.utils import new_id, utc_now
 
@@ -18,11 +24,8 @@ TERMINAL_STATUSES = {"completed", "stopped", "failed"}
 def get_context_snapshot(
     db: Database, smart_capture_id: str, channel: str = "deep_job_search"
 ) -> dict[str, object]:
-    """按 Smart Capture owner 读取 current context，linked 运行继续复用旧生成逻辑。"""
+    """按 Smart Capture owner 读取 current context。"""
     capture = smart_captures.get_smart_capture(db, smart_capture_id)
-    workflow_run_id = str(capture.get("workflow_run_id") or "")
-    if workflow_run_id and str(capture.get("status")) != "completed":
-        return workflow_runs.get_context_snapshot(db, workflow_run_id, channel)
 
     repository = pipeline_repository.PipelineRepository.for_smart_capture(
         db, smart_capture_id
@@ -50,20 +53,6 @@ def create_manual_analysis_batch(
     """以 Smart Capture 为 owner 创建自动或手工 Analysis 批次。"""
     capture = smart_captures.get_smart_capture(db, smart_capture_id)
     workflow_run_id = str(capture.get("workflow_run_id") or "")
-    # 非终态 linked 运行复用现有 Workflow service，保证原有策略、Prefetch 和计数不分叉。
-    if workflow_run_id and str(capture.get("status")) != "completed":
-        if not recommendation_strategy_id:
-            raise AppError(422, "RECOMMENDATION_STRATEGY_REQUIRED", "linked 分析批次需要建议投递策略。")
-        return workflow_runs.create_manual_analysis_batch(
-            db,
-            config,
-            workflow_run_id,
-            recommendation_strategy_id=recommendation_strategy_id,
-            job_ids=job_ids,
-            analysis_batch_size=analysis_batch_size,
-            codex_model=codex_model,
-            codex_reasoning_effort=codex_reasoning_effort,
-        )
 
     if str(capture.get("status")) in {"stopped", "failed"}:
         raise AppError(409, "SMART_CAPTURE_ANALYSIS_NOT_ALLOWED", "已停止或失败的 Smart Capture 不能创建分析批次。")
@@ -137,8 +126,6 @@ def list_analysis_items(
 ) -> dict[str, object]:
     capture = smart_captures.get_smart_capture(db, smart_capture_id)
     workflow_run_id = str(capture.get("workflow_run_id") or "")
-    if workflow_run_id and str(capture.get("status")) != "completed":
-        return workflow_runs.list_workflow_analysis_items(db, workflow_run_id, analysis_batch_id)
 
     with db.connect() as connection:
         rows = connection.execute(
@@ -197,8 +184,6 @@ def get_analysis_item_context(
 ) -> dict[str, object]:
     capture = smart_captures.get_smart_capture(db, smart_capture_id)
     workflow_run_id = str(capture.get("workflow_run_id") or "")
-    if workflow_run_id and str(capture.get("status")) != "completed":
-        return workflow_runs.get_workflow_analysis_item_context(db, workflow_run_id, workflow_task_id)
 
     item = _get_analysis_item(db, smart_capture_id, workflow_task_id)
     payload = workflow_runs._load(item["payload_json"], {})
@@ -278,17 +263,6 @@ def save_analysis_item(
     workflow_task_id: str,
     payload: dict[str, object],
 ) -> dict[str, object]:
-    capture = smart_captures.get_smart_capture(db, smart_capture_id)
-    workflow_run_id = str(capture.get("workflow_run_id") or "")
-    if workflow_run_id and str(capture.get("status")) != "completed":
-        from backend.app.services.fine_job.codex_tools import CodexToolService
-
-        return CodexToolService(db, config).save_workflow_analysis_item(
-            {"workflow_run_id": workflow_run_id, "workflow_task_id": workflow_task_id, **payload}
-        )[
-            "data"
-        ]
-
     item = _get_analysis_item(db, smart_capture_id, workflow_task_id)
     if str(item["status"]) == "succeeded":
         return _domain_snapshot(
@@ -335,6 +309,7 @@ def save_analysis_item(
             """,
             (now, now, smart_capture_id, workflow_task_id, str(context["job_id"])),
         )
+    smart_capture_engine.analysis_item_saved(db, smart_capture_id, batch_id)
     return _domain_snapshot(db, smart_capture_id, batch_id, workflow_task_id=workflow_task_id)
 
 
@@ -343,10 +318,6 @@ def save_feedback(
 ) -> dict[str, object]:
     capture = smart_captures.get_smart_capture(db, smart_capture_id)
     workflow_run_id = str(capture.get("workflow_run_id") or "")
-    if workflow_run_id and str(capture.get("status")) != "completed":
-        return workflow_runs.save_workflow_analysis_feedback(
-            db, workflow_run_id, workflow_task_id, payload
-        )
     _get_analysis_item(db, smart_capture_id, workflow_task_id)
     feedback_id = new_id()
     with db.connect() as connection:
@@ -374,9 +345,6 @@ def save_feedback(
 
 def update_guidance(db: Database, smart_capture_id: str, guidance: str) -> dict[str, object]:
     capture = smart_captures.get_smart_capture(db, smart_capture_id)
-    workflow_run_id = str(capture.get("workflow_run_id") or "")
-    if workflow_run_id and str(capture.get("status")) != "completed":
-        return workflow_runs.update_workflow_analysis_guidance(db, workflow_run_id, guidance)
     execution_config = dict(capture.get("execution_config") or {})
     analysis = dict(execution_config.get("analysis") or {})
     normalized_guidance = guidance.strip()
@@ -402,10 +370,6 @@ def attach_codex_session(
 ) -> dict[str, object]:
     capture = smart_captures.get_smart_capture(db, smart_capture_id)
     workflow_run_id = str(capture.get("workflow_run_id") or "")
-    if workflow_run_id and str(capture.get("status")) != "completed":
-        return workflow_runs.attach_codex_session(
-            db, workflow_run_id, codex_session_ref, codex_runtime_id
-        )
     now = utc_now()
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -441,15 +405,6 @@ def claim_handoff(
 ) -> dict[str, object]:
     capture = smart_captures.get_smart_capture(db, smart_capture_id)
     workflow_run_id = str(capture.get("workflow_run_id") or "")
-    if workflow_run_id and str(capture.get("status")) != "completed":
-        return workflow_runs.claim_workflow_analysis_handoff(
-            db,
-            workflow_run_id,
-            codex_session_ref=codex_session_ref,
-            codex_runtime_id=codex_runtime_id,
-            handoff_kind=handoff_kind,
-            retry_handoff_attempt_id=retry_handoff_attempt_id,
-        )
     rows = _analysis_rows(db, smart_capture_id)
     active_batch_id = _active_batch_id(rows)
     if not active_batch_id:
@@ -499,12 +454,6 @@ def claim_handoff(
 def prompt_written(
     db: Database, smart_capture_id: str, analysis_batch_id: str, handoff_attempt_id: str, codex_session_ref: str
 ) -> dict[str, object]:
-    capture = smart_captures.get_smart_capture(db, smart_capture_id)
-    workflow_run_id = str(capture.get("workflow_run_id") or "")
-    if workflow_run_id and str(capture.get("status")) != "completed":
-        return workflow_runs.mark_workflow_analysis_handoff_prompt_written(
-            db, workflow_run_id, analysis_batch_id, handoff_attempt_id, codex_session_ref
-        )
     _update_handoff(
         db, smart_capture_id, analysis_batch_id, handoff_attempt_id, codex_session_ref,
         expected={"claimed", "prompt_written"}, updates={"status": "submitted", "attempt_status": "prompt_written", "submitted_at": utc_now(), "prompt_written_at": utc_now()},
@@ -516,16 +465,17 @@ def prompt_written(
 def ack_started(
     db: Database, config: AppConfig, smart_capture_id: str, analysis_batch_id: str, handoff_attempt_id: str
 ) -> dict[str, object]:
-    capture = smart_captures.get_smart_capture(db, smart_capture_id)
-    workflow_run_id = str(capture.get("workflow_run_id") or "")
-    if workflow_run_id and str(capture.get("status")) != "completed":
-        return workflow_runs.ack_workflow_analysis_batch_started(
-            db, workflow_run_id, analysis_batch_id, handoff_attempt_id, config
-        )
     _update_handoff(
         db, smart_capture_id, analysis_batch_id, handoff_attempt_id, None,
         expected={"prompt_written", "started"}, updates={"status": "submitted", "attempt_status": "started", "started_at": utc_now()},
         check_session=False, idempotent_attempt_statuses={"started"},
+    )
+    output_root = Path(getattr(config, "output_root", Path.cwd()))
+    smart_capture_engine.start_prefetch_after_handoff(
+        db,
+        smart_capture_id,
+        analysis_batch_id,
+        output_root / "fine-job" / "boss-capture",
     )
     return _domain_snapshot(db, smart_capture_id, analysis_batch_id, handoff=True)
 
@@ -534,12 +484,6 @@ def release_handoff(
     db: Database, smart_capture_id: str, analysis_batch_id: str, handoff_attempt_id: str,
     codex_session_ref: str, release_reason: str | None = None,
 ) -> dict[str, object]:
-    capture = smart_captures.get_smart_capture(db, smart_capture_id)
-    workflow_run_id = str(capture.get("workflow_run_id") or "")
-    if workflow_run_id and str(capture.get("status")) != "completed":
-        return workflow_runs.release_workflow_analysis_handoff(
-            db, workflow_run_id, analysis_batch_id, handoff_attempt_id, codex_session_ref, release_reason
-        )
     handoff = _update_handoff(
         db, smart_capture_id, analysis_batch_id, handoff_attempt_id, codex_session_ref,
         expected={"claimed", "prompt_written"},

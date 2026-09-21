@@ -81,6 +81,82 @@ def _setup_completed_capture(test_db) -> tuple[str, str]:
     return smart_capture_id, job_id
 
 
+def _setup_running_delivery_capture(test_db) -> tuple[str, list[str]]:
+    payload = {
+        "filter_strategy_id": "strategy-1",
+        "allowed_search_keywords": ["Python"],
+        "allowed_cities": ["上海"],
+        "candidate_target_count": 3,
+        "delivery_target_enabled": True,
+        "recommend_target": 2,
+        "analysis_batch_size": 1,
+    }
+    capture = smart_captures.create_smart_capture(
+        test_db,
+        source="boss_capture",
+        workflow_run_id=None,
+        search_config=payload,
+        target_count=3,
+        execution_config=smart_captures._build_execution_config(payload),
+    )
+    smart_capture_id = str(capture["smart_capture_id"])
+    search_task = smart_capture_engine.prepare_search_execution(
+        test_db, smart_capture_id, payload
+    )
+    batch_id = "domain-delivery-batch"
+    create_capture_batch(
+        test_db,
+        capture_id=batch_id,
+        smart_capture_id=smart_capture_id,
+        keyword="Python",
+        city="上海",
+        pages=1,
+        auto_details=True,
+        created_at="2026-09-21T00:00:00Z",
+        capture_source="smart",
+    )
+    jobs = record_capture_jobs(
+        test_db,
+        capture_id=batch_id,
+        search_keyword="Python",
+        jobs=[
+            {
+                "job_id": f"delivery-job-{index}",
+                "title": f"Python 工程师 {index}",
+                "boss_name": f"测试公司 {index}",
+                "detail_status": "completed",
+                "detail": {"description": f"负责 Python 服务开发 {index}"},
+            }
+            for index in range(1, 4)
+        ],
+    )
+    job_ids = [str(job["history_record_id"]) for job in jobs]
+    with test_db.connect() as connection:
+        for index, job_id in enumerate(job_ids, start=1):
+            connection.execute(
+                """
+                INSERT INTO fj_workflow_job_discoveries (
+                  id, workflow_run_id, smart_capture_id, task_id, job_id,
+                  search_keyword, city, search_combination_json, discovered_at,
+                  is_run_first_discovery, is_historical_duplicate, is_filter_candidate
+                ) VALUES (?, NULL, ?, ?, ?, 'Python', '上海', ?, ?, 1, 0, 1)
+                """,
+                (
+                    f"delivery-discovery-{index}",
+                    smart_capture_id,
+                    search_task["task_id"],
+                    job_id,
+                    json.dumps({"search_combination_id": search_task["combination_id"]}),
+                    f"2026-09-21T00:00:0{index}Z",
+                ),
+            )
+        connection.execute(
+            "UPDATE fj_smart_captures SET status = 'running', stage = 'waiting_codex' WHERE id = ?",
+            (smart_capture_id,),
+        )
+    return smart_capture_id, job_ids
+
+
 def test_independent_smart_capture_analysis_handoff_context_and_save(configured_client) -> None:
     smart_capture_id, job_id = _setup_completed_capture(configured_client.app.state.db)
     before = configured_client.get(f"/api/fine-job/smart-captures/{smart_capture_id}").json()
@@ -175,6 +251,206 @@ def test_independent_smart_capture_save_requires_started_handoff(configured_clie
     )
     assert blocked_save.status_code == 409
     assert blocked_save.json()["error_category"] == "SMART_CAPTURE_ANALYSIS_NOT_STARTED"
+
+
+def test_analysis_and_prefetch_run_in_parallel_then_promote_ready_batch(configured_client) -> None:
+    smart_capture_id, job_ids = _setup_running_delivery_capture(
+        configured_client.app.state.db
+    )
+    first_batch = configured_client.post(
+        f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-batches",
+        json={"job_ids": [job_ids[0]], "analysis_batch_size": 1},
+    ).json()
+    first_batch_id = str(first_batch["analysis_batch_id"])
+    first_task_id = str(first_batch["items"][0]["workflow_task_id"])
+    claimed = configured_client.post(
+        f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-handoff/claim",
+        json={"codex_session_ref": "parallel-codex", "handoff_kind": "initial"},
+    ).json()
+    attempt_id = str(claimed["handoff"]["handoff_attempt_id"])
+    configured_client.post(
+        f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-handoff/prompt-written",
+        json={
+            "analysis_batch_id": first_batch_id,
+            "handoff_attempt_id": attempt_id,
+            "codex_session_ref": "parallel-codex",
+        },
+    )
+    acked = configured_client.post(
+        f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-handoff/ack-started",
+        json={"analysis_batch_id": first_batch_id, "handoff_attempt_id": attempt_id},
+    )
+    assert acked.status_code == 200
+
+    parallel = configured_client.get(
+        f"/api/fine-job/smart-captures/{smart_capture_id}"
+    ).json()
+    assert parallel["status"] == "running"
+    assert parallel["stage"] == "analyzing_prefetch"
+    assert parallel["prefetch"]["status"] == "ready"
+    assert parallel["prefetch"]["ready_count"] == 1
+
+    saved = configured_client.post(
+        f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-items/{first_task_id}/save",
+        json={"decision": "recommend", "summary": "第一批通过"},
+    )
+    assert saved.status_code == 200
+    promoted = configured_client.get(
+        f"/api/fine-job/smart-captures/{smart_capture_id}"
+    ).json()
+    assert promoted["status"] == "running"
+    assert promoted["stage"] == "waiting_codex"
+    assert promoted["prefetch"]["status"] == "promoted"
+    pending = [
+        item
+        for item in configured_client.get(
+            f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-items"
+        ).json()["items"]
+        if item["status"] == "pending"
+    ]
+    assert len(pending) == 1
+    assert pending[0]["job"]["job_id"] == job_ids[1]
+    with configured_client.app.state.db.connect() as connection:
+        active_jobs = connection.execute(
+            "SELECT job_id FROM fj_workflow_candidate_reservations WHERE status = 'reserved' ORDER BY job_id"
+        ).fetchall()
+    assert [str(row["job_id"]) for row in active_jobs] == [job_ids[1]]
+
+
+def test_restart_converges_running_prefetch_unit_to_recoverable_pending(
+    configured_client, monkeypatch
+) -> None:
+    db = configured_client.app.state.db
+    smart_capture_id, job_ids = _setup_running_delivery_capture(db)
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_boss_jobs SET detail_status = 'not_collected' WHERE id = ?",
+            (job_ids[1],),
+        )
+    batch = configured_client.post(
+        f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-batches",
+        json={"job_ids": [job_ids[0]], "analysis_batch_size": 1},
+    ).json()
+    batch_id = str(batch["analysis_batch_id"])
+    claimed = configured_client.post(
+        f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-handoff/claim",
+        json={"codex_session_ref": "restart-codex", "handoff_kind": "initial"},
+    ).json()
+    attempt_id = str(claimed["handoff"]["handoff_attempt_id"])
+    configured_client.post(
+        f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-handoff/prompt-written",
+        json={
+            "analysis_batch_id": batch_id,
+            "handoff_attempt_id": attempt_id,
+            "codex_session_ref": "restart-codex",
+        },
+    )
+    monkeypatch.setattr(
+        smart_capture_engine.boss_capture_task_manager,
+        "start_history_detail",
+        lambda *args, **kwargs: {"id": "prefetch-detail-running"},
+    )
+    acked = configured_client.post(
+        f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-handoff/ack-started",
+        json={"analysis_batch_id": batch_id, "handoff_attempt_id": attempt_id},
+    )
+    assert acked.status_code == 200
+    with db.connect() as connection:
+        before = connection.execute(
+            "SELECT status, operation_ref_id FROM fj_workflow_prefetch_items WHERE smart_capture_id = ?",
+            (smart_capture_id,),
+        ).fetchone()
+    assert str(before["status"]) == "collecting"
+    assert str(before["operation_ref_id"]) == "prefetch-detail-running"
+
+    smart_captures.recover_interrupted_smart_captures(db)
+
+    recovered = smart_captures.get_smart_capture(db, smart_capture_id)
+    assert recovered["status"] == "interrupted"
+    assert recovered["capabilities"]["retry"] is True
+    with db.connect() as connection:
+        after = connection.execute(
+            "SELECT status, operation_ref_id FROM fj_workflow_prefetch_items WHERE smart_capture_id = ?",
+            (smart_capture_id,),
+        ).fetchone()
+    assert str(after["status"]) == "pending"
+    assert after["operation_ref_id"] is None
+
+
+def test_last_prefetch_detail_promotes_when_analysis_finished_first(
+    configured_client, monkeypatch
+) -> None:
+    db = configured_client.app.state.db
+    smart_capture_id, job_ids = _setup_running_delivery_capture(db)
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE fj_boss_jobs SET detail_status = 'not_collected' WHERE id = ?",
+            (job_ids[1],),
+        )
+    batch = configured_client.post(
+        f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-batches",
+        json={"job_ids": [job_ids[0]], "analysis_batch_size": 1},
+    ).json()
+    batch_id = str(batch["analysis_batch_id"])
+    first_task_id = str(batch["items"][0]["workflow_task_id"])
+    claimed = configured_client.post(
+        f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-handoff/claim",
+        json={"codex_session_ref": "late-prefetch-codex", "handoff_kind": "initial"},
+    ).json()
+    attempt_id = str(claimed["handoff"]["handoff_attempt_id"])
+    configured_client.post(
+        f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-handoff/prompt-written",
+        json={
+            "analysis_batch_id": batch_id,
+            "handoff_attempt_id": attempt_id,
+            "codex_session_ref": "late-prefetch-codex",
+        },
+    )
+    monkeypatch.setattr(
+        smart_capture_engine.boss_capture_task_manager,
+        "start_history_detail",
+        lambda *args, **kwargs: {"id": "late-prefetch-detail"},
+    )
+    configured_client.post(
+        f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-handoff/ack-started",
+        json={"analysis_batch_id": batch_id, "handoff_attempt_id": attempt_id},
+    )
+    saved = configured_client.post(
+        f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-items/{first_task_id}/save",
+        json={"decision": "recommend", "summary": "分析先完成"},
+    )
+    assert saved.status_code == 200
+    waiting = smart_captures.get_smart_capture(db, smart_capture_id)
+    assert waiting["status"] == "waiting_next_batch"
+    waiting_version = int(waiting["state_version"])
+    with db.connect() as connection:
+        item = connection.execute(
+            "SELECT id FROM fj_workflow_prefetch_items WHERE smart_capture_id = ? AND status = 'collecting'",
+            (smart_capture_id,),
+        ).fetchone()
+        connection.execute(
+            "UPDATE fj_boss_jobs SET detail_status = 'completed' WHERE id = ?",
+            (job_ids[1],),
+        )
+
+    smart_capture_engine.process_detail_task_update(
+        db,
+        smart_capture_id,
+        {
+            "status": "completed",
+            "pipeline_unit_type": "prefetch",
+            "pipeline_unit_id": str(item["id"]),
+            "_output_dir": configured_client.app.state.config.output_root
+            / "fine-job"
+            / "boss-capture",
+        },
+    )
+
+    promoted = smart_captures.get_smart_capture(db, smart_capture_id)
+    assert promoted["status"] == "running"
+    assert promoted["stage"] == "waiting_codex"
+    assert promoted["prefetch"]["status"] == "promoted"
+    assert int(promoted["state_version"]) > waiting_version
 
 
 def test_independent_smart_capture_context_and_state_are_mcp_identity_based(test_db) -> None:

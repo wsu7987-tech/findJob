@@ -1735,6 +1735,12 @@ export const api = {
       { method: "POST" }
     );
   },
+  async startFineJobWorkflowChild(workflowRunId: string, childRelationId: string) {
+    return request<FineJobWorkflowRun>(
+      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/children/${encodeURIComponent(childRelationId)}/start`,
+      { method: "POST" }
+    );
+  },
   async resumeFineJobWorkflowRun(workflowRunId: string) {
     return request<FineJobWorkflowRun>(
       `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/resume`,

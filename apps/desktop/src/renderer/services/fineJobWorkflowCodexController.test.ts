@@ -50,7 +50,7 @@ describe("fineJobWorkflowCodexController", () => {
     expect(setRun).toHaveBeenCalled();
   });
 
-  it("Prefetch 准备期间由 App-level controller 轮询旁路进度", async () => {
+  it("Prefetch 准备期间不再由 App-level Workflow controller 推进", async () => {
     const run = {
       ...waitingRun(),
       analysis_handoff: {
@@ -89,7 +89,7 @@ describe("fineJobWorkflowCodexController", () => {
 
     await controller.tick();
 
-    expect(advance).toHaveBeenCalledWith(run.workflow_run_id);
+    expect(advance).not.toHaveBeenCalled();
     advance.mockRestore();
   });
 

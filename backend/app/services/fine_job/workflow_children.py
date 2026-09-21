@@ -286,12 +286,13 @@ def consume_child_event_in_connection(
 
     event_status = str(event["child_status"])
     relation_status = str(relation["status"])
-    if relation_status in {"completed", "stopped", "failed"} and relation_status != event_status:
+    # child 进入终态后结果不可再被重复或迟到事件覆盖。
+    if relation_status in {"completed", "stopped", "failed"}:
         connection.execute(
             "UPDATE fj_workflow_child_events SET consumed_at = COALESCE(consumed_at, ?) WHERE event_id = ?",
             (consumed_at or utc_now(), event_id),
         )
-        return "terminal_conflict"
+        return "terminal_conflict" if relation_status != event_status else "stale"
 
     now = consumed_at or utc_now()
     control_cause = str(event["control_cause"] or "")
@@ -329,7 +330,22 @@ def consume_child_event_in_connection(
         "SELECT * FROM fj_workflow_runs WHERE id = ?",
         (str(relation["workflow_run_id"]),),
     ).fetchone()
-    if parent is not None and event_status in {"stopped", "failed", "interrupted"}:
+    if parent is not None and event_status == "completed":
+        if str(parent["status"]) not in {"cancelled", "completed", "completed_with_errors", "failed"}:
+            # 最小 outcome 闭环：父层只消费通用 relation/result，不读取 child 私有批次字段。
+            connection.execute(
+                """
+                UPDATE fj_workflow_runs
+                SET status = 'completed', current_step = 'completed', next_action = 'none',
+                    next_action_reason = '已消费子任务完成结果。', waiting_for_user = 0,
+                    paused = 0, control_state = 'active', waiting_reason = '',
+                    control_cause = '', completed_at = COALESCE(completed_at, ?),
+                    state_version = state_version + 1, transition_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, str(event["transition_id"] or ""), now, str(parent["id"])),
+            )
+    elif parent is not None and event_status in {"stopped", "failed", "interrupted"}:
         parent_status = str(parent["status"])
         parent_control_state = str(parent["control_state"] or "active")
         parent_control_cause = str(parent["control_cause"] or "")

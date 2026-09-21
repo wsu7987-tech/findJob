@@ -41,4 +41,27 @@ describe("fineJobWorkflowRun store", () => {
     expect(resume).toHaveBeenCalledWith("workflow-1");
     expect(advance).not.toHaveBeenCalled();
   });
+
+  it("创建后通过 child start endpoint 启动岗位采集，不调用旧 advance", async () => {
+    const pendingRun = {
+      ...run("pending"),
+      children: [{
+        child_relation_id: "relation-1",
+        child_type: "smart_capture",
+        status: "pending",
+      }],
+    };
+    const runningRun = { ...run("running"), children: pendingRun.children };
+    const create = vi.spyOn(api, "createFineJobDeepJobSearchRun").mockResolvedValue(pendingRun as never);
+    const startChild = vi.spyOn(api, "startFineJobWorkflowChild").mockResolvedValue(runningRun as never);
+    const advance = vi.spyOn(api, "advanceFineJobWorkflowRun").mockResolvedValue(runningRun as never);
+    const store = useFineJobWorkflowRunStore();
+
+    await store.create({} as never);
+    store.stopPolling();
+
+    expect(create).toHaveBeenCalled();
+    expect(startChild).toHaveBeenCalledWith("workflow-1", "relation-1");
+    expect(advance).not.toHaveBeenCalled();
+  });
 });

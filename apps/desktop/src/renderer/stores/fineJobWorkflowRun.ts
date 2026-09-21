@@ -111,7 +111,10 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
     try {
       setRun(await api.createFineJobDeepJobSearchRun(payload, createdFrom));
       startPolling();
-      await advance();
+      if (currentRun.value?.status !== "pending") return currentRun.value;
+      const child = currentRun.value?.children?.find((item) => item.status === "pending");
+      if (!child || !currentRun.value) throw new Error("Workflow Run 缺少可启动的岗位采集子任务。");
+      setRun(await api.startFineJobWorkflowChild(currentRun.value.workflow_run_id, child.child_relation_id));
       return currentRun.value;
     } finally {
       loading.value = false;
