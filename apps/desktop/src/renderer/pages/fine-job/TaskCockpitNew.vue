@@ -13,28 +13,45 @@ import {
 } from "@/services/smartCaptureExecutionConfig";
 import type {
   FineJobFilterStrategy,
-  FineJobRecommendationStrategy
+  FineJobRecommendationStrategy,
+  FineJobWorkflowChild
 } from "@/types";
+import type { SmartCaptureExecutionConfig, SmartCaptureConfigValidation } from "@/services/smartCaptureExecutionConfig";
 
 const strategies = ref<FineJobFilterStrategy[]>([]);
 const recommendationStrategies = ref<FineJobRecommendationStrategy[]>([]);
 const codexModels = ref<Array<{ id: string; label?: string | null; reasoning_efforts?: string[] }>>([]);
 const codexModelLoadError = ref("");
 const smartConfig = reactive(createDefaultSmartCaptureExecutionConfig("task_cockpit"));
+const selectedChildren = ref<string[]>(["smart_capture"]);
+const childConfigs = reactive<Record<string, SmartCaptureExecutionConfig>>({
+  smart_capture: smartConfig
+});
+const childValidation = computed<Record<string, SmartCaptureConfigValidation>>(() => ({
+  smart_capture: validateSmartCaptureExecutionConfig(childConfigs.smart_capture)
+}));
+const childTypes = [{ type: "smart_capture", label: "岗位采集", description: "搜索、候选、JD 与分析由岗位采集域执行。" }];
+const configDrawerVisible = ref(false);
+const editingChildType = ref("smart_capture");
 const smartConfigModel = computed({
-  get: () => smartConfig,
-  set: (value) => Object.assign(smartConfig, value)
+  get: () => childConfigs.smart_capture,
+  set: (value) => Object.assign(childConfigs.smart_capture, value)
 });
 const workflowStore = useFineJobWorkflowRunStore();
 const router = useRouter();
 const workflowRun = computed(() => workflowStore.currentRun);
-const childDecisionWaiting = computed(() => {
+const terminalStatuses = new Set(["cancelled", "completed", "completed_with_errors", "failed"]);
+const canEditOrchestration = computed(() => !workflowRun.value || terminalStatuses.has(workflowRun.value.status));
+const selectedChildValidation = computed(() => selectedChildren.value.map((type) => childValidation.value[type]));
+const orchestrationComplete = computed(() =>
+  selectedChildren.value.length > 0 && selectedChildValidation.value.every((validation) => validation?.isValid)
+);
+const decisionChild = computed(() => {
   const run = workflowRun.value;
-  return Boolean(
-    run
-    && ["child_cancelled_waiting_decision", "child_failed_waiting_decision"].includes(run.control_state)
-    && run.children?.some((item) => item.control_state === run.control_state)
-  );
+  if (!run || !["child_cancelled_waiting_decision", "child_failed_waiting_decision"].includes(run.control_state)) {
+    return null;
+  }
+  return run.children?.find((child) => child.control_state === run.control_state) ?? null;
 });
 
 const selectedStrategy = computed(
@@ -44,7 +61,7 @@ const selectedRecommendationStrategy = computed(() =>
   recommendationStrategies.value.find((item) => item.id === smartConfig.recommendation_strategy_id) ?? null
 );
 const compatibleRecommendationStrategies = computed(() => recommendationStrategies.value.filter(
-  (item) => item.filter_strategy_id === smartConfig.filter_strategy_id
+  (item) => item.filter_strategy_id === childConfigs.smart_capture.filter_strategy_id
 ));
 
 const syncStrategyScope = () => {
@@ -71,7 +88,7 @@ const ensureCollectionStartAvailable = async () => {
 
 const createRun = async () => {
   const strategy = selectedStrategy.value;
-  const validation = validateSmartCaptureExecutionConfig(smartConfig);
+  const validation = childValidation.value.smart_capture;
   if (!validation.isValid) {
     ElMessage.warning(Object.values(validation.errors).join("；"));
     return;
@@ -93,7 +110,7 @@ const createRun = async () => {
   }
   try {
     if (!await ensureCollectionStartAvailable()) return;
-    const run = await workflowStore.create(toSmartCaptureRequest(smartConfig));
+    const run = await workflowStore.create(toSmartCaptureRequest(childConfigs.smart_capture));
     if (run) {
       await router.push({ name: "fine-job-capture" });
     }
@@ -144,6 +161,53 @@ const decideChild = async (decision: "skip" | "end") => {
   }
 };
 
+const openChildConfig = (childType: string) => {
+  editingChildType.value = childType;
+  configDrawerVisible.value = true;
+};
+
+const handleChildSelectionChange = (selected: string[]) => {
+  selectedChildren.value = selected;
+  const latestSelectedChild = selected[selected.length - 1];
+  if (latestSelectedChild) openChildConfig(latestSelectedChild);
+};
+
+const openCapture = async () => {
+  await router.push({ name: "fine-job-capture" });
+};
+
+const resumeChild = async (child: FineJobWorkflowChild) => {
+  try {
+    await workflowStore.resumeChild(child);
+  } catch (value) {
+    ElMessage.error(value instanceof Error ? value.message : String(value));
+  }
+};
+
+const retryChild = async (child: FineJobWorkflowChild) => {
+  try {
+    await workflowStore.retryChild(child);
+  } catch (value) {
+    ElMessage.error(value instanceof Error ? value.message : String(value));
+  }
+};
+
+const childLabel = (child: FineJobWorkflowChild) =>
+  childTypes.find((item) => item.type === child.child_type)?.label ?? child.child_type;
+
+const resultSummary = (child: FineJobWorkflowChild) => {
+  const summary = child.result_summary ?? {};
+  const shortSummary = summary.short_summary ?? summary.message;
+  return typeof shortSummary === "string" && shortSummary ? shortSummary : "暂无结果摘要";
+};
+
+const canResumeChild = (child: FineJobWorkflowChild) =>
+  ["waiting_child_paused", "waiting_child_interrupted"].includes(child.control_state)
+  && Boolean(child.capabilities.resume);
+
+const canRetryChild = (child: FineJobWorkflowChild) =>
+  child.control_state === "waiting_child_interrupted" && Boolean(child.capabilities.retry);
+
 onMounted(async () => {
   try {
     strategies.value = (await api.listFineJobFilterStrategies()).strategies.filter((item) => item.enabled);
@@ -177,60 +241,93 @@ onMounted(async () => {
         <p class="secondary-text">Phase 1 先展示后端真实的任务上下文快照；岗位搜索、聊天和资料分析将逐步接入。</p>
       </div>
     </div>
-    <el-card shadow="never">
-      <template #header>新岗位深挖 Run</template>
-      <div class="run-form">
-        <SmartCaptureConfigForm
-          v-model="smartConfigModel"
-          :filter-strategies="strategies"
-          :recommendation-strategies="recommendationStrategies"
-          :codex-models="codexModels"
-          :codex-model-load-error="codexModelLoadError"
-        />
+    <el-card v-if="canEditOrchestration" shadow="never" data-testid="orchestration-panel">
+      <template #header>新任务编排</template>
+      <div class="orchestration-panel">
+        <p class="secondary-text">选择本轮需要编排的子任务，完成每项配置后即可开始。</p>
+        <el-checkbox-group v-model="selectedChildren" class="child-selection" @change="handleChildSelectionChange">
+          <div v-for="child in childTypes" :key="child.type" class="child-config-row">
+            <el-checkbox :label="child.type">{{ child.label }}</el-checkbox>
+            <span class="secondary-text">{{ child.description }}</span>
+            <el-tag :type="childValidation[child.type]?.isValid ? 'success' : 'warning'" size="small">
+              {{ childValidation[child.type]?.isValid ? '配置完整' : '待补充配置' }}
+            </el-tag>
+            <el-button text type="primary" @click="openChildConfig(child.type)">配置</el-button>
+          </div>
+        </el-checkbox-group>
         <div class="cockpit-actions">
-          <el-button type="primary" :loading="workflowStore.loading" @click="createRun">建立并自动推进</el-button>
-          <el-button
-            v-if="workflowRun && workflowRun.status !== 'paused' && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)"
-            @click="pauseRun"
-          >暂停</el-button>
-          <el-button
-            v-if="workflowRun?.status === 'paused' || (workflowRun?.status === 'waiting_for_user' && ['capture_interrupted', 'browser_not_running', 'collection_task_active'].includes(workflowRun.stop_reason))"
-            :loading="workflowStore.advancing"
-            @click="resumeRun"
-          >继续</el-button>
-          <el-button
-            v-if="workflowRun && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(workflowRun.status)"
-            type="danger"
-            plain
-            @click="cancelRun"
-          >停止任务</el-button>
-          <el-button
-            v-if="childDecisionWaiting"
-            @click="decideChild('skip')"
-          >跳过该子任务继续</el-button>
-          <el-button
-            v-if="childDecisionWaiting"
-            type="danger"
-            plain
-            @click="decideChild('end')"
-          >结束父任务</el-button>
+          <el-button type="primary" :disabled="!orchestrationComplete" :loading="workflowStore.loading" @click="createRun">
+            建立并自动推进
+          </el-button>
         </div>
-        <el-alert
-          v-if="workflowRun"
-          :title="`Run 状态：${workflowRun.status}；当前步骤：${workflowRun.current_step}`"
-          :description="workflowRun.next_action_reason"
-          :type="workflowRun.waiting_for_user ? 'warning' : 'info'"
-          :closable="false"
-          show-icon
-        />
       </div>
     </el-card>
+
+    <el-card v-if="workflowRun" shadow="never" data-testid="workflow-status-panel">
+      <template #header>父任务状态</template>
+      <el-alert
+        :title="`父任务状态：${workflowRun.control_state}`"
+        :description="workflowRun.waiting_reason || workflowRun.next_action_reason || '任务正在等待状态更新。'"
+        :type="workflowRun.control_state.includes('waiting') ? 'warning' : 'info'"
+        :closable="false"
+        show-icon
+      />
+      <div class="cockpit-actions">
+        <el-button v-if="workflowRun.control_state === 'active'" @click="pauseRun">暂停</el-button>
+        <el-button v-if="workflowRun.control_state === 'paused'" :loading="workflowStore.advancing" @click="resumeRun">继续</el-button>
+        <el-button v-if="!canEditOrchestration" type="danger" plain @click="cancelRun">停止任务</el-button>
+        <el-button v-if="decisionChild" @click="decideChild('skip')">跳过该子任务继续</el-button>
+        <el-button v-if="decisionChild" type="danger" plain @click="decideChild('end')">结束父任务</el-button>
+      </div>
+    </el-card>
+
+    <el-card v-if="workflowRun" shadow="never" data-testid="child-timeline">
+      <template #header>子任务时间线</template>
+      <el-timeline>
+        <el-timeline-item
+          v-for="child in workflowRun.children ?? []"
+          :key="child.child_relation_id"
+          :timestamp="child.completed_at || child.started_at || child.updated_at"
+          placement="top"
+        >
+          <div class="timeline-step">
+            <div class="timeline-step__title">
+              <strong>{{ childLabel(child) }}</strong>
+              <el-tag size="small">{{ child.status }}</el-tag>
+            </div>
+            <p>控制状态：{{ child.control_state }}</p>
+            <p v-if="child.waiting_reason">等待原因：{{ child.waiting_reason }}</p>
+            <p>结果摘要：{{ resultSummary(child) }}</p>
+            <div class="cockpit-actions">
+              <el-button v-if="child.child_type === 'smart_capture'" text type="primary" @click="openCapture">
+                查看岗位采集
+              </el-button>
+              <el-button v-if="canResumeChild(child)" @click="resumeChild(child)">恢复子任务</el-button>
+              <el-button v-if="canRetryChild(child)" @click="retryChild(child)">重试子任务</el-button>
+            </div>
+          </div>
+        </el-timeline-item>
+      </el-timeline>
+      <el-empty v-if="!(workflowRun.children?.length)" description="父任务尚未返回子任务摘要" />
+    </el-card>
+
+    <el-drawer v-model="configDrawerVisible" direction="rtl" size="min(760px, 92vw)" :title="`${childTypes.find((item) => item.type === editingChildType)?.label ?? '子任务'}配置`">
+      <SmartCaptureConfigForm
+        v-if="editingChildType === 'smart_capture'"
+        v-model="smartConfigModel"
+        :filter-strategies="strategies"
+        :recommendation-strategies="recommendationStrategies"
+        :codex-models="codexModels"
+        :codex-model-load-error="codexModelLoadError"
+      />
+    </el-drawer>
   </section>
 </template>
 
 <style scoped>
 .task-cockpit { display: grid; gap: 16px; }
-.run-form { max-width: 760px; }
-.codex-config { display: grid; gap: 10px; }
-.codex-config { grid-template-columns: minmax(220px, 1fr) 160px; }
+.orchestration-panel, .child-selection, .timeline-step { display: grid; gap: 12px; }
+.child-config-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.timeline-step__title, .cockpit-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.timeline-step p { margin: 0; color: var(--el-text-color-secondary); }
 </style>

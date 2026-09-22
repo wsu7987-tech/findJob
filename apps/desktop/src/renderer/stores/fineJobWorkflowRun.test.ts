@@ -64,4 +64,28 @@ describe("fineJobWorkflowRun store", () => {
     expect(startChild).toHaveBeenCalledWith("workflow-1", "relation-1");
     expect(advance).not.toHaveBeenCalled();
   });
+
+  it("收到较旧 state_version 的 SSE 快照时保留当前父子投影", () => {
+    const store = useFineJobWorkflowRunStore();
+    store.setRun({ ...run("running"), state_version: 4 } as never);
+
+    store.setRun({ ...run("paused"), state_version: 3 } as never);
+
+    expect(store.currentRun?.state_version).toBe(4);
+    expect(store.currentRun?.control_state).toBe("active");
+  });
+
+  it("恢复子任务后回读父快照，保持驾驶舱父子投影同步", async () => {
+    const resumeChild = vi.spyOn(api, "resumeFineJobSmartCapture").mockResolvedValue({} as never);
+    const refreshed = run("waiting_for_user");
+    const getRun = vi.spyOn(api, "getFineJobWorkflowRun").mockResolvedValue(refreshed as never);
+    const store = useFineJobWorkflowRunStore();
+    store.setRun({ ...refreshed, control_state: "waiting_child_interrupted" } as never);
+
+    await store.resumeChild({ child_ref: "capture-1", capabilities: { resume: true } } as never);
+
+    expect(resumeChild).toHaveBeenCalledWith("capture-1");
+    expect(getRun).toHaveBeenCalledWith("workflow-1");
+    expect(store.currentRun?.status).toBe("waiting_for_user");
+  });
 });

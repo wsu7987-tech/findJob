@@ -2,7 +2,7 @@ import { defineStore } from "pinia";
 import { ref } from "vue";
 
 import { api, getBackendOrigin } from "@/services/api";
-import type { FineJobWorkflowRun } from "@/types";
+import type { FineJobWorkflowChild, FineJobWorkflowRun } from "@/types";
 
 const boundaryStatuses = new Set([
   "waiting_codex",
@@ -66,6 +66,14 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
   };
 
   const setRun = (run: FineJobWorkflowRun | null) => {
+    if (
+      run
+      && currentRun.value?.workflow_run_id === run.workflow_run_id
+      && run.state_version < currentRun.value.state_version
+    ) {
+      // SSE 重连时可能收到旧快照，不能覆盖已展示的新版父子投影。
+      return currentRun.value;
+    }
     currentRun.value = run;
     if (!run || terminalStatuses.has(run.status)) stopPolling();
     if (run && pollingActive.value && !terminalStatuses.has(run.status)) ensurePolling();
@@ -166,6 +174,18 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
     return setRun(await api.decideFineJobWorkflowChild(run.workflow_run_id, child.child_relation_id, decision));
   };
 
+  const resumeChild = async (child: FineJobWorkflowChild) => {
+    if (!child.capabilities.resume) return null;
+    await api.resumeFineJobSmartCapture(child.child_ref);
+    return refresh();
+  };
+
+  const retryChild = async (child: FineJobWorkflowChild) => {
+    if (!child.capabilities.retry) return null;
+    await api.retryFineJobSmartCapture(child.child_ref);
+    return refresh();
+  };
+
   return {
     currentRun,
     pollingActive,
@@ -182,6 +202,8 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
     resume,
     cancel,
     decideChild,
+    resumeChild,
+    retryChild,
     startPolling,
     ensurePolling,
     stopPolling
