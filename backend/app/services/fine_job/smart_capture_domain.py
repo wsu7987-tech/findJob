@@ -358,7 +358,7 @@ def update_guidance(db: Database, smart_capture_id: str, guidance: str) -> dict[
             "UPDATE fj_smart_captures SET execution_config_json = ?, state_version = state_version + 1, updated_at = ? WHERE id = ?",
             (_dump(execution_config), utc_now(), smart_capture_id),
         )
-    return smart_captures.get_smart_capture(db, smart_capture_id)
+    return smart_captures.publish_smart_capture_snapshot(db, smart_capture_id) or {}
 
 
 def attach_codex_session(

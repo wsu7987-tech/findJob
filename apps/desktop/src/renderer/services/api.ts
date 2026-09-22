@@ -1488,7 +1488,7 @@ export const api = {
     } satisfies FineJobSmartCaptureAnalysisSnapshot;
   },
   async getFineJobSmartCaptureContextSnapshot(smartCaptureId: string, channel = "deep_job_search") {
-    return request<Record<string, unknown>>(
+    return request<FineJobWorkflowContextSnapshot>(
       `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/context-snapshot?channel=${encodeURIComponent(channel)}`
     );
   },

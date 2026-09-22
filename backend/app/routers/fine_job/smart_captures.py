@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Iterator
+from queue import Empty
+
 from fastapi import APIRouter, Depends, status
+from fastapi.responses import StreamingResponse
 
 from backend.app.config import AppConfig
 from backend.app.db import Database
@@ -19,6 +24,7 @@ from backend.app.schemas.fine_job.smart_captures import (
 )
 from backend.app.services.fine_job import smart_captures
 from backend.app.services.fine_job import smart_capture_domain
+from backend.app.services.fine_job.smart_capture_events import smart_capture_event_broker
 
 
 router = APIRouter(prefix="/fine-job/smart-captures", tags=["fine-job-smart-captures"])
@@ -39,9 +45,67 @@ def current(db: Database = Depends(get_database)):
     return {"smart_capture": smart_captures.get_current_smart_capture(db)}
 
 
+@router.get("/current/events")
+def current_events(db: Database = Depends(get_database)) -> StreamingResponse:
+    subscriber = smart_capture_event_broker.subscribe_current()
+    try:
+        initial_snapshot = smart_captures.get_current_smart_capture(db)
+    except Exception:
+        smart_capture_event_broker.unsubscribe_current(subscriber)
+        raise
+
+    def event_stream() -> Iterator[str]:
+        try:
+            yield f"data: {json.dumps(initial_snapshot, ensure_ascii=False)}\n\n"
+            while True:
+                try:
+                    snapshot = subscriber.get(timeout=15)
+                except Empty:
+                    yield ": heartbeat\n\n"
+                    continue
+                yield f"data: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
+        finally:
+            smart_capture_event_broker.unsubscribe_current(subscriber)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.get("/{smart_capture_id}")
 def get(smart_capture_id: str, db: Database = Depends(get_database)):
     return smart_captures.get_smart_capture(db, smart_capture_id)
+
+
+@router.get("/{smart_capture_id}/events")
+def events(smart_capture_id: str, db: Database = Depends(get_database)) -> StreamingResponse:
+    subscriber = smart_capture_event_broker.subscribe(smart_capture_id)
+    try:
+        initial_snapshot = smart_captures.get_smart_capture(db, smart_capture_id)
+    except Exception:
+        smart_capture_event_broker.unsubscribe(smart_capture_id, subscriber)
+        raise
+
+    def event_stream() -> Iterator[str]:
+        try:
+            yield f"data: {json.dumps(initial_snapshot, ensure_ascii=False)}\n\n"
+            while True:
+                try:
+                    snapshot = subscriber.get(timeout=15)
+                except Empty:
+                    yield ": heartbeat\n\n"
+                    continue
+                yield f"data: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
+        finally:
+            smart_capture_event_broker.unsubscribe(smart_capture_id, subscriber)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/{smart_capture_id}/pause")

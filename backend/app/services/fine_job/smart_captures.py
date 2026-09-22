@@ -26,6 +26,7 @@ from backend.app.services.fine_job.boss_scraper.service import (
     BossCaptureRequest,
     boss_scraper_service,
 )
+from backend.app.services.fine_job.smart_capture_events import smart_capture_event_broker
 from backend.app.utils import new_id, utc_now
 
 
@@ -277,7 +278,7 @@ def create_smart_capture(
             target_count=target_count,
             execution_config=execution_config,
         )
-    return get_smart_capture(db, capture_id)
+    return publish_smart_capture_snapshot(db, capture_id, current_pointer_changed=True) or {}
 
 
 def create_smart_capture_in_connection(
@@ -388,11 +389,33 @@ def require_by_workflow_run(db: Database, workflow_run_id: str) -> dict[str, obj
 
 
 def get_current_smart_capture(db: Database) -> dict[str, object] | None:
+    smart_capture_id = get_current_smart_capture_id(db)
+    return get_smart_capture(db, smart_capture_id) if smart_capture_id else None
+
+
+def get_current_smart_capture_id(db: Database) -> str | None:
     with db.connect() as connection:
         row = connection.execute(
             "SELECT smart_capture_id FROM fj_smart_capture_current WHERE slot = 1"
         ).fetchone()
-    return get_smart_capture(db, str(row["smart_capture_id"])) if row is not None else None
+    return str(row["smart_capture_id"]) if row is not None else None
+
+
+def publish_smart_capture_snapshot(
+    db: Database,
+    smart_capture_id: str,
+    *,
+    current_pointer_changed: bool = False,
+) -> dict[str, object] | None:
+    """在事务提交后发布最新快照，避免 SSE 读取到未提交状态。"""
+    try:
+        snapshot = get_smart_capture(db, smart_capture_id)
+    except AppError:
+        return None
+    smart_capture_event_broker.publish(smart_capture_id, snapshot)
+    if current_pointer_changed:
+        smart_capture_event_broker.publish_current(snapshot)
+    return snapshot
 
 
 def get_active_smart_capture(db: Database) -> dict[str, object] | None:
@@ -926,6 +949,7 @@ def bind_batch(
     except AppError:
         # 批次进程快照短暂不可读时，父任务仍可从后续监听事件继续同步。
         pass
+    publish_smart_capture_snapshot(db, smart_capture_id, current_pointer_changed=True)
 
 
 def pause_smart_capture(
@@ -962,7 +986,7 @@ def pause_smart_capture(
                     boss_capture_task_manager.pause_capture(batch_id)
             except AppError:
                 pass
-        return get_smart_capture(db, smart_capture_id)
+        return publish_smart_capture_snapshot(db, smart_capture_id) or {}
     requested_batch_pause = False
     executor_missing = False
     if batch_id:
@@ -989,7 +1013,7 @@ def pause_smart_capture(
             else "岗位采集任务已暂停。"
         ),
     )
-    return get_smart_capture(db, smart_capture_id)
+    return publish_smart_capture_snapshot(db, smart_capture_id) or {}
 
 
 def resume_smart_capture(
@@ -1043,8 +1067,8 @@ def resume_smart_capture(
                 smart_capture_id,
                 config.output_root / "fine-job" / "boss-capture",
             ):
-                return get_smart_capture(db, smart_capture_id)
-            return get_smart_capture(db, smart_capture_id)
+                return publish_smart_capture_snapshot(db, smart_capture_id) or {}
+            return publish_smart_capture_snapshot(db, smart_capture_id) or {}
         with db.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             child_batch_id = child_resume_in_connection(
@@ -1064,8 +1088,8 @@ def resume_smart_capture(
             smart_capture_id,
             config.output_root / "fine-job" / "boss-capture",
         ):
-            return get_smart_capture(db, smart_capture_id)
-        return get_smart_capture(db, smart_capture_id)
+            return publish_smart_capture_snapshot(db, smart_capture_id) or {}
+        return publish_smart_capture_snapshot(db, smart_capture_id) or {}
     resumed = False
     executor_missing = False
     if batch_id:
@@ -1099,7 +1123,7 @@ def resume_smart_capture(
         smart_capture_id,
         config.output_root / "fine-job" / "boss-capture",
     ):
-        return get_smart_capture(db, smart_capture_id)
+        return publish_smart_capture_snapshot(db, smart_capture_id) or {}
     elif not workflow_run_id:
         config_payload = dict(capture.get("search_config") or {})
         capture = _start_new_batch(db, config, smart_capture_id, config_payload)
@@ -1140,7 +1164,7 @@ def resume_smart_capture(
             message="驾驶舱仍在等待进入岗位采集阶段。",
         )
         refreshed = get_smart_capture(db, smart_capture_id)
-    return refreshed
+    return publish_smart_capture_snapshot(db, smart_capture_id) or refreshed
 
 
 def stop_smart_capture(
@@ -1177,7 +1201,7 @@ def stop_smart_capture(
                     boss_capture_task_manager.stop_capture(batch_id)
             except AppError:
                 pass
-        return get_smart_capture(db, smart_capture_id)
+        return publish_smart_capture_snapshot(db, smart_capture_id) or {}
     if batch_id:
         try:
             task = boss_capture_task_manager.get_task(batch_id)
@@ -1196,7 +1220,7 @@ def stop_smart_capture(
         message="岗位采集任务已停止，已获得的岗位继续保留。",
         completed=True,
     )
-    return get_smart_capture(db, smart_capture_id)
+    return publish_smart_capture_snapshot(db, smart_capture_id) or {}
 
 
 def sync_capture_snapshot(db: Database, task: dict[str, object]) -> None:
@@ -1466,7 +1490,7 @@ def _start_new_batch(
             except Exception:
                 runtime_guard.release_live_start(child_ref=owner.identity)
         raise
-    return get_smart_capture(db, smart_capture_id)
+    return publish_smart_capture_snapshot(db, smart_capture_id) or {}
 
 
 def _update_capture(
@@ -1623,6 +1647,7 @@ def _update_capture(
                     ),
                     now=now,
                 )
+    publish_smart_capture_snapshot(db, smart_capture_id)
 
 
 def touch_pipeline_snapshot(db: Database, smart_capture_id: str) -> None:
@@ -1649,6 +1674,7 @@ def touch_pipeline_snapshot(db: Database, smart_capture_id: str) -> None:
                 ),
                 now=now,
             )
+    publish_smart_capture_snapshot(db, smart_capture_id)
 
 
 def _progress_from_task(task: dict[str, object]) -> dict[str, object]:

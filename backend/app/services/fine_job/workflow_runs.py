@@ -1215,6 +1215,9 @@ def resume_deep_job_search_run(
             batch_id = smart_captures.parent_resume_child_in_connection(
                 connection, workflow_run_id, transition_id
             )
+        smart_captures.publish_smart_capture_snapshot(
+            db, _smart_capture_id_for_workflow(db, workflow_run_id)
+        )
         if sync_capture and batch_id:
             _resume_capture_batch_by_id(batch_id)
         return get_workflow_run(db, workflow_run_id)
@@ -1411,6 +1414,9 @@ def pause_deep_job_search_run(
         batch_id = smart_captures.parent_pause_child_in_connection(
             connection, workflow_run_id, transition_id
         )
+    smart_captures.publish_smart_capture_snapshot(
+        db, _smart_capture_id_for_workflow(db, workflow_run_id)
+    )
     if sync_capture and batch_id:
         _pause_capture_batch_by_id(batch_id)
     return get_workflow_run(db, workflow_run_id)
@@ -1433,6 +1439,9 @@ def cancel_deep_job_search_run(
         batch_id = smart_captures.parent_cancel_child_in_connection(
             connection, workflow_run_id, transition_id
         )
+    smart_captures.publish_smart_capture_snapshot(
+        db, _smart_capture_id_for_workflow(db, workflow_run_id)
+    )
     if sync_capture and not batch_id:
         batch_id = _get_current_capture_operation_id(db, workflow_run_id)
     if sync_capture and batch_id:
