@@ -9,13 +9,18 @@ const mocks = vi.hoisted(() => ({
   getCurrent: vi.fn(),
   getCapture: vi.fn(),
   createCapture: vi.fn(),
+  startCapture: vi.fn(),
+  retryCapture: vi.fn(),
   getRun: vi.fn(),
   getContext: vi.fn(),
   getAnalysisItems: vi.fn(),
   getAnalysisSnapshot: vi.fn(),
   triggerSmartHandoff: vi.fn(),
   setRun: vi.fn(),
+  currentRun: null as unknown,
   pauseWorkflow: vi.fn(),
+  resumeWorkflow: vi.fn(),
+  cancelWorkflow: vi.fn(),
   startPolling: vi.fn(),
   stopPolling: vi.fn(),
   eventSources: [] as Array<{
@@ -49,6 +54,8 @@ vi.mock("@/services/api", () => ({
     getCurrentFineJobSmartCapture: mocks.getCurrent,
     getFineJobSmartCapture: mocks.getCapture,
     createFineJobSmartCapture: mocks.createCapture,
+    startFineJobSmartCapture: mocks.startCapture,
+    retryFineJobSmartCapture: mocks.retryCapture,
     getFineJobWorkflowRun: mocks.getRun,
     getFineJobSmartCaptureContextSnapshot: mocks.getContext,
     getFineJobWorkflowContextSnapshot: mocks.getContext,
@@ -74,9 +81,9 @@ vi.mock("@/stores/fineJobStrategies", () => ({
 }));
 vi.mock("@/stores/fineJobWorkflowRun", () => ({
   useFineJobWorkflowRunStore: () => ({
-    currentRun: null, loading: false, advancing: false, pollingActive: false,
+    get currentRun() { return mocks.currentRun; }, loading: false, advancing: false, pollingActive: false,
     setRun: mocks.setRun, startPolling: mocks.startPolling, stopPolling: mocks.stopPolling,
-    pause: mocks.pauseWorkflow, resume: vi.fn(), cancel: vi.fn(), refresh: vi.fn(), advance: vi.fn()
+    pause: mocks.pauseWorkflow, resume: mocks.resumeWorkflow, cancel: mocks.cancelWorkflow, refresh: vi.fn(), advance: vi.fn()
   })
 }));
 vi.mock("@/services/workflowCodexHandoff", () => ({
@@ -94,7 +101,7 @@ const capture = (workflowRunId: string | null) => ({
 });
 
 const workflowRun = (id: string) => ({
-  workflow_run_id: id, workflow_type: "deep_job_search", status: "running", state_version: 3,
+  workflow_run_id: id, workflow_type: "deep_job_search", status: "running", control_state: "active", control_cause: "", state_version: 3,
   progress: {}, telemetry: {}, tasks: [], children: [], next_action_reason: "等待子任务"
 });
 
@@ -122,6 +129,7 @@ describe("BossCapture current 与历史状态隔离", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
+    mocks.currentRun = null;
     mocks.eventSources.length = 0;
     vi.stubGlobal("EventSource", MockEventSource);
     mocks.getContext.mockResolvedValue({ channel: "deep_job_search", status: "ready", sections: [] });
@@ -174,8 +182,23 @@ describe("BossCapture current 与历史状态隔离", () => {
   });
 
   it("independent current 不查询 latest Workflow，也不建立关联父镜像", async () => {
-    mocks.getCurrent.mockResolvedValue({ smart_capture: capture(null) });
-    mocks.getCapture.mockResolvedValue(capture(null));
+    const independentCapture = {
+      ...capture(null),
+      search_combinations: [{
+        id: "combination-1", keyword: "Python", city: "东京", platform_filters_json: "{}",
+        status: "running", sequence: 0, transition_action: "SWITCH_COMBINATION",
+        transition_reason: "baseline", selected_axis: "", evidence_json: "{}", stop_reason: "",
+        jobs_seen: 8, run_fresh_jobs: 5, historical_duplicates: 3, strategy_reject: 1,
+        qualified_fresh_jobs: 4
+      }],
+      candidate_pool: [{ id: "candidate-1" }],
+      prefetch: {
+        prefetch_batch_id: "prefetch-1", source_analysis_batch_id: "analysis-1", status: "ready",
+        target_count: 3, pending_count: 0, collecting_count: 0, ready_count: 3, failed_count: 0
+      }
+    };
+    mocks.getCurrent.mockResolvedValue({ smart_capture: independentCapture });
+    mocks.getCapture.mockResolvedValue(independentCapture);
     const mounted = mountCapture();
     wrapper = mounted;
     await flushPromises();
@@ -185,7 +208,129 @@ describe("BossCapture current 与历史状态隔离", () => {
     expect(mocks.getRun).not.toHaveBeenCalled();
     expect(mocks.setRun).toHaveBeenCalledWith(null);
     expect(mounted.text()).toContain("待分析岗位队列");
+    expect(mounted.text()).toContain("历史 / Context 检查工具");
+    expect(mounted.text()).toContain("智能搜索策略");
+    expect(mounted.text()).toContain("3 / 3 已准备");
+    expect(mounted.text()).not.toContain("关联父任务镜像");
+    expect(mounted.text()).not.toContain("立即推进");
     expect((mounted.vm as unknown as { smartManualAnalysisAvailable: boolean }).smartManualAnalysisAvailable).toBe(false);
+  });
+
+  it("pending 与 interrupted 保留 Smart Capture 语义化动作", async () => {
+    const pendingCapture = {
+      ...capture(null),
+      status: "pending",
+      stage: "pending",
+      capabilities: { start: true, pause: false, resume: false, retry: false, stop: true }
+    };
+    mocks.getCurrent.mockResolvedValue({ smart_capture: pendingCapture });
+    mocks.getCapture.mockResolvedValue(pendingCapture);
+    mocks.startCapture.mockResolvedValue({ ...capture(null), state_version: 8 });
+    const mounted = mountCapture();
+    wrapper = mounted;
+    await flushPromises();
+
+    expect(mounted.text()).toContain("启动当前采集");
+    await (mounted.vm as unknown as { startCurrentSmartCapture: () => Promise<void> }).startCurrentSmartCapture();
+    expect(mocks.startCapture).toHaveBeenCalledWith("capture-current");
+
+    const interruptedCapture = {
+      ...capture(null),
+      status: "interrupted",
+      stage: "capture_interrupted",
+      state_version: 9,
+      capabilities: { start: false, pause: false, resume: true, retry: true, stop: true }
+    };
+    await (mounted.vm as unknown as {
+      applyCurrentSmartCapture: (capture: unknown) => Promise<void>;
+    }).applyCurrentSmartCapture(interruptedCapture);
+    mocks.retryCapture.mockResolvedValue({ ...interruptedCapture, state_version: 10, status: "running" });
+    await flushPromises();
+
+    expect(mounted.text()).toContain("继续采集");
+    expect(mounted.text()).toContain("重试采集");
+    await (mounted.vm as unknown as { retryCurrentSmartCapture: () => Promise<void> }).retryCurrentSmartCapture();
+    expect(mocks.retryCapture).toHaveBeenCalledWith("capture-current");
+  });
+
+  it("linked pending 不绕过父编排直接启动 child", async () => {
+    const linkedPendingCapture = {
+      ...capture("workflow-A"),
+      status: "pending",
+      stage: "pending",
+      capabilities: { start: true, pause: false, resume: false, retry: false, stop: true }
+    };
+    mocks.getCurrent.mockResolvedValue({ smart_capture: linkedPendingCapture });
+    mocks.getCapture.mockResolvedValue(linkedPendingCapture);
+    mocks.getRun.mockResolvedValue(workflowRun("workflow-A"));
+    mocks.currentRun = workflowRun("workflow-A");
+    const mounted = mountCapture();
+    wrapper = mounted;
+    await flushPromises();
+
+    expect(mounted.text()).not.toContain("启动当前采集");
+    await (mounted.vm as unknown as { startCurrentSmartCapture: () => Promise<void> }).startCurrentSmartCapture();
+    expect(mocks.startCapture).not.toHaveBeenCalled();
+  });
+
+  it("linked current 显示父镜像，历史工具独立于父控制区域", async () => {
+    mocks.getCurrent.mockResolvedValue({ smart_capture: capture("workflow-A") });
+    mocks.getCapture.mockResolvedValue(capture("workflow-A"));
+    mocks.getRun.mockResolvedValue(workflowRun("workflow-A"));
+    mocks.currentRun = workflowRun("workflow-A");
+    const mounted = mountCapture();
+    wrapper = mounted;
+    await flushPromises();
+
+    expect(mounted.text()).toContain("关联父任务镜像");
+    expect(mounted.text()).toContain("历史 / Context 检查工具");
+    expect(mounted.text()).toContain("返回驾驶舱");
+    expect(mounted.text()).not.toContain("立即推进");
+  });
+
+  it("父镜像控制按 control_state 显示，子任务中断时不误显示父 resume", async () => {
+    const interruptedParent = {
+      ...workflowRun("workflow-A"),
+      status: "waiting_for_user",
+      control_state: "waiting_child_interrupted",
+      control_cause: "recovery",
+      stop_reason: "capture_interrupted"
+    };
+    mocks.getCurrent.mockResolvedValue({ smart_capture: capture("workflow-A") });
+    mocks.getCapture.mockResolvedValue(capture("workflow-A"));
+    mocks.getRun.mockResolvedValue(interruptedParent);
+    mocks.currentRun = interruptedParent;
+    const mounted = mountCapture();
+    wrapper = mounted;
+    await flushPromises();
+
+    expect(mounted.text()).not.toContain("暂停父任务");
+    expect(mounted.text()).not.toContain("继续父任务");
+    expect(mounted.text()).toContain("停止父任务");
+  });
+
+  it("历史 Context 切换类型后仍刷新 inspected Run，而不改变 current identity", async () => {
+    mocks.getCurrent.mockResolvedValue({ smart_capture: null });
+    mocks.getRun.mockResolvedValue(workflowRun("workflow-B"));
+    const mounted = mountCapture();
+    wrapper = mounted;
+    await flushPromises();
+
+    mocks.getContext.mockClear();
+    const view = mounted.vm as unknown as {
+      smartRunLookupId: string;
+      smartContextChannel: string;
+      restoreSmartWorkflowRun: () => Promise<void>;
+      loadSelectedContextSnapshots: () => Promise<void>;
+    };
+    view.smartRunLookupId = "workflow-B";
+    await view.restoreSmartWorkflowRun();
+    expect(mocks.getContext).toHaveBeenCalledWith("workflow-B", "deep_job_search");
+
+    view.smartContextChannel = "candidate_analysis";
+    await view.loadSelectedContextSnapshots();
+    expect(mocks.getContext).toHaveBeenCalledWith("workflow-B", "candidate_analysis");
+    expect(mocks.getCapture).not.toHaveBeenCalled();
   });
 
   it("independent completed 使用 Smart Capture Manual Analysis，不开放 custom 岗位操作", async () => {

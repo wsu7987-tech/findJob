@@ -361,6 +361,37 @@ export type FineJobSmartCaptureStatus =
   | "failed"
   | "interrupted";
 
+export interface FineJobSmartCaptureSearchCombination {
+  id: string;
+  keyword: string;
+  city: string;
+  platform_filters_json: string;
+  status: string;
+  sequence: number;
+  transition_action: string;
+  transition_reason: string;
+  selected_axis: string;
+  evidence_json: string;
+  stop_reason: string;
+  jobs_seen: number;
+  run_fresh_jobs: number;
+  historical_duplicates: number;
+  strategy_reject: number;
+  qualified_fresh_jobs: number;
+  [key: string]: unknown;
+}
+
+export interface FineJobSmartCapturePrefetchSummary {
+  prefetch_batch_id: string;
+  source_analysis_batch_id: string;
+  status: string;
+  target_count: number;
+  pending_count: number;
+  collecting_count: number;
+  ready_count: number;
+  failed_count: number;
+}
+
 export interface FineJobSmartCapture {
   smart_capture_id: string;
   source: "task_cockpit" | "boss_capture";
@@ -389,6 +420,9 @@ export interface FineJobSmartCapture {
   updated_at: string;
   completed_at?: string | null;
   batches: Array<Record<string, unknown>>;
+  search_combinations?: FineJobSmartCaptureSearchCombination[];
+  candidate_pool?: Array<Record<string, unknown>>;
+  prefetch?: FineJobSmartCapturePrefetchSummary;
   current_batch?: FineJobBossCaptureTask | Record<string, unknown> | null;
   jobs: FineJobBossCapturedJob[];
   workflow_run?: FineJobWorkflowRun | null;

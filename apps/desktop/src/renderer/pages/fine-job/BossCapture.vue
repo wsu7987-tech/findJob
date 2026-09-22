@@ -22,6 +22,7 @@ import type {
   FineJobWorkflowContextSnapshot,
   FineJobSmartCapture,
   FineJobSmartCaptureHandoff,
+  FineJobSearchPlannerSummary,
   FineJobWorkflowRun
 } from "@/types";
 import { ApiError, api, getBackendOrigin } from "@/services/api";
@@ -205,6 +206,35 @@ const smartWorkflowRun = computed(() => {
   const run = workflowStore.currentRun;
   return run?.workflow_run_id === smartWorkflowRunId.value ? run : null;
 });
+// linked 父任务只由当前 Smart Capture 的关联 ID 确定，历史查询不会写入此镜像。
+const linkedParentWorkflowRun = computed(() => smartWorkflowRun.value);
+const linkedParentStartedAt = computed(() => {
+  const run = linkedParentWorkflowRun.value;
+  const smartCaptureId = currentSmartCapture.value?.smart_capture_id;
+  if (!run || !smartCaptureId) return "—";
+  const relation = run.children?.find((child) => child.smart_capture_id === smartCaptureId);
+  return relation?.started_at || relation?.created_at || run.updated_at || "—";
+});
+const linkedParentTerminal = computed(() => {
+  const status = linkedParentWorkflowRun.value?.status;
+  return !status || ["cancelled", "completed", "completed_with_errors", "failed"].includes(status);
+});
+// 父镜像控制依据父层 control_state，避免用 legacy status 覆盖子任务卡点语义。
+const linkedParentCanPause = computed(() => Boolean(
+  linkedParentWorkflowRun.value
+    && !linkedParentTerminal.value
+    && linkedParentWorkflowRun.value.control_state === "active"
+));
+const linkedParentCanResume = computed(() => Boolean(
+  linkedParentWorkflowRun.value
+    && linkedParentWorkflowRun.value.control_state === "paused"
+    && linkedParentWorkflowRun.value.control_cause === "parent_pause"
+));
+const linkedParentCanCancel = computed(() => Boolean(
+  linkedParentWorkflowRun.value
+    && !linkedParentTerminal.value
+    && linkedParentWorkflowRun.value.control_state
+));
 // Workflow 进入这些终态后，采集槽位已释放，页面允许重新开始或切换采集模式。
 const smartWorkflowTerminalStatuses = [
   "completed",
@@ -216,8 +246,17 @@ const smartWorkflowTerminalStatuses = [
 const smartCaptureRunning = computed(() =>
   Boolean(currentSmartCapture.value?.capabilities?.pause)
 );
+const smartCaptureStartable = computed(() =>
+  Boolean(
+    currentSmartCapture.value?.capabilities?.start
+      && !currentSmartCapture.value.workflow_run_id
+  )
+);
 const smartCaptureResumable = computed(() =>
   Boolean(currentSmartCapture.value?.capabilities?.resume)
+);
+const smartCaptureRetryable = computed(() =>
+  Boolean(currentSmartCapture.value?.capabilities?.retry)
 );
 const smartCaptureCanStart = computed(() =>
   !currentSmartCapture.value || smartWorkflowTerminalStatuses.includes(currentSmartCapture.value.status)
@@ -237,11 +276,116 @@ const smartPendingReviewItems = computed(() => smartAnalysisItems.value.filter(
 const smartAnalysisResultItems = computed(() => smartAnalysisItems.value.filter(
   (item) => item.status === "succeeded"
 ));
-const smartCompletionProgress = computed(() => smartWorkflowRun.value?.completion_progress);
-const smartPrefetchProgress = computed(() =>
-  smartWorkflowRun.value?.prefetch ?? smartWorkflowRun.value?.telemetry.prefetch
-);
-const smartSearchPlanner = computed(() => smartWorkflowRun.value?.telemetry.search_planner ?? null);
+const parseJsonRecord = (value: unknown): Record<string, unknown> => {
+  if (typeof value !== "string" || !value) return {};
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+};
+// Planner 与 Prefetch 直接读取 Smart Capture snapshot，确保 independent 不依赖父 Workflow。
+const smartPrefetchProgress = computed(() => currentSmartCapture.value?.prefetch ?? null);
+const smartSearchPlanner = computed<FineJobSearchPlannerSummary | null>(() => {
+  const combinations = currentSmartCapture.value?.search_combinations ?? [];
+  if (!combinations.length) return null;
+  const current = combinations.find((item) => item.status === "running") ?? combinations[combinations.length - 1];
+  const filters = parseJsonRecord(current.platform_filters_json);
+  return {
+    current_scope: { keyword: current.keyword, city: current.city },
+    current_combination: {
+      id: current.id,
+      sequence: current.sequence,
+      status: current.status,
+      platform_filters: Object.fromEntries(Object.entries(filters).map(([key, value]) => [key, String(value)])),
+      platform_filter_labels: Object.entries(filters).map(([key, value]) => `${key}: ${String(value)}`),
+      metrics: {
+        jobs_seen: Number(current.jobs_seen ?? 0),
+        run_fresh_jobs: Number(current.run_fresh_jobs ?? 0),
+        historical_duplicates: Number(current.historical_duplicates ?? 0),
+        strategy_reject: Number(current.strategy_reject ?? 0),
+        qualified_fresh_jobs: Number(current.qualified_fresh_jobs ?? 0)
+      }
+    },
+    last_transition: {
+      action: current.transition_action,
+      reason: current.transition_reason,
+      selected_axis: current.selected_axis,
+      evidence: parseJsonRecord(current.evidence_json),
+      stop_reason: current.stop_reason
+    },
+    pending_combination_count: combinations.filter((item) => item.status === "pending").length
+  };
+});
+const smartAnalysisDecisionCounts = computed(() => {
+  const counts = { recommend_count: 0, review_count: 0, reject_count: 0 };
+  smartAnalysisResultItems.value.forEach((item) => {
+    const decision = String(item.analysis_result.decision ?? "");
+    const key = `${decision}_count` as keyof typeof counts;
+    if (key in counts) counts[key] += 1;
+  });
+  return counts;
+});
+const smartCompletionProgress = computed(() => {
+  const deliveryTarget = currentSmartCapture.value?.execution_config?.delivery_target;
+  if (!deliveryTarget || typeof deliveryTarget !== "object") return null;
+  const config = deliveryTarget as Record<string, unknown>;
+  if (!config.enabled) return null;
+  const recommendTarget = Number(config.recommend_target ?? 0);
+  const reviewTarget = config.review_target === null || config.review_target === undefined
+    ? null
+    : Number(config.review_target);
+  const recommendCurrent = smartAnalysisDecisionCounts.value.recommend_count;
+  const reviewCurrent = smartAnalysisDecisionCounts.value.review_count;
+  const targetMode = config.target_mode === "any" ? "any" : "all";
+  const recommendReached = recommendCurrent >= recommendTarget;
+  const reviewReached = reviewTarget === null ? null : reviewCurrent >= reviewTarget;
+  return {
+    recommend: {
+      current: recommendCurrent,
+      target: recommendTarget,
+      remaining: Math.max(0, recommendTarget - recommendCurrent),
+      reached: recommendReached
+    },
+    review: {
+      current: reviewCurrent,
+      target: reviewTarget,
+      remaining: reviewTarget === null ? null : Math.max(0, reviewTarget - reviewCurrent),
+      reached: reviewReached
+    },
+    target_mode: targetMode,
+    target_reached: targetMode === "any"
+      ? recommendReached || reviewReached === true
+      : recommendReached && reviewReached !== false
+  };
+});
+const smartDetailProgress = computed(() => {
+  const capture = currentSmartCapture.value;
+  const progress = capture?.progress ?? {};
+  const combinations = capture?.search_combinations ?? [];
+  const currentCombination = combinations.find((item) => item.status === "running") ?? combinations[combinations.length - 1];
+  const totals = combinations.reduce((result, item) => ({
+    jobsSeen: result.jobsSeen + Number(item.jobs_seen ?? 0),
+    freshJobs: result.freshJobs + Number(item.run_fresh_jobs ?? 0),
+    duplicateJobs: result.duplicateJobs + Number(item.historical_duplicates ?? 0)
+  }), { jobsSeen: 0, freshJobs: 0, duplicateJobs: 0 });
+  return {
+    keyword: currentCombination?.keyword ?? "等待开始",
+    city: currentCombination?.city ?? "—",
+    depth: Number(progress.current ?? progress.progress_current ?? 0),
+    batchCount: capture?.batches.length ?? 0,
+    jobsSeen: totals.jobsSeen || capture?.jobs.length || Number(progress.jobs_collected ?? 0),
+    freshJobs: totals.freshJobs,
+    duplicateJobs: totals.duplicateJobs,
+    candidates: capture?.candidate_pool?.length ?? 0,
+    jdCompleted: Number(progress.details_completed ?? 0),
+    jdTotal: capture?.candidate_pool?.length ?? 0,
+    ...smartAnalysisDecisionCounts.value
+  };
+});
 const smartPlannerMetric = (key: string) => Number(
   smartSearchPlanner.value?.current_combination?.metrics?.[key] ?? 0
 );
@@ -1042,6 +1186,20 @@ const startSmartCapture = async () => {
   }
 };
 
+const startCurrentSmartCapture = async () => {
+  const capture = currentSmartCapture.value;
+  if (!capture?.capabilities.start || capture.workflow_run_id) return;
+  try {
+    smartCaptureControlLoading.value = true;
+    await applyCurrentSmartCapture(await api.startFineJobSmartCapture(capture.smart_capture_id));
+    ElMessage.success("岗位采集任务已启动");
+  } catch (errorValue) {
+    ElMessage.error(errorValue instanceof Error ? errorValue.message : "启动岗位采集失败");
+  } finally {
+    smartCaptureControlLoading.value = false;
+  }
+};
+
 const pauseCurrentSmartCapture = async () => {
   const capture = currentSmartCapture.value;
   if (!capture) return;
@@ -1065,6 +1223,20 @@ const resumeCurrentSmartCapture = async () => {
     ElMessage.success("岗位采集任务已继续");
   } catch (errorValue) {
     ElMessage.error(errorValue instanceof Error ? errorValue.message : "继续岗位采集失败");
+  } finally {
+    smartCaptureControlLoading.value = false;
+  }
+};
+
+const retryCurrentSmartCapture = async () => {
+  const capture = currentSmartCapture.value;
+  if (!capture?.capabilities.retry) return;
+  try {
+    smartCaptureControlLoading.value = true;
+    await applyCurrentSmartCapture(await api.retryFineJobSmartCapture(capture.smart_capture_id));
+    ElMessage.success("岗位采集任务已重试");
+  } catch (errorValue) {
+    ElMessage.error(errorValue instanceof Error ? errorValue.message : "重试岗位采集失败");
   } finally {
     smartCaptureControlLoading.value = false;
   }
@@ -1183,24 +1355,6 @@ const loadSmartContextSnapshot = async (showError = false) => {
     if (showError) {
       ElMessage.error(errorValue instanceof Error ? errorValue.message : "加载 Context 快照失败");
     }
-  }
-};
-
-const advanceSmartWorkflowRun = async () => {
-  const run = smartWorkflowRun.value;
-  if (!run) return;
-  try {
-    // 推进前刷新当前 Run，确保采集任务关联与后续快照基于最新状态。
-    await workflowStore.refresh(run.workflow_run_id);
-    workflowStore.startPolling();
-    await workflowStore.advance();
-    if (workflowStore.currentRun) {
-      await syncSmartCaptureTask(workflowStore.currentRun);
-    }
-    await loadSmartContextSnapshot();
-    await loadSmartAnalysisItems();
-  } catch (errorValue) {
-    ElMessage.error(errorValue instanceof Error ? errorValue.message : "推进智能采集 Run 失败");
   }
 };
 
@@ -1409,6 +1563,13 @@ const loadInspectedContextSnapshot = async (showError = false) => {
       ElMessage.error(errorValue instanceof Error ? errorValue.message : "加载历史 Context 快照失败");
     }
   }
+};
+
+const loadSelectedContextSnapshots = async () => {
+  await Promise.all([
+    loadSmartContextSnapshot(),
+    loadInspectedContextSnapshot()
+  ]);
 };
 
 watch(smartRunLookupId, (workflowRunId) => {
@@ -1790,21 +1951,21 @@ function formatDuration(seconds: number) {
       </p>
     </section>
 
-    <section v-if="smartWorkflowRun" class="page-panel smart-workflow-panel">
+    <section v-if="currentSmartCapture" class="page-panel smart-workflow-panel">
       <div class="panel-title-row">
-        <div><p class="panel-eyebrow">Workflow Run</p><h2>智能任务进度</h2></div>
-        <el-tag :type="smartWorkflowRun.waiting_for_user ? 'warning' : 'info'">
-          {{ smartWorkflowRun.status }} / {{ smartWorkflowRun.current_step }}
+        <div><p class="panel-eyebrow">Smart Capture</p><h2>智能采集执行详情</h2></div>
+        <el-tag :type="currentSmartCapture.status === 'waiting_for_user' ? 'warning' : 'info'">
+          {{ currentSmartCapture.status }} / {{ currentSmartCapture.stage }}
         </el-tag>
       </div>
-      <p>{{ smartWorkflowRun.next_action_reason }}</p>
+      <p>{{ currentSmartCapture.message || smartWorkflowRun?.next_action_reason }}</p>
       <div class="workflow-run-grid">
-        <div><span class="secondary-text">当前搜索</span><strong>{{ smartWorkflowRun.progress.current_keyword || "等待开始" }} / {{ smartWorkflowRun.progress.current_city || "—" }}</strong></div>
-        <div><span class="secondary-text">搜索深度 / 批次</span><strong>{{ smartWorkflowRun.progress.search_depth }} / {{ smartWorkflowRun.progress.search_batch_count }}</strong></div>
-        <div><span class="secondary-text">岗位：已见 / Fresh / 重复</span><strong>{{ smartWorkflowRun.progress.jobs_seen }} / {{ smartWorkflowRun.progress.fresh_jobs }} / {{ smartWorkflowRun.progress.duplicate_jobs }}</strong></div>
-        <div><span class="secondary-text">初筛候选</span><strong>{{ smartWorkflowRun.progress.candidates }}</strong></div>
-        <div><span class="secondary-text">JD：完成 / 已建</span><strong>{{ smartWorkflowRun.progress.jd_completed }} / {{ smartWorkflowRun.progress.jd_total }}</strong></div>
-        <div><span class="secondary-text">分析：推荐 / 复核 / 拒绝</span><strong>{{ smartWorkflowRun.progress.recommend_count }} / {{ smartWorkflowRun.progress.review_count }} / {{ smartWorkflowRun.progress.reject_count }}</strong></div>
+        <div><span class="secondary-text">当前搜索</span><strong>{{ smartDetailProgress.keyword }} / {{ smartDetailProgress.city }}</strong></div>
+        <div><span class="secondary-text">搜索深度 / 批次</span><strong>{{ smartDetailProgress.depth }} / {{ smartDetailProgress.batchCount }}</strong></div>
+        <div><span class="secondary-text">岗位：已见 / Fresh / 重复</span><strong>{{ smartDetailProgress.jobsSeen }} / {{ smartDetailProgress.freshJobs }} / {{ smartDetailProgress.duplicateJobs }}</strong></div>
+        <div><span class="secondary-text">初筛候选</span><strong>{{ smartDetailProgress.candidates }}</strong></div>
+        <div><span class="secondary-text">JD：完成 / 已建</span><strong>{{ smartDetailProgress.jdCompleted }} / {{ smartDetailProgress.jdTotal }}</strong></div>
+        <div><span class="secondary-text">分析：推荐 / 复核 / 拒绝</span><strong>{{ smartDetailProgress.recommend_count }} / {{ smartDetailProgress.review_count }} / {{ smartDetailProgress.reject_count }}</strong></div>
         <div v-if="smartCompletionProgress"><span class="secondary-text">Recommend 完成</span><strong>{{ smartCompletionProgress.recommend.current }} / {{ smartCompletionProgress.recommend.target }}（剩余 {{ smartCompletionProgress.recommend.remaining }}）</strong></div>
         <div v-if="smartCompletionProgress"><span class="secondary-text">Review 完成</span><strong>{{ smartCompletionProgress.review.target === null ? `${smartCompletionProgress.review.current}（未计入目标）` : `${smartCompletionProgress.review.current} / ${smartCompletionProgress.review.target}（剩余 ${smartCompletionProgress.review.remaining}）` }}</strong></div>
         <div v-if="smartPrefetchProgress && smartPrefetchProgress.status !== 'none'"><span class="secondary-text">下一批 JD</span><strong>{{ smartPrefetchProgress.ready_count }} / {{ smartPrefetchProgress.target_count }} 已准备</strong></div>
@@ -1813,23 +1974,15 @@ function formatDuration(seconds: number) {
 
     <section class="page-panel smart-workflow-operations">
       <div class="panel-title-row">
-        <div><p class="panel-eyebrow">Workflow Run</p><h2>关联父任务与历史查询</h2></div>
+        <div><p class="panel-eyebrow">Workflow History</p><h2>历史 / Context 检查工具</h2></div>
       </div>
       <div class="smart-run-restore">
         <el-input v-model="smartRunLookupId" clearable placeholder="输入历史 Workflow Run ID 查看 Context" @keyup.enter="restoreSmartWorkflowRun" />
-        <el-select v-model="smartContextChannel" class="smart-context-channel">
+        <el-select v-model="smartContextChannel" class="smart-context-channel" @change="loadSelectedContextSnapshots">
           <el-option label="搜索 Context" value="deep_job_search" />
           <el-option label="分析 Shared Base" value="candidate_analysis" />
         </el-select>
         <el-button :loading="workflowStore.loading" @click="restoreSmartWorkflowRun">查看历史 Context</el-button>
-        <el-button :loading="workflowStore.advancing" :disabled="!smartWorkflowRun" @click="advanceSmartWorkflowRun">立即推进</el-button>
-        <el-button v-if="smartWorkflowRun && smartWorkflowRun.status !== 'paused' && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(smartWorkflowRun.status)" :loading="smartControlLoading" @click="pauseSmartWorkflow">暂停自动推进</el-button>
-        <el-button v-if="smartWorkflowRun?.status === 'paused' || (smartWorkflowRun?.status === 'waiting_for_user' && ['capture_interrupted', 'browser_not_running', 'collection_task_active', 'analysis_batch_completed_waiting_user', 'analysis_batch_waiting_user'].includes(smartWorkflowRun.stop_reason))" :loading="smartControlLoading" @click="resumeSmartWorkflow">继续任务</el-button>
-        <el-button v-if="smartWorkflowRun && !['cancelled', 'completed', 'completed_with_errors', 'failed'].includes(smartWorkflowRun.status)" type="danger" plain :loading="smartControlLoading" @click="stopSmartWorkflow">停止任务</el-button>
-        <el-button v-if="smartWorkflowCodexEntry" type="primary" @click="openSmartWorkflowCodex(smartWorkflowCodexEntry.action)">{{ smartWorkflowCodexEntry.label }}</el-button>
-        <el-button v-if="canResubmitSmartWorkflowCodex" @click="resubmitSmartWorkflowCodex">再次提交</el-button>
-        <el-button v-if="canRetrySmartWorkflowCodex" type="warning" @click="retrySmartWorkflowCodex">重新交接</el-button>
-        <el-tag v-if="smartWorkflowHandoffStatus" type="info">{{ smartWorkflowHandoffStatus }}</el-tag>
       </div>
       <el-alert
         v-if="inspectedHistoricalRun"
@@ -1847,46 +2000,24 @@ function formatDuration(seconds: number) {
           <el-empty v-else description="该历史 Run 当前通道没有 Context 快照。" :image-size="64" />
         </el-collapse-item>
       </el-collapse>
-      <el-alert
-        v-if="hasEndedSmartWorkflowCodexSession"
-        title="原 Codex 会话不可恢复；下一批进入 waiting_codex 后可重新交给 Codex 分析。"
-        type="info"
-        :closable="false"
-        show-icon
-      />
     </section>
 
-    <section v-if="smartWorkflowRun" class="page-panel smart-workflow-details">
+    <section v-if="linkedParentWorkflowRun" class="page-panel smart-workflow-details">
       <div class="panel-title-row">
-        <div><p class="panel-eyebrow">Workflow Run</p><h2>Workflow Run 状态与详情</h2></div>
+        <div><p class="panel-eyebrow">Linked Parent</p><h2>关联父任务镜像</h2></div>
       </div>
-      <el-descriptions :column="3" border>
-        <el-descriptions-item label="Workflow Run ID"><code>{{ smartWorkflowRun.workflow_run_id }}</code></el-descriptions-item>
-        <el-descriptions-item label="Recommend 目标">{{ smartWorkflowRun.completion_contract?.recommend_target ?? smartWorkflowRun.completion_contract?.target_count ?? smartRecommendTarget }}</el-descriptions-item>
-        <el-descriptions-item label="Review 目标">{{ smartWorkflowRun.completion_contract?.review_target ?? '未配置' }}</el-descriptions-item>
-        <el-descriptions-item label="目标模式">{{ smartWorkflowRun.completion_contract?.target_mode ?? 'all' }}</el-descriptions-item>
-        <el-descriptions-item label="业务完成状态">{{ smartCompletionProgress?.target_reached ? '已达到配置目标' : '尚未达到配置目标' }}</el-descriptions-item>
-        <el-descriptions-item label="Recommend 完成">{{ smartCompletionProgress ? `${smartCompletionProgress.recommend.current} / ${smartCompletionProgress.recommend.target}（剩余 ${smartCompletionProgress.recommend.remaining}）` : '—' }}</el-descriptions-item>
-        <el-descriptions-item label="Review 完成">{{ smartCompletionProgress?.review.target === null ? `${smartCompletionProgress?.review.current ?? 0}（未计入目标）` : `${smartCompletionProgress?.review.current ?? 0} / ${smartCompletionProgress?.review.target ?? 0}（剩余 ${smartCompletionProgress?.review.remaining ?? 0}）` }}</el-descriptions-item>
-        <el-descriptions-item label="正式 Recommend（兼容计数）">{{ smartWorkflowRun.completed_count }}</el-descriptions-item>
-        <el-descriptions-item label="Recommend 剩余（兼容计数）">{{ smartWorkflowRun.remaining_count }}</el-descriptions-item>
-        <el-descriptions-item label="当前搜索">{{ smartWorkflowRun.progress.current_keyword || '等待开始' }} / {{ smartWorkflowRun.progress.current_city || '—' }}</el-descriptions-item>
-        <el-descriptions-item label="搜索深度 / 批次">{{ smartWorkflowRun.progress.search_depth }} / {{ smartWorkflowRun.progress.search_batch_count }}</el-descriptions-item>
-        <el-descriptions-item label="岗位：已见 / Fresh / 重复">{{ smartWorkflowRun.progress.jobs_seen }} / {{ smartWorkflowRun.progress.fresh_jobs }} / {{ smartWorkflowRun.progress.duplicate_jobs }}</el-descriptions-item>
-        <el-descriptions-item label="初筛候选">{{ smartWorkflowRun.progress.candidates }}</el-descriptions-item>
-        <el-descriptions-item label="JD：完成 / 已建">{{ smartWorkflowRun.progress.jd_completed }} / {{ smartWorkflowRun.progress.jd_total }}</el-descriptions-item>
-        <el-descriptions-item v-if="smartPrefetchProgress && smartPrefetchProgress.status !== 'none'" label="下一批 JD">{{ smartPrefetchProgress.ready_count }} / {{ smartPrefetchProgress.target_count }} 已准备（{{ smartPrefetchProgress.status }}）</el-descriptions-item>
-        <el-descriptions-item label="分析：推荐 / 复核 / 拒绝">{{ smartWorkflowRun.progress.recommend_count }} / {{ smartWorkflowRun.progress.review_count }} / {{ smartWorkflowRun.progress.reject_count }}</el-descriptions-item>
-        <el-descriptions-item label="当前状态">{{ smartWorkflowRun.status }} / {{ smartWorkflowRun.current_step }}</el-descriptions-item>
-        <el-descriptions-item label="下一步">{{ smartWorkflowRun.next_action }}</el-descriptions-item>
-        <el-descriptions-item label="下一步原因">{{ smartWorkflowRun.next_action_reason }}</el-descriptions-item>
-        <el-descriptions-item label="建议投递策略">{{ smartWorkflowRun.completion_contract?.selected_strategy_ids?.recommendation_strategy_id || '—' }}</el-descriptions-item>
-        <el-descriptions-item label="本 Run 模型">{{ smartWorkflowRun.completion_contract?.codex_execution_config?.model || '—' }}</el-descriptions-item>
-        <el-descriptions-item label="推理强度">{{ smartWorkflowRun.completion_contract?.codex_execution_config?.reasoning_effort || '—' }}</el-descriptions-item>
-        <el-descriptions-item label="Analysis Batch">{{ smartWorkflowRun.completion_contract?.analysis_policy?.analysis_batch_size ?? '—' }}</el-descriptions-item>
-        <el-descriptions-item label="批次衔接">{{ smartWorkflowRun.completion_contract?.execution_policy?.after_analysis_batch ?? 'auto_continue' }}</el-descriptions-item>
-        <el-descriptions-item label="Codex 交接">{{ smartWorkflowRun.completion_contract?.execution_policy?.codex_handoff ?? 'auto' }}</el-descriptions-item>
+      <el-descriptions :column="2" border>
+        <el-descriptions-item label="父任务 ID"><code>{{ linkedParentWorkflowRun.workflow_run_id }}</code></el-descriptions-item>
+        <el-descriptions-item label="父任务状态">{{ linkedParentWorkflowRun.status }} / {{ linkedParentWorkflowRun.control_state }}</el-descriptions-item>
+        <el-descriptions-item label="当前编排步骤">{{ linkedParentWorkflowRun.current_step || linkedParentWorkflowRun.next_action }}</el-descriptions-item>
+        <el-descriptions-item label="关联开始时间">{{ linkedParentStartedAt }}</el-descriptions-item>
       </el-descriptions>
+      <div class="platform-actions">
+        <el-button v-if="linkedParentCanPause" :loading="smartControlLoading" @click="pauseSmartWorkflow">暂停父任务</el-button>
+        <el-button v-if="linkedParentCanResume" :loading="smartControlLoading" @click="resumeSmartWorkflow">继续父任务</el-button>
+        <el-button v-if="linkedParentCanCancel" type="danger" plain :loading="smartControlLoading" @click="stopSmartWorkflow">停止父任务</el-button>
+        <el-button @click="router.push({ name: 'fine-job-cockpit' })">返回驾驶舱</el-button>
+      </div>
     </section>
 
     <section v-if="smartSearchPlanner" class="page-panel smart-search-planner">
@@ -1924,6 +2055,15 @@ function formatDuration(seconds: number) {
           </div>
           <div class="platform-actions capture-submit">
             <el-button
+              v-if="smartCaptureStartable"
+              type="primary"
+              :loading="smartCaptureControlLoading"
+              @click="startCurrentSmartCapture"
+            >
+              启动当前采集
+            </el-button>
+            <el-button
+              v-else
               type="primary"
               :loading="smartCaptureControlLoading"
               :disabled="smartCaptureControlLoading || !smartCaptureCanStart"
@@ -1936,6 +2076,9 @@ function formatDuration(seconds: number) {
             </el-button>
             <el-button v-if="smartCaptureResumable" type="success" :loading="smartCaptureControlLoading" @click="resumeCurrentSmartCapture">
               继续采集
+            </el-button>
+            <el-button v-if="smartCaptureRetryable" type="warning" :loading="smartCaptureControlLoading" @click="retryCurrentSmartCapture">
+              重试采集
             </el-button>
             <el-button
               v-if="currentSmartCapture && !smartWorkflowTerminalStatuses.includes(currentSmartCapture.status)"
@@ -1955,7 +2098,19 @@ function formatDuration(seconds: number) {
             :title="`岗位采集：${currentSmartCapture.status}`"
             :description="currentSmartCapture.message"
           />
-          <el-alert v-if="smartWorkflowRun" type="info" :closable="false" show-icon :title="`智能采集：${smartWorkflowRun.status}`" :description="smartWorkflowRun.next_action_reason" />
+          <el-alert
+            v-if="hasEndedSmartWorkflowCodexSession"
+            title="原 Codex 会话不可恢复；下一批进入 waiting_codex 后可重新交给 Codex 分析。"
+            type="info"
+            :closable="false"
+            show-icon
+          />
+          <div v-if="currentSmartCapture" class="platform-actions">
+            <el-button v-if="smartWorkflowCodexEntry" type="primary" @click="openSmartWorkflowCodex(smartWorkflowCodexEntry.action)">{{ smartWorkflowCodexEntry.label }}</el-button>
+            <el-button v-if="canResubmitSmartWorkflowCodex" @click="resubmitSmartWorkflowCodex">再次提交</el-button>
+            <el-button v-if="canRetrySmartWorkflowCodex" type="warning" @click="retrySmartWorkflowCodex">重新交接</el-button>
+            <el-tag v-if="smartWorkflowHandoffStatus" type="info">{{ smartWorkflowHandoffStatus }}</el-tag>
+          </div>
           <div v-if="currentSmartCapture" class="smart-guidance-actions">
             <h2>本次智能采集分析指导</h2>
             <el-input v-model="smartAnalysisGuidance" type="textarea" :rows="2" placeholder="补充要求会保存并作用于后续批次" />
@@ -1969,7 +2124,7 @@ function formatDuration(seconds: number) {
               <el-collapse-item name="smart-context">
                 <template #title>查看 Context 快照与预算</template>
                 <div class="smart-context-controls">
-                  <el-select v-model="smartContextChannel" @change="loadSmartContextSnapshot(); loadInspectedContextSnapshot()">
+                  <el-select v-model="smartContextChannel" @change="loadSelectedContextSnapshots">
                     <el-option label="搜索 Context" value="deep_job_search" />
                     <el-option label="分析 Shared Base" value="candidate_analysis" />
                   </el-select>
@@ -2001,12 +2156,6 @@ function formatDuration(seconds: number) {
                   </el-collapse>
                 </template>
                 <el-empty v-else description="当前通道尚未生成 Context 快照。" :image-size="64" />
-              </el-collapse-item>
-              <el-collapse-item v-if="inspectedHistoricalRun" name="inspected-context">
-                <template #title>历史 Run Context：{{ inspectedHistoricalRun.workflow_run_id }}</template>
-                <el-button @click="loadInspectedContextSnapshot(true)">刷新历史 Context</el-button>
-                <pre v-if="inspectedContextSnapshot">{{ JSON.stringify(inspectedContextSnapshot, null, 2) }}</pre>
-                <el-empty v-else description="该历史 Run 当前通道没有 Context 快照。" :image-size="64" />
               </el-collapse-item>
             </el-collapse>
           </section>
