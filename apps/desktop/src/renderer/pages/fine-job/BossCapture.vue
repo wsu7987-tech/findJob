@@ -991,6 +991,7 @@ const smartCaptureRefreshKey = (capture: FineJobSmartCapture | null) => capture
 const applyCurrentSmartCapture = async (capture: FineJobSmartCapture | null) => {
   if (!bossCapturePageActive) return;
   if (!capture) {
+    closeSmartCaptureDetailEventSource();
     smartContextRequestGeneration += 1;
     smartAnalysisRequestGeneration += 1;
     currentSmartCapture.value = null;
@@ -1023,6 +1024,10 @@ const applyCurrentSmartCapture = async (capture: FineJobSmartCapture | null) => 
     workflowStore.stopPolling();
   }
   currentSmartCapture.value = capture;
+  if (smartWorkflowTerminalStatuses.includes(capture.status)) {
+    // 终态快照保留结果展示，同时立即释放页面级详情订阅。
+    closeSmartCaptureDetailEventSource();
+  }
   smartWorkflowRunId.value = capture.workflow_run_id ?? "";
   smartWorkflowJobs.value = [...(capture.jobs ?? [])];
   if (captureStore.task?.capture_source === "smart") {
@@ -1046,7 +1051,12 @@ const applyCurrentSmartCapture = async (capture: FineJobSmartCapture | null) => 
   // 关联父镜像只由当前 Smart Capture 的 workflow_run_id 建立。
   if (!bossCapturePageActive || currentSmartCapture.value?.smart_capture_id !== capture.smart_capture_id) return;
   workflowStore.setRun(linkedRun);
-  if (!workflowStore.pollingActive) workflowStore.startPolling();
+  if (
+    !["cancelled", "completed", "completed_with_errors", "failed"].includes(linkedRun.status)
+    && !workflowStore.pollingActive
+  ) {
+    workflowStore.startPolling();
+  }
 };
 
 const refreshCurrentSmartCapture = async () => {
@@ -1096,6 +1106,7 @@ const openSmartCaptureDetailEventSource = async (
     || currentSmartCapture.value?.smart_capture_id !== smartCaptureId
   ) return;
   closeSmartCaptureDetailEventSource();
+  if (smartCaptureTerminal.value) return;
   smartCaptureStreamId = smartCaptureId;
   const source = new EventSource(
     new URL(`/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/events`, backendOrigin).toString()
@@ -1140,6 +1151,7 @@ const connectSmartCaptureEventStreams = async () => {
           if (
             generation === smartCaptureStreamGeneration
             && previousId !== snapshot.smart_capture_id
+            && !smartWorkflowTerminalStatuses.includes(snapshot.status)
           ) {
             await openSmartCaptureDetailEventSource(snapshot.smart_capture_id, generation, origin);
           }
@@ -1148,7 +1160,7 @@ const connectSmartCaptureEventStreams = async () => {
         }
       })();
     };
-    if (currentSmartCapture.value) {
+    if (currentSmartCapture.value && !smartCaptureTerminal.value) {
       await openSmartCaptureDetailEventSource(
         currentSmartCapture.value.smart_capture_id,
         generation,

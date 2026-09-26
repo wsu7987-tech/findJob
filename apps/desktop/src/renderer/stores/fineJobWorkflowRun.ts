@@ -106,8 +106,12 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
 
   const startPolling = () => {
     // 保留旧方法名，调用方无需改动；实际建立的是 SSE 状态订阅。
+    if (!currentRun.value || terminalStatuses.has(currentRun.value.status)) {
+      stopPolling();
+      return;
+    }
     pollingActive.value = true;
-    if (currentRun.value && !terminalStatuses.has(currentRun.value.status)) ensurePolling();
+    ensurePolling();
   };
 
   const create = async (

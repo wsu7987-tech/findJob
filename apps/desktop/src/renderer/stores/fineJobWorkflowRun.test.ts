@@ -1,4 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+// @vitest-environment jsdom
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 
 import { api } from "@/services/api";
@@ -30,6 +32,10 @@ describe("fineJobWorkflowRun store", () => {
     vi.restoreAllMocks();
   });
 
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it("恢复父任务时只调用一个 resume endpoint，不追加 advance", async () => {
     const resume = vi.spyOn(api, "resumeFineJobWorkflowRun").mockResolvedValue(run("running") as never);
     const advance = vi.spyOn(api, "advanceFineJobWorkflowRun").mockResolvedValue(run("running") as never);
@@ -56,6 +62,7 @@ describe("fineJobWorkflowRun store", () => {
     const startChild = vi.spyOn(api, "startFineJobWorkflowChild").mockResolvedValue(runningRun as never);
     const advance = vi.spyOn(api, "advanceFineJobWorkflowRun").mockResolvedValue(runningRun as never);
     const store = useFineJobWorkflowRunStore();
+    store.setRun(run("completed") as never);
 
     await store.create({} as never);
     store.stopPolling();
@@ -63,6 +70,7 @@ describe("fineJobWorkflowRun store", () => {
     expect(create).toHaveBeenCalled();
     expect(startChild).toHaveBeenCalledWith("workflow-1", "relation-1");
     expect(advance).not.toHaveBeenCalled();
+    expect(store.currentRun?.status).toBe("running");
   });
 
   it("收到较旧 state_version 的 SSE 快照时保留当前父子投影", () => {
@@ -89,6 +97,47 @@ describe("fineJobWorkflowRun store", () => {
     expect(pause).not.toHaveBeenCalled();
     expect(resume).not.toHaveBeenCalled();
     expect(cancel).not.toHaveBeenCalled();
+  });
+
+  it("终态父任务保持订阅关闭，重复启动也是安全 no-op", () => {
+    const eventSource = vi.fn();
+    vi.stubGlobal("EventSource", eventSource);
+    const store = useFineJobWorkflowRunStore();
+    store.setRun(run("running") as never);
+    store.startPolling();
+    store.setRun(run("completed") as never);
+
+    expect(store.pollingActive).toBe(false);
+    expect(store.streamActive).toBe(false);
+    store.startPolling();
+    expect(store.pollingActive).toBe(false);
+    expect(store.streamActive).toBe(false);
+    expect(eventSource).not.toHaveBeenCalled();
+  });
+
+  it.each(["running", "waiting_for_user", "paused"])("非终态 %s 正常建立父任务 SSE", async (status) => {
+    const instances: MockEventSource[] = [];
+    class MockEventSource {
+      onopen: (() => void) | null = null;
+      onmessage: ((event: MessageEvent<string>) => void) | null = null;
+      onerror: (() => void) | null = null;
+      close = vi.fn();
+
+      constructor(readonly url: string) {
+        instances.push(this);
+      }
+    }
+    vi.stubGlobal("EventSource", MockEventSource);
+    const store = useFineJobWorkflowRunStore();
+    store.setRun(run(status) as never);
+
+    store.startPolling();
+    await vi.waitFor(() => expect(instances).toHaveLength(1));
+
+    expect(store.pollingActive).toBe(true);
+    expect(instances[0].url).toContain("/api/fine-job/workflow-runs/workflow-1/events");
+    store.stopPolling();
+    expect(instances[0].close).toHaveBeenCalledTimes(1);
   });
 
   it("恢复子任务后回读父快照，保持驾驶舱父子投影同步", async () => {

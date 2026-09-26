@@ -20,12 +20,20 @@ const run = (updates: Partial<FineJobWorkflowRun> = {}): FineJobWorkflowRun => (
   next_action_reason: "等待 Codex",
   waiting_for_user: false,
   stop_reason: "",
+  control_state: "waiting_codex",
+  waiting_reason: "等待 Codex",
+  control_cause: "analysis",
+  state_version: 1,
+  transition_id: "transition-1",
   telemetry: {},
   progress: {
     current_keyword: "", current_city: "", search_depth: 0, search_batch_count: 0,
     jobs_seen: 0, fresh_jobs: 0, duplicate_jobs: 0, candidates: 0,
     current_batch_new_jobs: 0, current_batch_duplicates: 0, jd_total: 0, jd_completed: 0,
-    recommend_count: 0, review_count: 0, reject_count: 0
+    recommend_count: 0, review_count: 0, reject_count: 0, historical_duplicates: 0,
+    cooldown_excluded: 0, strategy_pass: 0, strategy_review: 0, strategy_reject: 0,
+    qualified_fresh_jobs: 0, candidate_jobs: 0, novelty_yield: 0,
+    qualified_novelty_yield: 0, duplicate_rate: 0
   },
   completion_contract: {
     codex_execution_config: { model: "gpt-5.6-luna", reasoning_effort: "high" },

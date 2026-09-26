@@ -284,6 +284,20 @@ describe("BossCapture current 与历史状态隔离", () => {
     expect(mounted.text()).not.toContain("立即推进");
   });
 
+  it("terminal linked parent 只展示快照且不启动 Workflow SSE", async () => {
+    const terminalParent = { ...workflowRun("workflow-A"), status: "completed", control_state: "completed" };
+    mocks.getCurrent.mockResolvedValue({ smart_capture: capture("workflow-A") });
+    mocks.getRun.mockResolvedValue(terminalParent);
+    mocks.currentRun = terminalParent;
+    const mounted = mountCapture();
+    wrapper = mounted;
+    await flushPromises();
+
+    expect(mocks.setRun).toHaveBeenCalledWith(expect.objectContaining({ status: "completed" }));
+    expect(mocks.startPolling).not.toHaveBeenCalled();
+    expect(mounted.text()).toContain("关联父任务镜像");
+  });
+
   it("父镜像控制按 control_state 显示，子任务中断时不误显示父 resume", async () => {
     const interruptedParent = {
       ...workflowRun("workflow-A"),
@@ -355,10 +369,24 @@ describe("BossCapture current 与历史状态隔离", () => {
     expect(mounted.text()).toContain("交给 Codex 批量生成建议");
     expect(mounted.text()).not.toContain("采集选中的");
     expect(mounted.text()).not.toContain("AI 初筛详情岗位");
+    expect(mocks.eventSources.map((source) => source.url)).toEqual([
+      "http://127.0.0.1:8000/api/fine-job/smart-captures/current/events"
+    ]);
 
     (mounted.vm as unknown as { activeCaptureConditionTab: "smart" | "custom" }).activeCaptureConditionTab = "custom";
     await flushPromises();
     expect((mounted.vm as unknown as { displayingCurrentSmartCapture: boolean }).displayingCurrentSmartCapture).toBe(false);
+  });
+
+  it.each(["completed", "stopped", "failed"])("terminal Smart Capture %s 不建立页面详情 SSE", async (status) => {
+    mocks.getCurrent.mockResolvedValue({ smart_capture: { ...capture(null), status } });
+    const mounted = mountCapture();
+    wrapper = mounted;
+    await flushPromises();
+
+    expect(mocks.eventSources.map((source) => source.url)).toEqual([
+      "http://127.0.0.1:8000/api/fine-job/smart-captures/current/events"
+    ]);
   });
 
   it("创建后通过 current API 确认页面身份", async () => {

@@ -10,6 +10,7 @@ const runtime = {
   listen_enabled: true,
   generation_enabled: false,
   send_enabled: true,
+  direct_execution_enabled: true,
   trigger_mode: "manual",
   interval_minutes: 0,
   leader_epoch: 3,
@@ -58,6 +59,7 @@ const detail = () => ({
   session,
   messages: [],
   reply_tasks: [replyTask],
+  draft: replyTask,
   send_actions: []
 });
 
@@ -74,6 +76,11 @@ describe("fineJobBossChat store", () => {
       queued_chat_count: 0,
       batch_limit: 100
     } as never);
+    vi.spyOn(api, "getFineJobChatResumeAttachments").mockResolvedValue({
+      attachments: [],
+      saved: true
+    } as never);
+    vi.spyOn(api, "getFineJobChatMessageTransformConfig").mockResolvedValue({} as never);
   });
 
   it("加载运行状态、会话列表和选中会话详情", async () => {
@@ -87,6 +94,7 @@ describe("fineJobBossChat store", () => {
 
   it("确认发送时携带草稿依据消息和会话版本", async () => {
     vi.spyOn(api, "editFineJobChatReply").mockResolvedValue({ reply_task: replyTask } as never);
+    vi.spyOn(api, "createFineJobChatManualReply").mockResolvedValue({ reply_task: replyTask } as never);
     const confirmSpy = vi.spyOn(api, "confirmFineJobChatReply").mockResolvedValue({
       action: { id: "send-1", status: "queued" }
     } as never);

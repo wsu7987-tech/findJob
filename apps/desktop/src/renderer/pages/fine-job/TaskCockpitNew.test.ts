@@ -130,7 +130,42 @@ describe("TaskCockpitNew", () => {
     expect(terminalWrapper.get('[data-testid="child-timeline"]').text()).toContain("已采集 8 个候选");
     expect(terminalWrapper.text()).toContain("父任务状态：completed");
     expect(terminalWrapper.findAll("button").some((button) => button.text() === "暂停")).toBe(false);
-    expect(mocks.restoreLatest).toHaveBeenCalledWith(false, "task_cockpit");
+    expect(mocks.restoreLatest).toHaveBeenCalledWith(true, "task_cockpit");
+  });
+
+  it("离开后重新进入仍恢复同一终态 Run 和时间线", async () => {
+    mocks.run = run({
+      workflow_run_id: "terminal-run",
+      status: "completed",
+      children: [child({ result_summary: { short_summary: "最终采集 12 个候选" } })]
+    });
+    const first = mountPage();
+    await flushPromises();
+    expect(first.text()).toContain("最终采集 12 个候选");
+    first.unmount();
+
+    const second = mountPage();
+    await flushPromises();
+    expect(second.text()).toContain("父任务状态：completed");
+    expect(second.get('[data-testid="child-timeline"]').text()).toContain("最终采集 12 个候选");
+    expect(second.find('[data-testid="orchestration-panel"]').exists()).toBe(true);
+    expect(mocks.restoreLatest).toHaveBeenLastCalledWith(true, "task_cockpit");
+  });
+
+  it.each([
+    ["running", "active"],
+    ["paused", "paused"],
+    ["waiting_for_user", "waiting_for_user"],
+    ["waiting_for_user", "child_cancelled_waiting_decision"],
+    ["waiting_for_user", "child_failed_waiting_decision"],
+    ["waiting_for_user", "waiting_child_interrupted"]
+  ])("非终态 %s/%s 重新进入时隐藏新任务编排区", async (status, controlState) => {
+    mocks.run = run({ status, control_state: controlState });
+    const wrapper = mountPage();
+    await flushPromises();
+
+    expect(wrapper.find('[data-testid="orchestration-panel"]').exists()).toBe(false);
+    expect(mocks.restoreLatest).toHaveBeenCalledWith(true, "task_cockpit");
   });
 
   it("running 与等待决策隐藏编排区，并只显示合法父层操作", async () => {

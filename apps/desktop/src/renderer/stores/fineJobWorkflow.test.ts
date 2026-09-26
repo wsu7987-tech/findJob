@@ -49,6 +49,8 @@ describe("fineJobWorkflow store", () => {
   beforeEach(() => {
     setActivePinia(createPinia());
     vi.restoreAllMocks();
+    vi.spyOn(api, "listFineJobChatReviewTasks").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "listFineJobChatExecutedTasks").mockResolvedValue({ items: [] } as never);
   });
 
   it("loads review items and queued actions together", async () => {

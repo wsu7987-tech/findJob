@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   listFineJobReviewItems: vi.fn(),
   listFineJobAutomationActions: vi.fn(),
   listFineJobChatReviewTasks: vi.fn(),
+  listFineJobChatExecutedTasks: vi.fn(),
   routerPush: vi.fn(),
   messageError: vi.fn(),
   messageSuccess: vi.fn()
@@ -25,7 +26,8 @@ vi.mock("@/services/api", () => ({
   api: {
     listFineJobReviewItems: mocks.listFineJobReviewItems,
     listFineJobAutomationActions: mocks.listFineJobAutomationActions,
-    listFineJobChatReviewTasks: mocks.listFineJobChatReviewTasks
+    listFineJobChatReviewTasks: mocks.listFineJobChatReviewTasks,
+    listFineJobChatExecutedTasks: mocks.listFineJobChatExecutedTasks
   }
 }));
 
@@ -35,16 +37,20 @@ vi.mock("vue-router", () => ({
   })
 }));
 
-vi.mock("element-plus", () => ({
-  ElMessage: {
-    error: mocks.messageError,
-    success: mocks.messageSuccess,
-    warning: vi.fn()
-  },
-  ElMessageBox: {
-    confirm: vi.fn()
-  }
-}));
+vi.mock("element-plus", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("element-plus")>();
+  return {
+    ...actual,
+    ElMessage: {
+      error: mocks.messageError,
+      success: mocks.messageSuccess,
+      warning: vi.fn()
+    },
+    ElMessageBox: {
+      confirm: vi.fn()
+    }
+  };
+});
 
 const ElRadioGroupStub = defineComponent({
   props: {
@@ -102,6 +108,7 @@ describe("ReviewQueue", () => {
     mocks.listFineJobReviewItems.mockResolvedValue({ items: [], total: 0 });
     mocks.listFineJobAutomationActions.mockResolvedValue({ actions: [], total: 0 });
     mocks.listFineJobChatReviewTasks.mockResolvedValue({ items: [] });
+    mocks.listFineJobChatExecutedTasks.mockResolvedValue({ items: [] });
   });
 
   it("使用不依赖 TabPane 的状态控件切换待确认列表", async () => {
@@ -136,15 +143,17 @@ describe("ReviewQueue", () => {
 
     const workflowStore = useFineJobWorkflowStore();
     workflowStore.page = 3;
-    await wrapper.get('[data-value="running"]').trigger("click");
+    await (wrapper.vm as unknown as {
+      handleTabChange: (name: string) => Promise<void>;
+    }).handleTabChange("executed");
     await flushPromises();
 
     expect(wrapper.findComponent({ name: "ElTabs" }).exists()).toBe(false);
-    expect(workflowStore.selectedStatus).toBe("running");
+    expect(workflowStore.selectedStatus).toBe("executed");
     expect(workflowStore.page).toBe(1);
-    expect(mocks.listFineJobReviewItems).toHaveBeenLastCalledWith(expect.objectContaining({
+    expect(mocks.listFineJobReviewItems).toHaveBeenCalledWith(expect.objectContaining({
       status: "approved",
-      execution_view: "running",
+      execution_view: "executed",
       page: 1
     }));
 

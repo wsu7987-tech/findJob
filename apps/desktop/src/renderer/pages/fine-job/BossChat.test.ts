@@ -13,7 +13,7 @@ const mocks = vi.hoisted(() => ({
     batchProgress: null,
     batchSize: 0,
     batchSummary: null,
-    currentTask: null,
+    currentTask: null as Record<string, unknown> | null,
     detail: null as Record<string, unknown> | null,
     error: null,
     loading: false,
@@ -72,6 +72,7 @@ describe("BossChat 进展操作", () => {
     mocks.store.resumeListError = null;
     mocks.store.resumeListLoaded = false;
     mocks.store.runtime = null;
+    mocks.store.currentTask = null;
     mocks.store.detail = {
       session: {
         id: "session-1",
@@ -87,8 +88,10 @@ describe("BossChat 进展操作", () => {
             status: "rejected",
             rejection_reason_source: "recruiter_explicit",
             rejection_reason_category: "fit",
-            rejection_reason_summary: "暂时不考虑"
+            rejection_reason_summary: "暂时不考虑",
+            rejection_party: "recruiter"
           },
+          resume_delivery: { status: "not_started", source: "none" },
           primary_action: { type: "ask_rejection_reason", label: "询问拒绝原因" }
         }
       },
@@ -128,6 +131,21 @@ describe("BossChat 进展操作", () => {
       session_id: "session-1",
       reply_task_id: "task-1"
     };
+    const pendingTask = {
+      id: "task-1",
+      session_id: "session-1",
+      trigger_source: "manual",
+      action_kind: "reply",
+      status: "awaiting_review",
+      based_on_message_id: "message-1",
+      based_on_session_version: 2,
+      context: {},
+      draft_text: "待审核草稿",
+      final_text: "待审核草稿",
+      generation_model: "test",
+      created_at: "2026-09-06T00:00:00Z",
+      updated_at: "2026-09-06T00:00:00Z"
+    };
     mocks.store.detail = {
       session: {
         id: "session-1",
@@ -137,24 +155,10 @@ describe("BossChat 进展操作", () => {
         progress: null
       },
       messages: [],
-      reply_tasks: [{
-        id: "task-1",
-        session_id: "session-1",
-        trigger_source: "manual",
-        action_kind: "reply",
-        status: "awaiting_review",
-        based_on_message_id: "message-1",
-        based_on_session_version: 2,
-        context: {},
-        draft_text: "待审核草稿",
-        final_text: "待审核草稿",
-        generation_model: "test",
-        created_at: "2026-09-06T00:00:00Z",
-        updated_at: "2026-09-06T00:00:00Z"
-      }],
+      reply_tasks: [pendingTask],
       send_actions: []
     };
-    mocks.store.currentTask = null;
+    mocks.store.currentTask = pendingTask;
 
     const wrapper = shallowMount(BossChat);
     await flushPromises();
@@ -191,12 +195,20 @@ describe("BossChat 进展操作", () => {
       showName: "测试简历.pdf"
     }];
     mocks.store.runtime = { send_enabled: false, leaders: [] };
+    const selectedSession = (mocks.store.detail as {
+      session: { progress: Record<string, unknown> }
+    }).session;
+    selectedSession.progress = {
+      ...selectedSession.progress,
+      stage: "resume_requested",
+      waiting_on: "candidate"
+    };
 
     const wrapper = shallowMount(BossChat);
     await flushPromises();
 
     const button = wrapper.findAll("el-button").find((item) => item.text() === "发送简历");
     expect(button).toBeDefined();
-    expect(button?.attributes("disabled")).toBeUndefined();
+    expect(button?.attributes("disabled")).toBe("false");
   });
 });

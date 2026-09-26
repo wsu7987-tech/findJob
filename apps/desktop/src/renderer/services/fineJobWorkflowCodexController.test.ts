@@ -12,8 +12,17 @@ const waitingRun = (): FineJobWorkflowRun => ({
   workflow_run_id: "workflow-run-away-from-cockpit",
   workflow_type: "deep_job_search", status: "waiting_codex", completed_count: 0, remaining_count: 1,
   current_step: "waiting_codex", next_action: "codex_analysis", next_action_reason: "", waiting_for_user: false,
-  stop_reason: "", telemetry: {},
-  progress: { current_keyword: "", current_city: "", search_depth: 0, search_batch_count: 0, jobs_seen: 0, fresh_jobs: 0, duplicate_jobs: 0, candidates: 0, current_batch_new_jobs: 0, current_batch_duplicates: 0, jd_total: 0, jd_completed: 0, recommend_count: 0, review_count: 0, reject_count: 0 },
+  stop_reason: "", telemetry: {}, control_state: "waiting_codex", waiting_reason: "",
+  control_cause: "analysis", state_version: 1, transition_id: "transition-away",
+  progress: {
+    current_keyword: "", current_city: "", search_depth: 0, search_batch_count: 0,
+    jobs_seen: 0, fresh_jobs: 0, duplicate_jobs: 0, candidates: 0,
+    current_batch_new_jobs: 0, current_batch_duplicates: 0, jd_total: 0, jd_completed: 0,
+    recommend_count: 0, review_count: 0, reject_count: 0, historical_duplicates: 0,
+    cooldown_excluded: 0, strategy_pass: 0, strategy_review: 0, strategy_reject: 0,
+    qualified_fresh_jobs: 0, candidate_jobs: 0, novelty_yield: 0,
+    qualified_novelty_yield: 0, duplicate_rate: 0
+  },
   completion_contract: { codex_execution_config: { model: "gpt-5.6-luna", reasoning_effort: "medium" }, execution_policy: { codex_handoff: "auto" } },
   analysis_handoff: { analysis_batch_id: "batch-away", handoff_attempt_id: "attempt-away", pending_item_count: 1, running_item_count: 0, succeeded_item_count: 0, handoff_status: "none", attempt_status: "none", needs_initial_codex_handoff: true, needs_next_batch_handoff: false, codex_processing: false, analysis_batch_complete: false, recovery_available: false, awaiting_start_ack: false, start_ack_timed_out: false, retry_available: false, start_ack_timeout_seconds: 45 }
 });
@@ -54,7 +63,7 @@ describe("fineJobWorkflowCodexController", () => {
     const run = {
       ...waitingRun(),
       analysis_handoff: {
-        ...waitingRun().analysis_handoff,
+        ...waitingRun().analysis_handoff!,
         pending_item_count: 0,
         attempt_status: "started" as const,
         needs_initial_codex_handoff: false,

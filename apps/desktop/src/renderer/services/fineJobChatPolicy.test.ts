@@ -17,17 +17,14 @@ const valid = {
     encrypt_job_id: "job"
   } as never,
   task: { status: "awaiting_review" } as never,
-  finalText: "人工确认后的回复",
-  leaderAvailable: true
+  finalText: "人工确认后的回复"
 };
 
 describe("自动代聊页面安全策略", () => {
-  it("只有发送权限、领导标签页、活动会话和有效草稿同时满足时才允许确认", () => {
+  it("只有发送权限、活动会话和有效草稿同时满足时才允许确认", () => {
     expect(canConfirmFineJobChatReply(valid)).toBe(true);
-    expect(canConfirmFineJobChatReply({ ...valid, leaderAvailable: false })).toBe(false);
     expect(canConfirmFineJobChatReply({ ...valid, runtime: { send_enabled: false } as never })).toBe(false);
     expect(canConfirmFineJobChatReply({ ...valid, session: { status: "paused" } as never })).toBe(false);
-    expect(canConfirmFineJobChatReply({ ...valid, task: { status: "stale" } as never })).toBe(false);
   });
 
   it("accepted 只展示为已提交发送", () => {
@@ -36,7 +33,6 @@ describe("自动代聊页面安全策略", () => {
   });
 
   it("返回可直接操作的确认阻塞原因", () => {
-    expect(fineJobChatConfirmBlocker({ ...valid, leaderAvailable: false })).toContain("领导标签页");
     expect(fineJobChatConfirmBlocker({
       ...valid,
       session: {

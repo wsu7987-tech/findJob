@@ -50,9 +50,9 @@ vi.mock("@/stores/fineJobWorkflowRun", async () => {
       get currentRun() {
         return currentRun.value;
       },
-      setRun: (run: ReturnType<typeof run> | null) => {
-        currentRun.value = run;
-        return run;
+      setRun: (nextRun: ReturnType<typeof run> | null) => {
+        currentRun.value = nextRun;
+        return nextRun;
       },
       loading: false,
       advancing: false,

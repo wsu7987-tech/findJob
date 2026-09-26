@@ -226,7 +226,8 @@ onMounted(async () => {
   workflowStore.stopPolling();
   workflowStore.setRun(null);
   try {
-    const restorePromise = workflowStore.restoreLatest(false, "task_cockpit").then((run) => {
+    // 同时恢复最近终态，让用户重进页面后仍能查看上一轮结果和子任务时间线。
+    const restorePromise = workflowStore.restoreLatest(true, "task_cockpit").then((run) => {
       if (cockpitPageActive) return run;
       workflowStore.stopPolling();
       workflowStore.setRun(null);
