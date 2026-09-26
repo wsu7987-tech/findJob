@@ -312,6 +312,11 @@ export interface FineJobBossCapturedJob {
 export type FineJobBossCaptureTaskStatus = "queued" | "running" | "completed" | "failed";
 
 export interface FineJobBossCaptureTask {
+  detail_phase_id?: string | null;
+  detail_phase_job_ids?: string[] | null;
+  list_phase_processed?: number;
+  list_phase_baseline?: number;
+  list_phase_id?: string;
   id: string;
   status: FineJobBossCaptureTaskStatus;
   stage: string;
@@ -392,7 +397,27 @@ export interface FineJobSmartCapturePrefetchSummary {
   failed_count: number;
 }
 
+export interface FineJobCollectionProgressScope {
+  scope_id: string;
+  unit: "page" | "job";
+  stage: string;
+  total: number | null;
+  processed: number;
+  succeeded: number | null;
+  failed: number | null;
+  pending: number | null;
+  running: number | null;
+  cancelled: number | null;
+  active_job: { id: string; title: string } | null;
+}
+
 export interface FineJobSmartCapture {
+  collection_progress?: {
+    schema_version: 1;
+    list: FineJobCollectionProgressScope | null;
+    formal_jd: FineJobCollectionProgressScope | null;
+    prefetch: FineJobCollectionProgressScope | null;
+  };
   smart_capture_id: string;
   source: "task_cockpit" | "boss_capture";
   workflow_run_id?: string | null;
@@ -2236,6 +2261,7 @@ export interface AppConfigPayload {
   codex_model?: string | null;
   codex_reasoning_effort?: "minimal" | "low" | "medium" | "high" | "xhigh" | null;
   codex_timeout_seconds?: number | null;
+  llm_timeout_seconds?: number | null;
 }
 
 export interface ProviderConnectivityCheckResponse {

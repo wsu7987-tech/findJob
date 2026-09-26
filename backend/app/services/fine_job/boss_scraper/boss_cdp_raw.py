@@ -292,6 +292,22 @@ def incr_request():
 # ============================================================
 # CDP 连接
 # ============================================================
+from contextvars import ContextVar
+
+# 启动检查共享总截止时间，各 CDP 步骤只使用剩余预算。
+START_DEADLINE = ContextVar("boss_start_deadline", default=None)
+
+
+def remaining_timeout(seconds):
+    deadline = START_DEADLINE.get()
+    if deadline is None:
+        return seconds
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("浏览器与登录检查总预算已耗尽")
+    return min(seconds, remaining)
+
+
 class CDPSession:
     EVENT_BUFFER_LIMIT = 4096
 
@@ -299,9 +315,9 @@ class CDPSession:
         if not require_runtime_dependencies("requests", "websocket"):
             raise RuntimeError("缺少 CDP 运行依赖")
         self.cdp_port = cdp_port
-        resp = requests.get(f"http://127.0.0.1:{cdp_port}/json/version", timeout=10)
+        resp = requests.get(f"http://127.0.0.1:{cdp_port}/json/version", timeout=remaining_timeout(10))
         ws_url = resp.json()["webSocketDebuggerUrl"]
-        self.ws = websocket.create_connection(ws_url, timeout=60)
+        self.ws = websocket.create_connection(ws_url, timeout=remaining_timeout(60))
         self.mid = 0
         # CDP 事件缓冲：send() 等待命令响应期间到达的事件通知都会存这里，
         # 供 Network 域被动捕获使用（见 NetworkJoblistCapture）。
@@ -388,6 +404,8 @@ class CDPSession:
         Raises:
             TimeoutError: 超过 max_retries 仍未收到匹配响应
         """
+        timeout = remaining_timeout(timeout)
+        self.ws.settimeout(timeout)
         self.mid += 1
         msg = {"id": self.mid, "method": method, "params": params or {}}
         if sid:
@@ -411,6 +429,7 @@ class CDPSession:
                 )
 
             try:
+                self.ws.settimeout(remaining_timeout(max(0.01, timeout - elapsed)))
                 raw = self.ws.recv()
             except websocket.WebSocketTimeoutException:
                 raise TimeoutError(f"CDP WebSocket recv 超时, method={method}")
@@ -441,7 +460,7 @@ class CDPSession:
 
         用于等待页面自身发起的请求完成（Network 域事件），不发送任何命令。
         """
-        deadline = time.time() + duration
+        deadline = time.time() + remaining_timeout(duration)
         try:
             while True:
                 remaining = deadline - time.time()
@@ -609,7 +628,7 @@ class NetworkJoblistCapture:
             raise CaptureStopRequested()
         if trigger is not None:
             trigger()
-        deadline = time.time() + timeout
+        deadline = time.time() + remaining_timeout(timeout)
         while time.time() < deadline:
             if should_stop and should_stop():
                 raise CaptureStopRequested()
@@ -689,7 +708,7 @@ class NetworkChatFriendListCapture:
         """等待聊天联系人列表响应，并返回页面收到的 JSON。"""
         if trigger is not None:
             trigger()
-        deadline = time.time() + timeout
+        deadline = time.time() + remaining_timeout(timeout)
         while time.time() < deadline:
             request_id = self._next_completed()
             if request_id is None:
@@ -1171,6 +1190,7 @@ class LoginProbeResult:
     code: int | None = None
     message: str = ""
     retryable: bool = False
+    final_url: str = ""
 
 
 def classify_login_probe_response(data, http_status=200):
@@ -1306,7 +1326,15 @@ def check_login_state(cdp_port=DEFAULT_CDP_PORT):
         tid, sid = create_page_session(cdp)
 
         # probe_login_state 会导航到真实搜索页并被动捕获页面自身的响应
-        return probe_login_state(cdp, sid)
+        result = probe_login_state(cdp, sid)
+        location = cdp.send("Runtime.evaluate", {"expression": "location.href", "returnByValue": True}, sid)
+        final_url = str(location.get("result", {}).get("result", {}).get("value") or "")
+        from urllib.parse import urlparse
+        from dataclasses import replace
+        parsed = urlparse(final_url)
+        if parsed.hostname in {"zhipin.com", "www.zhipin.com"} and parsed.path.startswith("/web/user/"):
+            return LoginProbeResult(LoginProbeStatus.UNAUTHENTICATED, message="探测页面已跳转登录页", final_url=final_url)
+        return replace(result, final_url=final_url)
     except (requests.ConnectionError, requests.Timeout, KeyError,
             json.JSONDecodeError, websocket.WebSocketException,
             TimeoutError, RuntimeError) as e:
@@ -1338,7 +1366,7 @@ def wait_for_login(cdp_port=DEFAULT_CDP_PORT, timeout=DEFAULT_LOGIN_TIMEOUT, int
         sid,
     )
 
-    deadline = time.time() + timeout
+    deadline = time.time() + remaining_timeout(timeout)
     logged_in = False
     attempt = 0
     transient_errors = 0
@@ -2488,7 +2516,7 @@ def is_cdp_ready(cdp_port):
     if not require_runtime_dependencies("requests"):
         return False
     try:
-        resp = requests.get(f"http://127.0.0.1:{cdp_port}/json/version", timeout=2)
+        resp = requests.get(f"http://127.0.0.1:{cdp_port}/json/version", timeout=remaining_timeout(2))
         return resp.status_code == 200
     except Exception:
         return False
@@ -2640,7 +2668,7 @@ def stop_cdp_chrome(cdp_data_dir):
 def wait_for_cdp(cdp_port, timeout=30):
     print("等待 CDP 可用", end="")
     for _ in range(timeout):
-        time.sleep(1)
+        time.sleep(remaining_timeout(1))
         print(".", end="", flush=True)
         if is_cdp_ready(cdp_port):
             print(f"\n✅ CDP 已就绪 (端口 {cdp_port})")

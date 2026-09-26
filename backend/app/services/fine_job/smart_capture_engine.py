@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from backend.app.services.fine_job.collection_progress import advance_version, publish_progress
+
 import json
 import sqlite3
 from pathlib import Path
@@ -45,6 +47,8 @@ def prepare_search_execution(
     identity = combination_identity(keyword, city, filters)
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        from backend.app.services.fine_job.collection_starts import guard_owner_in_connection
+        guard_owner_in_connection(connection)
         capture = connection.execute(
             "SELECT workflow_run_id FROM fj_smart_captures WHERE id = ?",
             (smart_capture_id,),
@@ -531,18 +535,22 @@ def _ensure_formal_jd_batch(
                         now,
                     ),
                 )
+            if candidates:
+                advance_version(connection, smart_capture_id)
     except sqlite3.IntegrityError as exc:
         raise AppError(
             409,
             "CANDIDATE_RESERVATION_CONFLICT",
             "候选岗位已被其他活动 Smart Capture 占用。",
         ) from exc
+    if candidates:
+        publish_progress(db, smart_capture_id)
     return len(candidates)
 
 
 def _next_pipeline_unit(db: Database, smart_capture_id: str, unit_type: str) -> Any | None:
     table = "fj_workflow_tasks" if unit_type == "formal_jd" else "fj_workflow_prefetch_items"
-    task_filter = "AND task_type = 'deep_job_search_jd'" if unit_type == "formal_jd" else ""
+    task_filter = "AND task_type = 'deep_job_search_jd'" if unit_type == "formal_jd" else "AND lifecycle_status NOT IN ('abandoned', 'cancelled')"
     with db.connect() as connection:
         return connection.execute(
             f"SELECT * FROM {table} WHERE smart_capture_id = ? {task_filter} AND status = 'pending' ORDER BY created_at, id LIMIT 1",
@@ -568,16 +576,21 @@ def _start_pipeline_detail(
         _advance_pipeline_details(db, smart_capture_id, unit_type, output_dir)
         return
     now = utc_now()
+    detail_task_id = new_id()
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         table = "fj_workflow_tasks" if unit_type == "formal_jd" else "fj_workflow_prefetch_items"
         next_status = "running" if unit_type == "formal_jd" else "collecting"
         changed = connection.execute(
-            f"UPDATE {table} SET status = ? WHERE id = ? AND smart_capture_id = ? AND status = 'pending'",
-            (next_status, unit["id"], smart_capture_id),
+            f"UPDATE {table} SET status = ? WHERE id = ? AND smart_capture_id = ? AND status = 'pending' AND EXISTS (SELECT 1 FROM fj_smart_captures WHERE id = ? AND status = 'running')",
+            (next_status, unit["id"], smart_capture_id, smart_capture_id),
         )
         if changed.rowcount != 1:
             return
+        # 先提交本单元的执行身份，极速回调和旧执行器迟到结果均可核对归属。
+        connection.execute(f"UPDATE {table} SET operation_ref_type = 'capture_task', operation_ref_id = ? WHERE id = ?", (detail_task_id, unit["id"]))
+        from backend.app.services.fine_job.collection_start_operations import bind_in_connection
+        bind_in_connection(connection, "smart", smart_capture_id, detail_task_id)
         if unit_type == "formal_jd":
             connection.execute(
                 "UPDATE fj_workflow_tasks SET started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ?",
@@ -588,6 +601,8 @@ def _start_pipeline_detail(
                 "UPDATE fj_workflow_prefetch_items SET lifecycle_status = 'preparing', detail_status = 'queued', started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ?",
                 (now, now, unit["id"]),
             )
+        advance_version(connection, smart_capture_id)
+    publish_progress(db, smart_capture_id)
     try:
         detail_task = boss_capture_task_manager.start_history_detail(
             job,
@@ -598,6 +613,7 @@ def _start_pipeline_detail(
             smart_capture_id=smart_capture_id,
             pipeline_unit_type=unit_type,
             pipeline_unit_id=str(unit["id"]),
+            task_id=detail_task_id,
         )
         table = "fj_workflow_tasks" if unit_type == "formal_jd" else "fj_workflow_prefetch_items"
         with db.connect() as connection:
@@ -605,8 +621,6 @@ def _start_pipeline_detail(
                 f"UPDATE {table} SET operation_ref_type = 'capture_task', operation_ref_id = ?, updated_at = ? WHERE id = ?",
                 (str(detail_task["id"]), utc_now(), unit["id"]),
             )
-        if unit_type == "prefetch":
-            _touch_pipeline_snapshot(db, smart_capture_id)
     except Exception as exc:
         _finish_pipeline_detail(
             db, smart_capture_id, unit_type, unit, succeeded=False, error_message=str(exc)
@@ -641,8 +655,11 @@ def _finish_pipeline_detail(
     )
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        owner = connection.execute("SELECT status FROM fj_smart_captures WHERE id = ?", (smart_capture_id,)).fetchone()
+        if owner is None or owner["status"] in {"completed", "stopped", "failed"}:
+            return
         if unit_type == "formal_jd":
-            connection.execute(
+            changed = connection.execute(
                 """
                 UPDATE fj_workflow_tasks
                 SET status = ?, result_json = ?, completed_at = ?, updated_at = ?
@@ -658,7 +675,7 @@ def _finish_pipeline_detail(
                 ),
             )
         else:
-            connection.execute(
+            changed = connection.execute(
                 """
                 UPDATE fj_workflow_prefetch_items
                 SET status = ?, lifecycle_status = ?, detail_status = ?, error_message = ?,
@@ -676,6 +693,9 @@ def _finish_pipeline_detail(
                     smart_capture_id,
                 ),
             )
+        if changed.rowcount != 1:
+            return
+        advance_version(connection, smart_capture_id)
         if not succeeded or unit_type == "formal_jd":
             connection.execute(
                 """
@@ -694,8 +714,7 @@ def _finish_pipeline_detail(
                     job_id,
                 ),
             )
-    if unit_type == "prefetch":
-        _touch_pipeline_snapshot(db, smart_capture_id)
+    publish_progress(db, smart_capture_id)
 
 
 def _advance_pipeline_details(
@@ -717,7 +736,7 @@ def _advance_pipeline_details(
         return
     with db.connect() as connection:
         table = "fj_workflow_tasks" if unit_type == "formal_jd" else "fj_workflow_prefetch_items"
-        task_filter = "AND task_type = 'deep_job_search_jd'" if unit_type == "formal_jd" else ""
+        task_filter = "AND task_type = 'deep_job_search_jd'" if unit_type == "formal_jd" else "AND lifecycle_status NOT IN ('abandoned', 'cancelled')"
         active = connection.execute(
             f"SELECT 1 FROM {table} WHERE smart_capture_id = ? {task_filter} AND status IN ('pending', 'running', 'collecting') LIMIT 1",
             (smart_capture_id,),
@@ -766,7 +785,7 @@ def resume_pipeline(
             (smart_capture_id,),
         ).fetchone()
         prefetch = connection.execute(
-            "SELECT 1 FROM fj_workflow_prefetch_items WHERE smart_capture_id = ? AND status IN ('pending', 'collecting') LIMIT 1",
+            "SELECT 1 FROM fj_workflow_prefetch_items WHERE smart_capture_id = ? AND status IN ('pending', 'collecting') AND lifecycle_status NOT IN ('abandoned', 'cancelled') LIMIT 1",
             (smart_capture_id,),
         ).fetchone()
         connection.execute(
@@ -774,7 +793,7 @@ def resume_pipeline(
             (utc_now(), smart_capture_id),
         )
         connection.execute(
-            "UPDATE fj_workflow_prefetch_items SET status = 'pending', operation_ref_type = NULL, operation_ref_id = NULL, updated_at = ? WHERE smart_capture_id = ? AND status = 'collecting'",
+            "UPDATE fj_workflow_prefetch_items SET status = 'pending', operation_ref_type = NULL, operation_ref_id = NULL, updated_at = ? WHERE smart_capture_id = ? AND status = 'collecting' AND lifecycle_status NOT IN ('abandoned', 'cancelled')",
             (utc_now(), smart_capture_id),
         )
     unit_type = "formal_jd" if formal is not None else "prefetch" if prefetch is not None else ""
@@ -810,6 +829,17 @@ def process_detail_task_update(
             (unit_id, smart_capture_id),
         ).fetchone()
     if unit is None or str(unit["status"]) not in {"pending", "running", "collecting"}:
+        return
+    if unit["operation_ref_id"] and str(unit["operation_ref_id"]) != str(task.get("id") or ""):
+        return
+    if str(task.get("stage") or "").endswith("paused"):
+        with db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(f"UPDATE {table} SET status = 'pending', updated_at = ? WHERE id = ? AND status IN ('running', 'collecting') AND EXISTS (SELECT 1 FROM fj_smart_captures WHERE id = ? AND status NOT IN ('completed', 'stopped', 'failed'))", (utc_now(), unit_id, smart_capture_id)).rowcount
+            if not changed:
+                return
+            advance_version(connection, smart_capture_id)
+        publish_progress(db, smart_capture_id)
         return
     job_id = str(
         _load(unit["payload_json"]).get("job_id")
@@ -1053,12 +1083,14 @@ def _ensure_prefetch_batch(
                     "UPDATE fj_workflow_prefetch_batches SET status = 'ready', started_at = ?, completed_at = ?, updated_at = ? WHERE id = ?",
                     (now, now, now, batch_id),
                 )
+            advance_version(connection, smart_capture_id)
     except sqlite3.IntegrityError as exc:
         raise AppError(
             409,
             "CANDIDATE_RESERVATION_CONFLICT",
             "Prefetch 候选岗位已被其他活动 Smart Capture 占用。",
         ) from exc
+    publish_progress(db, smart_capture_id)
     return batch_id
 
 
@@ -1066,6 +1098,7 @@ def _finalize_prefetch_batch(db: Database, smart_capture_id: str) -> None:
     now = utc_now()
     source_analysis_batch_id = ""
     with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
         batch = connection.execute(
             "SELECT * FROM fj_workflow_prefetch_batches WHERE smart_capture_id = ? AND status = 'preparing' ORDER BY created_at DESC, id DESC LIMIT 1",
             (smart_capture_id,),
@@ -1090,7 +1123,8 @@ def _finalize_prefetch_batch(db: Database, smart_capture_id: str) -> None:
             """,
             ("ready" if int(counts["ready_count"] or 0) else "failed", now, now, batch["id"]),
         )
-    _touch_pipeline_snapshot(db, smart_capture_id)
+        advance_version(connection, smart_capture_id)
+    publish_progress(db, smart_capture_id)
     with db.connect() as connection:
         unfinished_analysis = connection.execute(
             """
@@ -1298,6 +1332,8 @@ def _promote_ready_prefetch(db: Database, smart_capture_id: str) -> str:
             "UPDATE fj_workflow_prefetch_batches SET status = 'promoted', promoted_at = ?, completed_at = COALESCE(completed_at, ?), updated_at = ? WHERE id = ?",
             (now, now, now, batch["id"]),
         )
+        advance_version(connection, smart_capture_id)
+    publish_progress(db, smart_capture_id)
     return "promoted"
 
 
@@ -1327,6 +1363,10 @@ def _abandon_prefetch(db: Database, smart_capture_id: str) -> None:
                 "UPDATE fj_workflow_prefetch_batches SET status = 'abandoned', abandoned_at = ?, updated_at = ? WHERE id = ?",
                 (now, now, batch["id"]),
             )
+        if batches:
+            advance_version(connection, smart_capture_id)
+    if batches:
+        publish_progress(db, smart_capture_id)
 
 
 def advance_completed_batch(

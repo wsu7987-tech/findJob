@@ -29,6 +29,7 @@ class BossSearchPageRequest(BaseModel):
 
 
 class BossCapturePayload(BossSearchPageRequest):
+    operation_id: str | None = None
     pages: int = Field(default=1, ge=1, le=10)
     include_details: bool = False
     prefer_current_page: bool = True
@@ -36,6 +37,7 @@ class BossCapturePayload(BossSearchPageRequest):
 
 
 class BossContinueCaptureRequest(BaseModel):
+    operation_id: str | None = None
     pages: int = Field(default=1, ge=1, le=10)
 
 
@@ -45,6 +47,11 @@ class BossSearchPageResponse(BaseModel):
 
 
 class BossCaptureTaskResponse(BaseModel):
+    detail_phase_id: str | None = None
+    detail_phase_job_ids: list[str] | None = None
+    list_phase_processed: int = 0
+    list_phase_baseline: int = 0
+    list_phase_id: str | None = None
     id: str
     status: Literal["queued", "running", "completed", "failed"]
     stage: str
@@ -83,12 +90,14 @@ class BossCaptureTaskResponse(BaseModel):
 
 
 class BossDetailCaptureRequest(BaseModel):
+    operation_id: str | None = None
     job_ids: list[str] = Field(min_length=1)
     force: bool = False
     manual_override: bool = False
 
 
 class BossHistoryDetailCaptureRequest(BaseModel):
+    operation_id: str | None = None
     manual_override: bool = False
 
 

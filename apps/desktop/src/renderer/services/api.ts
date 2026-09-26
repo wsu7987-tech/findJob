@@ -1,4 +1,5 @@
-﻿import type {
+import { createCollectionStartCoordinator } from "./collectionStart";
+import type {
   ApiErrorShape,
   ApiRunSnapshot,
   ActiveParseResultEnvelope,
@@ -205,7 +206,10 @@ export const getBackendOrigin = async () => {
       }
 
       return import.meta.env.VITE_API_ORIGIN ?? "http://127.0.0.1:8000";
-    })();
+    })().catch((error) => {
+      backendOriginPromise = null;
+      throw error;
+    });
   }
 
   return backendOriginPromise;
@@ -219,7 +223,9 @@ const parseJsonSafely = async (response: Response) => {
 
   try {
     return (await response.json()) as Record<string, unknown>;
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") throw error;
+    if (response.ok) throw new Error("后端响应格式无效，请重新同步状态。");
     return null;
   }
 };
@@ -235,30 +241,72 @@ const buildHeaders = (init?: RequestInit) => {
   return headers;
 };
 
-export const request = async <T>(path: string, init?: RequestInit) => {
-  const origin = await getBackendOrigin();
-  const url = new URL(path, origin).toString();
+export class RequestTimeoutError extends NetworkError {
+  constructor() {
+    super("请求等待超时，请确认操作结果后继续。");
+    this.name = "RequestTimeoutError";
+  }
+}
 
-  let response: Response;
+export type RequestOptions = RequestInit & { timeoutMs?: number };
+
+export const request = async <T>(path: string, init?: RequestOptions): Promise<T> => {
+  // 采集接口独立预算；一次等待覆盖地址解析、响应和响应体。
+  const capturePath = /\/fine-job\/(boss-capture|smart-captures|workflow-runs|platform-sessions|collection-start-operations)/.test(path);
+  const slowRead = /context-snapshot/.test(path);
+  const timeoutMs = init?.timeoutMs ?? (capturePath ? (slowRead ? 180000 : init?.method && init.method !== "GET" ? 180000 : 15000) : 0);
+  const controller = new AbortController();
+  const { timeoutMs: _budget, signal, ...fetchInit } = init ?? {};
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  let rejectWait: (reason: unknown) => void = () => {};
+  const cancelled = new Promise<never>((_resolve, reject) => { rejectWait = reject; });
+  const abort = () => {
+    controller.abort();
+    rejectWait(timedOut ? new RequestTimeoutError() : new DOMException("请求已取消。", "AbortError"));
+  };
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
+  if (timeoutMs > 0) timer = setTimeout(() => { timedOut = true; abort(); }, timeoutMs);
   try {
-    response = await fetch(url, {
-      ...init,
-      headers: buildHeaders(init)
-    });
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw error;
-    }
-    throw new NetworkError();
+    return await Promise.race([cancelled, (async () => {
+      if (controller.signal.aborted) throw new DOMException("请求已取消。", "AbortError");
+      const origin = await getBackendOrigin();
+      if (controller.signal.aborted) throw new DOMException("请求已取消。", "AbortError");
+      let response: Response;
+      try {
+        response = await fetch(new URL(path, origin).toString(), {
+          ...fetchInit, signal: controller.signal, headers: buildHeaders(init)
+        });
+      } catch (error) {
+        if (controller.signal.aborted) throw error;
+        throw new NetworkError();
+      }
+      const data = await parseJsonSafely(response);
+      if (!response.ok) throw new ApiError(response.status, (data ?? undefined) as ApiErrorShape | undefined);
+      if (data == null && response.status !== 204) throw new Error("后端响应格式无效，请重新同步状态。");
+      return data as T;
+    })()]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+    // 地址解析未完成时也允许下一次请求重新向桌面桥接查询。
+    if (controller.signal.aborted) backendOriginPromise = null;
   }
+};
 
-  const data = await parseJsonSafely(response);
+export const collectionStarts = createCollectionStartCoordinator({ request, getOrigin: getBackendOrigin });
 
-  if (!response.ok) {
-    throw new ApiError(response.status, (data ?? undefined) as ApiErrorShape | undefined);
-  }
-
-  return (data ?? null) as T;
+const analysisRequestBudget = async (taskId: string | null, jobCount?: number, groupSize = 1) => {
+  const [config, task] = await Promise.all([
+    request<AppConfigPayload>("/api/config", { timeoutMs: 15000 }),
+    jobCount === undefined && taskId ? request<FineJobBossCaptureTask>(`/api/fine-job/boss-capture/tasks/${taskId}`) : Promise.resolve(null)
+  ]);
+  // 同步分析逐岗或每五岗调用；LLM 包含三次尝试与网络阶段余量。
+  const secondsPerCall = config.reasoning_executor === "codex-cli"
+    ? (config.codex_timeout_seconds ?? 300) + 30
+    : (config.llm_timeout_seconds ?? 90) * 12 + 15;
+  return Math.min(2147483647, Math.max(1, Math.ceil((jobCount ?? task?.jobs.length ?? 1) / groupSize)) * secondsPerCall * 1000 + 30000);
 };
 
 export const api = {
@@ -448,8 +496,8 @@ export const api = {
       method: "POST"
     });
   },
-  async getConfig() {
-    return request<AppConfigPayload>("/api/config");
+  async getConfig(options?: RequestOptions) {
+    return request<AppConfigPayload>("/api/config", options);
   },
   async updateConfig(payload: Partial<AppConfigPayload>) {
     return request<AppConfigPayload>("/api/config", {
@@ -472,8 +520,9 @@ export const api = {
       method: "POST"
     });
   },
-  async listCodexModels(cliPath: string) {
+  async listCodexModels(cliPath: string, options?: RequestOptions) {
     return request<CodexModelListResponse>("/api/config/codex-models", {
+      ...options,
       method: "POST",
       body: JSON.stringify({ cli_path: cliPath })
     });
@@ -497,7 +546,7 @@ export const api = {
     });
   },
   async listFineJobFilterStrategies() {
-    return request<FineJobFilterStrategyListEnvelope>("/api/fine-job/strategies/filters");
+    return request<FineJobFilterStrategyListEnvelope>("/api/fine-job/strategies/filters", { timeoutMs: 15000 });
   },
   async createFineJobFilterStrategy(payload: FineJobFilterStrategy) {
     return request<FineJobFilterStrategyEnvelope>("/api/fine-job/strategies/filters", {
@@ -714,22 +763,13 @@ export const api = {
     });
   },
   async captureFineJobBossJobs(payload: FineJobBossCaptureRequest) {
-    return request<FineJobBossCaptureTask>("/api/fine-job/boss-capture/capture", {
-      method: "POST",
-      body: JSON.stringify(payload)
-    });
+    return collectionStarts.start<FineJobBossCaptureTask>("/api/fine-job/boss-capture/capture", payload, "custom.capture", "");
   },
   async getFineJobBossCaptureTask(taskId: string) {
     return request<FineJobBossCaptureTask>(`/api/fine-job/boss-capture/tasks/${taskId}`);
   },
   async continueFineJobBossCapture(taskId: string, pages: number) {
-    return request<FineJobBossCaptureTask>(
-      `/api/fine-job/boss-capture/tasks/${taskId}/continue`,
-      {
-        method: "POST",
-        body: JSON.stringify({ pages })
-      }
-    );
+    return collectionStarts.start<FineJobBossCaptureTask>(`/api/fine-job/boss-capture/tasks/${taskId}/continue`, { pages }, "custom.continue", taskId);
   },
   async stopFineJobBossCaptureTask(taskId: string) {
     return request<FineJobBossCaptureTask>(
@@ -767,22 +807,10 @@ export const api = {
     force = false,
     manualOverride = true
   ) {
-    return request<FineJobBossCaptureTask>(
-      `/api/fine-job/boss-capture/tasks/${taskId}/details`,
-      {
-        method: "POST",
-        body: JSON.stringify({ job_ids: jobIds, force, manual_override: manualOverride })
-      }
-    );
+    return collectionStarts.start<FineJobBossCaptureTask>(`/api/fine-job/boss-capture/tasks/${taskId}/details`, { job_ids: jobIds, force, manual_override: manualOverride }, "custom.details", taskId);
   },
   async captureFineJobBossHistoryDetails(historyJobId: string, manualOverride = true) {
-    return request<FineJobBossCaptureTask>(
-      `/api/fine-job/boss-capture/history/${historyJobId}/details`,
-      {
-        method: "POST",
-        body: JSON.stringify({ manual_override: manualOverride })
-      }
-    );
+    return collectionStarts.start<FineJobBossCaptureTask>(`/api/fine-job/boss-capture/history/${historyJobId}/details`, { manual_override: manualOverride }, "custom.history_details", historyJobId);
   },
   async suggestFineJobBossDetails(
     taskId: string,
@@ -799,6 +827,7 @@ export const api = {
       `/api/fine-job/boss-capture/tasks/${taskId}/suggestions`,
       {
         method: "POST",
+        timeoutMs: payload.mode === "ai" ? await analysisRequestBudget(taskId, undefined, payload.recommendation_strategy_id ? 1 : 5) : 15000,
         body: JSON.stringify(payload)
       }
     );
@@ -822,7 +851,7 @@ export const api = {
   ) {
     return request<FineJobBossDeliveryEvaluationResponse>(
       `/api/fine-job/boss-capture/tasks/${taskId}/delivery-evaluations`,
-      { method: "POST", body: JSON.stringify(payload) }
+      { method: "POST", timeoutMs: await analysisRequestBudget(taskId, payload.job_ids?.length), body: JSON.stringify(payload) }
     );
   },
   async evaluateFineJobBossHistoryDelivery(
@@ -839,6 +868,7 @@ export const api = {
       `/api/fine-job/boss-capture/history/${historyJobId}/delivery-evaluations`,
       {
         method: "POST",
+        timeoutMs: await analysisRequestBudget(null, 1),
         body: JSON.stringify(payload)
       }
     );
@@ -1634,10 +1664,7 @@ export const api = {
     );
   },
   async createFineJobSmartCapture(payload: SmartCaptureExecutionConfigRequest) {
-    return request<FineJobSmartCapture>("/api/fine-job/smart-captures", {
-      method: "POST",
-      body: JSON.stringify(payload)
-    });
+    return collectionStarts.start<FineJobSmartCapture>("/api/fine-job/smart-captures", payload, "smart.create", "");
   },
   async pauseFineJobSmartCapture(smartCaptureId: string) {
     return request<FineJobSmartCapture>(
@@ -1646,22 +1673,13 @@ export const api = {
     );
   },
   async startFineJobSmartCapture(smartCaptureId: string) {
-    return request<FineJobSmartCapture>(
-      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/start`,
-      { method: "POST" }
-    );
+    return collectionStarts.start<FineJobSmartCapture>(`/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/start`, {}, "smart.start", smartCaptureId);
   },
   async resumeFineJobSmartCapture(smartCaptureId: string) {
-    return request<FineJobSmartCapture>(
-      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/resume`,
-      { method: "POST" }
-    );
+    return collectionStarts.start<FineJobSmartCapture>(`/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/resume`, {}, "smart.resume", smartCaptureId);
   },
   async retryFineJobSmartCapture(smartCaptureId: string) {
-    return request<FineJobSmartCapture>(
-      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/retry`,
-      { method: "POST" }
-    );
+    return collectionStarts.start<FineJobSmartCapture>(`/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/retry`, {}, "smart.retry", smartCaptureId);
   },
   async stopFineJobSmartCapture(smartCaptureId: string) {
     return request<FineJobSmartCapture>(
@@ -1706,16 +1724,10 @@ export const api = {
     );
   },
   async startFineJobWorkflowChild(workflowRunId: string, childRelationId: string) {
-    return request<FineJobWorkflowRun>(
-      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/children/${encodeURIComponent(childRelationId)}/start`,
-      { method: "POST" }
-    );
+    return collectionStarts.start<FineJobWorkflowRun>(`/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/children/${encodeURIComponent(childRelationId)}/start`, {}, "workflow.child_start", workflowRunId);
   },
   async resumeFineJobWorkflowRun(workflowRunId: string) {
-    return request<FineJobWorkflowRun>(
-      `/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/resume`,
-      { method: "POST" }
-    );
+    return collectionStarts.start<FineJobWorkflowRun>(`/api/fine-job/workflow-runs/${encodeURIComponent(workflowRunId)}/resume`, {}, "workflow.resume", workflowRunId);
   },
   async pauseFineJobWorkflowRun(workflowRunId: string) {
     return request<FineJobWorkflowRun>(

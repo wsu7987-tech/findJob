@@ -706,6 +706,7 @@ def test_last_prefetch_detail_promotes_when_analysis_finished_first(
         db,
         smart_capture_id,
         {
+            "id": "late-prefetch-detail",
             "status": "completed",
             "pipeline_unit_type": "prefetch",
             "pipeline_unit_id": str(item["id"]),

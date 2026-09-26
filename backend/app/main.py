@@ -7,6 +7,7 @@ from backend.app.config import load_config
 from backend.app.db import Database
 from backend.app.errors import register_error_handlers
 from backend.app.routers.config import router as config_router
+from backend.app.routers.fine_job.collection_start_operations import router as collection_start_operations_router
 from backend.app.routers.fine_job.boss_capture import router as fine_job_boss_capture_router
 from backend.app.routers.fine_job.codex import router as fine_job_codex_router
 from backend.app.routers.fine_job.companies import router as fine_job_companies_router
@@ -67,6 +68,8 @@ def create_app() -> FastAPI:
     workflow_runs.configure_realtime_runtime(db, config)
     # 启动时把丢失的采集执行器收敛为可恢复状态，并清理 custom 执行容量。
     smart_captures.recover_interrupted_smart_captures(db)
+    from backend.app.services.fine_job.collection_start_operations import recover_operations
+    recover_operations(db)
     # 后端启动后等待插件主动完成一次心跳测试，再恢复执行器连接状态。
     boss_executor.reset_executor_connections(db)
     ensure_default_profile(db)
@@ -96,6 +99,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router, prefix="/api")
     app.include_router(config_router, prefix="/api")
     app.include_router(fine_job_boss_capture_router, prefix="/api")
+    app.include_router(collection_start_operations_router, prefix="/api")
     app.include_router(fine_job_codex_router, prefix="/api")
     app.include_router(fine_job_companies_router, prefix="/api")
     app.include_router(fine_job_boss_chat_router, prefix="/api")

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from backend.app.services.fine_job.collection_start_operations import collection_start, bind_in_connection
+from backend.app.services.fine_job.collection_starts import prepare_smart, guard_owner_in_connection, has_pending_details
+
 import json
 from datetime import datetime, timedelta, timezone
 from threading import RLock
@@ -1170,6 +1173,7 @@ def ack_workflow_analysis_batch_started(
     return get_workflow_run(db, workflow_run_id)
 
 
+@collection_start("workflow.resume", "workflow", "workflow_run_id")
 def resume_deep_job_search_run(
     db: Database,
     config: AppConfig,
@@ -1177,24 +1181,62 @@ def resume_deep_job_search_run(
     *,
     sync_capture: bool = True,
     transition_id: str | None = None,
+    operation_id: str | None = None,
 ) -> dict[str, object]:
     """仅在用户确认后恢复中断的采集组合，避免后台静默重复采集。"""
     run = _require_run(db, workflow_run_id)
+    if run["status"] in {"cancelled", "completed", "completed_with_errors", "failed"}:
+        raise AppError(409, "WORKFLOW_NOT_RESUMABLE", "父任务已结束，不能恢复采集。")
+    checked_capture = None
+    checked_operation = ""
+    capture = smart_captures.get_by_workflow_run(db, workflow_run_id)
+    parent_paused = str(run["control_state"] or "") == "paused" and str(run["control_cause"] or "") == "parent_pause"
+    restores_child = capture and (
+        (parent_paused and capture["status"] in {"paused", "pausing"} and capture.get("control_cause") == "parent_pause")
+        or (not parent_paused and str(run["stop_reason"] or "") in {"capture_interrupted", "browser_not_running", "collection_task_active"})
+    )
+    if sync_capture and restores_child:
+        checked_operation = prepare_smart(db, capture, resume=True, parent_resume=True)
+        checked_capture = capture
+
     if str(run["control_state"] or "") == "paused" or bool(run["paused"]):
         transition_id = transition_id or new_id()
         with db.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if checked_capture:
+                guard_owner_in_connection(connection)
+                latest = connection.execute("SELECT state_version FROM fj_smart_captures WHERE id = ?", (checked_capture["smart_capture_id"],)).fetchone()
+                latest_run = connection.execute("SELECT updated_at FROM fj_workflow_runs WHERE id = ?", (workflow_run_id,)).fetchone()
+                if latest["state_version"] != checked_capture["state_version"] or latest_run["updated_at"] != run["updated_at"]:
+                    raise AppError(409, "START_OWNER_CHANGED", "检查期间父子任务已变化，请重新确认。")
+                bind_in_connection(connection, "workflow", workflow_run_id, checked_operation)
             batch_id = smart_captures.parent_resume_child_in_connection(
                 connection, workflow_run_id, transition_id
             )
         smart_captures.publish_smart_capture_snapshot(
             db, _smart_capture_id_for_workflow(db, workflow_run_id)
         )
-        if sync_capture and batch_id:
-            _resume_capture_batch_by_id(batch_id)
+        if sync_capture and checked_capture:
+            if has_pending_details(db, str(checked_capture["smart_capture_id"])):
+                smart_capture_engine.resume_pipeline(db, str(checked_capture["smart_capture_id"]), config.output_root / "fine-job" / "boss-capture")
+            elif checked_operation:
+                _resume_capture_batch_by_id(checked_operation)
+            else:
+                smart_captures._start_new_batch(db, config, str(checked_capture["smart_capture_id"]), dict(checked_capture.get("search_config") or {}))
         return get_workflow_run(db, workflow_run_id)
-    if sync_capture:
-        _resume_current_capture_batch(db, workflow_run_id)
+    if checked_capture:
+        with db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            guard_owner_in_connection(connection)
+            smart_captures.child_resume_in_connection(connection, str(checked_capture["smart_capture_id"]), transition_id or new_id())
+        if has_pending_details(db, str(checked_capture["smart_capture_id"])):
+            smart_capture_engine.resume_pipeline(db, str(checked_capture["smart_capture_id"]), config.output_root / "fine-job" / "boss-capture")
+        elif checked_operation:
+            _resume_capture_batch_by_id(checked_operation)
+        else:
+            smart_captures._start_new_batch(db, config, str(checked_capture["smart_capture_id"]), dict(checked_capture.get("search_config") or {}))
+        smart_captures.publish_smart_capture_snapshot(db, str(checked_capture["smart_capture_id"]))
+        return get_workflow_run(db, workflow_run_id)
     if bool(run["paused"]):
         if _capture_batch_is_missing(db, workflow_run_id):
             smart_capture_id = _smart_capture_id_for_workflow(db, workflow_run_id)
@@ -1303,8 +1345,10 @@ def _pause_current_capture_batch(db: Database, workflow_run_id: str) -> None:
         return
 
 
+@collection_start("workflow.child_start", "workflow", "workflow_run_id")
 def start_linked_child(
-    db: Database, config: AppConfig, workflow_run_id: str, child_relation_id: str
+    db: Database, config: AppConfig, workflow_run_id: str, child_relation_id: str,
+    operation_id: str | None = None,
 ) -> dict[str, object]:
     """父编排通过 ChildAdapter 启动 pending child，不越层操作 Pipeline 单元。"""
     relation = workflow_children.get_workflow_child(db, workflow_run_id, child_relation_id)
@@ -1342,16 +1386,10 @@ def _pause_capture_batch_by_id(operation_id: str) -> None:
 
 
 def _resume_capture_batch_by_id(operation_id: str) -> None:
-    """事务提交后恢复已安全暂停的采集批次。"""
-    try:
-        capture = boss_capture_task_manager.get_task(operation_id)
-        if str(capture.get("stage") or "").endswith("paused"):
-            boss_capture_task_manager.resume_paused_capture(
-                operation_id,
-                pages=max(1, int(capture.get("pages") or 1)),
-            )
-    except AppError:
-        return
+    """事务提交后恢复已安全暂停的批次，派发失败交由启动回执记录。"""
+    capture = boss_capture_task_manager.get_task(operation_id)
+    if str(capture.get("stage") or "").endswith("paused"):
+        boss_capture_task_manager.resume_paused_capture(operation_id, pages=max(1, int(capture.get("pages") or 1)))
 
 
 def _capture_batch_is_missing(db: Database, workflow_run_id: str) -> bool:

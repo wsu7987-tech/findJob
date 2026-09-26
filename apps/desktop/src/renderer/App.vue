@@ -8,9 +8,12 @@ import SettingsDrawer from "@/components/SettingsDrawer.vue";
 import { useConfigStore } from "@/stores/config";
 import { useFineJobBossExecutorStore } from "@/stores/fineJobBossExecutor";
 import { useFineJobCodexStore } from "@/stores/fineJobCodex";
+import { useFineJobSmartCaptureStore } from "@/stores/fineJobSmartCapture";
+import { collectionStarts } from "@/services/api";
 import { useNoticesStore } from "@/stores/notices";
 import { startFineJobSmartCaptureCodexController } from "@/services/fineJobWorkflowCodexController";
 
+const smartCaptureStore = useFineJobSmartCaptureStore();
 const noticesStore = useNoticesStore();
 const configStore = useConfigStore();
 const executorStore = useFineJobBossExecutorStore();
@@ -39,6 +42,8 @@ watchEffect(() => {
 
 onBeforeUnmount(() => {
   smartCaptureCodexController.stop();
+  smartCaptureStore.stopRealtime();
+  collectionStarts.dispose();
   if (typeof document === "undefined") {
     return;
   }
@@ -48,6 +53,8 @@ onBeforeUnmount(() => {
 
 onMounted(() => {
   // 自动交接由 Smart Capture SSE 驱动，不通过 latest Workflow 或 advance 推动业务 Pipeline。
+  void collectionStarts.restore().catch(() => undefined);
+  void smartCaptureStore.startRealtime();
   void smartCaptureCodexController.start().catch(() => undefined);
   void configStore.probeGenerationCapabilities();
   // 桌面端启动时主动确认一次插件连接状态。

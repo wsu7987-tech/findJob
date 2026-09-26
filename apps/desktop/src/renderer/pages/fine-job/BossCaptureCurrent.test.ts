@@ -3,6 +3,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, shallowMount, type VueWrapper } from "@vue/test-utils";
 
+import { createPinia, setActivePinia } from "pinia";
+import { useFineJobSmartCaptureStore } from "@/stores/fineJobSmartCapture";
 import BossCapture from "./BossCapture.vue";
 
 const mocks = vi.hoisted(() => ({
@@ -50,6 +52,7 @@ vi.mock("element-plus", () => ({
 }));
 vi.mock("@/services/api", () => ({
   ApiError: class extends Error {},
+  collectionStarts: { state: { intent: null, receipt: null, submitting: false, checking: false, error: "" }, restore: vi.fn().mockResolvedValue(null), check: vi.fn().mockResolvedValue(null) },
   api: {
     getCurrentFineJobSmartCapture: mocks.getCurrent,
     getFineJobSmartCapture: mocks.getCapture,
@@ -115,9 +118,10 @@ const elementStubs = Object.fromEntries(elementComponentNames.map((name) => [nam
 
 const mountCapture = () => shallowMount(BossCapture, {
   global: {
+    directives: { loading: () => {} },
     stubs: {
       ...elementStubs,
-      "el-table": { template: "<div />" },
+      "el-table": { template: "<div />", methods: { clearSelection() {} } },
       "el-table-column": { template: "<div />" }
     }
   }
@@ -127,6 +131,7 @@ describe("BossCapture current 与历史状态隔离", () => {
   let wrapper: VueWrapper | null = null;
 
   beforeEach(() => {
+    setActivePinia(createPinia());
     vi.useFakeTimers();
     vi.clearAllMocks();
     mocks.currentRun = null;
@@ -143,6 +148,7 @@ describe("BossCapture current 与历史状态隔离", () => {
   });
 
   afterEach(() => {
+    useFineJobSmartCaptureStore().stopRealtime();
     wrapper?.unmount();
     wrapper = null;
     mocks.eventSources.length = 0;
@@ -208,7 +214,7 @@ describe("BossCapture current 与历史状态隔离", () => {
     expect(mounted.text()).toContain("待分析岗位队列");
     expect(mounted.text()).toContain("历史 / Context 检查工具");
     expect(mounted.text()).toContain("智能搜索策略");
-    expect(mounted.text()).toContain("3 / 3 已准备");
+    expect(mounted.text()).not.toContain("3 / 3 已准备");
     expect(mounted.text()).not.toContain("关联父任务镜像");
     expect(mounted.text()).not.toContain("立即推进");
     expect((mounted.vm as unknown as { smartManualAnalysisAvailable: boolean }).smartManualAnalysisAvailable).toBe(false);

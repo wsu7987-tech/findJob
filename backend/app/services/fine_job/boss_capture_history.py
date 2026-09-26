@@ -66,6 +66,9 @@ def create_capture_batch(
             ),
         )
 
+        from backend.app.services.fine_job.collection_start_operations import bind_in_connection
+        bind_in_connection(connection, "custom", capture_id)
+
 
 def update_capture_batch(
     db: Database,
@@ -108,6 +111,9 @@ def update_capture_batch(
             f"UPDATE fj_boss_capture_batches SET {', '.join(assignments)} WHERE id = ?",
             values,
         )
+
+        from backend.app.services.fine_job.collection_start_operations import bind_in_connection
+        bind_in_connection(connection, "custom", capture_id)
 
 
 def record_capture_jobs(

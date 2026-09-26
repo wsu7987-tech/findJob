@@ -60,6 +60,10 @@ class BossCaptureTaskManager:
             snapshot["_db"] = task.get("_db")
             snapshot["_output_dir"] = task.get("_output_dir")
             listeners = list(self._listeners)
+        db = task.get("_db")
+        if isinstance(db, Database):
+            from backend.app.services.fine_job.collection_start_operations import record_task_summary
+            record_task_summary(db, snapshot)
         for listener in listeners:
             try:
                 listener(snapshot)
@@ -111,6 +115,9 @@ class BossCaptureTaskManager:
             "has_more": True,
             "last_added_jobs": 0,
             "total_pages_loaded": 0,
+            "list_phase_baseline": 0,
+            "list_phase_processed": 0,
+            "list_phase_id": task_id,
             "stop_requested": False,
             "pause_requested": False,
             "capture_source": request.capture_source,
@@ -169,6 +176,9 @@ class BossCaptureTaskManager:
                 prefer_current_page=True,
             )
             task.update(
+                list_phase_baseline=int(task.get("total_pages_loaded") or 0),
+                list_phase_id=new_id(),
+                list_phase_processed=0,
                 status="queued",
                 stage="list_continue_queued",
                 message=f"准备在原搜索页面继续下滑采集 {pages} 页。",
@@ -337,6 +347,8 @@ class BossCaptureTaskManager:
             task.update(
                 status="queued",
                 stage="details_queued",
+                detail_phase_id=new_id(),
+                detail_phase_job_ids=selected_ids,
                 message=f"已选择 {len(selected_ids)} 个岗位，等待采集详情。",
                 progress_current=0,
                 progress_total=len(selected_ids),
@@ -371,9 +383,12 @@ class BossCaptureTaskManager:
         smart_capture_id: str | None = None,
         pipeline_unit_type: str | None = None,
         pipeline_unit_id: str | None = None,
+        task_id: str | None = None,
     ) -> dict[str, object]:
         """为历史岗位创建独立详情任务，不新增采集批次或岗位采集次数。"""
-        task_id = new_id()
+        task_id = task_id or new_id()
+        from backend.app.services.fine_job.collection_start_operations import bind_existing
+        bind_existing(db, capture_source, task_id)
         now = utc_now()
         history_record_id = str(job.get("id") or "")
         source_job_id = str(job.get("job_id") or "").strip()
@@ -442,6 +457,13 @@ class BossCaptureTaskManager:
             daemon=True,
         ).start()
         return self.get_task(task_id)
+
+    def get_original_target(self, task_id: str) -> str:
+        with self._lock:
+            target_id = str(self._require_task(task_id).get("_capture_target_id") or "")
+        if not target_id:
+            raise AppError(409, "CAPTURE_PAGE_NOT_REUSABLE", "原搜索页面身份已丢失，已有结果已保留。")
+        return target_id
 
     def get_task(self, task_id: str) -> dict[str, object]:
         with self._lock:
@@ -646,7 +668,8 @@ class BossCaptureTaskManager:
                     last_added_jobs=int(
                         result.list_data.get("new_jobs_count") or len(task["jobs"])
                     ),
-                    total_pages_loaded=int(result.list_data.get("pages_loaded") or request.pages),
+                    total_pages_loaded=int(result.list_data.get("pages_loaded") or 0),
+                    list_phase_processed=int(result.list_data.get("pages_loaded") or 0),
                     stop_requested=False,
                     updated_at=utc_now(),
                     finished_at=utc_now(),
@@ -732,6 +755,7 @@ class BossCaptureTaskManager:
                     has_more=has_more,
                     last_added_jobs=added,
                     total_pages_loaded=int(task.get("total_pages_loaded") or 0) + loaded,
+                    list_phase_processed=loaded,
                     stop_requested=False,
                     updated_at=utc_now(),
                     finished_at=utc_now(),
@@ -841,6 +865,7 @@ class BossCaptureTaskManager:
                         [job for job in jobs if isinstance(job, dict)],
                     )
                     self._persist_list_jobs(task)
+                task["list_phase_processed"] = int(event.get("current") or 0)
                 task["progress_current"] = int(event.get("current") or 0)
                 task["progress_total"] = int(event.get("total") or task["pages"])
                 task["jobs_collected"] = len(task["jobs"])
@@ -863,6 +888,8 @@ class BossCaptureTaskManager:
                 task["progress_current"] = 0 if task["auto_details"] else len(task["jobs"])
                 task["progress_total"] = len(task["jobs"])
                 if task["auto_details"]:
+                    task["detail_phase_id"] = new_id()
+                    task["detail_phase_job_ids"] = [str(job["job_id"]) for job in jobs if job.get("job_id")]
                     task["estimated_seconds_min"] = len(task["jobs"]) * DETAIL_SECONDS_MIN
                     task["estimated_seconds_max"] = len(task["jobs"]) * DETAIL_SECONDS_MAX
                 else:

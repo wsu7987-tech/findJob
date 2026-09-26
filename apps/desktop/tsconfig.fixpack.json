@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "src/renderer/env.d.ts",
+    "src/renderer/App.vue",
+    "src/renderer/pages/fine-job/BossCapture.vue",
+    "src/renderer/stores/fineJobBossCapture.ts",
+    "src/renderer/stores/fineJobSmartCapture.ts",
+    "src/renderer/services/api.ts",
+    "src/renderer/services/collectionStart.ts",
+    "src/renderer/services/fineJobWorkflowCodexController.ts"
+  ],
+  "exclude": [
+    "**/*.test.ts"
+  ]
+}

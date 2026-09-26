@@ -840,7 +840,12 @@ class BossScraperService:
         if request.pages < 1 or request.pages > engine.MAX_PAGES:
             raise ValueError(f"pages must be between 1 and {engine.MAX_PAGES}")
         with _CAPTURE_LOCK:
-            capture_target = self._find_interactive_target(request.cdp_port)
+            cdp = engine.CDPSession(request.cdp_port)
+            try:
+                targets = cdp.send("Target.getTargets").get("result", {}).get("targetInfos", [])
+                capture_target = next((target for target in targets if target.get("type") == "page" and str(target.get("targetId") or "") == expected_target_id), None)
+            finally:
+                cdp.close()
             target_id = str((capture_target or {}).get("targetId") or "")
             current_url = str((capture_target or {}).get("url") or "")
             if not capture_target or target_id != expected_target_id:
@@ -966,7 +971,7 @@ class BossScraperService:
                 (target for target in targets if target.get("targetId") == self._interactive_target_id),
                 None,
             )
-            if selected:
+            if selected and self._is_search_url(str(selected.get("url") or "")):
                 return selected
             self._interactive_target_id = None
 

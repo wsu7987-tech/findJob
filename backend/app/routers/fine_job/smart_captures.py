@@ -4,6 +4,8 @@ import json
 from collections.abc import Iterator
 from queue import Empty
 
+from backend.app.services.fine_job.collection_start_operations import start_http_response
+
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import StreamingResponse
 
@@ -31,6 +33,7 @@ router = APIRouter(prefix="/fine-job/smart-captures", tags=["fine-job-smart-capt
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
+@start_http_response
 def create(
     payload: SmartCaptureCreateRequest,
     config: AppConfig = Depends(get_config),
@@ -121,15 +124,18 @@ def pause(
 
 
 @router.post("/{smart_capture_id}/start")
+@start_http_response
 def start(
     smart_capture_id: str,
+    payload: SmartCaptureControlRequest | None = None,
     config: AppConfig = Depends(get_config),
     db: Database = Depends(get_database),
 ):
-    return smart_captures.start_smart_capture(db, config, smart_capture_id)
+    return smart_captures.start_smart_capture(db, config, smart_capture_id, operation_id=payload.operation_id if payload else None)
 
 
 @router.post("/{smart_capture_id}/resume")
+@start_http_response
 def resume(
     smart_capture_id: str,
     payload: SmartCaptureControlRequest | None = None,
@@ -139,17 +145,19 @@ def resume(
     return smart_captures.resume_smart_capture(
         db, config, smart_capture_id,
         transition_id=payload.transition_id if payload else None,
+        operation_id=payload.operation_id if payload else None,
     )
 
 
 @router.post("/{smart_capture_id}/retry")
+@start_http_response
 def retry(
     smart_capture_id: str,
     payload: SmartCaptureControlRequest | None = None,
     config: AppConfig = Depends(get_config),
     db: Database = Depends(get_database),
 ):
-    return smart_captures.retry_smart_capture(db, config, smart_capture_id)
+    return smart_captures.retry_smart_capture(db, config, smart_capture_id, operation_id=payload.operation_id if payload else None)
 
 
 @router.post("/{smart_capture_id}/stop")

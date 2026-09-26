@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import json
+from backend.app.services.fine_job.collection_start_operations import collection_start
+from backend.app.services.fine_job.collection_readiness import ensure_ready
+from backend.app.services.fine_job.collection_starts import prepare_custom_phase
 
 from fastapi import APIRouter, Depends, Query, status
 
@@ -185,21 +189,23 @@ def get_boss_capture_history_job(
 
 @router.post(
     "/capture",
-    response_model=BossCaptureTaskResponse,
+    response_model=None,
     status_code=status.HTTP_202_ACCEPTED,
 )
+@collection_start("custom.capture", "custom", "")
 def start_boss_capture(
     payload: BossCapturePayload,
     config: AppConfig = Depends(get_config),
     db: Database = Depends(get_database),
-) -> BossCaptureTaskResponse:
+) -> dict[str, object]:
+    if not payload.keyword.strip() or not payload.city.strip():
+        raise AppError(422, "VALIDATION_FAILED", "搜索词与城市不能为空。")
+    if payload.filter_strategy_id:
+        strategy = get_filter_strategy(db, payload.filter_strategy_id)
+        if not strategy.get("enabled"):
+            raise AppError(409, "FILTER_STRATEGY_DISABLED", "所选筛选策略未启用。")
     def start_task() -> dict[str, object]:
-        if not boss_scraper_service.get_browser_status().running:
-            raise AppError(
-                status_code=409,
-                error_category="BROWSER_NOT_RUNNING",
-                error_message="FineJob 专用 Chrome 未启动，请先打开并完成 BOSS 登录。",
-            )
+        ensure_ready()
         return boss_capture_task_manager.start_capture(
             BossCaptureRequest(
                 keyword=payload.keyword,
@@ -218,7 +224,7 @@ def start_boss_capture(
         )
 
     task = start_custom_collection(db, start_task)
-    return BossCaptureTaskResponse(**task)
+    return task
 
 
 @router.get("/history", response_model=BossCaptureHistoryResponse)
@@ -281,15 +287,16 @@ def request_history_job_greeting_review(
 
 @router.post(
     "/history/{history_job_id}/details",
-    response_model=BossCaptureTaskResponse,
+    response_model=None,
     status_code=status.HTTP_202_ACCEPTED,
 )
+@collection_start("custom.history_details", "custom", "history_job_id")
 def capture_history_job_details(
     history_job_id: str,
     payload: BossHistoryDetailCaptureRequest | None = None,
     config: AppConfig = Depends(get_config),
     db: Database = Depends(get_database),
-) -> BossCaptureTaskResponse:
+) -> dict[str, object]:
     job = get_capture_history_job(db, history_job_id)
     filter_strategy_id = str(job.get("filter_strategy_id") or "")
     filter_strategy = get_filter_strategy(db, filter_strategy_id) if filter_strategy_id else None
@@ -301,49 +308,67 @@ def capture_history_job_details(
         action="detail",
         allow_manual_override=manual_override,
     )
-    if not boss_scraper_service.get_browser_status().running:
-        raise AppError(
-            status_code=409,
-            error_category="BROWSER_NOT_RUNNING",
-            error_message="FineJob 专用 Chrome 未启动，请先打开并完成 BOSS 登录。",
-        )
     def start_task() -> dict[str, object]:
+        ensure_ready()
         return boss_capture_task_manager.start_history_detail(
             job,
             output_dir=config.output_root / "fine-job" / "boss-capture",
             db=db,
         )
 
-    return BossCaptureTaskResponse(**start_custom_collection(db, start_task))
+    return start_custom_collection(db, start_task)
 
 
 @router.get("/tasks/{task_id}", response_model=BossCaptureTaskResponse)
-def get_boss_capture_task(task_id: str) -> BossCaptureTaskResponse:
-    return BossCaptureTaskResponse(**boss_capture_task_manager.get_task(task_id))
+def get_boss_capture_task(task_id: str, db: Database = Depends(get_database)) -> BossCaptureTaskResponse:
+    try:
+        return BossCaptureTaskResponse(**boss_capture_task_manager.get_task(task_id))
+    except AppError as exc:
+        if exc.status_code != 404:
+            raise
+    # 进程内执行器丢失后，仍可按真实引用读取持久化结果。
+    with db.connect() as connection:
+        batch = connection.execute("SELECT * FROM fj_boss_capture_batches WHERE id = ?", (task_id,)).fetchone()
+        receipt = connection.execute("SELECT * FROM fj_collection_start_operations WHERE result_task_id = ? OR result_phase_ref = ? ORDER BY updated_at DESC LIMIT 1", (task_id, task_id)).fetchone()
+        jobs = connection.execute("SELECT snapshot_json FROM fj_boss_capture_batch_jobs WHERE capture_id = ? ORDER BY collected_at", (task_id,)).fetchall()
+    if batch is None and receipt is None:
+        raise AppError(404, "CAPTURE_TASK_NOT_FOUND", "采集任务不存在。")
+    result = dict(batch) if batch else json.loads(receipt["result_summary_json"])
+    result.setdefault("id", task_id)
+    result.setdefault("status", "failed")
+    result.setdefault("stage", "interrupted")
+    result.setdefault("message", "采集执行已中断，已保存结果可继续查看。")
+    result.setdefault("keyword", "")
+    result.setdefault("city", "")
+    result.setdefault("pages", 0)
+    result.setdefault("auto_details", False)
+    result.setdefault("created_at", receipt["created_at"] if receipt else "")
+    result.setdefault("updated_at", receipt["updated_at"] if receipt else "")
+    result["jobs"] = [json.loads(job["snapshot_json"]) for job in jobs]
+    if not batch and receipt and receipt["action"] == "custom.history_details" and receipt["owner_id"]:
+        job = get_capture_history_job(db, receipt["owner_id"])
+        result["jobs"] = [{**job, "history_record_id": job["id"]}]
+    if result["status"] in {"queued", "running"}:
+        result.update(status="failed", stage="interrupted", message="采集执行进程已退出，已保存结果可继续查看。")
+    return BossCaptureTaskResponse(**result)
 
 
 @router.post(
     "/tasks/{task_id}/continue",
-    response_model=BossCaptureTaskResponse,
+    response_model=None,
     status_code=status.HTTP_202_ACCEPTED,
 )
+@collection_start("custom.continue", "custom", "task_id")
 def continue_boss_capture(
     task_id: str,
     payload: BossContinueCaptureRequest,
     db: Database = Depends(get_database),
-) -> BossCaptureTaskResponse:
+) -> dict[str, object]:
     def continue_task() -> dict[str, object]:
-        if not boss_scraper_service.get_browser_status().running:
-            raise AppError(
-                status_code=409,
-                error_category="BROWSER_NOT_RUNNING",
-                error_message="FineJob 专用 Chrome 未启动，原搜索页面无法继续下滑。",
-            )
+        prepare_custom_phase(db, task_id, pages=payload.pages)
         return boss_capture_task_manager.continue_capture(task_id, pages=payload.pages)
 
-    return BossCaptureTaskResponse(
-        **start_custom_collection_phase(db, task_id, continue_task)
-    )
+    return start_custom_collection_phase(db, task_id, continue_task)
 
 
 @router.post(
@@ -356,26 +381,26 @@ def stop_boss_capture(task_id: str) -> BossCaptureTaskResponse:
 
 @router.post(
     "/tasks/{task_id}/details",
-    response_model=BossCaptureTaskResponse,
+    response_model=None,
     status_code=status.HTTP_202_ACCEPTED,
 )
+@collection_start("custom.details", "custom", "task_id")
 def capture_selected_boss_details(
     task_id: str,
     payload: BossDetailCaptureRequest,
     db: Database = Depends(get_database),
-) -> BossCaptureTaskResponse:
+) -> dict[str, object]:
     start_kwargs = {"force": payload.force}
     if payload.manual_override:
         start_kwargs["manual_override"] = True
-    return BossCaptureTaskResponse(
-        **start_custom_collection_phase(
+    def start_details():
+        prepare_custom_phase(db, task_id, job_ids=payload.job_ids, force=payload.force, manual_override=payload.manual_override)
+        return boss_capture_task_manager.start_details(task_id, payload.job_ids, **start_kwargs)
+    return start_custom_collection_phase(
             db,
             task_id,
-            lambda: boss_capture_task_manager.start_details(
-                task_id, payload.job_ids, **start_kwargs
-            ),
+            start_details,
         )
-    )
 
 
 @router.post(

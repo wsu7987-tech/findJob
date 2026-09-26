@@ -75,6 +75,7 @@ class WorkflowRunCreateRequest(BaseModel):
 
 
 class WorkflowControlRequest(BaseModel):
+    operation_id: str | None = None
     transition_id: str | None = Field(default=None, min_length=1, max_length=160)
 
 

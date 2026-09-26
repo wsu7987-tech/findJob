@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from backend.app.services.fine_job.collection_start_operations import collection_start, bind_in_connection, bind_existing, current_operation
+from backend.app.services.fine_job.collection_readiness import ensure_ready
+from backend.app.services.fine_job.collection_starts import prepare_smart, guard_owner_in_connection, has_pending_details
+
 import json
 from collections.abc import Mapping
 from typing import Any
@@ -370,6 +374,7 @@ def create_smart_capture_in_connection(
             child_state_version=1,
             created_at=now,
         )
+    bind_in_connection(connection, "smart", capture_id)
     return capture_id
 
 
@@ -804,18 +809,19 @@ def child_stop_in_connection(
     )
 
 
+@collection_start("smart.create", "smart", "smart_capture_id")
 def start_independent_capture(
     db: Database,
     config: AppConfig,
     payload: dict[str, Any],
+    operation_id: str | None = None,
 ) -> dict[str, object]:
     """从岗位采集页创建不关联 Workflow Run 的任务并启动首批采集。"""
     _validate_execution_config_for_start(db, payload)
     assert_collection_start_allowed(db, requested_kind="smart")
     if get_active_smart_capture(db) is not None:
         raise AppError(409, "COLLECTION_TASK_ACTIVE", "当前岗位采集任务尚未结束，请先暂停后继续或停止当前任务。")
-    if not boss_scraper_service.get_browser_status().running:
-        raise AppError(409, "BROWSER_NOT_RUNNING", "FineJob 专用 Chrome 未启动，请先打开并完成 BOSS 登录。")
+    ensure_ready()
     capture = create_smart_capture(
         db,
         source="boss_capture",
@@ -827,10 +833,12 @@ def start_independent_capture(
     return _start_new_batch(db, config, str(capture["smart_capture_id"]), payload)
 
 
+@collection_start("smart.start", "smart", "smart_capture_id")
 def start_smart_capture(
     db: Database,
     config: AppConfig,
     smart_capture_id: str,
+    operation_id: str | None = None,
 ) -> dict[str, object]:
     """启动已创建的 pending Smart Capture，供恢复和 linked adapter 使用。"""
     capture = get_smart_capture(db, smart_capture_id)
@@ -846,10 +854,12 @@ def start_smart_capture(
     )
 
 
+@collection_start("smart.retry", "smart", "smart_capture_id")
 def retry_smart_capture(
     db: Database,
     config: AppConfig,
     smart_capture_id: str,
+    operation_id: str | None = None,
 ) -> dict[str, object]:
     """只恢复 pending/interrupted，failed 终态保持不可重试。"""
     capture = get_smart_capture(db, smart_capture_id)
@@ -1022,6 +1032,7 @@ def pause_smart_capture(
     return publish_smart_capture_snapshot(db, smart_capture_id) or {}
 
 
+@collection_start("smart.resume", "smart", "smart_capture_id")
 def resume_smart_capture(
     db: Database,
     config: AppConfig,
@@ -1029,6 +1040,7 @@ def resume_smart_capture(
     *,
     sync_workflow: bool = True,
     transition_id: str | None = None,
+    operation_id: str | None = None,
 ) -> dict[str, object]:
     capture = get_smart_capture(db, smart_capture_id)
     resumable_waiting = str(capture.get("waiting_reason") or "") in {
@@ -1042,14 +1054,21 @@ def resume_smart_capture(
         "interrupted",
     } and not (str(capture["status"]) == "waiting_for_user" and resumable_waiting):
         raise AppError(409, "SMART_CAPTURE_NOT_RESUMABLE", "当前岗位采集任务不在可继续状态。")
-    if not boss_scraper_service.get_browser_status().running:
-        raise AppError(409, "BROWSER_NOT_RUNNING", "FineJob 专用 Chrome 未启动，暂不能继续岗位采集。")
+    batch_id = prepare_smart(db, capture, resume=True)
     workflow_run_id = str(capture.get("workflow_run_id") or "")
     pipeline_operation_id = smart_capture_engine.active_pipeline_operation_id(
         db, smart_capture_id
     )
-    batch_id = pipeline_operation_id or str(capture.get("current_batch_id") or "")
     transition_id = transition_id or new_id()
+    if has_pending_details(db, smart_capture_id):
+        with db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            guard_owner_in_connection(connection)
+            if workflow_run_id and sync_workflow:
+                child_resume_in_connection(connection, smart_capture_id, transition_id)
+        # 详情统一由流水线恢复，避免同时恢复旧执行器又派发同一岗位。
+        smart_capture_engine.resume_pipeline(db, smart_capture_id, config.output_root / "fine-job" / "boss-capture")
+        return publish_smart_capture_snapshot(db, smart_capture_id) or {}
     if workflow_run_id and sync_workflow:
         executor_missing = False
         if batch_id:
@@ -1077,18 +1096,16 @@ def resume_smart_capture(
             return publish_smart_capture_snapshot(db, smart_capture_id) or {}
         with db.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            guard_owner_in_connection(connection)
             child_batch_id = child_resume_in_connection(
                 connection, smart_capture_id, transition_id
             )
         batch_id = pipeline_operation_id or child_batch_id
         if batch_id:
-            try:
-                task = boss_capture_task_manager.get_task(batch_id)
-                pages = max(1, int(task.get("pages") or 1))
-                if str(task.get("stage") or "").endswith("paused"):
-                    boss_capture_task_manager.resume_paused_capture(batch_id, pages=pages)
-            except AppError:
-                pass
+            task = boss_capture_task_manager.get_task(batch_id)
+            pages = max(1, int(task.get("pages") or 1))
+            if str(task.get("stage") or "").endswith("paused"):
+                boss_capture_task_manager.resume_paused_capture(batch_id, pages=pages)
         if smart_capture_engine.resume_pipeline(
             db,
             smart_capture_id,
@@ -1098,6 +1115,9 @@ def resume_smart_capture(
         return publish_smart_capture_snapshot(db, smart_capture_id) or {}
     resumed = False
     executor_missing = False
+    with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        guard_owner_in_connection(connection)
     if batch_id:
         try:
             task = boss_capture_task_manager.get_task(batch_id)
@@ -1377,7 +1397,9 @@ def get_smart_capture(db: Database, smart_capture_id: str) -> dict[str, object]:
     if status == "waiting_next_batch" and waiting_reason in LEGACY_MANUAL_WAITING_REASONS:
         # 旧数据读取时统一到人工阻塞的 canonical lifecycle。
         status = "waiting_for_user"
+    from backend.app.services.fine_job.collection_progress import get_collection_progress
     snapshot = {
+        "collection_progress": get_collection_progress(db, smart_capture_id, current_task, progress),
         "smart_capture_id": str(data["id"]),
         "source": str(data["source"]),
         "workflow_run_id": workflow_run_id or None,
@@ -1428,7 +1450,7 @@ def _start_new_batch(
 ) -> dict[str, object]:
     # pending/recovery 启动仍需经过统一执行容量检查，防止 custom 在两次请求间插入。
     assert_collection_start_allowed(db, requested_kind="smart")
-    if not boss_scraper_service.get_browser_status().running:
+    if current_operation() is None and not boss_scraper_service.get_browser_status().running:
         raise AppError(409, "BROWSER_NOT_RUNNING", "FineJob 专用 Chrome 未启动，请先打开并完成 BOSS 登录。")
     keywords = [str(value) for value in payload.get("allowed_search_keywords") or [] if str(value)]
     cities = [str(value) for value in payload.get("allowed_cities") or [] if str(value)]
@@ -1437,6 +1459,8 @@ def _start_new_batch(
     if not keyword or not city:
         raise AppError(422, "VALIDATION_FAILED", "岗位采集任务缺少搜索词或城市。")
     capture = get_smart_capture(db, smart_capture_id)
+    if current_operation() is not None:
+        prepare_smart(db, capture)
     owner = pipeline_owner.get_pipeline_owner(db, smart_capture_id)
     authority = requested_authority or (
         cutover_guard.ExecutionAuthority.WORKFLOW_PIPELINE
@@ -1517,6 +1541,7 @@ def _update_capture(
 ) -> None:
     now = utc_now()
     with db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
             """
             SELECT status, stage, waiting_reason, control_cause, current_batch_id,
@@ -1686,6 +1711,12 @@ def touch_pipeline_snapshot(db: Database, smart_capture_id: str) -> None:
 def _progress_from_task(task: dict[str, object]) -> dict[str, object]:
     """将批次进度转换为 Smart Capture snapshot 的稳定字段。"""
     return {
+        "list_phase_id": task.get("list_phase_id"),
+        "list_phase_baseline": task.get("list_phase_baseline", 0),
+        "list_phase_processed": task.get("list_phase_processed", 0),
+        "total_pages_loaded": task.get("total_pages_loaded", 0),
+        "list_planned_pages": task.get("pages"),
+        "stage": task.get("stage"),
         "current": int(task.get("progress_current") or 0),
         "total": int(task.get("progress_total") or 0),
         "jobs_collected": int(task.get("jobs_collected") or len(task.get("jobs") or [])),

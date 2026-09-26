@@ -10,6 +10,7 @@ from backend.app.schemas.fine_job.smart_capture_execution_config import (
 
 
 class SmartCaptureCreateRequest(BaseModel):
+    operation_id: str | None = None
     filter_strategy_id: str = Field(min_length=1, max_length=100)
     allowed_search_keywords: list[str] = Field(min_length=1, max_length=50)
     allowed_cities: list[str] = Field(min_length=1, max_length=20)
@@ -47,6 +48,7 @@ class SmartCaptureCreateRequest(BaseModel):
 
 
 class SmartCaptureControlRequest(BaseModel):
+    operation_id: str | None = None
     transition_id: str | None = Field(default=None, min_length=1, max_length=160)
 
 

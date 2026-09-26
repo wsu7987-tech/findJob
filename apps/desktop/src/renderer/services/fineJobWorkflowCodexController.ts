@@ -1,3 +1,4 @@
+import { createSmartCaptureRealtime, useFineJobSmartCaptureStore } from "@/stores/fineJobSmartCapture";
 import type { FineJobSmartCapture, FineJobSmartCaptureAnalysisSnapshot, FineJobWorkflowRun } from "@/types";
 
 import { api, getBackendOrigin } from "./api";
@@ -93,6 +94,7 @@ export const startFineJobWorkflowCodexController = (dependencies: Omit<Controlle
   });
 
 type SmartCaptureControllerDependencies = {
+  realtime?: Pick<ReturnType<typeof createSmartCaptureRealtime>, "subscribe" | "getCurrent" | "refreshCurrent" | "startRealtime" | "stopRealtime">;
   codexStore: Parameters<typeof triggerSmartCaptureCodexHandoff>[1];
   isActive?: () => boolean;
   getCurrentSmartCapture?: () => Promise<{ smart_capture: Awaited<ReturnType<typeof api.getFineJobSmartCapture>> | null }>;
@@ -106,10 +108,12 @@ export const createFineJobSmartCaptureCodexController = (
   dependencies: SmartCaptureControllerDependencies
 ) => {
   let started = false;
-  let backendOrigin = "";
-  let currentSource: EventSource | null = null;
-  let detailSource: EventSource | null = null;
-  let detailCaptureId = "";
+  const realtime = dependencies.realtime ?? createSmartCaptureRealtime({
+    getCurrent: dependencies.getCurrentSmartCapture,
+    getOrigin: dependencies.getBackendOrigin,
+    createEventSource: dependencies.createEventSource
+  });
+  let unsubscribe: (() => void) | null = null;
   let inspecting = false;
   let pendingInspection: { capture: FineJobSmartCapture; force: boolean } | null = null;
   const inspectedVersions = new Map<string, number>();
@@ -120,16 +124,8 @@ export const createFineJobSmartCaptureCodexController = (
     ["completed", "stopped", "failed"].includes(capture.status);
   const needsCodexInspection = (capture: FineJobSmartCapture) =>
     !isTerminal(capture) && (capture.stage === "waiting_codex" || capture.waiting_reason === "codex");
-  const parseCapture = (event: MessageEvent<string>) => {
-    try {
-      return JSON.parse(event.data) as FineJobSmartCapture;
-    } catch {
-      return null;
-    }
-  };
-
   const inspectCapture = async (capture: FineJobSmartCapture, force = false): Promise<void> => {
-    if (!isActive() || !needsCodexInspection(capture)) return;
+    if (!started || !isActive() || !needsCodexInspection(capture)) return;
     if (inspecting) {
       // 合并并发事件，只保留最新版本，避免同一状态重复读取 Analysis Snapshot。
       if (!pendingInspection || capture.state_version >= pendingInspection.capture.state_version) {
@@ -146,6 +142,8 @@ export const createFineJobSmartCaptureCodexController = (
       const snapshot = await (dependencies.getAnalysisSnapshot
         ? dependencies.getAnalysisSnapshot(capture.smart_capture_id)
         : api.getFineJobSmartCaptureAnalysisSnapshot(capture.smart_capture_id));
+      const latest = realtime.getCurrent();
+      if (!started || !isActive() || latest?.smart_capture_id !== capture.smart_capture_id || isTerminal(latest)) return;
       if (!isAutoSmartCaptureCodexHandoffReady(snapshot)) return;
       const batchKey = `${snapshot.smart_capture_id}:${snapshot.analysis_batch_id}`;
       if (attemptedAnalysisBatches.has(batchKey)) return;
@@ -163,69 +161,32 @@ export const createFineJobSmartCaptureCodexController = (
       inspecting = false;
       const next = pendingInspection;
       pendingInspection = null;
-      if (next) await inspectCapture(next.capture, next.force);
+      if (next && started && realtime.getCurrent()?.smart_capture_id === next.capture.smart_capture_id) await inspectCapture(next.capture, next.force);
     }
-  };
-
-  const closeDetailSource = () => {
-    detailSource?.close();
-    detailSource = null;
-    detailCaptureId = "";
-  };
-
-  const applyCapture = async (capture: FineJobSmartCapture, fromDetail = false) => {
-    if (!isActive()) return;
-    if (isTerminal(capture)) {
-      if (capture.smart_capture_id === detailCaptureId) closeDetailSource();
-      return;
-    }
-    if (started && backendOrigin && !fromDetail && detailCaptureId !== capture.smart_capture_id) {
-      closeDetailSource();
-      detailCaptureId = capture.smart_capture_id;
-      const sourceFactory = dependencies.createEventSource ?? ((url: string) => new EventSource(url));
-      detailSource = sourceFactory(
-        `${backendOrigin}/api/fine-job/smart-captures/${encodeURIComponent(capture.smart_capture_id)}/events`
-      );
-      detailSource.onmessage = (event) => {
-        const next = parseCapture(event);
-        if (next) void applyCapture(next, true).catch(() => undefined);
-      };
-    }
-    await inspectCapture(capture);
   };
 
   const tick = async () => {
-    if (!isActive()) return;
-    const current = await (dependencies.getCurrentSmartCapture
-      ? dependencies.getCurrentSmartCapture()
-      : api.getCurrentFineJobSmartCapture());
-    if (current.smart_capture) await inspectCapture(current.smart_capture, true);
+    if (!started || !isActive()) return;
+    await realtime.refreshCurrent();
+    const capture = realtime.getCurrent();
+    if (capture) await inspectCapture(capture, true);
   };
 
   const start = async () => {
     if (started) return;
     started = true;
-    backendOrigin = await (dependencies.getBackendOrigin ?? getBackendOrigin)();
-    if (!started) return;
-    const sourceFactory = dependencies.createEventSource
-      ?? (typeof EventSource === "undefined" ? null : (url: string) => new EventSource(url));
-    if (!sourceFactory) {
-      await tick();
-      return;
-    }
-    // current SSE 负责身份切换，detail SSE 负责该任务后续状态变化。
-    currentSource = sourceFactory(`${backendOrigin}/api/fine-job/smart-captures/current/events`);
-    currentSource.onmessage = (event) => {
-      const capture = parseCapture(event);
-      if (capture) void applyCapture(capture).catch(() => undefined);
-    };
+    unsubscribe = realtime.subscribe((capture) => {
+      if (capture) void inspectCapture(capture).catch(() => undefined);
+      else pendingInspection = null;
+    });
+    if (!dependencies.realtime) await realtime.startRealtime();
   };
 
   const stop = () => {
     started = false;
-    currentSource?.close();
-    currentSource = null;
-    closeDetailSource();
+    unsubscribe?.(); unsubscribe = null;
+    pendingInspection = null;
+    if (!dependencies.realtime) realtime.stopRealtime();
   };
 
   return { start, stop, tick };
@@ -235,6 +196,7 @@ export const startFineJobSmartCaptureCodexController = (
   dependencies: Omit<SmartCaptureControllerDependencies, "getCurrentSmartCapture" | "getAnalysisSnapshot" | "getBackendOrigin">
 ) => createFineJobSmartCaptureCodexController({
   ...dependencies,
+  realtime: dependencies.realtime ?? useFineJobSmartCaptureStore(),
   getCurrentSmartCapture: () => api.getCurrentFineJobSmartCapture(),
   getAnalysisSnapshot: (smartCaptureId) => api.getFineJobSmartCaptureAnalysisSnapshot(smartCaptureId),
   getBackendOrigin

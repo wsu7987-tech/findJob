@@ -4,6 +4,8 @@ import json
 from collections.abc import Iterator
 from queue import Empty
 
+from backend.app.services.fine_job.collection_start_operations import start_http_response
+
 from fastapi import APIRouter, Depends, Query, status
 from fastapi.responses import StreamingResponse
 
@@ -111,16 +113,19 @@ def advance(workflow_run_id: str, config: AppConfig = Depends(get_config), db: D
 
 
 @router.post("/{workflow_run_id}/children/{child_relation_id}/start")
+@start_http_response
 def start_child(
     workflow_run_id: str,
     child_relation_id: str,
+    payload: WorkflowControlRequest | None = None,
     config: AppConfig = Depends(get_config),
     db: Database = Depends(get_database),
 ):
-    return workflow_runs.start_linked_child(db, config, workflow_run_id, child_relation_id)
+    return workflow_runs.start_linked_child(db, config, workflow_run_id, child_relation_id, operation_id=payload.operation_id if payload else None)
 
 
 @router.post("/{workflow_run_id}/resume")
+@start_http_response
 def resume(
     workflow_run_id: str,
     payload: WorkflowControlRequest | None = None,
@@ -131,6 +136,7 @@ def resume(
     return workflow_runs.resume_deep_job_search_run(
         db, config, workflow_run_id,
         transition_id=payload.transition_id if payload else None,
+        operation_id=payload.operation_id if payload else None,
     )
 
 

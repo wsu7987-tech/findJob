@@ -72,12 +72,14 @@ describe("fineJobSmartCaptureCodexController", () => {
       handoffDependencies: { client, transport }
     });
 
+    await controller.start();
     await controller.tick();
 
-    expect(getCurrentSmartCapture).toHaveBeenCalledTimes(1);
+    expect(getCurrentSmartCapture).toHaveBeenCalledTimes(2);
     expect(advance).not.toHaveBeenCalled();
     expect(codexStore.startSmartCapture).toHaveBeenCalledTimes(1);
     expect(transport.submitSmartCaptureCodexPrompt).toHaveBeenCalledWith(expect.stringContaining("smart_capture_id="));
+    controller.stop();
   });
 
   it("通过 SSE 触发并按 state_version 去重，不创建定时轮询", async () => {

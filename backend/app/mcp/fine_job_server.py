@@ -473,7 +473,7 @@ async def start_job_capture(
     keyword: str = "",
     city: str = "",
     pages: int = 1,
-) -> dict[str, Any]:
+    operation_id: str | None = None) -> dict[str, Any]:
     """使用岗位筛选策略中的搜索词和城市启动现有采集任务。"""
     return await _invoke("start_job_capture", locals())
 
@@ -482,7 +482,7 @@ async def start_job_capture(
 async def continue_job_capture(
     capture_task_id: str,
     pages: int = 1,
-) -> dict[str, Any]:
+    operation_id: str | None = None) -> dict[str, Any]:
     """沿用同一采集任务和原 BOSS 搜索页，继续下滑指定逻辑页数并追加岗位。"""
     return await _invoke("continue_job_capture", locals())
 
@@ -508,7 +508,7 @@ async def collect_job_details(
     job_ids: list[str],
     force: bool = False,
     manual_override: bool = False,
-) -> dict[str, Any]:
+    operation_id: str | None = None) -> dict[str, Any]:
     """按自动候选标准或用户人工覆盖选择岗位，启动详情采集并保存最新 JD。"""
     return await _invoke("collect_job_details", locals())
 
@@ -526,7 +526,7 @@ async def get_job_context(job_id: str, resume_id: str = "") -> dict[str, Any]:
 
 
 @server.tool(name="finejob.collect_job_detail", structured_output=True)
-async def collect_job_detail(job_id: str, manual_override: bool = False) -> dict[str, Any]:
+async def collect_job_detail(job_id: str, manual_override: bool = False, operation_id: str | None = None) -> dict[str, Any]:
     """为已采集岗位创建详情采集任务；用户明确操作时可覆盖不推荐结果。"""
     return await _invoke("collect_job_detail", locals())
 
@@ -726,6 +726,20 @@ async def get_operation_status(resource_type: str, resource_id: str) -> dict[str
 def main() -> None:
     """以 stdio 方式启动，标准输出仅供 MCP 协议使用。"""
     server.run(transport="stdio")
+
+
+
+
+@server.tool(name="finejob.get_collection_start_operation", structured_output=True)
+async def get_collection_start_operation(operation_id: str) -> dict[str, Any]:
+    """查询启动回执和真实任务引用。"""
+    return await _invoke("get_collection_start_operation", locals())
+
+
+@server.tool(name="finejob.resolve_collection_start_operation", structured_output=True)
+async def resolve_collection_start_operation(operation_id: str) -> dict[str, Any]:
+    """确认结束尚未派发的意图，已派发请求保留其结果。"""
+    return await _invoke("resolve_collection_start_operation", locals())
 
 
 if __name__ == "__main__":

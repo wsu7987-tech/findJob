@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from backend.app.services.fine_job.collection_start_operations import collection_start, get_operation, resolve_operation
+from backend.app.services.fine_job.collection_readiness import ensure_ready
+from backend.app.services.fine_job.collection_starts import prepare_custom_phase
+
 import json
 from typing import Any, Callable
 
@@ -105,6 +109,8 @@ CORE_TOOLS = (
     "finejob.record_job_application",
     "finejob.list_job_strategies",
     "finejob.get_job_evaluation_context",
+    "finejob.get_collection_start_operation",
+    "finejob.resolve_collection_start_operation",
     "finejob.start_job_capture",
     "finejob.continue_job_capture",
     "finejob.stop_job_capture",
@@ -253,6 +259,10 @@ class CodexToolService:
         }
 
     def call(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, object]:
+        if tool_name == "finejob.get_collection_start_operation":
+            return get_operation(self.db, str(arguments.get("operation_id") or ""))
+        if tool_name == "finejob.resolve_collection_start_operation":
+            return resolve_operation(self.db, str(arguments.get("operation_id") or ""))
         handler = self._handlers.get(tool_name)
         if handler is None:
             raise AppError(
@@ -1020,6 +1030,7 @@ class CodexToolService:
             resource=_resource("context_revision", revision_id),
         )
 
+    @collection_start("custom.capture", "custom", "")
     def start_job_capture(self, arguments: dict[str, Any]) -> dict[str, object]:
         filter_strategy_id = str(arguments.get("filter_strategy_id") or "").strip()
         strategy = get_filter_strategy(self.db, filter_strategy_id)
@@ -1042,8 +1053,7 @@ class CodexToolService:
             raise AppError(422, "SEARCH_CITY_INVALID", "请选择该筛选策略中的城市。")
         pages = min(10, max(1, int(arguments.get("pages") or 1)))
         def start_task() -> dict[str, object]:
-            if not boss_scraper_service.get_browser_status().running:
-                raise AppError(409, "BROWSER_NOT_RUNNING", "FineJob 专用 Chrome 未运行。")
+            ensure_ready()
             return boss_capture_task_manager.start_capture(
                 BossCaptureRequest(
                     keyword=keyword,
@@ -1072,12 +1082,12 @@ class CodexToolService:
             message=f"已使用搜索词“{keyword}”和城市“{city}”启动岗位采集。",
         )
 
+    @collection_start("custom.continue", "custom", "capture_task_id")
     def continue_job_capture(self, arguments: dict[str, Any]) -> dict[str, object]:
         task_id = str(arguments.get("capture_task_id") or "").strip()
         pages = min(10, max(1, int(arguments.get("pages") or 1)))
         def continue_task() -> dict[str, object]:
-            if not boss_scraper_service.get_browser_status().running:
-                raise AppError(409, "BROWSER_NOT_RUNNING", "FineJob 专用 Chrome 未运行。")
+            prepare_custom_phase(self.db, task_id, pages=pages)
             return boss_capture_task_manager.continue_capture(task_id, pages=pages)
 
         task = start_custom_collection_phase(self.db, task_id, continue_task)
@@ -1155,6 +1165,7 @@ class CodexToolService:
             message=message,
         )
 
+    @collection_start("custom.details", "custom", "capture_task_id")
     def collect_job_details(self, arguments: dict[str, Any]) -> dict[str, object]:
         task_id = str(arguments.get("capture_task_id") or "").strip()
         job_ids = [str(value) for value in arguments.get("job_ids") or [] if str(value)]
@@ -1179,13 +1190,10 @@ class CodexToolService:
         detail_kwargs = {"force": bool(arguments.get("force", False))}
         if manual_override:
             detail_kwargs["manual_override"] = True
-        task = start_custom_collection_phase(
-            self.db,
-            task_id,
-            lambda: boss_capture_task_manager.start_details(
-                task_id, job_ids, **detail_kwargs
-            ),
-        )
+        def start_details():
+            prepare_custom_phase(self.db, task_id, job_ids=job_ids, force=detail_kwargs["force"], manual_override=manual_override)
+            return boss_capture_task_manager.start_details(task_id, job_ids, **detail_kwargs)
+        task = start_custom_collection_phase(self.db, task_id, start_details)
         return _result(
             result_type="task",
             status=str(task.get("status") or "queued"),
@@ -1282,6 +1290,7 @@ class CodexToolService:
             data=data,
         )
 
+    @collection_start("custom.history_details", "custom", "job_id")
     def collect_job_detail(self, arguments: dict[str, Any]) -> dict[str, object]:
         job_id = str(arguments.get("job_id") or "")
         manual_override = bool(arguments.get("manual_override", False))
@@ -1297,14 +1306,10 @@ class CodexToolService:
             action="detail",
             allow_manual_override=manual_override,
         )
-        task = start_custom_collection(
-            self.db,
-            lambda: boss_capture_task_manager.start_history_detail(
-                job,
-                output_dir=self.config.output_root / "fine-job" / "boss-capture",
-                db=self.db,
-            ),
-        )
+        def start_detail():
+            ensure_ready()
+            return boss_capture_task_manager.start_history_detail(job, output_dir=self.config.output_root / "fine-job" / "boss-capture", db=self.db)
+        task = start_custom_collection(self.db, start_detail)
         task_id = str(task["id"])
         return _result(
             result_type="task",

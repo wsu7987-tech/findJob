@@ -2427,6 +2427,9 @@ class Database:
         self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             connection.executescript(DDL)
+            from backend.app.services.fine_job.collection_start_operations import initialize_schema
+
+            initialize_schema(connection)
             self._ensure_knowledge_items_parse_column(connection)
             self._ensure_knowledge_items_capture_columns(connection)
             self._ensure_knowledge_items_tag_columns(connection)

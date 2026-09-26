@@ -244,6 +244,8 @@ def _assert_collection_start_allowed(
     *,
     requested_kind: str,
 ) -> None:
+    from backend.app.services.fine_job.collection_start_operations import assert_no_other_start
+    assert_no_other_start(connection)
     if requested_kind not in {"smart", "custom"}:
         raise AppError(422, "VALIDATION_FAILED", "采集任务类型无效。")
 
