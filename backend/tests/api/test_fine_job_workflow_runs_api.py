@@ -19,6 +19,7 @@ from backend.app.services.fine_job import workflow_children
 from backend.app.services.fine_job import child_adapter
 from backend.app.services.fine_job import cutover_guard
 from backend.app.services.fine_job import smart_capture_engine
+from backend.app.services.fine_job.workflow_run_events import workflow_run_event_broker
 
 
 @pytest.fixture(autouse=True)
@@ -2065,6 +2066,76 @@ def test_cutover_starts_linked_child_once_and_consumes_completion_outcome(
     ).json()
     assert completed["status"] == "completed"
     assert completed["children"][0]["result_summary"] == {"candidate_count": 4}
+
+
+def test_linked_smart_capture_update_publishes_parent_snapshot(
+    configured_client, test_db
+) -> None:
+    run = _create_run(configured_client, delivery_target_enabled=False)
+    child = run["children"][0]
+    subscriber = workflow_run_event_broker.subscribe(run["workflow_run_id"])
+    try:
+        smart_captures._update_capture(
+            test_db,
+            child["smart_capture_id"],
+            status="interrupted",
+            stage="interrupted",
+            waiting_reason="capture_interrupted",
+            control_cause="recovery",
+            transition_id="parent-sse-interrupted-1",
+            message="执行器已中断",
+        )
+
+        snapshot = subscriber.get_nowait()
+        assert snapshot["workflow_run_id"] == run["workflow_run_id"]
+        assert snapshot["control_state"] == "waiting_child_interrupted"
+        assert snapshot["children"][0]["status"] == "interrupted"
+    finally:
+        workflow_run_event_broker.unsubscribe(run["workflow_run_id"], subscriber)
+
+
+def test_completed_child_waits_for_next_pending_child(
+    configured_client, test_db
+) -> None:
+    run = _create_run(configured_client, delivery_target_enabled=False)
+    child = run["children"][0]
+    now = utc_now()
+    with test_db.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO fj_workflow_children (
+              id, workflow_run_id, child_type, child_ref, sequence, status,
+              control_state, waiting_reason, control_cause, capabilities_json,
+              result_summary_json, created_at, updated_at, state_version,
+              child_state_version, transition_id
+            ) VALUES (?, ?, 'followup', 'followup-child-1', 2, 'pending',
+                      'active', '', '', '{"start": true}', '{}', ?, ?, 1, 1, '')
+            """,
+            (new_id(), run["workflow_run_id"], now, now),
+        )
+
+    smart_captures._update_capture(
+        test_db,
+        child["smart_capture_id"],
+        status="completed",
+        stage="completed",
+        waiting_reason="",
+        control_cause="",
+        transition_id="first-child-completed-1",
+        message="首个子任务已完成",
+        result_summary={"candidate_count": 4},
+        completed=True,
+    )
+
+    parent = configured_client.get(
+        f"/api/fine-job/workflow-runs/{run['workflow_run_id']}"
+    ).json()
+    assert parent["status"] == "running"
+    assert parent["current_step"] == "next_child"
+    assert parent["next_action"] == "start_next_child"
+    assert parent["completed_at"] is None
+    assert parent["children"][0]["status"] == "completed"
+    assert parent["children"][1]["status"] == "pending"
 
 
 def test_completion_event_duplicate_and_old_version_do_not_rewrite_parent(

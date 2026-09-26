@@ -332,19 +332,43 @@ def consume_child_event_in_connection(
     ).fetchone()
     if parent is not None and event_status == "completed":
         if str(parent["status"]) not in {"cancelled", "completed", "completed_with_errors", "failed"}:
-            # 最小 outcome 闭环：父层只消费通用 relation/result，不读取 child 私有批次字段。
-            connection.execute(
+            next_child = connection.execute(
                 """
-                UPDATE fj_workflow_runs
-                SET status = 'completed', current_step = 'completed', next_action = 'none',
-                    next_action_reason = '已消费子任务完成结果。', waiting_for_user = 0,
-                    paused = 0, control_state = 'active', waiting_reason = '',
-                    control_cause = '', completed_at = COALESCE(completed_at, ?),
-                    state_version = state_version + 1, transition_id = ?, updated_at = ?
-                WHERE id = ?
+                SELECT id FROM fj_workflow_children
+                WHERE workflow_run_id = ? AND sequence > ? AND status = 'pending'
+                ORDER BY sequence, created_at, id
+                LIMIT 1
                 """,
-                (now, str(event["transition_id"] or ""), now, str(parent["id"])),
-            )
+                (str(parent["id"]), int(relation["sequence"])),
+            ).fetchone()
+            if next_child is not None:
+                # 父层只消费通用 relation/result，完成当前 child 后等待编排器启动下一 child。
+                connection.execute(
+                    """
+                    UPDATE fj_workflow_runs
+                    SET status = 'running', current_step = 'next_child',
+                        next_action = 'start_next_child',
+                        next_action_reason = '当前子任务已完成，等待启动下一个子任务。',
+                        waiting_for_user = 0, paused = 0, control_state = 'active',
+                        waiting_reason = '', control_cause = '',
+                        state_version = state_version + 1, transition_id = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (str(event["transition_id"] or ""), now, str(parent["id"])),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE fj_workflow_runs
+                    SET status = 'completed', current_step = 'completed', next_action = 'none',
+                        next_action_reason = '已消费子任务完成结果。', waiting_for_user = 0,
+                        paused = 0, control_state = 'active', waiting_reason = '',
+                        control_cause = '', completed_at = COALESCE(completed_at, ?),
+                        state_version = state_version + 1, transition_id = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, str(event["transition_id"] or ""), now, str(parent["id"])),
+                )
     elif parent is not None and event_status in {"stopped", "failed", "interrupted"}:
         parent_status = str(parent["status"])
         parent_control_state = str(parent["control_state"] or "active")

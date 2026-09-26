@@ -27,6 +27,7 @@ from backend.app.services.fine_job.boss_scraper.service import (
     boss_scraper_service,
 )
 from backend.app.services.fine_job.smart_capture_events import smart_capture_event_broker
+from backend.app.services.fine_job.workflow_run_events import workflow_run_event_broker
 from backend.app.utils import new_id, utc_now
 
 
@@ -413,6 +414,11 @@ def publish_smart_capture_snapshot(
     except AppError:
         return None
     smart_capture_event_broker.publish(smart_capture_id, snapshot)
+    workflow_run_id = str(snapshot.get("workflow_run_id") or "")
+    workflow_run = snapshot.get("workflow_run")
+    if workflow_run_id and isinstance(workflow_run, dict):
+        # linked child 更新后同步推送父快照，保证驾驶舱只依赖 Workflow SSE 也能及时看到状态变化。
+        workflow_run_event_broker.publish(workflow_run_id, workflow_run)
     if current_pointer_changed:
         smart_capture_event_broker.publish_current(snapshot)
     return snapshot
