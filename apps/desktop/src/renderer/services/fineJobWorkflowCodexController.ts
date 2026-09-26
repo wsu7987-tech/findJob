@@ -1,6 +1,6 @@
-import type { FineJobSmartCaptureAnalysisSnapshot, FineJobWorkflowRun } from "@/types";
+import type { FineJobSmartCapture, FineJobSmartCaptureAnalysisSnapshot, FineJobWorkflowRun } from "@/types";
 
-import { api } from "./api";
+import { api, getBackendOrigin } from "./api";
 import {
   isAutoSmartCaptureCodexHandoffReady,
   triggerSmartCaptureCodexHandoff,
@@ -95,56 +95,147 @@ export const startFineJobWorkflowCodexController = (dependencies: Omit<Controlle
 type SmartCaptureControllerDependencies = {
   codexStore: Parameters<typeof triggerSmartCaptureCodexHandoff>[1];
   isActive?: () => boolean;
-  intervalMs?: number;
   getCurrentSmartCapture?: () => Promise<{ smart_capture: Awaited<ReturnType<typeof api.getFineJobSmartCapture>> | null }>;
   getAnalysisSnapshot?: (smartCaptureId: string) => Promise<FineJobSmartCaptureAnalysisSnapshot>;
+  getBackendOrigin?: () => Promise<string>;
+  createEventSource?: (url: string) => EventSource;
   handoffDependencies?: Parameters<typeof triggerSmartCaptureCodexHandoff>[3];
 };
 
 export const createFineJobSmartCaptureCodexController = (
   dependencies: SmartCaptureControllerDependencies
 ) => {
-  let timer: ReturnType<typeof setInterval> | null = null;
-  let polling = false;
+  let started = false;
+  let backendOrigin = "";
+  let currentSource: EventSource | null = null;
+  let detailSource: EventSource | null = null;
+  let detailCaptureId = "";
+  let inspecting = false;
+  let pendingInspection: { capture: FineJobSmartCapture; force: boolean } | null = null;
+  const inspectedVersions = new Map<string, number>();
+  const attemptedAnalysisBatches = new Set<string>();
 
-  const tick = async () => {
-    if (polling || (dependencies.isActive && !dependencies.isActive())) return;
-    polling = true;
+  const isActive = () => !dependencies.isActive || dependencies.isActive();
+  const isTerminal = (capture: FineJobSmartCapture) =>
+    ["completed", "stopped", "failed"].includes(capture.status);
+  const needsCodexInspection = (capture: FineJobSmartCapture) =>
+    !isTerminal(capture) && (capture.stage === "waiting_codex" || capture.waiting_reason === "codex");
+  const parseCapture = (event: MessageEvent<string>) => {
     try {
-      const current = await (dependencies.getCurrentSmartCapture
-        ? dependencies.getCurrentSmartCapture()
-        : api.getCurrentFineJobSmartCapture());
-      const capture = current.smart_capture;
-      if (!capture || ["completed", "stopped", "failed"].includes(capture.status)) return;
+      return JSON.parse(event.data) as FineJobSmartCapture;
+    } catch {
+      return null;
+    }
+  };
+
+  const inspectCapture = async (capture: FineJobSmartCapture, force = false): Promise<void> => {
+    if (!isActive() || !needsCodexInspection(capture)) return;
+    if (inspecting) {
+      // 合并并发事件，只保留最新版本，避免同一状态重复读取 Analysis Snapshot。
+      if (!pendingInspection || capture.state_version >= pendingInspection.capture.state_version) {
+        pendingInspection = { capture, force: force || pendingInspection?.force === true };
+      }
+      return;
+    }
+    const inspectedVersion = inspectedVersions.get(capture.smart_capture_id);
+    if (!force && inspectedVersion !== undefined && inspectedVersion >= capture.state_version) return;
+
+    inspecting = true;
+    inspectedVersions.set(capture.smart_capture_id, capture.state_version);
+    try {
       const snapshot = await (dependencies.getAnalysisSnapshot
         ? dependencies.getAnalysisSnapshot(capture.smart_capture_id)
         : api.getFineJobSmartCaptureAnalysisSnapshot(capture.smart_capture_id));
       if (!isAutoSmartCaptureCodexHandoffReady(snapshot)) return;
-      await triggerSmartCaptureCodexHandoff(snapshot, dependencies.codexStore, "auto", dependencies.handoffDependencies);
+      const batchKey = `${snapshot.smart_capture_id}:${snapshot.analysis_batch_id}`;
+      if (attemptedAnalysisBatches.has(batchKey)) return;
+      const result = await triggerSmartCaptureCodexHandoff(
+        snapshot, dependencies.codexStore, "auto", dependencies.handoffDependencies
+      );
+      // Codex 忙碌时允许在其恢复 idle 后重试；其余结果等待新的 Analysis Batch。
+      if (result.status !== "busy") attemptedAnalysisBatches.add(batchKey);
+    } catch (error) {
+      if (inspectedVersions.get(capture.smart_capture_id) === capture.state_version) {
+        inspectedVersions.delete(capture.smart_capture_id);
+      }
+      throw error;
     } finally {
-      polling = false;
+      inspecting = false;
+      const next = pendingInspection;
+      pendingInspection = null;
+      if (next) await inspectCapture(next.capture, next.force);
     }
   };
 
-  const start = () => {
-    if (timer) return;
-    void tick().catch(() => undefined);
-    timer = setInterval(() => { void tick().catch(() => undefined); }, dependencies.intervalMs ?? 1_200);
+  const closeDetailSource = () => {
+    detailSource?.close();
+    detailSource = null;
+    detailCaptureId = "";
+  };
+
+  const applyCapture = async (capture: FineJobSmartCapture, fromDetail = false) => {
+    if (!isActive()) return;
+    if (isTerminal(capture)) {
+      if (capture.smart_capture_id === detailCaptureId) closeDetailSource();
+      return;
+    }
+    if (started && backendOrigin && !fromDetail && detailCaptureId !== capture.smart_capture_id) {
+      closeDetailSource();
+      detailCaptureId = capture.smart_capture_id;
+      const sourceFactory = dependencies.createEventSource ?? ((url: string) => new EventSource(url));
+      detailSource = sourceFactory(
+        `${backendOrigin}/api/fine-job/smart-captures/${encodeURIComponent(capture.smart_capture_id)}/events`
+      );
+      detailSource.onmessage = (event) => {
+        const next = parseCapture(event);
+        if (next) void applyCapture(next, true).catch(() => undefined);
+      };
+    }
+    await inspectCapture(capture);
+  };
+
+  const tick = async () => {
+    if (!isActive()) return;
+    const current = await (dependencies.getCurrentSmartCapture
+      ? dependencies.getCurrentSmartCapture()
+      : api.getCurrentFineJobSmartCapture());
+    if (current.smart_capture) await inspectCapture(current.smart_capture, true);
+  };
+
+  const start = async () => {
+    if (started) return;
+    started = true;
+    backendOrigin = await (dependencies.getBackendOrigin ?? getBackendOrigin)();
+    if (!started) return;
+    const sourceFactory = dependencies.createEventSource
+      ?? (typeof EventSource === "undefined" ? null : (url: string) => new EventSource(url));
+    if (!sourceFactory) {
+      await tick();
+      return;
+    }
+    // current SSE 负责身份切换，detail SSE 负责该任务后续状态变化。
+    currentSource = sourceFactory(`${backendOrigin}/api/fine-job/smart-captures/current/events`);
+    currentSource.onmessage = (event) => {
+      const capture = parseCapture(event);
+      if (capture) void applyCapture(capture).catch(() => undefined);
+    };
   };
 
   const stop = () => {
-    if (!timer) return;
-    clearInterval(timer);
-    timer = null;
+    started = false;
+    currentSource?.close();
+    currentSource = null;
+    closeDetailSource();
   };
 
   return { start, stop, tick };
 };
 
 export const startFineJobSmartCaptureCodexController = (
-  dependencies: Omit<SmartCaptureControllerDependencies, "getCurrentSmartCapture" | "getAnalysisSnapshot">
+  dependencies: Omit<SmartCaptureControllerDependencies, "getCurrentSmartCapture" | "getAnalysisSnapshot" | "getBackendOrigin">
 ) => createFineJobSmartCaptureCodexController({
   ...dependencies,
   getCurrentSmartCapture: () => api.getCurrentFineJobSmartCapture(),
-  getAnalysisSnapshot: (smartCaptureId) => api.getFineJobSmartCaptureAnalysisSnapshot(smartCaptureId)
+  getAnalysisSnapshot: (smartCaptureId) => api.getFineJobSmartCaptureAnalysisSnapshot(smartCaptureId),
+  getBackendOrigin
 });

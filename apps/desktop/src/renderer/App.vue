@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watchEffect } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch, watchEffect } from "vue";
 import { RouterView, useRoute } from "vue-router";
 
 import AppShell from "@/components/AppShell.vue";
@@ -22,6 +22,13 @@ const route = useRoute();
 const showCodexTerminal = computed(() => route.name === "fine-job-codex");
 const smartCaptureCodexController = startFineJobSmartCaptureCodexController({ codexStore });
 
+watch(() => codexStore.status, (status, previousStatus) => {
+  // Codex 从忙碌恢复后只核对一次当前批次，不启动周期轮询。
+  if (status === "idle" && previousStatus && previousStatus !== "idle") {
+    void smartCaptureCodexController.tick().catch(() => undefined);
+  }
+});
+
 watchEffect(() => {
   if (typeof document === "undefined") {
     return;
@@ -40,8 +47,8 @@ onBeforeUnmount(() => {
 });
 
 onMounted(() => {
-  // 自动交接只读取 current Smart Capture，不通过 latest Workflow 或 advance 推动业务 Pipeline。
-  smartCaptureCodexController.start();
+  // 自动交接由 Smart Capture SSE 驱动，不通过 latest Workflow 或 advance 推动业务 Pipeline。
+  void smartCaptureCodexController.start().catch(() => undefined);
   void configStore.probeGenerationCapabilities();
   // 桌面端启动时主动确认一次插件连接状态。
   void executorStore.testHeartbeat().catch(() => undefined);

@@ -118,6 +118,7 @@ def create_manual_analysis_batch(
                 raise AppError(409, "CANDIDATE_RESERVATION_CONFLICT", "岗位已被其他活动 Smart Capture 占用。") from exc
 
     get_context_snapshot(db, smart_capture_id, "candidate_analysis")
+    _publish_nonterminal_domain_change(db, smart_capture_id)
     return _domain_snapshot(db, smart_capture_id, analysis_batch_id)
 
 
@@ -448,24 +449,27 @@ def claim_handoff(
                 (attempt_id, codex_session_ref, codex_runtime_id or "", now, now if retry_handoff_attempt_id else None,
                  "retry" if retry_handoff_attempt_id else "", smart_capture_id, active_batch_id),
             )
+    _publish_nonterminal_domain_change(db, smart_capture_id)
     return _domain_snapshot(db, smart_capture_id, active_batch_id, handoff=True)
 
 
 def prompt_written(
     db: Database, smart_capture_id: str, analysis_batch_id: str, handoff_attempt_id: str, codex_session_ref: str
 ) -> dict[str, object]:
-    _update_handoff(
+    _, changed = _update_handoff(
         db, smart_capture_id, analysis_batch_id, handoff_attempt_id, codex_session_ref,
         expected={"claimed", "prompt_written"}, updates={"status": "submitted", "attempt_status": "prompt_written", "submitted_at": utc_now(), "prompt_written_at": utc_now()},
         idempotent_attempt_statuses={"prompt_written", "started"},
     )
+    if changed:
+        _publish_nonterminal_domain_change(db, smart_capture_id)
     return _domain_snapshot(db, smart_capture_id, analysis_batch_id, handoff=True)
 
 
 def ack_started(
     db: Database, config: AppConfig, smart_capture_id: str, analysis_batch_id: str, handoff_attempt_id: str
 ) -> dict[str, object]:
-    _update_handoff(
+    _, changed = _update_handoff(
         db, smart_capture_id, analysis_batch_id, handoff_attempt_id, None,
         expected={"prompt_written", "started"}, updates={"status": "submitted", "attempt_status": "started", "started_at": utc_now()},
         check_session=False, idempotent_attempt_statuses={"started"},
@@ -480,6 +484,8 @@ def ack_started(
             analysis_batch_id,
             output_root / "fine-job" / "boss-capture",
         )
+    if changed:
+        _publish_nonterminal_domain_change(db, smart_capture_id)
     return _domain_snapshot(db, smart_capture_id, analysis_batch_id, handoff=True)
 
 
@@ -487,12 +493,14 @@ def release_handoff(
     db: Database, smart_capture_id: str, analysis_batch_id: str, handoff_attempt_id: str,
     codex_session_ref: str, release_reason: str | None = None,
 ) -> dict[str, object]:
-    handoff = _update_handoff(
+    handoff, changed = _update_handoff(
         db, smart_capture_id, analysis_batch_id, handoff_attempt_id, codex_session_ref,
         expected={"claimed", "prompt_written"},
         updates={"status": "released", "attempt_status": "released", "released_at": utc_now(), "recovery_reason": release_reason or "transport_failure"},
         allow_full_retry=release_reason == "full_retry",
     )
+    if changed:
+        _publish_nonterminal_domain_change(db, smart_capture_id)
     return _domain_snapshot(db, smart_capture_id, analysis_batch_id, handoff=True, handoff_row=handoff)
 
 
@@ -690,7 +698,7 @@ def _update_handoff(
     codex_session_ref: str | None, *, expected: set[str], updates: dict[str, object],
     check_session: bool = True, allow_full_retry: bool = False,
     idempotent_attempt_statuses: set[str] | None = None,
-) -> Any:
+) -> tuple[Any, bool]:
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         handoff = connection.execute(
@@ -704,7 +712,7 @@ def _update_handoff(
         if check_session and codex_session_ref is not None and str(handoff["codex_session_ref"] or "") != codex_session_ref:
             raise AppError(409, "SMART_CAPTURE_ANALYSIS_HANDOFF_STALE", "当前 Codex 会话不是有效交接会话。")
         if str(handoff["attempt_status"] or "") in (idempotent_attempt_statuses or set()):
-            return handoff
+            return handoff, False
         if allow_full_retry and str(handoff["attempt_status"] or "") != "prompt_written":
             raise AppError(409, "SMART_CAPTURE_ANALYSIS_HANDOFF_ALREADY_SUBMITTED", "当前交接不能按完整重试释放。")
         assignments = ", ".join(f"{key} = ?" for key in updates)
@@ -712,10 +720,18 @@ def _update_handoff(
             f"UPDATE fj_workflow_analysis_handoffs SET {assignments} WHERE smart_capture_id = ? AND analysis_batch_id = ?",
             (*updates.values(), smart_capture_id, analysis_batch_id),
         )
-        return connection.execute(
+        updated = connection.execute(
             "SELECT * FROM fj_workflow_analysis_handoffs WHERE smart_capture_id = ? AND analysis_batch_id = ?",
             (smart_capture_id, analysis_batch_id),
         ).fetchone()
+        return updated, True
+
+
+def _publish_nonterminal_domain_change(db: Database, smart_capture_id: str) -> None:
+    """分析与交接变化通过 child 版本推进触发 SSE；终态后处理保持原生命周期版本。"""
+    capture = smart_captures.get_smart_capture(db, smart_capture_id)
+    if str(capture["status"]) not in TERMINAL_STATUSES:
+        smart_captures.touch_pipeline_snapshot(db, smart_capture_id)
 
 
 def _require_handoff_started(db: Database, smart_capture_id: str, analysis_batch_id: str) -> None:

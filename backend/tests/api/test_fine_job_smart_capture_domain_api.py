@@ -4,6 +4,7 @@ import json
 
 from backend.app.services.fine_job import smart_capture_engine, smart_captures
 from backend.app.services.fine_job.boss_capture_history import create_capture_batch, record_capture_jobs
+from backend.app.services.fine_job.smart_capture_events import smart_capture_event_broker
 
 
 def _setup_completed_capture(test_db) -> tuple[str, str]:
@@ -433,6 +434,55 @@ def test_independent_smart_capture_save_requires_started_handoff(configured_clie
     )
     assert blocked_save.status_code == 409
     assert blocked_save.json()["error_category"] == "SMART_CAPTURE_ANALYSIS_NOT_STARTED"
+
+
+def test_nonterminal_analysis_handoff_changes_publish_versioned_events(configured_client) -> None:
+    smart_capture_id, job_ids = _setup_running_delivery_capture(configured_client.app.state.db)
+    before = configured_client.get(f"/api/fine-job/smart-captures/{smart_capture_id}").json()
+    subscriber = smart_capture_event_broker.subscribe(smart_capture_id)
+    try:
+        batch = configured_client.post(
+            f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-batches",
+            json={"job_ids": [job_ids[0]], "analysis_batch_size": 1},
+        ).json()
+        batch_event = subscriber.get_nowait()
+        assert int(batch_event["state_version"]) > int(before["state_version"])
+
+        claimed = configured_client.post(
+            f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-handoff/claim",
+            json={"codex_session_ref": "event-codex", "handoff_kind": "initial"},
+        ).json()
+        claimed_event = subscriber.get_nowait()
+        assert int(claimed_event["state_version"]) > int(batch_event["state_version"])
+
+        analysis_batch_id = str(batch["analysis_batch_id"])
+        attempt_id = str(claimed["handoff"]["handoff_attempt_id"])
+        prompt = configured_client.post(
+            f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-handoff/prompt-written",
+            json={
+                "analysis_batch_id": analysis_batch_id,
+                "handoff_attempt_id": attempt_id,
+                "codex_session_ref": "event-codex",
+            },
+        )
+        assert prompt.status_code == 200
+        prompt_event = subscriber.get_nowait()
+        assert int(prompt_event["state_version"]) > int(claimed_event["state_version"])
+
+        released = configured_client.post(
+            f"/api/fine-job/smart-captures/{smart_capture_id}/analysis-handoff/release",
+            json={
+                "analysis_batch_id": analysis_batch_id,
+                "handoff_attempt_id": attempt_id,
+                "codex_session_ref": "event-codex",
+                "release_reason": "transport_failure",
+            },
+        )
+        assert released.status_code == 200
+        released_event = subscriber.get_nowait()
+        assert int(released_event["state_version"]) > int(prompt_event["state_version"])
+    finally:
+        smart_capture_event_broker.unsubscribe(smart_capture_id, subscriber)
 
 
 def test_analysis_and_prefetch_run_in_parallel_then_promote_ready_batch(configured_client) -> None:

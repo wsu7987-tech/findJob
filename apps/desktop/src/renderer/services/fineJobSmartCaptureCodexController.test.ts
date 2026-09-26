@@ -79,4 +79,58 @@ describe("fineJobSmartCaptureCodexController", () => {
     expect(codexStore.startSmartCapture).toHaveBeenCalledTimes(1);
     expect(transport.submitSmartCaptureCodexPrompt).toHaveBeenCalledWith(expect.stringContaining("smart_capture_id="));
   });
+
+  it("通过 SSE 触发并按 state_version 去重，不创建定时轮询", async () => {
+    const sources = new Map<string, {
+      onmessage: ((event: MessageEvent<string>) => void) | null;
+      close: ReturnType<typeof vi.fn>;
+    }>();
+    const createEventSource = vi.fn((url: string) => {
+      const source = { onmessage: null, close: vi.fn() };
+      sources.set(url, source);
+      return source as unknown as EventSource;
+    });
+    const getAnalysisSnapshot = vi.fn().mockResolvedValue(snapshot());
+    const codexStore = {
+      status: "idle",
+      runtimeId: null,
+      sessionRef: null,
+      startSmartCapture: vi.fn().mockResolvedValue({ runtimeId: "runtime-controller-1", sessionRef: "runtime:controller-1" })
+    };
+    const client = {
+      getFineJobSmartCaptureAnalysisSnapshot: getAnalysisSnapshot,
+      attachFineJobSmartCaptureCodexSession: vi.fn().mockResolvedValue({}),
+      claimFineJobSmartCaptureAnalysisHandoff: vi.fn().mockResolvedValue({
+        ...snapshot(),
+        handoff: { ...snapshot().handoff!, handoff_attempt_id: "attempt-controller-1" }
+      }),
+      markFineJobSmartCaptureAnalysisHandoffPromptWritten: vi.fn().mockResolvedValue(snapshot()),
+      releaseFineJobSmartCaptureAnalysisHandoff: vi.fn().mockResolvedValue(snapshot())
+    };
+    const transport = { submitSmartCaptureCodexPrompt: vi.fn().mockResolvedValue(true) };
+    const intervalSpy = vi.spyOn(globalThis, "setInterval");
+    const controller = createFineJobSmartCaptureCodexController({
+      codexStore,
+      getBackendOrigin: vi.fn().mockResolvedValue("http://127.0.0.1:8000"),
+      createEventSource,
+      getAnalysisSnapshot,
+      handoffDependencies: { client, transport }
+    });
+
+    await controller.start();
+    const currentSource = sources.get("http://127.0.0.1:8000/api/fine-job/smart-captures/current/events");
+    currentSource?.onmessage?.({ data: JSON.stringify(snapshot().smart_capture) } as MessageEvent<string>);
+    await vi.waitFor(() => expect(codexStore.startSmartCapture).toHaveBeenCalledTimes(1));
+
+    const detailSource = sources.get(
+      "http://127.0.0.1:8000/api/fine-job/smart-captures/smart-capture-controller-1/events"
+    );
+    detailSource?.onmessage?.({ data: JSON.stringify(snapshot().smart_capture) } as MessageEvent<string>);
+    await Promise.resolve();
+
+    expect(getAnalysisSnapshot).toHaveBeenCalledTimes(1);
+    expect(intervalSpy).not.toHaveBeenCalled();
+    controller.stop();
+    intervalSpy.mockRestore();
+  });
 });
