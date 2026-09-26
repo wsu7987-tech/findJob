@@ -177,6 +177,7 @@ const currentSmartCapture = ref<FineJobSmartCapture | null>(null);
 const smartAnalysisHandoff = ref<FineJobSmartCaptureHandoff | null>(null);
 let smartCaptureRefreshGeneration = 0;
 let smartCaptureStreamGeneration = 0;
+let bossCapturePageActive = false;
 let smartCaptureCurrentEventSource: EventSource | null = null;
 let smartCaptureEventSource: EventSource | null = null;
 let smartCaptureStreamId = "";
@@ -243,6 +244,10 @@ const smartWorkflowTerminalStatuses = [
   "failed",
   "stopped"
 ];
+const smartCaptureTerminal = computed(() => Boolean(
+  currentSmartCapture.value
+  && smartWorkflowTerminalStatuses.includes(currentSmartCapture.value.status)
+));
 const smartCaptureRunning = computed(() =>
   Boolean(currentSmartCapture.value?.capabilities?.pause)
 );
@@ -852,11 +857,38 @@ const mergeSmartCodexModels = (
 };
 
 onMounted(async () => {
+  // 先清理跨路由保留的父镜像和已结束自定义任务，避免初始化期间闪回上一个执行态。
+  bossCapturePageActive = true;
+  workflowStore.stopPolling();
+  workflowStore.setRun(null);
+  if (captureStore.task && !["queued", "running"].includes(captureStore.task.status)) {
+    captureStore.clearTask();
+  }
+  const currentCapturePromise = refreshCurrentSmartCapture();
+  void connectSmartCaptureEventStreams();
+  const configPromise = (async () => {
+    try {
+      const config = await api.getConfig();
+      smartCodexModel.value = config.codex_model || "";
+      smartCodexReasoningEffort.value = (config.codex_reasoning_effort as typeof smartCodexReasoningEffort.value) || "medium";
+      try {
+        const result = await api.listCodexModels(config.codex_cli_path || "codex");
+        smartCodexModels.value = mergeSmartCodexModels(result.models, config.codex_model);
+      } catch (value) {
+        smartCodexModels.value = mergeSmartCodexModels(loadCachedSmartCodexModels(), config.codex_model);
+        smartCodexModelLoadError.value = value instanceof Error ? value.message : "Codex 模型目录加载失败，可直接输入模型 ID。";
+      }
+    } catch (value) {
+      smartCodexModels.value = mergeSmartCodexModels(loadCachedSmartCodexModels(), "");
+      smartCodexModelLoadError.value = value instanceof Error ? value.message : "Codex 配置加载失败，可直接输入模型 ID。";
+    }
+  })();
   await Promise.all([
     captureStore.loadStatus(),
     captureStore.loadCities(),
     strategiesStore.load(),
-    platformStore.load()
+    platformStore.load(),
+    currentCapturePromise
   ]);
   const initialFilter = strategiesStore.filters.find((item) => item.enabled) ?? strategiesStore.filters[0];
   const initialRecommendation = strategiesStore.recommendations.find((item) => item.enabled) ?? strategiesStore.recommendations[0];
@@ -866,23 +898,6 @@ onMounted(async () => {
   smartSelectedCities.value = [...(initialFilter?.cities ?? [])];
   recommendationStrategyId.value = initialRecommendation?.id ?? null;
   smartRecommendationStrategyId.value = initialRecommendation?.id ?? null;
-  try {
-    const config = await api.getConfig();
-    smartCodexModel.value = config.codex_model || "";
-    smartCodexReasoningEffort.value = (config.codex_reasoning_effort as typeof smartCodexReasoningEffort.value) || "medium";
-    try {
-      const result = await api.listCodexModels(config.codex_cli_path || "codex");
-      smartCodexModels.value = mergeSmartCodexModels(result.models, config.codex_model);
-    } catch (value) {
-      smartCodexModels.value = mergeSmartCodexModels(loadCachedSmartCodexModels(), config.codex_model);
-      smartCodexModelLoadError.value = value instanceof Error ? value.message : "Codex 模型目录加载失败，可直接输入模型 ID。";
-    }
-  } catch (value) {
-    smartCodexModels.value = mergeSmartCodexModels(loadCachedSmartCodexModels(), "");
-    smartCodexModelLoadError.value = value instanceof Error ? value.message : "Codex 配置加载失败，可直接输入模型 ID。";
-  }
-  // 固定岗位采集路由只从服务端 current pointer 初始化当前智能采集。
-  await refreshCurrentSmartCapture();
   // 进入页面时优先展示正在执行的任务；普通采集任务没有智能 Run，因此落到自定义采集。
   if (taskRunning.value && !currentTaskBelongsToSmartWorkflow.value) {
     activeCaptureConditionTab.value = "custom";
@@ -891,11 +906,14 @@ onMounted(async () => {
   form.city = initialFilter?.cities[0] || "";
   // 自定义任务使用既有轮询；智能采集使用 current pointer 和 Smart Capture SSE。
   if (!currentTaskIsSmartCapture.value) captureStore.resumePolling();
-  void connectSmartCaptureEventStreams();
+  await configPromise;
 });
 
 onBeforeUnmount(() => {
+  bossCapturePageActive = false;
   captureStore.stopPolling();
+  workflowStore.stopPolling();
+  workflowStore.setRun(null);
   smartCaptureRefreshGeneration += 1;
   smartContextRequestGeneration += 1;
   smartAnalysisRequestGeneration += 1;
@@ -966,7 +984,12 @@ const syncSmartStrategyScope = () => {
   smartSelectedCities.value = [...(strategy?.cities ?? [])];
 };
 
+const smartCaptureRefreshKey = (capture: FineJobSmartCapture | null) => capture
+  ? [capture.status, capture.stage, capture.current_batch_id ?? "", capture.waiting_reason].join(":")
+  : "";
+
 const applyCurrentSmartCapture = async (capture: FineJobSmartCapture | null) => {
+  if (!bossCapturePageActive) return;
   if (!capture) {
     smartContextRequestGeneration += 1;
     smartAnalysisRequestGeneration += 1;
@@ -994,6 +1017,7 @@ const applyCurrentSmartCapture = async (capture: FineJobSmartCapture | null) => 
   }
   const currentIdentityChanged = previous?.smart_capture_id !== capture.smart_capture_id;
   const linkedParentChanged = previous?.workflow_run_id !== capture.workflow_run_id;
+  const semanticStateChanged = smartCaptureRefreshKey(previous) !== smartCaptureRefreshKey(capture);
   if (linkedParentChanged) {
     // 切换 current 的 linked parent 前先关闭旧 SSE，避免旧父任务迟到快照污染新父镜像。
     workflowStore.stopPolling();
@@ -1004,20 +1028,23 @@ const applyCurrentSmartCapture = async (capture: FineJobSmartCapture | null) => 
   if (captureStore.task?.capture_source === "smart") {
     captureStore.clearTask();
   }
-  if (currentIdentityChanged || capture.state_version > (previous?.state_version ?? 0)) {
-    await loadSmartContextSnapshot();
-    await loadSmartAnalysisItems();
+  if (currentIdentityChanged || semanticStateChanged) {
+    // 进度版本会高频增长；Context 与 Analysis 只在业务阶段变化时刷新。
+    await Promise.all([
+      loadSmartContextSnapshot(),
+      loadSmartAnalysisItems()
+    ]);
   }
   // 上述异步读取期间 current 可能已经切换；旧快照不能继续操作或清空新 current 的父镜像。
-  if (currentSmartCapture.value?.smart_capture_id !== capture.smart_capture_id) return;
+  if (!bossCapturePageActive || currentSmartCapture.value?.smart_capture_id !== capture.smart_capture_id) return;
   if (!capture.workflow_run_id) {
     workflowStore.setRun(null);
     return;
   }
   if (!linkedParentChanged && smartWorkflowRun.value) return;
-  const linkedRun = await api.getFineJobWorkflowRun(capture.workflow_run_id);
+  const linkedRun = capture.workflow_run ?? await api.getFineJobWorkflowRun(capture.workflow_run_id);
   // 关联父镜像只由当前 Smart Capture 的 workflow_run_id 建立。
-  if (currentSmartCapture.value?.smart_capture_id !== capture.smart_capture_id) return;
+  if (!bossCapturePageActive || currentSmartCapture.value?.smart_capture_id !== capture.smart_capture_id) return;
   workflowStore.setRun(linkedRun);
   if (!workflowStore.pollingActive) workflowStore.startPolling();
 };
@@ -1032,10 +1059,9 @@ const refreshCurrentSmartCapture = async () => {
       await applyCurrentSmartCapture(null);
       return null;
     }
-    const snapshot = await api.getFineJobSmartCapture(pointer.smart_capture_id);
-    if (generation !== smartCaptureRefreshGeneration) return null;
-    await applyCurrentSmartCapture(snapshot);
-    return snapshot;
+    // current API 已返回完整快照，直接应用，避免紧接着重复读取详情。
+    await applyCurrentSmartCapture(pointer);
+    return pointer;
   } catch (errorValue) {
     // 断线时保留同一 smart_capture_id 的最后已知 state_version，等待 SSE 重连或手动刷新恢复。
     if (generation === smartCaptureRefreshGeneration) {
@@ -1953,11 +1979,12 @@ function formatDuration(seconds: number) {
 
     <section v-if="currentSmartCapture" class="page-panel smart-workflow-panel">
       <div class="panel-title-row">
-        <div><p class="panel-eyebrow">Smart Capture</p><h2>智能采集执行详情</h2></div>
+        <div><p class="panel-eyebrow">Smart Capture</p><h2>{{ smartCaptureTerminal ? "最近任务结果" : "智能采集执行详情" }}</h2></div>
         <el-tag :type="currentSmartCapture.status === 'waiting_for_user' ? 'warning' : 'info'">
           {{ currentSmartCapture.status }} / {{ currentSmartCapture.stage }}
         </el-tag>
       </div>
+      <p v-if="smartCaptureTerminal" class="secondary-text">该任务已经结束，当前区域展示最终状态；采集控制已关闭，仍可处理结果分析。</p>
       <p>{{ currentSmartCapture.message || smartWorkflowRun?.next_action_reason }}</p>
       <div class="workflow-run-grid">
         <div><span class="secondary-text">当前搜索</span><strong>{{ smartDetailProgress.keyword }} / {{ smartDetailProgress.city }}</strong></div>

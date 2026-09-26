@@ -75,6 +75,22 @@ describe("fineJobWorkflowRun store", () => {
     expect(store.currentRun?.control_state).toBe("active");
   });
 
+  it("父任务终态不再发送暂停、继续或停止请求", async () => {
+    const pause = vi.spyOn(api, "pauseFineJobWorkflowRun");
+    const resume = vi.spyOn(api, "resumeFineJobWorkflowRun");
+    const cancel = vi.spyOn(api, "cancelFineJobWorkflowRun");
+    const store = useFineJobWorkflowRunStore();
+    store.setRun(run("completed") as never);
+
+    await store.pause();
+    await store.resume();
+    await store.cancel();
+
+    expect(pause).not.toHaveBeenCalled();
+    expect(resume).not.toHaveBeenCalled();
+    expect(cancel).not.toHaveBeenCalled();
+  });
+
   it("恢复子任务后回读父快照，保持驾驶舱父子投影同步", async () => {
     const resumeChild = vi.spyOn(api, "resumeFineJobSmartCapture").mockResolvedValue({} as never);
     const refreshed = run("waiting_for_user");

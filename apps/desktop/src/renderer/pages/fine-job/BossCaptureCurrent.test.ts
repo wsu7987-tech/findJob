@@ -152,14 +152,13 @@ describe("BossCapture current 与历史状态隔离", () => {
 
   it("以 current Smart Capture 关联 A，读取历史 B 不替换关联父镜像", async () => {
     mocks.getCurrent.mockResolvedValue({ smart_capture: capture("workflow-A") });
-    mocks.getCapture.mockResolvedValue(capture("workflow-A"));
     mocks.getRun.mockImplementation((id: string) => Promise.resolve(workflowRun(id)));
     const mounted = mountCapture();
     wrapper = mounted;
     await flushPromises();
 
     expect(mocks.getCurrent).toHaveBeenCalledTimes(1);
-    expect(mocks.getCapture).toHaveBeenCalledWith("capture-current");
+    expect(mocks.getCapture).not.toHaveBeenCalled();
     expect(mocks.getRun).toHaveBeenCalledWith("workflow-A");
     expect(mocks.setRun).toHaveBeenCalledWith(expect.objectContaining({ workflow_run_id: "workflow-A" }));
 
@@ -168,7 +167,7 @@ describe("BossCapture current 与历史状态隔离", () => {
 
     expect(mocks.getRun).toHaveBeenCalledWith("workflow-B");
     expect(mocks.setRun).not.toHaveBeenCalledWith(expect.objectContaining({ workflow_run_id: "workflow-B" }));
-    expect(mocks.getCapture).toHaveBeenLastCalledWith("capture-current");
+    expect(mocks.getCapture).not.toHaveBeenCalled();
 
     await (mounted.vm as unknown as { pauseSmartWorkflow: () => Promise<void> }).pauseSmartWorkflow();
     expect(mocks.pauseWorkflow).toHaveBeenCalledTimes(1);
@@ -198,13 +197,12 @@ describe("BossCapture current 与历史状态隔离", () => {
       }
     };
     mocks.getCurrent.mockResolvedValue({ smart_capture: independentCapture });
-    mocks.getCapture.mockResolvedValue(independentCapture);
     const mounted = mountCapture();
     wrapper = mounted;
     await flushPromises();
 
     expect(mocks.getCurrent).toHaveBeenCalledTimes(1);
-    expect(mocks.getCapture).toHaveBeenCalledWith("capture-current");
+    expect(mocks.getCapture).not.toHaveBeenCalled();
     expect(mocks.getRun).not.toHaveBeenCalled();
     expect(mocks.setRun).toHaveBeenCalledWith(null);
     expect(mounted.text()).toContain("待分析岗位队列");
@@ -261,7 +259,6 @@ describe("BossCapture current 与历史状态隔离", () => {
       capabilities: { start: true, pause: false, resume: false, retry: false, stop: true }
     };
     mocks.getCurrent.mockResolvedValue({ smart_capture: linkedPendingCapture });
-    mocks.getCapture.mockResolvedValue(linkedPendingCapture);
     mocks.getRun.mockResolvedValue(workflowRun("workflow-A"));
     mocks.currentRun = workflowRun("workflow-A");
     const mounted = mountCapture();
@@ -275,7 +272,6 @@ describe("BossCapture current 与历史状态隔离", () => {
 
   it("linked current 显示父镜像，历史工具独立于父控制区域", async () => {
     mocks.getCurrent.mockResolvedValue({ smart_capture: capture("workflow-A") });
-    mocks.getCapture.mockResolvedValue(capture("workflow-A"));
     mocks.getRun.mockResolvedValue(workflowRun("workflow-A"));
     mocks.currentRun = workflowRun("workflow-A");
     const mounted = mountCapture();
@@ -297,7 +293,6 @@ describe("BossCapture current 与历史状态隔离", () => {
       stop_reason: "capture_interrupted"
     };
     mocks.getCurrent.mockResolvedValue({ smart_capture: capture("workflow-A") });
-    mocks.getCapture.mockResolvedValue(capture("workflow-A"));
     mocks.getRun.mockResolvedValue(interruptedParent);
     mocks.currentRun = interruptedParent;
     const mounted = mountCapture();
@@ -350,12 +345,13 @@ describe("BossCapture current 与历史状态隔离", () => {
     mocks.getCurrent.mockResolvedValue({
       smart_capture: completedCapture
     });
-    mocks.getCapture.mockResolvedValue(completedCapture);
     const mounted = mountCapture();
     wrapper = mounted;
     await flushPromises();
 
     expect((mounted.vm as unknown as { smartManualAnalysisAvailable: boolean }).smartManualAnalysisAvailable).toBe(true);
+    expect(mounted.text()).toContain("最近任务结果");
+    expect(mounted.text()).toContain("采集控制已关闭");
     expect(mounted.text()).toContain("交给 Codex 批量生成建议");
     expect(mounted.text()).not.toContain("采集选中的");
     expect(mounted.text()).not.toContain("AI 初筛详情岗位");
@@ -369,7 +365,6 @@ describe("BossCapture current 与历史状态隔离", () => {
     mocks.getCurrent
       .mockResolvedValueOnce({ smart_capture: null })
       .mockResolvedValueOnce({ smart_capture: capture(null) });
-    mocks.getCapture.mockResolvedValue(capture(null));
     mocks.createCapture.mockResolvedValue(capture(null));
     const mounted = mountCapture();
     wrapper = mounted;
@@ -388,14 +383,13 @@ describe("BossCapture current 与历史状态隔离", () => {
 
     expect(mocks.createCapture).toHaveBeenCalledTimes(1);
     expect(mocks.getCurrent).toHaveBeenCalledTimes(2);
-    expect(mocks.getCapture).toHaveBeenCalledWith("capture-current");
+    expect(mocks.getCapture).not.toHaveBeenCalled();
   });
 
   it("同一 current 的旧 state_version 不覆盖已展示快照", async () => {
-    mocks.getCurrent.mockResolvedValue({ smart_capture: capture(null) });
-    mocks.getCapture
-      .mockResolvedValueOnce(capture(null))
-      .mockResolvedValueOnce({ ...capture(null), state_version: 6, status: "paused" });
+    mocks.getCurrent
+      .mockResolvedValueOnce({ smart_capture: capture(null) })
+      .mockResolvedValueOnce({ smart_capture: { ...capture(null), state_version: 6, status: "paused" } });
     const mounted = mountCapture();
     wrapper = mounted;
     await flushPromises();
@@ -407,7 +401,6 @@ describe("BossCapture current 与历史状态隔离", () => {
 
   it("通过 Smart Capture 详情 SSE 更新 current，页面不启动定时器", async () => {
     mocks.getCurrent.mockResolvedValue({ smart_capture: capture(null) });
-    mocks.getCapture.mockResolvedValue(capture(null));
     const timerSpy = vi.spyOn(globalThis, "setInterval");
     try {
       const mounted = mountCapture();
@@ -422,11 +415,20 @@ describe("BossCapture current 与历史状态隔离", () => {
       expect(detailSource).toBeDefined();
       expect(timerSpy).not.toHaveBeenCalled();
 
-      detailSource?.emit(JSON.stringify({ ...capture(null), state_version: 8, status: "paused" }));
+      mocks.getContext.mockClear();
+      mocks.getAnalysisItems.mockClear();
+      detailSource?.emit(JSON.stringify({ ...capture(null), state_version: 8 }));
+      await flushPromises();
+      expect(mocks.getContext).not.toHaveBeenCalled();
+      expect(mocks.getAnalysisItems).not.toHaveBeenCalled();
+
+      detailSource?.emit(JSON.stringify({ ...capture(null), state_version: 9, status: "paused" }));
       await flushPromises();
 
       expect((mounted.vm as unknown as { currentSmartCapture: { state_version: number; status: string } }).currentSmartCapture)
-        .toEqual(expect.objectContaining({ state_version: 8, status: "paused" }));
+        .toEqual(expect.objectContaining({ state_version: 9, status: "paused" }));
+      expect(mocks.getContext).toHaveBeenCalledTimes(1);
+      expect(mocks.getAnalysisItems).toHaveBeenCalledTimes(1);
     } finally {
       timerSpy.mockRestore();
     }

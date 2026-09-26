@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useRouter } from "vue-router";
 
@@ -39,9 +39,21 @@ const smartConfigModel = computed({
 });
 const workflowStore = useFineJobWorkflowRunStore();
 const router = useRouter();
+let cockpitPageActive = false;
 const workflowRun = computed(() => workflowStore.currentRun);
 const terminalStatuses = new Set(["cancelled", "completed", "completed_with_errors", "failed"]);
+const workflowRunTerminal = computed(() => terminalStatuses.has(workflowRun.value?.status ?? ""));
 const canEditOrchestration = computed(() => !workflowRun.value || terminalStatuses.has(workflowRun.value.status));
+const canPauseRun = computed(() => Boolean(
+  workflowRun.value
+  && !workflowRunTerminal.value
+  && workflowRun.value.control_state === "active"
+));
+const canResumeRun = computed(() => Boolean(
+  workflowRun.value
+  && !workflowRunTerminal.value
+  && workflowRun.value.control_state === "paused"
+));
 const selectedChildValidation = computed(() => selectedChildren.value.map((type) => childValidation.value[type]));
 const orchestrationComplete = computed(() =>
   selectedChildren.value.length > 0 && selectedChildValidation.value.every((validation) => validation?.isValid)
@@ -209,10 +221,24 @@ const canRetryChild = (child: FineJobWorkflowChild) =>
   child.control_state === "waiting_child_interrupted" && Boolean(child.capabilities.retry);
 
 onMounted(async () => {
+  // 进入驾驶舱时先释放其他页面遗留的订阅和快照，避免慢请求期间展示上一个任务。
+  cockpitPageActive = true;
+  workflowStore.stopPolling();
+  workflowStore.setRun(null);
   try {
-    strategies.value = (await api.listFineJobFilterStrategies()).strategies.filter((item) => item.enabled);
-    recommendationStrategies.value = (await api.listFineJobRecommendationStrategies()).strategies.filter((item) => item.enabled);
-    const config = await api.getConfig();
+    const restorePromise = workflowStore.restoreLatest(false, "task_cockpit").then((run) => {
+      if (cockpitPageActive) return run;
+      workflowStore.stopPolling();
+      workflowStore.setRun(null);
+      return null;
+    });
+    const [filterResult, recommendationResult, config] = await Promise.all([
+      api.listFineJobFilterStrategies(),
+      api.listFineJobRecommendationStrategies(),
+      api.getConfig()
+    ]);
+    strategies.value = filterResult.strategies.filter((item) => item.enabled);
+    recommendationStrategies.value = recommendationResult.strategies.filter((item) => item.enabled);
     smartConfig.codex_model = config.codex_model || "";
     smartConfig.codex_reasoning_effort = (config.codex_reasoning_effort as typeof smartConfig.codex_reasoning_effort) || "medium";
     try {
@@ -225,10 +251,17 @@ onMounted(async () => {
     const initialStrategy = strategies.value.find((item) => item.enabled) ?? strategies.value[0];
     smartConfig.filter_strategy_id = initialStrategy?.id ?? "";
     syncStrategyScope();
-    await workflowStore.restoreLatest(true, "task_cockpit");
+    await restorePromise;
   } catch (value) {
     ElMessage.error(value instanceof Error ? value.message : String(value));
   }
+});
+
+onBeforeUnmount(() => {
+  // 页面离开后停止父任务 SSE，防止后台继续改写共享 Store。
+  cockpitPageActive = false;
+  workflowStore.stopPolling();
+  workflowStore.setRun(null);
 });
 </script>
 
@@ -266,15 +299,15 @@ onMounted(async () => {
     <el-card v-if="workflowRun" shadow="never" data-testid="workflow-status-panel">
       <template #header>父任务状态</template>
       <el-alert
-        :title="`父任务状态：${workflowRun.control_state}`"
-        :description="workflowRun.waiting_reason || workflowRun.next_action_reason || '任务正在等待状态更新。'"
+        :title="`父任务状态：${workflowRun.status}`"
+        :description="`控制状态：${workflowRunTerminal ? '已结束' : workflowRun.control_state}；${workflowRun.waiting_reason || workflowRun.next_action_reason || '任务正在等待状态更新。'}`"
         :type="workflowRun.control_state.includes('waiting') ? 'warning' : 'info'"
         :closable="false"
         show-icon
       />
       <div class="cockpit-actions">
-        <el-button v-if="workflowRun.control_state === 'active'" @click="pauseRun">暂停</el-button>
-        <el-button v-if="workflowRun.control_state === 'paused'" :loading="workflowStore.advancing" @click="resumeRun">继续</el-button>
+        <el-button v-if="canPauseRun" @click="pauseRun">暂停</el-button>
+        <el-button v-if="canResumeRun" :loading="workflowStore.advancing" @click="resumeRun">继续</el-button>
         <el-button v-if="!canEditOrchestration" type="danger" plain @click="cancelRun">停止任务</el-button>
         <el-button v-if="decisionChild" @click="decideChild('skip')">跳过该子任务继续</el-button>
         <el-button v-if="decisionChild" type="danger" plain @click="decideChild('end')">结束父任务</el-button>

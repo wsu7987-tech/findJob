@@ -13,6 +13,8 @@ const mocks = vi.hoisted(() => ({
   decideChild: vi.fn(),
   resumeChild: vi.fn(),
   retryChild: vi.fn(),
+  setRun: vi.fn(),
+  stopPolling: vi.fn(),
   push: vi.fn(),
   listFilters: vi.fn(),
   listRecommendations: vi.fn(),
@@ -33,7 +35,9 @@ vi.mock("@/stores/fineJobWorkflowRun", () => ({
     cancel: mocks.cancel,
     decideChild: mocks.decideChild,
     resumeChild: mocks.resumeChild,
-    retryChild: mocks.retryChild
+    retryChild: mocks.retryChild,
+    setRun: mocks.setRun,
+    stopPolling: mocks.stopPolling
   })
 }));
 
@@ -58,6 +62,10 @@ const ButtonStub = defineComponent({
   template: '<button v-bind="$attrs" type="button" @click="$emit(\'click\')"><slot /></button>'
 });
 const ContainerStub = defineComponent({ template: "<div><slot /></div>" });
+const AlertStub = defineComponent({
+  props: ["title", "description"],
+  template: "<div>{{ title }} {{ description }}<slot /></div>"
+});
 const DrawerStub = defineComponent({ props: ["modelValue"], template: '<div v-if="modelValue" data-testid="config-drawer"><slot /></div>' });
 const CheckboxGroupStub = defineComponent({ template: "<div><slot /></div>" });
 const CheckboxStub = defineComponent({ template: "<label><slot /></label>" });
@@ -88,7 +96,7 @@ const run = (updates: Record<string, unknown> = {}) => ({
 });
 
 const mountPage = () => mount(TaskCockpitNew, { global: { stubs: {
-  ElCard: ContainerStub, ElAlert: ContainerStub, ElTag: ContainerStub, ElTimeline: ContainerStub,
+  ElCard: ContainerStub, ElAlert: AlertStub, ElTag: ContainerStub, ElTimeline: ContainerStub,
   ElTimelineItem: ContainerStub, ElEmpty: ContainerStub, ElButton: ButtonStub, ElDrawer: DrawerStub,
   ElCheckboxGroup: CheckboxGroupStub, ElCheckbox: CheckboxStub, SmartCaptureConfigForm: ContainerStub
 } } });
@@ -99,6 +107,7 @@ describe("TaskCockpitNew", () => {
     mocks.restoreLatest.mockReset().mockResolvedValue(null);
     mocks.create.mockReset(); mocks.pause.mockReset(); mocks.resume.mockReset(); mocks.cancel.mockReset();
     mocks.decideChild.mockReset(); mocks.resumeChild.mockReset(); mocks.retryChild.mockReset(); mocks.push.mockReset();
+    mocks.setRun.mockReset(); mocks.stopPolling.mockReset();
     mocks.listFilters.mockReset().mockResolvedValue({ strategies: [] });
     mocks.listRecommendations.mockReset().mockResolvedValue({ strategies: [] });
     mocks.getConfig.mockReset().mockResolvedValue({ codex_model: "", codex_reasoning_effort: "medium" });
@@ -119,6 +128,9 @@ describe("TaskCockpitNew", () => {
     await flushPromises();
     expect(terminalWrapper.find('[data-testid="orchestration-panel"]').exists()).toBe(true);
     expect(terminalWrapper.get('[data-testid="child-timeline"]').text()).toContain("已采集 8 个候选");
+    expect(terminalWrapper.text()).toContain("父任务状态：completed");
+    expect(terminalWrapper.findAll("button").some((button) => button.text() === "暂停")).toBe(false);
+    expect(mocks.restoreLatest).toHaveBeenCalledWith(false, "task_cockpit");
   });
 
   it("running 与等待决策隐藏编排区，并只显示合法父层操作", async () => {

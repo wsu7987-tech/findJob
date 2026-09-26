@@ -147,11 +147,14 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
 
   const pause = async () => {
     if (!currentRun.value) return null;
+    // 终态父任务只保留结果展示，不能再向后端发送控制请求。
+    if (terminalStatuses.has(currentRun.value.status)) return currentRun.value;
     return setRun(await api.pauseFineJobWorkflowRun(currentRun.value.workflow_run_id));
   };
 
   const resume = async () => {
     if (!currentRun.value) return null;
+    if (terminalStatuses.has(currentRun.value.status)) return currentRun.value;
     setRun(await api.resumeFineJobWorkflowRun(currentRun.value.workflow_run_id));
     startPolling();
     return currentRun.value;
@@ -159,6 +162,7 @@ export const useFineJobWorkflowRunStore = defineStore("fine-job-workflow-run", (
 
   const cancel = async () => {
     if (!currentRun.value) return null;
+    if (terminalStatuses.has(currentRun.value.status)) return currentRun.value;
     return setRun(await api.cancelFineJobWorkflowRun(currentRun.value.workflow_run_id));
   };
 
