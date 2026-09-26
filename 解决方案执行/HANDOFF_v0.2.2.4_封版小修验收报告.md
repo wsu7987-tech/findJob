@@ -3,8 +3,10 @@
 当前仍未满足 v0.2.2.4 最终封版条件。
 
 - Task12 终态恢复与 terminal realtime 小修已完成，专项回归通过。
-- frontend full、`vue-tsc`、启动冒烟通过。
-- backend full 为 `624 passed / 16 failed`，Gate D 未通过。
+- 历史 frontend full、`vue-tsc`、启动冒烟通过；本轮未重跑这些检查。
+- 历史 backend full 为 `624 passed / 16 failed`，Gate D 未通过；本轮未重跑 full suite。
+- 本轮 Boss scraper 与 MCP targeted validation 全部通过。
+- 当前 HEAD 为 `429eb2c2192321a0cc677390186d1aba46a7cb91`。
 - BOSS 会话为 `needs_login`、`ready=false`，真实 BOSS/Codex 13 步未执行，Gate H 未通过。
 
 ## 1. 基线
@@ -13,13 +15,14 @@
 |---|---|
 | 执行时间 | 2026-09-26（Asia/Tokyo） |
 | branch | `task-cockpit-phase1` |
-| before SHA | `31a5e4bdddfcda0c5626cdd82932324b48636086` |
-| after SHA（代码与测试小修） | `ea958c6a8f7b71bbfc9bfe08e43a5ab5458202df` |
-| 代码与测试 commit | `ea958c6 fix: close v0.2.2.4 sealing gaps` |
+| 历史 before SHA | `31a5e4bdddfcda0c5626cdd82932324b48636086` |
+| 历史代码与测试小修 SHA | `ea958c6a8f7b71bbfc9bfe08e43a5ab5458202df` |
+| 当前 HEAD（本轮定点复核） | `429eb2c2192321a0cc677390186d1aba46a7cb91` |
+| 历史代码与测试 commit | `ea958c6 fix: close v0.2.2.4 sealing gaps` |
 | 报告归档 commit | `docs: record v0.2.2.4 sealing validation`（本文件所在提交） |
 | Node / pnpm / Python | `v22.16.0` / `10.8.1` / `Python 3.13.12` |
 
-基线 HEAD 与任务书复核时一致，没有新增代码提交。执行前工作区仅有用户提供、尚未跟踪的 `解决方案执行/v0.2.2.4_封版小修执行任务.md`；该文件未纳入小修提交。
+`ea958c6a8f7b71bbfc9bfe08e43a5ab5458202df` 是历史封版小修提交，不再代表当前代码 HEAD。本轮定点复核确认当前 HEAD 为 `429eb2c2192321a0cc677390186d1aba46a7cb91`。
 
 ### 修改文件
 
@@ -91,6 +94,23 @@ BossCapture 对 `completed`、`stopped`、`failed` terminal current 保留 snaps
 
 ## 4. 测试矩阵
 
+### 本轮 targeted validation（2026-09-26）
+
+| 检查 | 结果 |
+|---|---|
+| `backend/tests/services/test_boss_scraper_service.py::test_capture_jobs_calls_embedded_engine_and_resets_request_budget` | `1 passed` |
+| `backend/tests/services/test_boss_scraper_service.py` | `11 passed` |
+| `backend/tests/api/test_fine_job_codex_api.py::test_mcp_server_registers_exact_core_tool_set` | `1 passed` |
+| `backend/tests/api/test_fine_job_codex_api.py` | `9 passed` |
+
+Boss scraper 失败判定为测试 double 签名过时：生产实现仍在 `_CAPTURE_LOCK` 内重置请求计数，并保留 `progress_callback` / `should_stop` 接口。本轮仅让 `fake_scrape_details` 接收并校验 `should_stop=None`。
+
+MCP 精确核对结果：`CORE_TOOLS` 有而 server 无的工具为 `[]`，server 有而 `CORE_TOOLS` 无的工具为 `[]`；两者顺序一致且均无重复。11 个 Smart Capture 工具全部存在。本轮未修改 Smart Capture/MCP production code。
+
+本轮未运行 backend 或 frontend full suite。以下 full suite、历史 targeted、类型检查和启动冒烟结果均为既有验收记录，本轮没有覆盖或改写其结果。
+
+### 历史验证记录
+
 | Gate | 实际命令 / 检查 | 结果 |
 |---|---|---|
 | frontend local | `pnpm --filter fine-job-desktop test:run -- TaskCockpitNew.test.ts fineJobWorkflowRun.test.ts BossCaptureCurrent.test.ts --silent=true` | `34 passed / 0 failed` |
@@ -137,7 +157,7 @@ BossCapture 对 `completed`、`stopped`、`failed` terminal current 保留 snaps
 
 ## 5. 真实 BOSS / Codex 13 步
 
-环境检查：`GET /api/fine-job/platform-sessions/boss` 返回 `status="needs_login"`、`ready=false`。没有可用于真实 BOSS 采集的已登录会话，故未创建真实任务，也没有可记录的 `smart_capture_id` / `workflow_run_id` / Codex handoff。所有步骤均按原 Task15 顺序记录为 BLOCKED。
+环境检查：`GET /api/fine-job/platform-sessions/boss` 返回 `status="needs_login"`、`ready=false`。没有可用于真实 BOSS 采集的已登录会话，故未创建真实任务，也没有可记录的 `smart_capture_id` / `workflow_run_id` / Codex handoff。所有步骤均按原 Task15 顺序记录为 BLOCKED；真实 BOSS/Codex E2E 仍需用户提供已登录 BOSS 会话后执行。
 
 | # | 输入/动作 | smart_capture_id | workflow_run_id | 关键状态 / Codex | 预期 | 实际 | 结果 |
 |---|---|---|---|---|---|---|---|
@@ -175,11 +195,11 @@ BossCapture 对 `completed`、`stopped`、`failed` terminal current 保留 snaps
 
 - Gate A（Task12）：PASS
 - Gate B（terminal realtime）：PASS
-- Gate C（专项测试）：PASS
-- Gate D（backend full）：FAIL，16 failed
-- Gate E（frontend full）：PASS，266 passed
-- Gate F（vue-tsc）：PASS，0 errors
-- Gate G（启动冒烟）：PASS
+- Gate C（历史专项测试及本轮 targeted validation）：PASS
+- Gate D（历史 backend full）：FAIL，16 failed
+- Gate E（历史 frontend full）：PASS，266 passed
+- Gate F（历史 vue-tsc）：PASS，0 errors
+- Gate G（历史启动冒烟）：PASS
 - Gate H（真实 13 步）：BLOCKED，BOSS `needs_login`
 
 Smart Capture / Workflow 封版专项通过；全仓 release gate 仍未通过；v0.2.2.4 不得宣告最终封版。

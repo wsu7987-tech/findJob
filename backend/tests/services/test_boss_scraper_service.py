@@ -68,13 +68,22 @@ def test_capture_jobs_calls_embedded_engine_and_resets_request_budget(
         }
         return {"jobs": [{"job_id": "job-1"}]}
 
-    def fake_scrape_details(list_data, max_details, output_path, *, cdp_port, fmt):
+    def fake_scrape_details(
+        list_data,
+        max_details,
+        output_path,
+        *,
+        cdp_port,
+        fmt,
+        should_stop,
+    ):
         calls["details"] = {
             "list_data": list_data,
             "max_details": max_details,
             "output_path": output_path,
             "cdp_port": cdp_port,
             "fmt": fmt,
+            "should_stop": should_stop,
         }
         return [{"job_id": "job-1", "jd": "Python"}]
 
@@ -110,6 +119,7 @@ def test_capture_jobs_calls_embedded_engine_and_resets_request_budget(
         "output_path": str(result.details_path),
         "cdp_port": 9222,
         "fmt": "json",
+        "should_stop": None,
     }
     assert result.details == [{"job_id": "job-1", "jd": "Python"}]
 
