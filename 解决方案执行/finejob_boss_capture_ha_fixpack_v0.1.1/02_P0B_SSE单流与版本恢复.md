@@ -1,4 +1,6 @@
-﻿# 02 / P0B：共享实时订阅与状态恢复
+# 02 / P0B：共享实时订阅与状态恢复
+
+文档修订：2026-09-26-r1；基于 `task-cockpit-phase1@b5c4df74f170661d98a1cd236cf693296e85b41d` 静态核对。新增接口/字段均为待实施规划，代码与业务测试尚未执行。
 
 本次执行任务。保留原文件名方便引用，当前方案采用应用级共享 current + detail 完整快照订阅。单流及增量协议移至后续范围。
 
@@ -84,3 +86,12 @@ App.vue 持有应用级启停。页面读取 Store 状态并注册自己的展�
 - linked 父镜像与历史查询保持现有身份边界。
 
 后续如切换为单流增量协议，需另行定义缺口恢复与数据资源拆分；该事项不影响本次验收。
+
+
+## 8. 与新增进度及启动回执的接合
+
+- 共享双流只减少重复订阅，不会自动补出缺失的正式 JD 进度。消费 13 新增的 collection_progress；服务端必须先完成其数据聚合与提交后发布。
+- current GET/detail GET/SSE 返回同一进度字段形状，任务内版本比较一致；旧快照缺字段显示暂不可用，不套用列表计数。
+- 启动回执状态是用户动作状态，不写成 Smart Capture current。operation_id、容量预占 ID 和 smart_capture_id 分别管理。
+- 初次 GET 与 current SSE 的身份竞态处理后，按最终身份确保存在且仅存在一条必要 detail；不能仅依赖“current ID 改变”来补建漏掉的连接。
+- 自动分析异步读取返回后，重新检查 controller 生命周期、owner 和最新终态；旧 owner 的 pending inspection 不触发新 handoff。原批次去重和 Codex idle 后复核行为保留。
