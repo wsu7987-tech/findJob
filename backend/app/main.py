@@ -63,7 +63,7 @@ def create_app() -> FastAPI:
 
     db = Database(config.sqlite_path)
     db.initialize()
-    # 采集任务在后台线程更新时，需要可用的数据库与配置来同步父任务和 Workflow Run。
+    # 历史 Workflow 采集快照通知需要可用的数据库与配置。
     workflow_runs.configure_realtime_runtime(db, config)
     # 启动时把丢失的采集执行器收敛为可恢复状态，并清理 custom 执行容量。
     smart_captures.recover_interrupted_smart_captures(db)

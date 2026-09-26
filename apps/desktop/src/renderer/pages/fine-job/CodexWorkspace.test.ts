@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   resubmitWorkflowEnter: vi.fn(),
   retryWorkflowHandoff: vi.fn(),
   refreshWorkflow: vi.fn(),
+  startWorkflowPolling: vi.fn(),
   push: vi.fn(),
   replace: vi.fn(),
   routeQuery: {} as Record<string, string>,
@@ -56,7 +57,11 @@ vi.mock("@/stores/fineJobCodex", () => ({
 }));
 
 vi.mock("@/stores/fineJobWorkflowRun", () => ({
-  useFineJobWorkflowRunStore: () => ({ refresh: mocks.refreshWorkflow, setRun: vi.fn() })
+  useFineJobWorkflowRunStore: () => ({
+    refresh: mocks.refreshWorkflow,
+    setRun: vi.fn(),
+    startPolling: mocks.startWorkflowPolling
+  })
 }));
 
 vi.mock("@/services/api", () => ({
@@ -114,6 +119,7 @@ vi.mock("vue-router", () => ({
 }));
 
 import CodexWorkspace from "./CodexWorkspace.vue";
+import CodexTerminalPanel from "@/components/CodexTerminalPanel.vue";
 
 const ElButtonStub = defineComponent({
   inheritAttrs: false,
@@ -181,6 +187,7 @@ describe("CodexWorkspace", () => {
       status: "submitted", run: value, message: "已重新交接"
     }));
     mocks.refreshWorkflow.mockReset().mockResolvedValue(undefined);
+    mocks.startWorkflowPolling.mockReset();
     mocks.push.mockReset().mockResolvedValue(undefined);
     mocks.replace.mockReset().mockImplementation(async (target: { query: Record<string, string> }) => {
       mocks.routeQuery = target.query;
@@ -215,8 +222,9 @@ describe("CodexWorkspace", () => {
     expect(mocks.focus).toHaveBeenCalledTimes(1);
   });
 
-  it("Clear 只清空终端显示", async () => {
-    const wrapper = mount(CodexWorkspace, {
+  it("终端面板的 Clear 只清空终端显示", async () => {
+    const wrapper = mount(CodexTerminalPanel, {
+      props: { visible: true },
       global: {
         stubs: {
           CodexTerminal: CodexTerminalStub,

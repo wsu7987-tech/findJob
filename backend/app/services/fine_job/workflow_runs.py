@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
-from threading import RLock, Thread
+from threading import RLock
 from typing import Any
 
 from backend.app.config import AppConfig
@@ -50,14 +50,14 @@ _realtime_runtime_lock = RLock()
 
 
 def configure_realtime_runtime(db: Database, config: AppConfig) -> None:
-    """保存当前应用运行时，用于后台采集完成后继续推进 Workflow。"""
+    """保存当前应用运行时，用于历史 Workflow 采集快照通知。"""
     global _realtime_runtime
     with _realtime_runtime_lock:
         _realtime_runtime = (db, config)
 
 
 def _on_capture_task_updated(capture: dict[str, object]) -> None:
-    """将采集器进度转换为 Workflow 快照事件，并在结束时继续编排。"""
+    """仅为历史 Workflow 采集记录发布快照，当前执行由 Smart Capture 负责。"""
     capture_id = str(capture.get("id") or "")
     if not capture_id:
         return
@@ -71,15 +71,11 @@ def _on_capture_task_updated(capture: dict[str, object]) -> None:
             capture_id=capture_id
         )
         return
-    if smart_capture_id and str(capture.get("status") or "") in {"completed", "stopped", "failed"}:
-        cutover_guard.get_runtime_cutover_guard().release_live_start(
-            child_ref=smart_capture_id
-        )
     with _realtime_runtime_lock:
         runtime = _realtime_runtime
     if runtime is None:
         return
-    db, config = runtime
+    db, _config = runtime
     with db.connect() as connection:
         rows = connection.execute(
             """
@@ -95,30 +91,6 @@ def _on_capture_task_updated(capture: dict[str, object]) -> None:
             workflow_run_event_broker.publish(workflow_run_id, get_workflow_run(db, workflow_run_id))
         except Exception:
             continue
-        stage = str(capture.get("stage") or "")
-        if (
-            str(capture.get("status") or "") in {"completed", "failed"}
-            and not stage.endswith("paused")
-            and not stage.endswith("stopped")
-        ):
-            Thread(
-                target=_advance_after_capture_finished,
-                args=(db, config, workflow_run_id),
-                daemon=True,
-            ).start()
-
-
-def _advance_after_capture_finished(db: Database, config: AppConfig, workflow_run_id: str) -> None:
-    """采集结束后由后端继续推进，页面只订阅状态。"""
-    cutover_guard.get_runtime_cutover_guard().assert_workflow_live_allowed(
-        operation="capture finished advance"
-    )
-    try:
-        snapshot = advance_deep_job_search(db, config, workflow_run_id)
-        workflow_run_event_broker.publish(workflow_run_id, snapshot)
-    except Exception:
-        # 后续恢复入口仍可读取已持久化的 Run 状态并由用户继续处理。
-        return
 
 
 boss_capture_task_manager.add_listener(_on_capture_task_updated)
