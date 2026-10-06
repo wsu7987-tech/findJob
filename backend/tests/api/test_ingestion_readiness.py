@@ -31,7 +31,6 @@ def _wait_for_snapshot_row(
 @pytest.mark.parametrize(
     ("source_type", "source_value", "title", "raw_text"),
     [
-        ("url", "https://example.com/article", "Example article", "Fetched article body."),
         ("pdf", "D:/fixtures/example.pdf", "Example PDF", "Extracted pdf text."),
         ("markdown", "D:/fixtures/example.md", "Example Markdown", "# Example\n\nMarkdown body."),
         ("text", "manual-note", "Example Text", "Plain text body."),
@@ -65,7 +64,6 @@ def test_pool_accepts_all_declared_source_types(
 @pytest.mark.parametrize(
     ("source_type", "source_value", "raw_text"),
     [
-        ("url", "https://example.com/summary", "Normalized URL content."),
         ("pdf", "D:/fixtures/summary.pdf", "Normalized PDF content."),
         ("markdown", "D:/fixtures/summary.md", "# Parsed Markdown"),
     ],

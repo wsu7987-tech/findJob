@@ -20,11 +20,6 @@
     "markdown-it": "^14.1.0",
     "node-pty": "^1.1.0",
     "pinia": "^3.0.2",
-    "puppeteer-core": "^24.9.0",
-    "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin": "^3.2.3",
-    "puppeteer-extra-plugin-anonymize-ua": "^2.4.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "vue": "^3.5.13",
     "vue-router": "^4.5.1"
   },

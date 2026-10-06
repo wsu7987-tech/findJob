@@ -36,8 +36,6 @@ from backend.app.routers.pdf_drafts import router as pdf_drafts_router
 from backend.app.routers.pdf_parse import router as pdf_parse_router
 from backend.app.routers.quick_capture import router as quick_capture_router
 from backend.app.routers.qa import router as qa_router
-from backend.app.routers.web_drafts import router as web_drafts_router
-from backend.app.routers.web_session_profiles import router as web_session_profiles_router
 from backend.app.routers.pool import router as pool_router
 from backend.app.routers.retrieval import router as retrieval_router
 from backend.app.routers.report import report_router, reports_router
@@ -46,9 +44,6 @@ from backend.app.routers.runs import router as runs_router
 from backend.app.routers.summary import router as summary_router
 from backend.app.services.pdf_draft_store import PdfDraftStore
 from backend.app.services.pdf_reparse_job_store import PdfReparseJobStore
-from backend.app.services.web_draft_store import WebDraftStore
-from backend.app.services.web_reparse_job_store import WebReparseJobStore
-from backend.app.services.web_session_profiles import WebSessionProfileStore
 from backend.app.services.fine_job import boss_executor, smart_captures, workflow_runs
 from backend.app.services.fine_job.codex_runtime import CodexRuntimeRegistry
 from backend.app.services.fine_job.profile_store import ensure_default_profile
@@ -87,11 +82,6 @@ def create_app() -> FastAPI:
     app.state.db = db
     app.state.pdf_draft_store = PdfDraftStore()
     app.state.pdf_reparse_job_store = PdfReparseJobStore()
-    app.state.web_draft_store = WebDraftStore()
-    app.state.web_reparse_job_store = WebReparseJobStore()
-    app.state.web_session_profile_store = WebSessionProfileStore(
-        config.app_data_dir / "web-session-profiles.json"
-    )
     app.state.codex_runtime_registry = CodexRuntimeRegistry()
 
     register_error_handlers(app)
@@ -122,8 +112,6 @@ def create_app() -> FastAPI:
     app.include_router(fine_job_smart_captures_router, prefix="/api")
     app.include_router(parse_results_router, prefix="/api")
     app.include_router(pdf_drafts_router, prefix="/api")
-    app.include_router(web_drafts_router, prefix="/api")
-    app.include_router(web_session_profiles_router, prefix="/api")
     app.include_router(pdf_parse_router, prefix="/api")
     app.include_router(quick_capture_router, prefix="/api")
     app.include_router(qa_router, prefix="/api")

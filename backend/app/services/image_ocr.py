@@ -124,7 +124,7 @@ def _decode_image(screenshot_base64: str):
         raise AppError(
             status_code=500,
             error_category="INGEST_FAILED",
-            error_message="NumPy and OpenCV are required for web image OCR.",
+            error_message="NumPy and OpenCV are required for screenshot OCR.",
         )
     binary = base64.b64decode(screenshot_base64)
     array = np.frombuffer(binary, dtype=np.uint8)

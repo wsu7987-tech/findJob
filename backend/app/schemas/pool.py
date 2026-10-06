@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 
 class PoolItemCreateRequest(BaseModel):
-    source_type: Literal["url", "pdf", "markdown", "text"]
+    source_type: Literal["pdf", "markdown", "text"]
     source_value: str
     title: str | None = None
     raw_text: str | None = None
@@ -17,7 +17,7 @@ class PoolItemCreateRequest(BaseModel):
 
 
 class PoolMetadataSuggestionRequest(BaseModel):
-    source_type: Literal["url", "pdf", "markdown", "text"]
+    source_type: Literal["pdf", "markdown", "text"]
     source_value: str
     title: str | None = None
     raw_text: str | None = None

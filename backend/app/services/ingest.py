@@ -3,10 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
 
-import httpx
-from bs4 import BeautifulSoup
 from backend.app.config import AppConfig
 from backend.app.errors import AppError
 
@@ -45,19 +42,6 @@ def ingest_source(
             source_value=source_value,
             raw_text=raw_text,
             title=title,
-        )
-
-    if source_type == "url":
-        normalized_source_value, extracted_title, text = _fetch_url_content(
-            config,
-            source_value,
-        )
-        final_title = _choose_title(title, extracted_title, normalized_source_value)
-        return IngestedContent(
-            normalized_source_value=normalized_source_value,
-            title=final_title,
-            source_name=urlparse(normalized_source_value).netloc or final_title,
-            raw_content=text,
         )
 
     if source_type == "pdf":
@@ -168,57 +152,6 @@ def _ingest_text_source(
     )
 
 
-def _fetch_url_content(config: AppConfig, source_value: str) -> tuple[str, str | None, str]:
-    normalized_url = source_value.strip()
-    if not normalized_url.startswith(("http://", "https://")):
-        raise AppError(
-            status_code=400,
-            error_category="VALIDATION_FAILED",
-            error_message="URL sources must start with http:// or https://",
-        )
-
-    try:
-        with httpx.Client(
-            follow_redirects=True,
-            timeout=config.fetch_timeout_seconds,
-            headers={"User-Agent": config.fetch_user_agent},
-        ) as client:
-            response = client.get(normalized_url)
-            response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise AppError(
-            status_code=400,
-            error_category="FETCH_FAILED",
-            error_message=f"Failed to fetch URL content: {exc}",
-        ) from exc
-
-    content_type = response.headers.get("content-type", "").lower()
-    body = response.text
-    if "text/plain" in content_type:
-        text = _normalize_text(body)
-        title = _first_line(text)
-    elif "markdown" in content_type:
-        text = _markdown_to_text(body)
-        title = _extract_markdown_title(body)
-    else:
-        title, text = _html_to_text(body)
-
-    _ensure_meaningful_text(text, normalized_url)
-    return normalized_url, title, text
-
-
-def _html_to_text(html: str) -> tuple[str | None, str]:
-    soup = BeautifulSoup(html, "html.parser")
-    for node in soup(["script", "style", "noscript"]):
-        node.decompose()
-    title = None
-    if soup.title and soup.title.string:
-        title = _normalize_text(soup.title.string)
-    main_node = soup.find("article") or soup.find("main") or soup.body or soup
-    text = _normalize_text(main_node.get_text("\n"))
-    return title, text
-
-
 def _markdown_to_text(
     markdown_source: str,
     *,
@@ -305,8 +238,6 @@ def _ensure_meaningful_text(text: str, source_name: str) -> None:
 
 
 def _normalize_source_reference(source_type: str, source_value: str) -> str:
-    if source_type == "url":
-        return source_value.strip()
     maybe_path = _try_resolve_path(source_value)
     if maybe_path is not None and maybe_path.exists():
         return str(maybe_path)
@@ -315,9 +246,6 @@ def _normalize_source_reference(source_type: str, source_value: str) -> str:
 
 
 def _source_name_for(source_type: str, normalized_source_value: str) -> str:
-    if source_type == "url":
-        parsed = urlparse(normalized_source_value)
-        return parsed.netloc or normalized_source_value
     maybe_path = _try_resolve_path(normalized_source_value)
     if maybe_path is not None and maybe_path.suffix:
         return maybe_path.name

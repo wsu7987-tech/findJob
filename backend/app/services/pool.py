@@ -18,7 +18,6 @@ from backend.app.services.pdf_parse.store import (
     activate_parse_result,
     insert_parse_result,
 )
-from backend.app.services.web_capture.service import build_default_web_capture_service
 from backend.app.utils import new_id, utc_now
 
 
@@ -76,13 +75,6 @@ def create_pool_item(
     config: AppConfig,
     payload: PoolItemCreateRequest,
 ) -> dict[str, object]:
-    if payload.source_type == "url" and not (payload.raw_text and payload.raw_text.strip()):
-        return _create_url_pool_item_from_capture(
-            db=db,
-            config=config,
-            payload=payload,
-        )
-
     if payload.source_type == "markdown":
         return _create_markdown_pool_item(
             db=db,
@@ -109,44 +101,6 @@ def create_pool_item(
         category=payload.category,
         tags=payload.tags,
         cleaning_level=None,
-    )
-
-
-def _create_url_pool_item_from_capture(
-    *,
-    db: Database,
-    config: AppConfig,
-    payload: PoolItemCreateRequest,
-) -> dict[str, object]:
-    capture_service = build_default_web_capture_service()
-    captured = capture_service.capture_url(
-        url=payload.source_value,
-        parser_name="playwright_dom",
-        session_profile_id=None,
-    )
-    parse_result = StoredParseResultSeed(
-        parser_name="playwright_dom",
-        raw_text=str(captured.get("raw_text") or ""),
-        markdown_text=(
-            None if captured.get("markdown_text") is None else str(captured.get("markdown_text"))
-        ),
-        preview_text=str(captured.get("preview_text") or ""),
-        page_count=len(list(captured.get("preview_pages") or [])),
-        char_count=len(str(captured.get("raw_text") or "")),
-        quality_score=_score_canonical_content(
-            str(captured.get("markdown_text") or captured.get("raw_text") or "")
-        ),
-        warnings=[str(item) for item in (captured.get("warnings") or [])],
-        created_at=utc_now(),
-    )
-    return create_pool_item_from_saved_web_content(
-        db,
-        config,
-        url=payload.source_value,
-        title=payload.title or str(captured.get("title") or ""),
-        parse_result=parse_result,
-        category=payload.category,
-        tags=payload.tags,
     )
 
 
@@ -224,47 +178,6 @@ def create_pool_item_from_saved_pdf_content(
         db,
         config,
         source_type="pdf",
-        ingested=ingested,
-        pdf_parse_seed={
-            "parse_result": parse_result,
-            "activated_raw_content": ingested.raw_content,
-        },
-        capture_source=None,
-        captured_at=None,
-        category=category,
-        tags=tags or [],
-        cleaning_level=cleaning_level,
-    )
-
-
-def create_pool_item_from_saved_web_content(
-    db: Database,
-    config: AppConfig,
-    *,
-    url: str,
-    title: str | None,
-    parse_result,
-    category: str | None = None,
-    tags: list[str] | None = None,
-    cleaned_text: str | None = None,
-    cleaning_level: str | None = None,
-) -> dict[str, object]:
-    canonical_content = _resolve_canonical_content(
-        cleaned_text=cleaned_text,
-        structured_text=parse_result.markdown_text,
-        fallback_text=parse_result.raw_text,
-    )
-    ingested = ingest_source(
-        config,
-        source_type="url",
-        source_value=url,
-        raw_text=canonical_content,
-        title=title,
-    )
-    return _create_pool_item_from_ingested(
-        db,
-        config,
-        source_type="url",
         ingested=ingested,
         pdf_parse_seed={
             "parse_result": parse_result,

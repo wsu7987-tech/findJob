@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from backend.app.services.web_capture.image_ocr import (
+from backend.app.services.image_ocr import (
     _decode_image,
     _default_ocr_factory,
     _extract_lines,

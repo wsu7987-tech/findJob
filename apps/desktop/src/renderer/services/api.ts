@@ -142,23 +142,6 @@ import type {
   PdfReparseJobListEnvelope,
   PdfDraftReparseRequest
 } from "../types";
-import type {
-  WebDraftCommitResponse,
-  WebDraftCreateRequest,
-  WebDraftDeleteResponse,
-  WebDraftEnvelope,
-  WebDraftPreviewPageEnvelope,
-  WebDraftReparseResponse,
-  WebReparseJobEnvelope,
-  WebReparseJobListEnvelope,
-  WebDraftReparseRequest,
-  WebSessionProfileCreateRequest,
-  WebSessionProfileDeleteResponse,
-  WebSessionProfileEnvelope,
-  WebSessionProfileListEnvelope,
-  WebSessionProfileLoginRequest,
-  WebSessionProfileUpdateRequest
-} from "../types";
 import { mapApiError } from "./contract";
 import type { SmartCaptureExecutionConfigRequest } from "./smartCaptureExecutionConfig";
 
@@ -373,83 +356,6 @@ export const api = {
   },
   async deletePdfDraft(draftId: string) {
     return request<PdfDraftDeleteResponse>(`/api/pdf/drafts/${draftId}`, {
-      method: "DELETE"
-    });
-  },
-  async createWebDraft(payload: WebDraftCreateRequest) {
-    return request<WebDraftReparseResponse>("/api/web/drafts", {
-      method: "POST",
-      body: JSON.stringify(payload)
-    });
-  },
-  async getWebDraft(draftId: string) {
-    return request<WebDraftEnvelope>(`/api/web/drafts/${draftId}`);
-  },
-  async reparseWebDraft(draftId: string, payload: WebDraftReparseRequest, signal?: AbortSignal) {
-    return request<WebDraftReparseResponse>(`/api/web/drafts/${draftId}/reparse`, {
-      method: "POST",
-      body: JSON.stringify(payload),
-      signal
-    });
-  },
-  async listWebReparseJobs() {
-    return request<WebReparseJobListEnvelope>("/api/web/drafts/jobs");
-  },
-  async getWebReparseJob(draftId: string, jobId: string) {
-    return request<WebReparseJobEnvelope>(`/api/web/drafts/${draftId}/jobs/${jobId}`);
-  },
-  async cancelWebReparseJob(draftId: string, jobId: string) {
-    return request<WebReparseJobEnvelope>(`/api/web/drafts/${draftId}/jobs/${jobId}/cancel`, {
-      method: "POST"
-    });
-  },
-  async getWebDraftPreviewPage(draftId: string, parseResultId: string, pageNumber: number) {
-    return request<WebDraftPreviewPageEnvelope>(
-      `/api/web/drafts/${draftId}/parse-results/${parseResultId}/pages/${pageNumber}`
-    );
-  },
-  async saveWebDraftParseResult(draftId: string, parseResultId: string) {
-    return request<WebDraftEnvelope>(
-      `/api/web/drafts/${draftId}/parse-results/${parseResultId}/save`,
-      {
-        method: "POST"
-      }
-    );
-  },
-  async commitWebDraft(draftId: string, payload?: PoolCommitMetadataRequest) {
-    return request<WebDraftCommitResponse>(`/api/web/drafts/${draftId}/commit`, {
-      method: "POST",
-      body: JSON.stringify(payload ?? {})
-    });
-  },
-  async deleteWebDraft(draftId: string) {
-    return request<WebDraftDeleteResponse>(`/api/web/drafts/${draftId}`, {
-      method: "DELETE"
-    });
-  },
-  async listWebSessionProfiles() {
-    return request<WebSessionProfileListEnvelope>("/api/web/session-profiles");
-  },
-  async createWebSessionProfile(payload: WebSessionProfileCreateRequest) {
-    return request<WebSessionProfileEnvelope>("/api/web/session-profiles", {
-      method: "POST",
-      body: JSON.stringify(payload)
-    });
-  },
-  async updateWebSessionProfile(profileId: string, payload: WebSessionProfileUpdateRequest) {
-    return request<WebSessionProfileEnvelope>(`/api/web/session-profiles/${profileId}`, {
-      method: "PATCH",
-      body: JSON.stringify(payload)
-    });
-  },
-  async startWebSessionProfileLogin(profileId: string, payload: WebSessionProfileLoginRequest) {
-    return request<WebSessionProfileEnvelope>(`/api/web/session-profiles/${profileId}/login`, {
-      method: "POST",
-      body: JSON.stringify(payload)
-    });
-  },
-  async deleteWebSessionProfile(profileId: string) {
-    return request<WebSessionProfileDeleteResponse>(`/api/web/session-profiles/${profileId}`, {
       method: "DELETE"
     });
   },

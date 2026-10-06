@@ -51,7 +51,7 @@ export interface PoolListResponse {
 }
 
 export interface PoolCreateRequest {
-  source_type: "url" | "pdf" | "markdown" | "text";
+  source_type: "pdf" | "markdown" | "text";
   source_value: string;
   title?: string | null;
   raw_text?: string | null;
@@ -62,7 +62,7 @@ export interface PoolCreateRequest {
 }
 
 export interface PoolMetadataSuggestionRequest {
-  source_type: "url" | "pdf" | "markdown" | "text";
+  source_type: "pdf" | "markdown" | "text";
   source_value: string;
   title?: string | null;
   raw_text?: string | null;
@@ -2001,146 +2001,6 @@ export interface PdfDraftCommitResponse {
 }
 
 export interface PdfDraftDeleteResponse {
-  deleted: boolean;
-}
-
-export type WebDraftParserName = "playwright_dom";
-
-export interface WebDraftCreateRequest {
-  url: string;
-  title?: string | null;
-  session_profile_id?: string | null;
-}
-
-export interface WebDraftReparseRequest {
-  parser_name: WebDraftParserName;
-  session_profile_id?: string | null;
-}
-
-export interface WebDraftPreviewPage {
-  page_number: number;
-  content_type: "markdown" | "text";
-  content: string;
-}
-
-export interface WebDraftParseResult {
-  id: string;
-  parser_name: WebDraftParserName;
-  status: string;
-  raw_text: string;
-  markdown_text?: string | null;
-  preview_text: string;
-  section_count: number;
-  char_count: number;
-  quality_score: number;
-  warnings: string[];
-  auth_mode: string;
-  created_at: string;
-}
-
-export interface WebReparseJob {
-  id: string;
-  draft_id: string;
-  parser_name: WebDraftParserName;
-  status: "queued" | "running" | "completed" | "failed" | "cancelled";
-  created_at: string;
-  started_at?: string | null;
-  finished_at?: string | null;
-  error_message?: string | null;
-  processed_pages: number;
-  total_pages: number;
-  latest_available_page: number;
-  cancel_requested: boolean;
-  preview_result_id?: string | null;
-}
-
-export interface WebDraft {
-  id: string;
-  url: string;
-  title?: string | null;
-  source_name: string;
-  session_profile_id?: string | null;
-  created_at: string;
-  updated_at: string;
-  saved_parse_result_id?: string | null;
-  latest_preview_result_id?: string | null;
-  parse_results: WebDraftParseResult[];
-}
-
-export interface WebDraftEnvelope {
-  draft: WebDraft;
-}
-
-export interface WebDraftReparseResponse {
-  draft: WebDraft;
-  job: WebReparseJob;
-}
-
-export interface WebReparseJobEnvelope {
-  job: WebReparseJob;
-}
-
-export interface WebReparseJobListEnvelope {
-  jobs: WebReparseJob[];
-}
-
-export interface WebDraftPreviewPageEnvelope {
-  page: WebDraftPreviewPage;
-}
-
-export interface WebDraftCommitResponse {
-  item: ApiPoolItem;
-}
-
-export interface WebDraftDeleteResponse {
-  deleted: boolean;
-}
-
-export type WebSessionProfileMode = "browser_profile" | "app_session";
-export type WebSessionProfileStatus = "ready" | "needs_login" | "invalid";
-
-export interface WebSessionProfile {
-  id: string;
-  name: string;
-  mode: WebSessionProfileMode;
-  browser_channel: string;
-  profile_path?: string | null;
-  managed_profile_path?: string | null;
-  login_url?: string | null;
-  status: WebSessionProfileStatus;
-  status_detail: string;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface WebSessionProfileCreateRequest {
-  name: string;
-  mode: WebSessionProfileMode;
-  browser_channel?: string | null;
-  profile_path?: string | null;
-  login_url?: string | null;
-}
-
-export interface WebSessionProfileUpdateRequest {
-  name?: string | null;
-  browser_channel?: string | null;
-  profile_path?: string | null;
-  login_url?: string | null;
-}
-
-export interface WebSessionProfileLoginRequest {
-  login_url?: string | null;
-}
-
-export interface WebSessionProfileEnvelope {
-  profile: WebSessionProfile;
-}
-
-export interface WebSessionProfileListEnvelope {
-  profiles: WebSessionProfile[];
-}
-
-export interface WebSessionProfileDeleteResponse {
   deleted: boolean;
 }
 
