@@ -92,8 +92,13 @@ def _on_capture_task_updated(capture: dict[str, object]) -> None:
         try:
             # 先落批次进度，再由 Engine 写入更高层 Pipeline 状态，避免批次终态覆盖 JD/Analysis。
             sync_capture_snapshot(db, capture)
-            smart_capture_engine.process_completed_batch(db, smart_capture_id, capture)
-            smart_capture_engine.advance_completed_batch(db, smart_capture_id, capture)
+            metrics = smart_capture_engine.process_completed_batch(db, smart_capture_id, capture)
+            auto_continued = smart_capture_engine.advance_completed_batch(
+                db,
+                smart_capture_id,
+                capture,
+                metrics=metrics,
+            )
         except Exception as exc:
             _update_capture(
                 db,
@@ -106,9 +111,10 @@ def _on_capture_task_updated(capture: dict[str, object]) -> None:
                 error_message=str(exc),
             )
             return
-        cutover_guard.get_runtime_cutover_guard().release_live_start(
-            child_ref=smart_capture_id
-        )
+        if not auto_continued:
+            cutover_guard.get_runtime_cutover_guard().release_live_start(
+                child_ref=smart_capture_id
+            )
         return
     if str(capture.get("status") or "") in {"stopped", "failed"}:
         cutover_guard.get_runtime_cutover_guard().release_live_start(
@@ -1490,7 +1496,7 @@ def _start_new_batch(
             BossCaptureRequest(
                 keyword=keyword,
                 city=city,
-                pages=max(1, min(10, int(payload.get("pages") or payload.get("min_depth") or 1))),
+                pages=max(1, min(10, int(payload.get("min_depth") or 1))),
                 filters=dict(payload.get("filters") or {}),
                 include_details=bool(payload.get("include_details", False)),
                 prefer_current_page=bool(payload.get("prefer_current_page", True)),
@@ -1779,7 +1785,6 @@ def _build_execution_config(payload: dict[str, Any]) -> dict[str, object]:
             "filter_strategy_id": str(payload.get("filter_strategy_id") or ""),
             "keywords": list(payload.get("allowed_search_keywords") or []),
             "cities": list(payload.get("allowed_cities") or []),
-            "pages": int(payload.get("pages") or payload.get("min_depth") or 1),
             "filters": dict(payload.get("filters") or {}),
             "include_details": bool(payload.get("include_details", False)),
             "prefer_current_page": bool(payload.get("prefer_current_page", True)),
@@ -1809,7 +1814,7 @@ def _build_execution_config(payload: dict[str, Any]) -> dict[str, object]:
         },
         "context_budget": int(payload.get("context_soft_budget_characters") or 12000),
         "stop_policy": {
-            "min_depth": int(payload.get("min_depth") or payload.get("pages") or 1),
+            "min_depth": int(payload.get("min_depth") or 1),
             "scroll_batch_size": int(payload.get("scroll_batch_size") or 3),
             "max_depth": int(payload.get("max_depth") or 20),
             "low_yield_streak_limit": int(payload.get("low_yield_streak_limit") or 3),

@@ -120,14 +120,6 @@ defineExpose({ validation });
     </el-form-item>
 
     <div class="form-grid">
-      <el-form-item label="采集页数">
-        <el-input-number
-          :model-value="modelValue.pages"
-          :min="1"
-          :max="10"
-          @update:model-value="updateField('pages', Number($event ?? 0))"
-        />
-      </el-form-item>
       <el-form-item label="搜索深度范围">
         <div class="inline-form-control">
           <el-input-number

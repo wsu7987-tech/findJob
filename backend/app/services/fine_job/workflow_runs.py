@@ -300,7 +300,6 @@ def _create_workflow_identity_in_connection(
             **payload,
             "allowed_search_keywords": requested_keywords,
             "allowed_cities": requested_cities,
-            "pages": int(payload.get("pages") or min_depth),
             "filter_strategy_id": filter_strategy_id,
         },
         target_count=candidate_target,

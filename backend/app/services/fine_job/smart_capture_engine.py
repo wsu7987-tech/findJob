@@ -1370,19 +1370,24 @@ def _abandon_prefetch(db: Database, smart_capture_id: str) -> None:
 
 
 def advance_completed_batch(
-    db: Database, smart_capture_id: str, capture_task: dict[str, object]
-) -> None:
+    db: Database,
+    smart_capture_id: str,
+    capture_task: dict[str, object],
+    *,
+    metrics: dict[str, object] | None = None,
+) -> bool:
     """由 Smart Capture Engine 消费 BOSS 完成，不经 Workflow 推进内部 Pipeline。"""
     # 延迟导入避免 Engine 与 lifecycle service 的模块初始化循环。
     from backend.app.services.fine_job import smart_captures
 
     snapshot = smart_captures.get_smart_capture(db, smart_capture_id)
     if str(snapshot["status"]) in {"completed", "stopped", "failed"}:
-        return
+        return False
     config = snapshot.get("execution_config")
     config = config if isinstance(config, dict) else {}
     delivery_target = config.get("delivery_target")
     delivery_enabled = bool(delivery_target.get("enabled")) if isinstance(delivery_target, dict) else False
+    workflow_run_id = str(snapshot.get("workflow_run_id") or "")
     candidate_count = count_candidates(db, smart_capture_id)
     target_count = int(snapshot.get("target_count") or 0)
     exhausted = not bool(capture_task.get("has_more"))
@@ -1403,7 +1408,15 @@ def advance_completed_batch(
             },
             completed=True,
         )
-        return
+        return False
+    if not workflow_run_id and _continue_independent_capture_batch(
+        db,
+        smart_capture_id,
+        capture_task,
+        metrics or {},
+        config,
+    ):
+        return True
     result_summary = {
         "candidate_count": candidate_count,
         "last_batch_id": str(capture_task.get("id") or ""),
@@ -1423,7 +1436,7 @@ def advance_completed_batch(
             result_summary=result_summary,
         )
         _advance_pipeline_details(db, smart_capture_id, "formal_jd", output_dir)
-        return
+        return False
     # 暂无可用候选时保留系统等待态，不将 ON 任务提前 completed。
     smart_captures._update_capture(
         db,
@@ -1435,6 +1448,62 @@ def advance_completed_batch(
         message="候选池已更新，等待可用的详情与分析批次。",
         result_summary=result_summary,
     )
+    return False
+
+
+def _continue_independent_capture_batch(
+    db: Database,
+    smart_capture_id: str,
+    capture_task: dict[str, object],
+    metrics: dict[str, object],
+    execution_config: dict[str, object],
+) -> bool:
+    """独立智能采集按搜索深度自动推进，不再用用户页数作为停止条件。"""
+    if not bool(capture_task.get("continuation_available") and capture_task.get("has_more")):
+        return False
+    stop_policy = execution_config.get("stop_policy")
+    if not isinstance(stop_policy, dict):
+        return False
+    depth = int(capture_task.get("total_pages_loaded") or 0)
+    max_depth = int(stop_policy.get("max_depth") or 20)
+    if depth >= max_depth:
+        return False
+    qualified = int(metrics.get("qualified_fresh_jobs") or 0)
+    fresh = int(metrics.get("run_fresh_jobs") or 0)
+    low_novelty_streak = int(metrics.get("low_novelty_streak") or 0)
+    duplicate_rate = float(metrics.get("duplicate_rate") or 0)
+    low_yield_limit = int(stop_policy.get("low_yield_streak_limit") or 3)
+    should_continue = qualified > 0 or (
+        fresh == 0
+        and low_novelty_streak < low_yield_limit
+        and duplicate_rate < 0.6
+    )
+    if not should_continue:
+        return False
+    batch_pages = min(
+        int(stop_policy.get("scroll_batch_size") or 3),
+        max_depth - depth,
+        10,
+    )
+    if batch_pages < 1:
+        return False
+    boss_capture_task_manager.continue_capture(
+        str(capture_task["id"]),
+        pages=batch_pages,
+    )
+    from backend.app.services.fine_job import smart_captures
+
+    # 当前批次有继续价值时立即进入下一批，目标未达成前保持同一搜索组合。
+    smart_captures._update_capture(
+        db,
+        smart_capture_id,
+        status="running",
+        stage="capturing",
+        waiting_reason="",
+        control_cause="",
+        message="当前搜索组合仍有有效产出，正在自动继续采集。",
+    )
+    return True
 
 
 def list_search_combinations(db: Database, smart_capture_id: str) -> list[dict[str, object]]:

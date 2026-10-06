@@ -9,7 +9,6 @@ export interface SmartCaptureExecutionConfig {
   allowed_cities: string[];
   filters: Record<string, string>;
   candidate_target_count: number;
-  pages: number;
   include_details: boolean;
   prefer_current_page: boolean;
   delivery_target_enabled: boolean;
@@ -52,7 +51,6 @@ export const createDefaultSmartCaptureExecutionConfig = (
   allowed_cities: [],
   filters: {},
   candidate_target_count: 15,
-  pages: 1,
   include_details: false,
   prefer_current_page: true,
   // 岗位采集页原来默认关闭投递目标，驾驶舱原来默认开启投递目标。
@@ -94,7 +92,6 @@ export const validateSmartCaptureExecutionConfig = (
   required("allowed_search_keywords", config.allowed_search_keywords, "至少选择一个搜索词。");
   required("allowed_cities", config.allowed_cities, "至少选择一个城市。");
   if (config.candidate_target_count < 1) errors.candidate_target_count = "候选目标必须至少为 1。";
-  if (config.pages < 1) errors.pages = "采集页数必须至少为 1。";
   if (config.max_depth < config.min_depth) errors.max_depth = "最大搜索深度不能小于最低探索深度。";
   if (config.context_soft_budget_characters < 1000) {
     errors.context_soft_budget_characters = "Context 软预算不能小于 1000。";
@@ -131,7 +128,6 @@ export const toSmartCaptureRequest = (config: SmartCaptureExecutionConfig) => ({
   allowed_cities: [...config.allowed_cities],
   filters: { ...config.filters },
   candidate_target_count: config.candidate_target_count,
-  pages: config.pages,
   include_details: config.include_details,
   prefer_current_page: config.prefer_current_page,
   delivery_target_enabled: config.delivery_target_enabled,
@@ -160,7 +156,6 @@ export interface SmartCaptureExecutionConfigRequest {
   allowed_cities: string[];
   filters?: Record<string, string>;
   candidate_target_count?: number;
-  pages?: number;
   include_details?: boolean;
   prefer_current_page?: boolean;
   delivery_target_enabled?: boolean;

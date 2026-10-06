@@ -23,7 +23,7 @@ def execution_config_validation_errors(payload: Mapping[str, Any]) -> list[str]:
             if candidate_target < int(recommend_target):
                 errors.append("候选池目标不能小于本轮推荐岗位目标。")
 
-    min_depth = int(payload.get("min_depth") or payload.get("pages") or 1)
+    min_depth = int(payload.get("min_depth") or 1)
     max_depth = int(payload.get("max_depth") or 20)
     if max_depth < min_depth:
         errors.append("最大搜索深度不能小于最低探索深度。")
