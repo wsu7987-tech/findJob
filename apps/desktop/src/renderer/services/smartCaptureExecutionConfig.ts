@@ -9,7 +9,6 @@ export interface SmartCaptureExecutionConfig {
   allowed_cities: string[];
   filters: Record<string, string>;
   candidate_target_count: number;
-  include_details: boolean;
   prefer_current_page: boolean;
   delivery_target_enabled: boolean;
   recommendation_strategy_id: string;
@@ -51,7 +50,6 @@ export const createDefaultSmartCaptureExecutionConfig = (
   allowed_cities: [],
   filters: {},
   candidate_target_count: 15,
-  include_details: false,
   prefer_current_page: true,
   // 岗位采集页原来默认关闭投递目标，驾驶舱原来默认开启投递目标。
   delivery_target_enabled: source === "task_cockpit",
@@ -128,7 +126,6 @@ export const toSmartCaptureRequest = (config: SmartCaptureExecutionConfig) => ({
   allowed_cities: [...config.allowed_cities],
   filters: { ...config.filters },
   candidate_target_count: config.candidate_target_count,
-  include_details: config.include_details,
   prefer_current_page: config.prefer_current_page,
   delivery_target_enabled: config.delivery_target_enabled,
   recommendation_strategy_id: config.delivery_target_enabled ? config.recommendation_strategy_id || undefined : undefined,
@@ -156,7 +153,6 @@ export interface SmartCaptureExecutionConfigRequest {
   allowed_cities: string[];
   filters?: Record<string, string>;
   candidate_target_count?: number;
-  include_details?: boolean;
   prefer_current_page?: boolean;
   delivery_target_enabled?: boolean;
   recommendation_strategy_id?: string;

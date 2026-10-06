@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, watch } from "vue";
+import { InfoFilled } from "@element-plus/icons-vue";
 
 import type { FineJobFilterStrategy, FineJobRecommendationStrategy } from "@/types";
 import {
@@ -119,8 +120,20 @@ defineExpose({ validation });
       <p v-if="!selectedStrategy?.cities?.length" class="secondary-text">当前策略没有可用城市。</p>
     </el-form-item>
 
-    <div class="form-grid">
-      <el-form-item label="搜索深度范围">
+    <section class="search-policy-section">
+      <div class="search-policy-section__header">
+        <strong>搜索策略</strong>
+        <span class="secondary-text">控制当前条件的探索和继续采集方式</span>
+      </div>
+      <el-form-item class="search-policy-item">
+        <template #label>
+          <span class="search-policy-label">
+            <span>搜索深度范围</span>
+            <el-tooltip content="当前搜索条件的探索范围。首次至少探索最小深度，达到最大深度后不再继续当前条件。" placement="top">
+              <el-icon class="search-policy-info"><InfoFilled /></el-icon>
+            </el-tooltip>
+          </span>
+        </template>
         <div class="inline-form-control">
           <el-input-number
             :model-value="modelValue.min_depth"
@@ -137,7 +150,39 @@ defineExpose({ validation });
           />
         </div>
       </el-form-item>
-    </div>
+      <el-form-item class="search-policy-item">
+        <template #label>
+          <span class="search-policy-label">
+            <span>搜索滚动批次</span>
+            <el-tooltip content="每次继续当前搜索条件时新增采集的页数，只影响单批大小，不是整个任务的总页数。" placement="top">
+              <el-icon class="search-policy-info"><InfoFilled /></el-icon>
+            </el-tooltip>
+          </span>
+        </template>
+        <el-input-number
+          :model-value="modelValue.scroll_batch_size"
+          :min="1"
+          :max="10"
+          @update:model-value="updateField('scroll_batch_size', Number($event ?? 0))"
+        />
+      </el-form-item>
+      <el-form-item class="search-policy-item">
+        <template #label>
+          <span class="search-policy-label">
+            <span>低产出连续批次上限</span>
+            <el-tooltip content="连续出现无新岗位或新鲜度低于约 25% 的批次数。达到上限后停止继续当前搜索条件。" placement="top">
+              <el-icon class="search-policy-info"><InfoFilled /></el-icon>
+            </el-tooltip>
+          </span>
+        </template>
+        <el-input-number
+          :model-value="modelValue.low_yield_streak_limit"
+          :min="1"
+          :max="20"
+          @update:model-value="updateField('low_yield_streak_limit', Number($event ?? 0))"
+        />
+      </el-form-item>
+    </section>
     <div class="capture-options">
       <el-switch
         :model-value="modelValue.prefer_current_page"
@@ -145,14 +190,6 @@ defineExpose({ validation });
       />
       <span>优先采集当前 BOSS 搜索页；当前页无效时自动定位</span>
     </div>
-    <div class="capture-options">
-      <el-switch
-        :model-value="modelValue.include_details"
-        @update:model-value="updateField('include_details', Boolean($event))"
-      />
-      <span>采集列表后，自动获取岗位详情</span>
-    </div>
-
     <el-form-item v-if="showAnalysisGuidance" label="本 Run 临时分析指导（可选）">
       <el-input
         :model-value="modelValue.analysis_guidance"
@@ -297,23 +334,6 @@ defineExpose({ validation });
       </div>
     </template>
 
-    <div class="capture-options">
-      <span>搜索滚动批次</span>
-      <el-input-number
-        :model-value="modelValue.scroll_batch_size"
-        :min="1"
-        :max="10"
-        @update:model-value="updateField('scroll_batch_size', Number($event ?? 0))"
-      />
-      <span>低产出连续批次上限</span>
-      <el-input-number
-        :model-value="modelValue.low_yield_streak_limit"
-        :min="1"
-        :max="20"
-        @update:model-value="updateField('low_yield_streak_limit', Number($event ?? 0))"
-      />
-    </div>
-
     <el-alert
       v-if="!validation.isValid"
       type="warning"
@@ -327,6 +347,19 @@ defineExpose({ validation });
 
 <style scoped>
 .smart-capture-config-form { display: grid; gap: 12px; }
+.search-policy-section { padding: 0; }
+.search-policy-section__header { display: flex; align-items: baseline; gap: 10px; padding: 0 0 4px; }
+.search-policy-item { display: grid; grid-template-columns: minmax(190px, 0.35fr) minmax(0, 1fr); align-items: center; min-width: 0; margin: 0; padding: 12px 0; border-bottom: 1px solid var(--el-border-color-lighter); }
+.search-policy-item:last-child { border-bottom: 0; }
+.search-policy-item :deep(.el-form-item__label) { margin: 0; padding: 0 16px 0 0; }
+.search-policy-item :deep(.el-form-item__content) { min-width: 0; }
+.search-policy-label { display: inline-flex; align-items: center; gap: 4px; }
+.search-policy-info { color: var(--el-text-color-secondary); cursor: help; }
 .inline-form-control { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .capture-options { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+@media (max-width: 900px) {
+  .search-policy-item { grid-template-columns: 1fr; gap: 6px; }
+  .search-policy-item :deep(.el-form-item__label) { padding-right: 0; }
+}
 </style>

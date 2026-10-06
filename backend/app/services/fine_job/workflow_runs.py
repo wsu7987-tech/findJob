@@ -475,7 +475,6 @@ def advance_deep_job_search(db: Database, config: AppConfig, workflow_run_id: st
                 **payload,
                 "pages": pages,
                 "filters": platform_filters,
-                "include_details": False,
                 "prefer_current_page": True,
                 "force_search_navigation": not bool(payload.get("is_baseline")),
                 "filter_strategy_id": str(contract["selected_strategy_ids"]["filter_strategy_id"]),

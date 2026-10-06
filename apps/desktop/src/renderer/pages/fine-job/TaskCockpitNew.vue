@@ -353,6 +353,8 @@ onBeforeUnmount(() => {
         :recommendation-strategies="recommendationStrategies"
         :codex-models="codexModels"
         :codex-model-load-error="codexModelLoadError"
+        :show-analysis-guidance="false"
+        :show-context-budget="false"
       />
     </el-drawer>
   </section>

@@ -32,7 +32,6 @@ class DeepJobSearchConfig(BaseModel):
     allowed_cities: list[str] = Field(min_length=1, max_length=20)
     # 这些采集参数必须随父任务请求传入 Smart Capture，避免模型归一化时丢失。
     filters: dict[str, str] = Field(default_factory=dict)
-    include_details: bool = False
     prefer_current_page: bool = True
     source_policy: Literal["fresh_only"] = "fresh_only"
     allow_historical_jobs: bool = False

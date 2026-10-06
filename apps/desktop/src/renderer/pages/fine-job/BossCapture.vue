@@ -590,7 +590,6 @@ const smartExecutionConfig = computed<SmartCaptureExecutionConfig>({
     allowed_cities: [...smartSelectedCities.value],
     filters: { ...selectedBossFilters.value },
     candidate_target_count: smartCandidateTargetCount.value,
-    include_details: form.includeDetails,
     prefer_current_page: form.preferCurrentPage,
     delivery_target_enabled: smartDeliveryTargetEnabled.value,
     recommendation_strategy_id: smartRecommendationStrategyId.value || "",
@@ -617,7 +616,6 @@ const smartExecutionConfig = computed<SmartCaptureExecutionConfig>({
     smartSelectedKeywords.value = [...value.allowed_search_keywords];
     smartSelectedCities.value = [...value.allowed_cities];
     smartCandidateTargetCount.value = value.candidate_target_count;
-    form.includeDetails = value.include_details;
     form.preferCurrentPage = value.prefer_current_page;
     smartDeliveryTargetEnabled.value = value.delivery_target_enabled;
     smartRecommendationStrategyId.value = value.recommendation_strategy_id || null;
