@@ -59,7 +59,7 @@ const returnToTaskCockpit = async () => {
   const workflowRunId = String(route.query.workflow_run_id || "").trim();
   if (!workflowRunId) return;
   await router.push({
-    name: "fine-job-task-cockpit",
+    name: "fine-job-cockpit",
     query: { workflow_run_id: workflowRunId }
   });
 };

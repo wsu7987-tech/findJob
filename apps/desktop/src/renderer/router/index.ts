@@ -15,7 +15,6 @@ import CompanyManagementPage from "@/pages/fine-job/CompanyManagement.vue";
 import JobHuntAnalyticsPage from "@/pages/fine-job/JobHuntAnalytics.vue";
 import JobHuntRefreshPage from "@/pages/fine-job/JobHuntRefresh.vue";
 import JobActionsPage from "@/pages/fine-job/JobActions.vue";
-import TaskCockpitPage from "@/pages/fine-job/TaskCockpit.vue";
 import TaskCockpitNewPage from "@/pages/fine-job/TaskCockpitNew.vue";
 
 export const router = createRouter({
@@ -112,12 +111,6 @@ export const router = createRouter({
       name: "fine-job-cockpit",
       component: TaskCockpitNewPage,
       meta: { title: "任务驾驶舱" }
-    },
-    {
-      path: "/fine-job/task-cockpit",
-      name: "fine-job-task-cockpit",
-      component: TaskCockpitPage,
-      meta: { title: "任务驾驶舱（旧版）" }
     },
     {
       path: "/fine-job/codex",

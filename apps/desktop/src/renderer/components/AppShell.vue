@@ -45,7 +45,6 @@ const navigation = [
   { label: "今日行动", routeName: "fine-job-actions", icon: List },
   { label: "求职分析", routeName: "fine-job-analytics", icon: DataAnalysis },
   { label: "任务驾驶舱", routeName: "fine-job-cockpit", icon: Cpu },
-  { label: "任务驾驶舱（旧版）", routeName: "fine-job-task-cockpit", icon: Cpu },
   { label: "Codex 工作台", routeName: "fine-job-codex", icon: Cpu },
   { label: "动作日志", routeName: "fine-job-logs", icon: User }
 ];
