@@ -34,6 +34,10 @@ class BossCaptureRequest:
     capture_source: str = "custom"
     workflow_run_id: str | None = None
     smart_capture_id: str | None = None
+    capture_pacing: dict | None = None
+    runtime_state: dict = field(default_factory=dict)
+    window_state: dict = field(default_factory=dict)
+    window_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

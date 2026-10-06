@@ -2,7 +2,20 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+
+class CapturePacing(BaseModel):
+    list_min_seconds: float = Field(default=12, ge=12, allow_inf_nan=False)
+    list_max_seconds: float = Field(default=22, ge=12, allow_inf_nan=False)
+    detail_min_seconds: float = Field(default=10, ge=10, allow_inf_nan=False)
+    detail_max_seconds: float = Field(default=25, ge=10, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_intervals(self):
+        if self.list_min_seconds > self.list_max_seconds or self.detail_min_seconds > self.detail_max_seconds:
+            raise ValueError("采集间隔下限不能超过上限")
+        return self
 
 
 class BossBrowserStatusResponse(BaseModel):
@@ -47,6 +60,24 @@ class BossSearchPageResponse(BaseModel):
 
 
 class BossCaptureTaskResponse(BaseModel):
+    state_version: int = 1
+    server_now: str | None = None
+    capture_pacing: CapturePacing = Field(default_factory=CapturePacing)
+    scope_id: str | None = None
+    activity: Literal["loading", "scrolling", "collecting", "cooling"] | None = None
+    activity_scope: str | None = None
+    activity_message: str = ""
+    activity_started_at: str | None = None
+    activity_deadline_at: str | None = None
+    capture_validity: Literal["VALID_NONEMPTY", "VALID_EMPTY", "INVALID", "PARTIAL_INTERRUPTED"] | None = None
+    validity_reason: str = ""
+    filters_confirmed: bool = False
+    range_complete: bool = False
+    window_id: str | None = None
+    attempted_pages: int = 0
+    succeeded_pages: int = 0
+    failed_pages: int = 0
+    recovery_reason: str | None = None
     detail_phase_id: str | None = None
     detail_phase_job_ids: list[str] | None = None
     list_phase_processed: int = 0

@@ -41,10 +41,13 @@ def create_capture_batch(
     created_at: str,
     smart_capture_id: str | None = None,
     capture_source: Literal["smart", "custom"] = "custom",
-) -> None:
+    capture_pacing: dict | None = None,
+) -> dict:
     if smart_capture_id is not None:
         capture_source = "smart"
     with db.connect() as connection:
+        from backend.app.services.fine_job.capture_pacing import pacing_in_connection, default_pacing
+        pacing = default_pacing(capture_pacing) if capture_pacing is not None else pacing_in_connection(connection)
         connection.execute(
             """
             INSERT INTO fj_boss_capture_batches (
@@ -68,6 +71,9 @@ def create_capture_batch(
 
         from backend.app.services.fine_job.collection_start_operations import bind_in_connection
         bind_in_connection(connection, "custom", capture_id)
+        connection.execute("UPDATE fj_boss_capture_batches SET pacing_snapshot_json=? WHERE id=?",
+                           (json.dumps(pacing), capture_id))
+    return pacing
 
 
 def update_capture_batch(

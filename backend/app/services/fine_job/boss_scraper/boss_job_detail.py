@@ -80,58 +80,52 @@ def _parse_job_fields(html: str) -> dict[str, str]:
     }
 
 
-def _capture_detail_html(cdp: engine.CDPSession, sid: str, url: str) -> tuple[str, str]:
-    """监听指定详情页的 Document 响应，读取原始 HTML 响应体。"""
-    cdp.send("Network.enable", {}, sid)
-    cursor = cdp.create_event_cursor()
+def _current_fields(cdp, sid):
+    """??? DOM ????????????????"""
+    html = cdp.eval_js("document.documentElement.outerHTML", sid) or ""
+    fields = _parse_job_fields(html)
+    value = cdp.eval_js(engine.EXTRACT_DETAIL_JS, sid)
+    extracted = json.loads(value) if isinstance(value, str) else (value or {})
+    checked = engine.extract_detail_fields({
+        "jd": fields.get("jd") or extracted.get("jd"),
+        "page_text": extracted.get("page_text", ""),
+    })
+    fields["jd"] = checked["jd"]
+    fields["boss_active_status"] = fields.get("boss_active_status") or checked["boss_active_status"]
+    fields["tags"] = extracted.get("tags") or []
+    return html, fields
+
+
+def _capture_detail_html(cdp, sid, url, *, runtime=None, timeout=20):
+    from backend.app.services.fine_job.capture_runtime import CaptureRuntime, check_stop
+    runtime = runtime or CaptureRuntime(scope="formal_jd")
+    check_stop(runtime.should_stop)
+    runtime.activity("loading", "????????")
     cdp.send("Page.navigate", {"url": url}, sid)
-    request_urls: dict[str, str] = {}
-    finished: set[str] = set()
-    deadline = time.time() + 20
-    while time.time() < deadline:
-        cdp.drain_events(0.4)
-        events, cursor = cdp.events_since(
-            cursor,
-            session_id=sid,
-            methods={"Network.responseReceived", "Network.loadingFinished"},
-        )
-        for event in events:
-            params = event.get("params") or {}
-            request_id = _text(params.get("requestId"))
-            if event.get("method") == "Network.responseReceived" and request_id:
-                response = params.get("response") or {}
-                response_url = _text(response.get("url"))
-                if response_url == url and _text(response.get("mimeType")).startswith("text/html"):
-                    request_urls[request_id] = response_url
-            elif event.get("method") == "Network.loadingFinished" and request_id:
-                finished.add(request_id)
-        for request_id, response_url in request_urls.items():
-            if request_id not in finished:
-                continue
-            result = cdp.send("Network.getResponseBody", {"requestId": request_id}, sid)
-            payload = result.get("result") or {}
-            body = payload.get("body") or ""
-            if payload.get("base64Encoded"):
-                body = base64.b64decode(body).decode("utf-8", errors="replace")
-            if body:
-                return response_url, body
-    raise RuntimeError("未捕获到指定 BOSS 详情页的 HTML 响应")
+    deadline = time.monotonic() + timeout
+    last_error = "????????"
+    while time.monotonic() < deadline:
+        check_stop(runtime.should_stop)
+        try:
+            html, _fields = _current_fields(cdp, sid)
+            return url, html
+        except engine.DetailLoginRequiredError:
+            raise
+        except (engine.DetailExtractionError, ValueError, TypeError) as exc:
+            last_error = str(exc)
+        runtime.wait(min(0.25, max(0, deadline - time.monotonic())))
+    raise engine.DetailExtractionError(f"?????????{last_error}")
 
 
-def _wait_and_scroll(cdp: engine.CDPSession, sid: str) -> None:
-    """保持原详情采集的页面等待和滚动行为。"""
-    time.sleep(random.uniform(5, 10))
+def _wait_and_scroll(cdp, sid, *, runtime=None):
+    from backend.app.services.fine_job.capture_runtime import CaptureRuntime
+    runtime = runtime or CaptureRuntime(scope="formal_jd")
+    runtime.activity("scrolling", "??????")
     for _ in range(random.randint(3, 7)):
+        runtime.wait(0)
         delta = -random.randint(80, 200) if random.random() < 0.12 else random.randint(200, 600)
         cdp.eval_js(f"window.scrollBy(0,{delta})", sid)
-        time.sleep(random.uniform(2.0, 5.0) if random.random() < 0.35 else random.uniform(0.8, 1.8))
-    if random.random() < 0.5:
-        cdp.send(
-            "Input.dispatchMouseEvent",
-            {"type": "mouseMoved", "x": random.randint(200, 800), "y": random.randint(200, 600)},
-            sid,
-        )
-        time.sleep(random.uniform(0.5, 1.5))
+        runtime.wait(random.uniform(2.0, 5.0) if random.random() < 0.35 else random.uniform(0.8, 1.8))
 
 
 def fetch_job_detail(
@@ -140,13 +134,18 @@ def fetch_job_detail(
     output_path: Path | None = None,
     cdp_port: int = engine.DEFAULT_CDP_PORT,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
+    should_stop=None,
+    runtime=None,
 ) -> dict[str, object]:
     """独立获取聊天岗位详情并输出统一历史岗位字段。"""
     encrypt_job_id = _text(job.get("encrypt_job_id"))
     job_link = _text(job.get("job_link"))
-    if not encrypt_job_id or not job_link:
+    if not job_link:
         raise ValueError("聊天岗位缺少 BOSS 加密岗位标识或详情地址")
 
+    from backend.app.services.fine_job.capture_runtime import CaptureRuntime
+    runtime = runtime or CaptureRuntime(callback=progress_callback, should_stop=should_stop, scope="formal_jd")
+    runtime.before_network("detail")
     callback_id = _text(job.get("job_id"))
     if progress_callback:
         progress_callback({
@@ -165,9 +164,11 @@ def fetch_job_detail(
     sid: str | None = None
     try:
         tid, sid = engine.create_page_session(cdp)
-        response_url, html = _capture_detail_html(cdp, sid, job_link)
-        _wait_and_scroll(cdp, sid)
-        fields = _parse_job_fields(html)
+        response_url, _html = _capture_detail_html(cdp, sid, engine.build_detail_url(job), runtime=runtime)
+        _wait_and_scroll(cdp, sid, runtime=runtime)
+        runtime.activity("collecting", "????????")
+        _html, fields = _current_fields(cdp, sid)
+        fields = {key: value or job.get(key, "") for key, value in fields.items()}
         if not fields["title"] or not fields["jd"]:
             raise RuntimeError("详情页缺少岗位名称或职位描述，未写入空详情数据")
         result = {
@@ -180,6 +181,7 @@ def fetch_job_detail(
         if output_path:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        runtime.arm("detail")
         if progress_callback:
             progress_callback({
                 "stage": "details_collecting",
@@ -193,7 +195,10 @@ def fetch_job_detail(
                 "message": f"岗位详情采集完成：{result['title']}",
             })
         return result
+    except engine.CaptureStopRequested:
+        raise
     except Exception as exc:
+        runtime.arm("detail")
         if progress_callback:
             progress_callback({
                 "stage": "details_collecting",
@@ -208,6 +213,7 @@ def fetch_job_detail(
             })
         raise
     finally:
+        runtime.activity()
         if sid:
             try:
                 cdp.send("Network.disable", {}, sid)

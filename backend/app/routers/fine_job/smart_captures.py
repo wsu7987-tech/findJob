@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from queue import Empty
+from backend.app.utils import utc_now
 
 from backend.app.services.fine_job.collection_start_operations import start_http_response
 
@@ -45,7 +46,7 @@ def create(
 @router.get("/current")
 def current(db: Database = Depends(get_database)):
     # current 只读取持久化 Smart Capture 指针，不能与 custom 执行容量混为一谈。
-    return {"smart_capture": smart_captures.get_current_smart_capture(db)}
+    return {"smart_capture": smart_captures.get_current_smart_capture(db), "server_now": utc_now()}
 
 
 @router.get("/current/events")
@@ -59,14 +60,14 @@ def current_events(db: Database = Depends(get_database)) -> StreamingResponse:
 
     def event_stream() -> Iterator[str]:
         try:
-            yield f"data: {json.dumps(initial_snapshot, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({**initial_snapshot, 'server_now': utc_now()} if initial_snapshot else None, ensure_ascii=False)}\n\n"
             while True:
                 try:
                     snapshot = subscriber.get(timeout=15)
                 except Empty:
                     yield ": heartbeat\n\n"
                     continue
-                yield f"data: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({**snapshot, 'server_now': utc_now()} if snapshot else None, ensure_ascii=False)}\n\n"
         finally:
             smart_capture_event_broker.unsubscribe_current(subscriber)
 
@@ -79,7 +80,7 @@ def current_events(db: Database = Depends(get_database)) -> StreamingResponse:
 
 @router.get("/{smart_capture_id}")
 def get(smart_capture_id: str, db: Database = Depends(get_database)):
-    return smart_captures.get_smart_capture(db, smart_capture_id)
+    return {**smart_captures.get_smart_capture(db, smart_capture_id), "server_now": utc_now()}
 
 
 @router.get("/{smart_capture_id}/events")
@@ -93,14 +94,14 @@ def events(smart_capture_id: str, db: Database = Depends(get_database)) -> Strea
 
     def event_stream() -> Iterator[str]:
         try:
-            yield f"data: {json.dumps(initial_snapshot, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({**initial_snapshot, 'server_now': utc_now()}, ensure_ascii=False)}\n\n"
             while True:
                 try:
                     snapshot = subscriber.get(timeout=15)
                 except Empty:
                     yield ": heartbeat\n\n"
                     continue
-                yield f"data: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({**snapshot, 'server_now': utc_now()}, ensure_ascii=False)}\n\n"
         finally:
             smart_capture_event_broker.unsubscribe(smart_capture_id, subscriber)
 

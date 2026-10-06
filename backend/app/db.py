@@ -929,6 +929,15 @@ CREATE TABLE IF NOT EXISTS fj_job_recommendation_strategies (
 CREATE INDEX IF NOT EXISTS idx_fj_job_recommendation_strategies_updated_at
   ON fj_job_recommendation_strategies(updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS fj_boss_capture_pacing (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  list_min_seconds REAL NOT NULL DEFAULT 12 CHECK (list_min_seconds >= 12),
+  list_max_seconds REAL NOT NULL DEFAULT 22 CHECK (list_max_seconds >= list_min_seconds),
+  detail_min_seconds REAL NOT NULL DEFAULT 10 CHECK (detail_min_seconds >= 10),
+  detail_max_seconds REAL NOT NULL DEFAULT 25 CHECK (detail_max_seconds >= detail_min_seconds),
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS fj_boss_capture_batches (
   id TEXT PRIMARY KEY,
   smart_capture_id TEXT,
@@ -948,6 +957,9 @@ CREATE TABLE IF NOT EXISTS fj_boss_capture_batches (
   progress_current INTEGER NOT NULL DEFAULT 0,
   progress_total INTEGER NOT NULL DEFAULT 0,
   control_status TEXT NOT NULL DEFAULT 'active',
+  state_version INTEGER NOT NULL DEFAULT 1,
+  pacing_snapshot_json TEXT NOT NULL DEFAULT '{}',
+  progress_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   finished_at TEXT,
@@ -2629,6 +2641,9 @@ class Database:
         }
         migrations = {
             "smart_capture_id": "ALTER TABLE fj_boss_capture_batches ADD COLUMN smart_capture_id TEXT",
+            "state_version": "ALTER TABLE fj_boss_capture_batches ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1",
+            "pacing_snapshot_json": "ALTER TABLE fj_boss_capture_batches ADD COLUMN pacing_snapshot_json TEXT NOT NULL DEFAULT '{}'",
+            "progress_json": "ALTER TABLE fj_boss_capture_batches ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'",
             "capture_source": "ALTER TABLE fj_boss_capture_batches ADD COLUMN capture_source TEXT NOT NULL DEFAULT 'custom'",
             "stage": "ALTER TABLE fj_boss_capture_batches ADD COLUMN stage TEXT NOT NULL DEFAULT 'queued'",
             "message": "ALTER TABLE fj_boss_capture_batches ADD COLUMN message TEXT NOT NULL DEFAULT ''",

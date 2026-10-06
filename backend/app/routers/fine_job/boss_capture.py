@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
+from queue import Empty
+from fastapi.responses import StreamingResponse
+from backend.app.utils import utc_now
+from backend.app.schemas.fine_job.boss_capture import CapturePacing
+from backend.app.services.fine_job.capture_pacing import get_pacing, save_pacing
+from backend.app.services.fine_job.boss_capture_state import boss_capture_event_broker
 from backend.app.services.fine_job.collection_start_operations import collection_start
 from backend.app.services.fine_job.collection_readiness import ensure_ready
 from backend.app.services.fine_job.collection_starts import prepare_custom_phase
@@ -76,6 +82,44 @@ from backend.app.services.fine_job.collection_capacity import (
 
 
 router = APIRouter(prefix="/fine-job/boss-capture", tags=["fine-job-boss-capture"])
+
+
+@router.get("/pacing", response_model=CapturePacing)
+def get_capture_pacing(db: Database = Depends(get_database)):
+    return get_pacing(db)
+
+
+@router.put("/pacing", response_model=CapturePacing)
+def put_capture_pacing(payload: CapturePacing, db: Database = Depends(get_database)):
+    return save_pacing(db, payload.model_dump())
+
+
+@router.get("/tasks/{task_id}/events")
+def capture_events(task_id: str, db: Database = Depends(get_database)):
+    subscriber = boss_capture_event_broker.subscribe(task_id)
+    try:
+        initial = boss_capture_task_manager.get_task(task_id, db=db)
+    except Exception:
+        boss_capture_event_broker.unsubscribe(task_id, subscriber)
+        raise
+
+    def stream():
+        try:
+            snapshot = initial
+            while True:
+                # 队列保存业务快照；发送首帧或重连帧时重新生成时间基准。
+                yield f"data: {json.dumps(BossCaptureTaskResponse(**{**snapshot, 'server_now': utc_now()}).model_dump(), ensure_ascii=False)}\n\n"
+                while True:
+                    try:
+                        snapshot = subscriber.get(timeout=15)
+                        break
+                    except Empty:
+                        yield ": heartbeat\n\n"
+        finally:
+            boss_capture_event_broker.unsubscribe(task_id, subscriber)
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 def _candidate_evaluation_context(
@@ -321,36 +365,7 @@ def capture_history_job_details(
 
 @router.get("/tasks/{task_id}", response_model=BossCaptureTaskResponse)
 def get_boss_capture_task(task_id: str, db: Database = Depends(get_database)) -> BossCaptureTaskResponse:
-    try:
-        return BossCaptureTaskResponse(**boss_capture_task_manager.get_task(task_id))
-    except AppError as exc:
-        if exc.status_code != 404:
-            raise
-    # 进程内执行器丢失后，仍可按真实引用读取持久化结果。
-    with db.connect() as connection:
-        batch = connection.execute("SELECT * FROM fj_boss_capture_batches WHERE id = ?", (task_id,)).fetchone()
-        receipt = connection.execute("SELECT * FROM fj_collection_start_operations WHERE result_task_id = ? OR result_phase_ref = ? ORDER BY updated_at DESC LIMIT 1", (task_id, task_id)).fetchone()
-        jobs = connection.execute("SELECT snapshot_json FROM fj_boss_capture_batch_jobs WHERE capture_id = ? ORDER BY collected_at", (task_id,)).fetchall()
-    if batch is None and receipt is None:
-        raise AppError(404, "CAPTURE_TASK_NOT_FOUND", "采集任务不存在。")
-    result = dict(batch) if batch else json.loads(receipt["result_summary_json"])
-    result.setdefault("id", task_id)
-    result.setdefault("status", "failed")
-    result.setdefault("stage", "interrupted")
-    result.setdefault("message", "采集执行已中断，已保存结果可继续查看。")
-    result.setdefault("keyword", "")
-    result.setdefault("city", "")
-    result.setdefault("pages", 0)
-    result.setdefault("auto_details", False)
-    result.setdefault("created_at", receipt["created_at"] if receipt else "")
-    result.setdefault("updated_at", receipt["updated_at"] if receipt else "")
-    result["jobs"] = [json.loads(job["snapshot_json"]) for job in jobs]
-    if not batch and receipt and receipt["action"] == "custom.history_details" and receipt["owner_id"]:
-        job = get_capture_history_job(db, receipt["owner_id"])
-        result["jobs"] = [{**job, "history_record_id": job["id"]}]
-    if result["status"] in {"queued", "running"}:
-        result.update(status="failed", stage="interrupted", message="采集执行进程已退出，已保存结果可继续查看。")
-    return BossCaptureTaskResponse(**result)
+    return BossCaptureTaskResponse(**boss_capture_task_manager.get_task(task_id, db=db))
 
 
 @router.post(

@@ -29,6 +29,11 @@ from backend.app.services.fine_job.filter_exclusions import (
 from backend.app.services.fine_job.job_evaluation import evaluate_filter_strategy
 from backend.app.services.fine_job.strategies import get_filter_strategy
 from backend.app.utils import new_id, utc_now
+from backend.app.services.fine_job.capture_pacing import default_pacing
+from backend.app.services.fine_job.capture_runtime import ACTIVITY_FIELDS
+from backend.app.services.fine_job.boss_capture_state import (
+    QUALITY_FIELDS, boss_capture_event_broker, clear_activity, persist_task, public_task, recover_task,
+)
 
 
 DETAIL_SECONDS_MIN = 25
@@ -53,17 +58,17 @@ class BossCaptureTaskManager:
     def _notify_task_updated(self, task_id: str) -> None:
         with self._lock:
             task = self._require_task(task_id)
-            snapshot = {
-                key: value for key, value in deepcopy(task).items() if not key.startswith("_")
-            }
+            if task.get("status") not in {"queued", "running"} or task.get("stop_requested"):
+                clear_activity(task)
+            changed, snapshot = persist_task(task)
+            if not changed:
+                return
+            boss_capture_event_broker.publish(task_id, deepcopy(snapshot))
             # 监听器需要用任务所属数据库同步 Smart Capture，公开轮询快照不携带该内部引用。
             snapshot["_db"] = task.get("_db")
             snapshot["_output_dir"] = task.get("_output_dir")
+            snapshot["_runtime_state"] = deepcopy(task.get("_runtime_state") or {})
             listeners = list(self._listeners)
-        db = task.get("_db")
-        if isinstance(db, Database):
-            from backend.app.services.fine_job.collection_start_operations import record_task_summary
-            record_task_summary(db, snapshot)
         for listener in listeners:
             try:
                 listener(snapshot)
@@ -79,6 +84,7 @@ class BossCaptureTaskManager:
         db: Database | None = None,
     ) -> dict[str, object]:
         task_id = new_id()
+        request = replace(request, window_id=task_id)
         now = utc_now()
         expected_jobs = request.pages * ESTIMATED_JOBS_PER_PAGE
         list_seconds = 8 + max(0, request.pages - 1) * 25
@@ -118,6 +124,11 @@ class BossCaptureTaskManager:
             "list_phase_baseline": 0,
             "list_phase_processed": 0,
             "list_phase_id": task_id,
+            "window_id": task_id,
+            "state_version": 1,
+            "capture_pacing": default_pacing(request.capture_pacing),
+            "_runtime_state": dict(request.runtime_state),
+            "_execution_id": new_id(),
             "stop_requested": False,
             "pause_requested": False,
             "capture_source": request.capture_source,
@@ -132,7 +143,7 @@ class BossCaptureTaskManager:
             "_capture_target_id": None,
         }
         if db is not None:
-            create_capture_batch(
+            pacing = create_capture_batch(
                 db,
                 capture_id=task_id,
                 keyword=request.keyword,
@@ -142,7 +153,11 @@ class BossCaptureTaskManager:
                 created_at=now,
                 smart_capture_id=request.smart_capture_id,
                 capture_source=request.capture_source,
+                capture_pacing=request.capture_pacing,
             )
+            task["capture_pacing"] = pacing
+        request = replace(request, capture_pacing=task["capture_pacing"], runtime_state=task["_runtime_state"])
+        task["_request"] = request
         with self._lock:
             self._tasks[task_id] = task
         self._notify_task_updated(task_id)
@@ -168,23 +183,35 @@ class BossCaptureTaskManager:
             request = task.get("_request")
             if not isinstance(request, BossCaptureRequest):
                 raise AppError(409, "CAPTURE_NOT_READY", "采集任务缺少原搜索条件。")
+            recovering = str(task.get("stage")) in {"list_interrupted", "list_paused"}
+            saved_window = dict((task.get("_list_data") or {}).get("_window") or {})
+            if recovering and not saved_window.get("position_confirmed"):
+                raise AppError(409, "CAPTURE_RESTART_REQUIRED", "分页位置无法确认，已保留结果，请重新开始。")
+            planned_pages = int(saved_window.get("planned_pages") or pages) if recovering else pages
+            phase_id = str(task.get("window_id") or task["list_phase_id"]) if recovering else new_id()
+            processed = int(task.get("succeeded_pages") or task.get("list_phase_processed") or 0) if recovering else 0
             task["_continue_request"] = replace(
                 request,
-                pages=pages,
+                pages=planned_pages,
                 include_details=False,
                 max_details=None,
                 prefer_current_page=True,
+                window_id=phase_id,
+                window_state=saved_window if recovering else {"next_page": saved_window.get("next_page"), "position_confirmed": saved_window.get("position_confirmed", False)},
+                runtime_state=task.get("_runtime_state") or {},
             )
             task.update(
-                list_phase_baseline=int(task.get("total_pages_loaded") or 0),
-                list_phase_id=new_id(),
-                list_phase_processed=0,
+                list_phase_baseline=int(task.get("list_phase_baseline") or 0) if recovering else int(task.get("total_pages_loaded") or 0),
+                list_phase_id=phase_id,
+                window_id=phase_id,
+                list_phase_processed=processed,
+                _execution_id=new_id(),
                 status="queued",
                 stage="list_continue_queued",
                 message=f"准备在原搜索页面继续下滑采集 {pages} 页。",
-                pages=pages,
-                progress_current=0,
-                progress_total=pages,
+                pages=planned_pages,
+                progress_current=processed,
+                progress_total=planned_pages,
                 estimated_seconds_min=max(8, pages * 12),
                 estimated_seconds_max=max(20, pages * 22),
                 finished_at=None,
@@ -250,7 +277,7 @@ class BossCaptureTaskManager:
                     if job.get("detail_status") == "completed"
                 }
                 paused_detail_ids = [job_id for job_id in paused_detail_ids if job_id not in completed_ids]
-        if stage == "list_paused":
+        if stage in {"list_paused", "list_interrupted"}:
             return self.continue_capture(task_id, pages=pages)
         if stage == "details_paused" and paused_detail_ids:
             return self.start_details(
@@ -347,6 +374,7 @@ class BossCaptureTaskManager:
             task.update(
                 status="queued",
                 stage="details_queued",
+                _execution_id=new_id(),
                 detail_phase_id=new_id(),
                 detail_phase_job_ids=selected_ids,
                 message=f"已选择 {len(selected_ids)} 个岗位，等待采集详情。",
@@ -384,6 +412,8 @@ class BossCaptureTaskManager:
         pipeline_unit_type: str | None = None,
         pipeline_unit_id: str | None = None,
         task_id: str | None = None,
+        capture_pacing: dict | None = None,
+        runtime_state: dict | None = None,
     ) -> dict[str, object]:
         """为历史岗位创建独立详情任务，不新增采集批次或岗位采集次数。"""
         task_id = task_id or new_id()
@@ -406,6 +436,10 @@ class BossCaptureTaskManager:
         }
         task: dict[str, object] = {
             "id": task_id,
+            "capture_pacing": default_pacing(capture_pacing),
+            "_runtime_state": dict(runtime_state or {}),
+            "state_version": 1,
+            "_execution_id": new_id(),
             "status": "queued",
             "capture_source": capture_source,
             "workflow_run_id": workflow_run_id,
@@ -465,10 +499,20 @@ class BossCaptureTaskManager:
             raise AppError(409, "CAPTURE_PAGE_NOT_REUSABLE", "原搜索页面身份已丢失，已有结果已保留。")
         return target_id
 
-    def get_task(self, task_id: str) -> dict[str, object]:
+    def get_task(self, task_id: str, *, db: Database | None = None) -> dict[str, object]:
         with self._lock:
-            task = deepcopy(self._require_task(task_id))
-        return {key: value for key, value in task.items() if not key.startswith("_")}
+            if task_id not in self._tasks and db is not None:
+                task = recover_task(db, task_id)
+                request = task.get("_request")
+                if isinstance(request, dict):
+                    if request.get("output_dir"):
+                        request["output_dir"] = Path(request["output_dir"])
+                    task["_request"] = BossCaptureRequest(**request)
+                    task["_output_dir"] = request.get("output_dir")
+                task["_execution_id"] = new_id()
+                self._tasks[task_id] = task
+            task = public_task(self._require_task(task_id))
+        return {**task, "server_now": utc_now()}
 
     def get_task_status(self, task_id: str) -> dict[str, object]:
         """返回采集任务的轻量状态，供 Workflow 状态查询使用。"""
@@ -602,6 +646,7 @@ class BossCaptureTaskManager:
     def _run_capture(self, task_id: str) -> None:
         with self._lock:
             task = self._require_task(task_id)
+            execution_id = task.get("_execution_id")
             request = task["_request"]
             output_dir = task["_output_dir"]
             task.update(
@@ -615,11 +660,13 @@ class BossCaptureTaskManager:
         try:
             result = self._scraper.capture_jobs(
                 request,
-                progress_callback=lambda event: self._handle_progress(task_id, event),
-                should_stop=lambda: self._capture_stop_requested(task_id),
+                progress_callback=lambda event: self._handle_progress(task_id, event, execution_id),
+                should_stop=lambda: self._capture_stop_requested(task_id, execution_id),
             )
             with self._lock:
                 task = self._require_task(task_id)
+                if task.get("_execution_id") != execution_id:
+                    return
                 task["_list_data"] = result.list_data
                 task["jobs_path"] = str(result.jobs_path)
                 task["details_path"] = str(result.details_path) if result.details_path else None
@@ -631,13 +678,15 @@ class BossCaptureTaskManager:
                     self._persist_list_jobs(task)
                 stopped = bool(result.list_data.get("stopped") or task.get("stop_requested"))
                 paused = stopped and bool(task.get("pause_requested"))
+                interrupted = result.list_data.get("capture_validity") in {"INVALID", "PARTIAL_INTERRUPTED"} and not stopped
+                self._apply_list_quality(task, result.list_data)
                 stopped_during_details = stopped and str(task.get("stage") or "").startswith("details")
                 has_more = bool(result.list_data.get("has_more", True))
                 continuation_available = bool(result.capture_target_id and has_more)
                 task.update(
-                    status="completed",
+                    status="failed" if interrupted else "completed",
                     stage=(
-                        "details_paused"
+                        "list_interrupted" if interrupted else "details_paused"
                         if paused and stopped_during_details
                         else "details_stopped" if stopped_during_details
                         else "list_paused" if paused
@@ -645,7 +694,8 @@ class BossCaptureTaskManager:
                         else "details_completed" if request.include_details else "list_completed"
                     ),
                     message=(
-                        f"采集已暂停，保留 {len(task['jobs'])} 个岗位和当前搜索页。"
+                        f"列表采集中断，已保留 {len(task['jobs'])} 个岗位：{task.get('validity_reason', '')}"
+                        if interrupted else f"采集已暂停，保留 {len(task['jobs'])} 个岗位和当前搜索页。"
                         if paused
                         else f"已停止采集，保留 {len(task['jobs'])} 个岗位。"
                         if stopped
@@ -657,9 +707,9 @@ class BossCaptureTaskManager:
                     progress_current=(
                         int(task["details_completed"]) + int(task["details_failed"])
                         if request.include_details
-                        else len(task["jobs"])
+                        else int(result.list_data.get("pages_loaded") or 0)
                     ),
-                    progress_total=len(task["jobs"]),
+                    progress_total=len(task["jobs"]) if request.include_details and not interrupted else request.pages,
                     estimated_seconds_min=0,
                     estimated_seconds_max=0,
                     current_job=None,
@@ -682,12 +732,14 @@ class BossCaptureTaskManager:
                     ]
                 self._sync_capture_batch(
                     task,
-                    status="completed",
+                    status=task["status"],
                     finished=True,
-                    control_status="paused" if paused else "stopped" if stopped else "active",
+                    control_status="interrupted" if interrupted else "paused" if paused else "stopped" if stopped else "active",
                 )
             self._notify_task_updated(task_id)
         except Exception as exc:  # noqa: BLE001 - 后台任务边界
+            if self._tasks.get(task_id, {}).get("_execution_id") != execution_id:
+                return
             with self._lock:
                 task = self._require_task(task_id)
                 detail_stage = str(task.get("stage") or "").startswith("details")
@@ -701,6 +753,7 @@ class BossCaptureTaskManager:
     def _run_continue_capture(self, task_id: str) -> None:
         with self._lock:
             task = self._require_task(task_id)
+            execution_id = task.get("_execution_id")
             request = task["_continue_request"]
             # 详情门禁会收窄内部列表；续采去重必须使用任务中保存的完整岗位集合。
             list_data = {
@@ -722,24 +775,31 @@ class BossCaptureTaskManager:
                 list_data=list_data,
                 jobs_path=jobs_path,
                 expected_target_id=target_id,
-                progress_callback=lambda event: self._handle_progress(task_id, event),
-                should_stop=lambda: self._capture_stop_requested(task_id),
+                progress_callback=lambda event: self._handle_progress(task_id, event, execution_id),
+                should_stop=lambda: self._capture_stop_requested(task_id, execution_id),
             )
             with self._lock:
                 task = self._require_task(task_id)
+                if task.get("_execution_id") != execution_id:
+                    return
                 task["_list_data"] = result.list_data
+                self._set_list_jobs(task, result.list_data.get("jobs") or task["jobs"])
+                self._persist_list_jobs(task)
+                self._apply_list_quality(task, result.list_data)
                 task["source_url"] = result.source_url
                 task["used_current_page"] = True
                 stopped = bool(result.list_data.get("stopped") or task.get("stop_requested"))
                 paused = stopped and bool(task.get("pause_requested"))
+                interrupted = result.list_data.get("capture_validity") in {"INVALID", "PARTIAL_INTERRUPTED"} and not stopped
                 added = int(result.list_data.get("new_jobs_count") or 0)
                 loaded = int(result.list_data.get("pages_loaded") or 0)
                 has_more = bool(result.list_data.get("has_more", True))
                 task.update(
-                    status="completed",
-                    stage="list_paused" if paused else "list_stopped" if stopped else "list_completed",
+                    status="failed" if interrupted else "completed",
+                    stage="list_interrupted" if interrupted else "list_paused" if paused else "list_stopped" if stopped else "list_completed",
                     message=(
-                        f"继续采集已暂停，本次新增 {added} 个，累计 {len(task['jobs'])} 个岗位。"
+                        f"列表采集中断，保留 {len(task['jobs'])} 个岗位：{task.get('validity_reason', '')}"
+                        if interrupted else f"继续采集已暂停，本次新增 {added} 个，累计 {len(task['jobs'])} 个岗位。"
                         if paused
                         else f"已停止继续采集，本次新增 {added} 个，累计 {len(task['jobs'])} 个岗位。"
                         if stopped
@@ -754,7 +814,7 @@ class BossCaptureTaskManager:
                     continuation_available=has_more,
                     has_more=has_more,
                     last_added_jobs=added,
-                    total_pages_loaded=int(task.get("total_pages_loaded") or 0) + loaded,
+                    total_pages_loaded=int(task.get("list_phase_baseline") or 0) + loaded,
                     list_phase_processed=loaded,
                     stop_requested=False,
                     updated_at=utc_now(),
@@ -762,17 +822,20 @@ class BossCaptureTaskManager:
                 )
                 self._sync_capture_batch(
                     task,
-                    status="completed",
+                    status=task["status"],
                     finished=True,
-                    control_status="paused" if paused else "stopped" if stopped else "active",
+                    control_status="interrupted" if interrupted else "paused" if paused else "stopped" if stopped else "active",
                 )
             self._notify_task_updated(task_id)
         except Exception as exc:  # noqa: BLE001 - 后台任务边界
+            if self._tasks.get(task_id, {}).get("_execution_id") != execution_id:
+                return
             self._mark_failed(task_id, exc)
 
     def _run_selected_details(self, task_id: str, job_ids: list[str]) -> None:
         with self._lock:
             task = self._require_task(task_id)
+            execution_id = task.get("_execution_id")
             # 详情采集使用任务内保存的完整岗位集合，自动门禁只影响自动采集候选。
             list_data = {
                 **(task.get("_list_data") or {}),
@@ -788,12 +851,19 @@ class BossCaptureTaskManager:
             )
         self._notify_task_updated(task_id)
         try:
-            progress_callback = lambda event: self._handle_progress(task_id, event)
+            from backend.app.services.fine_job.capture_runtime import CaptureRuntime
+            progress_callback = lambda event: self._handle_progress(task_id, event, execution_id)
+            runtime = CaptureRuntime(pacing=task.get("capture_pacing"), state=task.get("_runtime_state"),
+                                     callback=progress_callback, should_stop=lambda: self._capture_stop_requested(task_id, execution_id),
+                                     scope=str(task.get("pipeline_unit_type") or "formal_jd"),
+                                     scope_id=str(task.get("detail_phase_id") or task.get("pipeline_unit_id") or task_id))
             if task.get("_detail_mode") == "chat":
                 self._scraper.capture_chat_job_detail(
                     job=dict(task["jobs"][0]),
                     output_path=output_path,
                     progress_callback=progress_callback,
+                    runtime=runtime,
+                    should_stop=runtime.should_stop,
                 )
             else:
                 try:
@@ -802,10 +872,11 @@ class BossCaptureTaskManager:
                         job_ids=job_ids,
                         output_path=output_path,
                         progress_callback=progress_callback,
-                        should_stop=lambda: self._capture_stop_requested(task_id),
+                        should_stop=runtime.should_stop,
+                        runtime=runtime,
                     )
                 except TypeError as exc:
-                    if "should_stop" not in str(exc):
+                    if "should_stop" not in str(exc) and "runtime" not in str(exc):
                         raise
                     # 兼容未实现停止回调的采集器替身，详情结果仍按同一流程落库。
                     self._scraper.capture_selected_details(
@@ -816,6 +887,8 @@ class BossCaptureTaskManager:
                     )
             with self._lock:
                 task = self._require_task(task_id)
+                if task.get("_execution_id") != execution_id:
+                    return
                 selected_jobs = [
                     job for job in task["jobs"] if str(job.get("job_id") or "") in job_ids
                 ]
@@ -844,14 +917,33 @@ class BossCaptureTaskManager:
                 self._sync_capture_batch(task, status="completed", finished=True)
             self._notify_task_updated(task_id)
         except Exception as exc:  # noqa: BLE001 - 后台任务边界
+            if self._tasks.get(task_id, {}).get("_execution_id") != execution_id:
+                return
             if self._capture_stop_requested(task_id):
                 self._mark_details_stopped(task_id, job_ids, output_path)
             else:
                 self._mark_failed(task_id, exc)
 
-    def _handle_progress(self, task_id: str, event: dict[str, object]) -> None:
+    def _handle_progress(self, task_id: str, event: dict[str, object], execution_id=None) -> None:
         with self._lock:
             task = self._require_task(task_id)
+            if execution_id is not None and task.get("_execution_id") != execution_id:
+                return
+            if task.get("status") not in {"queued", "running"} and execution_id is not None:
+                return
+            if "_runtime_state" in event:
+                task["_runtime_state"] = deepcopy(event["_runtime_state"])
+            if event.get("_activity_only"):
+                # 活动只更新展示与内部等待信息，计数和业务阶段保持原值。
+                if not task.get("stop_requested"):
+                    task.update({key: event.get(key) for key in ACTIVITY_FIELDS})
+                    task["scope_id"] = event.get("scope_id")
+                task["updated_at"] = utc_now()
+                self._notify_task_updated(task_id)
+                return
+            if "_window" in event:
+                task["_list_data"] = {**(task.get("_list_data") or {}), "_window": deepcopy(event["_window"])}
+            self._apply_list_quality(task, event)
             stage = str(event.get("stage") or task["stage"])
             task["stage"] = stage
             task["message"] = str(event.get("message") or task["message"])
@@ -865,8 +957,9 @@ class BossCaptureTaskManager:
                         [job for job in jobs if isinstance(job, dict)],
                     )
                     self._persist_list_jobs(task)
-                task["list_phase_processed"] = int(event.get("current") or 0)
-                task["progress_current"] = int(event.get("current") or 0)
+                task["list_phase_processed"] = int(event.get("current", task.get("list_phase_processed", 0)))
+                task["progress_current"] = task["list_phase_processed"]
+                task["total_pages_loaded"] = int(task.get("list_phase_baseline") or 0) + task["list_phase_processed"]
                 task["progress_total"] = int(event.get("total") or task["pages"])
                 task["jobs_collected"] = len(task["jobs"])
                 self._sync_capture_batch(task, status="running")
@@ -875,7 +968,7 @@ class BossCaptureTaskManager:
             if stage == "list_completed":
                 jobs = event.get("jobs") or []
                 self._set_list_jobs(task, jobs)
-                task["_list_data"] = {
+                task["_list_data"] = {**(task.get("_list_data") or {}),
                     "keyword": task["keyword"],
                     "city": task["city"],
                     "jobs": jobs,
@@ -885,8 +978,8 @@ class BossCaptureTaskManager:
                 task["jobs_collected"] = len(task["jobs"])
                 self._persist_list_jobs(task)
                 self._apply_capture_gate(task, jobs)
-                task["progress_current"] = 0 if task["auto_details"] else len(task["jobs"])
-                task["progress_total"] = len(task["jobs"])
+                task["progress_current"] = 0 if task["auto_details"] else int(event.get("current", task.get("list_phase_processed", 0)))
+                task["progress_total"] = len(task["jobs"]) if task["auto_details"] else task["pages"]
                 if task["auto_details"]:
                     task["detail_phase_id"] = new_id()
                     task["detail_phase_job_ids"] = [str(job["job_id"]) for job in jobs if job.get("job_id")]
@@ -913,6 +1006,11 @@ class BossCaptureTaskManager:
             job = self._find_job(task, str(event.get("job_id") or ""))
             status = str(event.get("status") or "collecting")
             if job:
+                if status in {"completed", "failed"} and job.get("detail_status") == status and (
+                    (status == "completed" and job.get("detail") == event.get("detail"))
+                    or (status == "failed" and job.get("detail_error") == str(event.get("error") or "详情采集失败"))
+                ):
+                    return
                 job["detail_status"] = status
                 if status == "completed":
                     detail = event.get("detail")
@@ -1046,6 +1144,12 @@ class BossCaptureTaskManager:
         ]
 
     @staticmethod
+    def _apply_list_quality(task, result):
+        for key in QUALITY_FIELDS:
+            if key in result:
+                task[key] = result[key]
+
+    @staticmethod
     def _sync_capture_batch(
         task: dict[str, object],
         *,
@@ -1056,22 +1160,8 @@ class BossCaptureTaskManager:
         db = task.get("_db")
         if not isinstance(db, Database):
             return
-        update_capture_batch(
-            db,
-            capture_id=str(task.get("_capture_id") or task["id"]),
-            status=status,
-            source_url=str(task.get("source_url") or "") or None,
-            jobs_collected=int(task.get("jobs_collected") or 0),
-            details_completed=int(task.get("details_completed") or 0),
-            details_failed=int(task.get("details_failed") or 0),
-            finished_at=str(task.get("finished_at") or "") or (utc_now() if finished else None),
-            stage=str(task.get("stage") or ""),
-            message=str(task.get("message") or ""),
-            error_message=str(task.get("error_message") or "") or None,
-            progress_current=int(task.get("progress_current") or 0),
-            progress_total=int(task.get("progress_total") or 0),
-            control_status=control_status,
-        )
+        if control_status:
+            task["_control_status"] = control_status
         if (
             str(task.get("capture_source") or "custom") == "custom"
             and (
@@ -1121,10 +1211,10 @@ class BossCaptureTaskManager:
             )
         task["jobs"] = normalized
 
-    def _capture_stop_requested(self, task_id: str) -> bool:
+    def _capture_stop_requested(self, task_id: str, execution_id=None) -> bool:
         with self._lock:
             task = self._tasks.get(task_id)
-            return bool(task and task.get("stop_requested"))
+            return not task or bool(task.get("stop_requested")) or (execution_id is not None and task.get("_execution_id") != execution_id)
 
     def _mark_details_stopped(self, task_id: str, job_ids: list[str], output_path: Path) -> None:
         """详情采集在等待间隔内收到停止请求后，保留已完成部分并结束任务。"""
