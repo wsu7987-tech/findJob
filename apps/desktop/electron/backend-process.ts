@@ -4,8 +4,10 @@ import path from "node:path";
 
 export interface BackendProcessOptions {
   debugLog: (message: string) => void;
+  appDataDir: string;
   workspaceRoot: string;
   backendOrigin: string;
+  backendExecutable?: string;
 }
 
 export const createBackendProcessController = (options: BackendProcessOptions) => {
@@ -49,24 +51,38 @@ export const createBackendProcessController = (options: BackendProcessOptions) =
         options.debugLog("backend already ready");
         return;
       }
-      if (!fs.existsSync(pythonPath)) {
-        throw new Error(`项目 Python 不存在：${pythonPath}`);
+      const executable = options.backendExecutable ?? pythonPath;
+      if (!fs.existsSync(executable)) {
+        throw new Error(`FineJob 后端启动文件不存在：${executable}`);
       }
+      const packaged = Boolean(options.backendExecutable);
+      const args = packaged
+        ? [
+            "--host",
+            "127.0.0.1",
+            "--port",
+            new URL(options.backendOrigin).port || "8000"
+          ]
+        : [
+            "-m",
+            "uvicorn",
+            "backend.app.main:create_app",
+            "--factory",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            new URL(options.backendOrigin).port || "8000"
+          ];
       const spawned = spawn(
-        pythonPath,
-        [
-          "-m",
-          "uvicorn",
-          "backend.app.main:create_app",
-          "--factory",
-          "--host",
-          "127.0.0.1",
-          "--port",
-          new URL(options.backendOrigin).port || "8000"
-        ],
+        executable,
+        args,
         {
-          cwd: options.workspaceRoot,
-          env: process.env,
+          cwd: packaged ? path.dirname(executable) : options.workspaceRoot,
+          env: {
+            ...process.env,
+            KNOWLEDGE_CURATOR_APP_DATA_DIR: options.appDataDir,
+            KNOWLEDGE_CURATOR_BACKEND_PORT: new URL(options.backendOrigin).port || "8000"
+          },
           detached: true,
           windowsHide: true,
           stdio: "ignore"

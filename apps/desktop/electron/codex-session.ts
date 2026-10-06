@@ -62,6 +62,10 @@ export interface CodexSessionOptions {
   workspaceRoot: string;
   backendOrigin: string;
   pythonPath: string;
+  mcpCommand?: string;
+  mcpArgs?: string[];
+  mcpCwd?: string;
+  codexResourcesRoot?: string;
   getCodexPath: () => Promise<string>;
   createRuntime: () => Promise<{ run_id: string; token: string; expires_at: string }>;
   completeRuntime: (
@@ -172,19 +176,20 @@ const writeWindowsUtf8Launcher = (workspace: string, launch: ReturnType<typeof r
 };
 
 export const writeManagedWorkspace = (
-  options: Pick<CodexSessionOptions, "appDataDir" | "workspaceRoot" | "pythonPath">
+  options: Pick<
+    CodexSessionOptions,
+    "appDataDir" | "workspaceRoot" | "pythonPath" | "mcpCommand" | "mcpArgs" | "mcpCwd" | "codexResourcesRoot"
+  >
 ) => {
   const tuiWorkspace = path.resolve(options.appDataDir, "codex-workspace");
   const configDir = path.resolve(tuiWorkspace, ".codex");
   const managedSkillsDir = path.resolve(tuiWorkspace, ".agents", "skills");
-  const skillResourcesDir = path.resolve(
-    options.workspaceRoot,
-    "apps",
-    "desktop",
-    "resources",
-    "codex",
-    "skills"
-  );
+  const skillResourcesDir = options.codexResourcesRoot
+    ? path.resolve(options.codexResourcesRoot, "skills")
+    : path.resolve(options.workspaceRoot, "apps", "desktop", "resources", "codex", "skills");
+  const mcpCommand = options.mcpCommand ?? options.pythonPath;
+  const mcpArgs = options.mcpArgs ?? ["-m", "backend.app.mcp.fine_job_server"];
+  const mcpCwd = options.mcpCwd ?? options.workspaceRoot;
   fs.mkdirSync(configDir, { recursive: true });
   fs.mkdirSync(managedSkillsDir, { recursive: true });
   for (const skillName of MANAGED_SKILLS) {
@@ -199,9 +204,9 @@ export const writeManagedWorkspace = (
   }
   const config = [
     "[mcp_servers.finejob]",
-    `command = ${JSON.stringify(options.pythonPath)}`,
-    `args = ["-m", "backend.app.mcp.fine_job_server"]`,
-    `cwd = ${JSON.stringify(options.workspaceRoot)}`,
+    `command = ${JSON.stringify(mcpCommand)}`,
+    `args = ${JSON.stringify(mcpArgs)}`,
+    `cwd = ${JSON.stringify(mcpCwd)}`,
     `env_vars = ["FINE_JOB_BACKEND_ORIGIN", "FINE_JOB_MCP_RUN_TOKEN"]`,
     ""
   ].join("\n");

@@ -9,6 +9,10 @@ export interface ExternalCodexIntegrationOptions {
   homeDir: string;
   pythonPath: string;
   workspaceRoot: string;
+  mcpCommand?: string;
+  mcpArgs?: string[];
+  mcpCwd?: string;
+  codexResourcesRoot?: string;
 }
 
 export interface ExternalCodexIntegrationStatus {
@@ -49,14 +53,18 @@ export const createExternalCodexIntegration = (options: ExternalCodexIntegration
     integrationRoot,
     process.platform === "win32" ? "finejob-mcp.cmd" : "finejob-mcp"
   );
-  const skillSourceRoot = path.resolve(
-    options.workspaceRoot,
-    "apps",
-    "desktop",
-    "resources",
-    "codex",
-    "skills"
-  );
+  const skillSourceRoot = options.codexResourcesRoot
+    ? path.resolve(options.codexResourcesRoot, "skills")
+    : path.resolve(options.workspaceRoot, "apps", "desktop", "resources", "codex", "skills");
+  const mcpCommand = options.mcpCommand ?? options.pythonPath;
+  const mcpArgs = options.mcpArgs ?? ["-m", "backend.app.mcp.fine_job_server"];
+  const mcpCwd = options.mcpCwd ?? options.workspaceRoot;
+  const mcpCommandLine = [mcpCommand, ...mcpArgs]
+    .map((value) => quoteBatchValue(value))
+    .join(" ");
+  const mcpShellCommandLine = [mcpCommand, ...mcpArgs]
+    .map((value) => quoteShellValue(value))
+    .join(" ");
 
   const status = (): ExternalCodexIntegrationStatus => ({
     mcp: {
@@ -83,10 +91,10 @@ export const createExternalCodexIntegration = (options: ExternalCodexIntegration
         [
           "@echo off",
           "setlocal",
-          `cd /d ${quoteBatchValue(options.workspaceRoot)}`,
+          `cd /d ${quoteBatchValue(mcpCwd)}`,
           `set \"FINE_JOB_BACKEND_ORIGIN=${options.backendOrigin}\"`,
           'set "FINE_JOB_MCP_LOCAL_EXTERNAL=1"',
-          `${quoteBatchValue(options.pythonPath)} -m backend.app.mcp.fine_job_server`,
+          mcpCommandLine,
           ""
         ].join("\r\n"),
         "utf8"
@@ -97,10 +105,10 @@ export const createExternalCodexIntegration = (options: ExternalCodexIntegration
       launcherPath,
       [
         "#!/usr/bin/env sh",
-        `cd ${quoteShellValue(options.workspaceRoot)}`,
+        `cd ${quoteShellValue(mcpCwd)}`,
         `export FINE_JOB_BACKEND_ORIGIN=${quoteShellValue(options.backendOrigin)}`,
         "export FINE_JOB_MCP_LOCAL_EXTERNAL=1",
-        `exec ${quoteShellValue(options.pythonPath)} -m backend.app.mcp.fine_job_server`,
+        `exec ${mcpShellCommandLine}`,
         ""
       ].join("\n"),
       "utf8"

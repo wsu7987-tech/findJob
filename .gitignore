@@ -12,7 +12,9 @@ node_modules/
 !.env.example
 
 # 构建产物
+/build/
 dist/
+/dist/portable/
 coverage/
 htmlcov/
 .coverage

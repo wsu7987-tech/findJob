@@ -44,7 +44,8 @@ const getRendererUrl = () =>
 
 const getPreloadPath = () => path.resolve(getAppRoot(), "dist-electron/preload.cjs");
 const workspaceRoot =
-  process.env.FINE_JOB_WORKSPACE_ROOT ?? path.resolve(getAppRoot(), "../..");
+  process.env.FINE_JOB_WORKSPACE_ROOT ??
+  (app.isPackaged ? process.resourcesPath : path.resolve(getAppRoot(), "../.."));
 const backendOrigin =
   process.env.KNOWLEDGE_CURATOR_API_ORIGIN ?? "http://127.0.0.1:8000";
 const appDataDir =
@@ -56,6 +57,24 @@ const pythonPath =
     ".venv",
     process.platform === "win32" ? "Scripts/python.exe" : "bin/python"
   );
+const packagedBackendExecutable = path.resolve(
+  process.resourcesPath,
+  "backend",
+  process.platform === "win32" ? "FineJob-Backend.exe" : "FineJob-Backend"
+);
+const backendExecutable = process.env.FINE_JOB_BACKEND_EXECUTABLE ??
+  (app.isPackaged ? packagedBackendExecutable : undefined);
+const mcpCommand = process.env.FINE_JOB_MCP_COMMAND ??
+  (app.isPackaged ? packagedBackendExecutable : pythonPath);
+const mcpArgs = process.env.FINE_JOB_MCP_COMMAND
+  ? []
+  : app.isPackaged
+    ? ["--mcp"]
+    : ["-m", "backend.app.mcp.fine_job_server"];
+const mcpCwd = process.env.FINE_JOB_MCP_CWD ??
+  (app.isPackaged ? process.resourcesPath : workspaceRoot);
+const codexResourcesRoot = process.env.FINE_JOB_CODEX_RESOURCES_ROOT ??
+  (app.isPackaged ? path.resolve(process.resourcesPath, "codex") : undefined);
 
 let shellConfig = loadShellConfig();
 
@@ -96,8 +115,10 @@ const trayController = createTrayController({
 
 const backendController = createBackendProcessController({
   debugLog,
+  appDataDir,
   workspaceRoot,
-  backendOrigin
+  backendOrigin,
+  backendExecutable
 });
 
 const codexSessionController = createCodexSessionController({
@@ -105,6 +126,10 @@ const codexSessionController = createCodexSessionController({
   workspaceRoot,
   backendOrigin,
   pythonPath,
+  mcpCommand,
+  mcpArgs,
+  mcpCwd,
+  codexResourcesRoot,
   getCodexPath: () => backendController.getCodexPath(),
   createRuntime: () => backendController.createCodexRuntime(),
   completeRuntime: (runId, token, status, reason) =>
@@ -121,7 +146,11 @@ const externalCodexIntegration = createExternalCodexIntegration({
   backendOrigin,
   homeDir: app.getPath("home"),
   pythonPath,
-  workspaceRoot
+  workspaceRoot,
+  mcpCommand,
+  mcpArgs,
+  mcpCwd,
+  codexResourcesRoot
 });
 
 const reloadShellConfig = () => {

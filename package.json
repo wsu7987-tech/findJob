@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "pnpm --filter fine-job-desktop dev",
     "build": "pnpm --filter fine-job-desktop build",
+    "package:portable": "powershell -ExecutionPolicy Bypass -File ./scripts/package-portable.ps1",
     "test": "pnpm --filter fine-job-desktop test",
     "test:run": "pnpm --filter fine-job-desktop test:run"
   }
