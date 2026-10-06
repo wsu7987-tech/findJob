@@ -551,24 +551,23 @@ def attach_page_session(cdp, target_id):
 # 识别为异常环境（code 37）。改为导航真实搜索页 + 滚动加载，仅旁听页面
 # 自己发出的 /wapi/zpgeek/search/joblist.json 响应，全程零注入请求。
 # ============================================================
-class CaptureStopRequested(Exception):
-    """用户请求停止当前列表采集。"""
+from backend.app.services.fine_job.capture_runtime import CaptureStopRequested, CaptureRuntime, interruptible_wait
 
 
 def _countdown_wait(seconds, label, should_stop=None):
     """按秒输出等待倒计时，并在等待期间检查停止请求。"""
-    deadline = time.time() + max(0.0, float(seconds))
+    deadline = time.monotonic() + max(0.0, float(seconds))
     last_remaining = None
     while True:
         if should_stop and should_stop():
             raise CaptureStopRequested()
-        remaining = max(0, math.ceil(deadline - time.time()))
+        remaining = max(0, math.ceil(deadline - time.monotonic()))
         if remaining != last_remaining:
             print(f"{label}：{remaining}秒", flush=True)
             last_remaining = remaining
         if remaining <= 0:
             return
-        time.sleep(min(0.25, max(0.0, deadline - time.time())))
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
 
 
 class NetworkJoblistCapture:
@@ -1994,160 +1993,53 @@ def build_detail_record(job, extracted):
 
 def scrape_details(list_data, max_details=None, output_path=None,
                    cdp_port=DEFAULT_CDP_PORT, fmt="json",
-                   progress_callback=None, should_stop=None):
-    jobs = list_data.get("jobs", [])
+                   progress_callback=None, should_stop=None, runtime=None):
+    from backend.app.services.fine_job.boss_scraper.boss_job_detail import fetch_job_detail
+    runtime = runtime or CaptureRuntime(callback=progress_callback, should_stop=should_stop, scope="formal_jd")
+    jobs = list(list_data.get("jobs") or [])
     if max_details:
         jobs = jobs[:max_details]
-    if not output_path:
-        output_path = default_output_path("details")
-
-    print(f"\n=== 抓取岗位详情 ({len(jobs)} 个) ===\n")
+    output_path = output_path or default_output_path("details")
     results = []
     seen_links = set()
+    try:
+        for index, job in enumerate(jobs, 1):
+            runtime.wait(0)
+            link = job.get("job_link")
+            if not link or link in seen_links:
+                continue
+            seen_links.add(link)
+            if job.get("detail_status") == "completed" and isinstance(job.get("detail"), dict) and job["detail"].get("jd"):
+                results.append(dict(job["detail"]))
+                continue
 
-    for idx, job in enumerate(jobs):
-        if should_stop and should_stop():
-            raise CaptureStopRequested()
-        link = job.get("job_link", "")
-        title = job.get("title", "")
-        company = job.get("boss_name", "")
-        if not link:
-            continue
+            def on_progress(event):
+                if progress_callback:
+                    if event.get("_activity_only"):
+                        progress_callback(event)
+                    else:
+                        progress_callback({**event, "current": index, "total": len(jobs)})
 
-        # 按 link 去重
-        if link in seen_links:
-            print(f"[{idx+1}/{len(jobs)}] 跳过重复: {company} - {title}")
-            continue
-        seen_links.add(link)
-
-        t0 = time.time()
-        print(f"[{idx+1}/{len(jobs)}] {company} - {title}")
-        if progress_callback:
-            progress_callback({
-                "stage": "details_collecting",
-                "status": "collecting",
-                "current": idx + 1,
-                "total": len(jobs),
-                "job_id": job.get("job_id", ""),
-                "title": title,
-                "company": company,
-                "message": f"正在采集详情：{idx + 1}/{len(jobs)}，{title} / {company}",
-            })
-
-        incr_request()
-
-        # 每个详情页用新 session 避免检测；自动化 target 默认后台创建。
-        ws = CDPSession(cdp_port)
-        tid, sid = create_page_session(ws)
-
-        detail_url = build_detail_url(job)
-        ws.send("Page.navigate", {"url": detail_url}, sid)
-        print(f"  加载页面...")
-        _countdown_wait(random.uniform(5, 10), "详情采集页面等待", should_stop=should_stop)
-
-        # 模拟人类阅读详情页的滚动行为
-        scroll_count = random.randint(3, 7)
-        print(f"  模拟滚动 ({scroll_count} 次)...")
-        for i in range(scroll_count):
-            if random.random() < 0.12:
-                # 偶尔往上回滚（回看内容）
-                delta = -random.randint(80, 200)
-            else:
-                delta = random.randint(200, 600)
-            ws.eval_js(f"window.scrollBy(0,{delta})", sid)
-            # 有时快滚，有时停下来"阅读"
-            if random.random() < 0.35:
-                _countdown_wait(random.uniform(2.0, 5.0), "详情采集滚动等待", should_stop=should_stop)
-            else:
-                _countdown_wait(random.uniform(0.8, 1.8), "详情采集滚动等待", should_stop=should_stop)
-
-        # 偶尔模拟鼠标移动
-        if random.random() < 0.5:
-            ws.send("Input.dispatchMouseEvent", {
-                "type": "mouseMoved",
-                "x": random.randint(200, 800),
-                "y": random.randint(200, 600)
-            }, sid)
-            _countdown_wait(random.uniform(0.5, 1.5), "详情采集操作等待", should_stop=should_stop)
-
-        print(f"  提取 JD...")
-        val = ws.eval_js(EXTRACT_DETAIL_JS, sid)
-        try:
-            d = json.loads(val) if isinstance(val, str) else {"jd": "", "tags": []}
-        except (json.JSONDecodeError, ValueError, TypeError):
-            d = {"jd": "", "tags": []}
-
-        try:
-            fields = extract_detail_fields(d)
-            d["jd"] = fields["jd"]
-            d["boss_active_status"] = resolve_boss_active_status(
-                list_status=job.get("boss_active_status", ""),
-                detail_status=fields["boss_active_status"],
-            )
-        except DetailLoginRequiredError as exc:
-            ws.send("Target.closeTarget", {"targetId": tid})
-            ws.close()
-            raise RuntimeError(
-                "BOSS detail login expired; stopped before writing truncated JD data"
-            ) from exc
-        except DetailExtractionError as exc:
-            print(f"  跳过无效详情页: {exc}")
-            if progress_callback:
-                progress_callback({
-                    "stage": "details_collecting",
-                    "status": "failed",
-                    "current": idx + 1,
-                    "total": len(jobs),
-                    "job_id": job.get("job_id", ""),
-                    "title": title,
-                    "company": company,
-                    "error": str(exc),
-                    "message": f"岗位详情采集失败：{title} / {company}",
-                })
-            ws.send("Target.closeTarget", {"targetId": tid})
-            ws.close()
-            continue
-
-        detail = build_detail_record(job, d)
-        results.append(detail)
-        if progress_callback:
-            progress_callback({
-                "stage": "details_collecting",
-                "status": "completed",
-                "current": idx + 1,
-                "total": len(jobs),
-                "job_id": job.get("job_id", ""),
-                "title": title,
-                "company": company,
-                "detail": detail,
-                "message": f"岗位详情采集完成：{idx + 1}/{len(jobs)}，{title} / {company}",
-            })
-
-        if d.get("tags"):
-            print(f"  技能: {', '.join(d['tags'])}")
-        if d.get("boss_active_status"):
-            print(f"  活跃: {d['boss_active_status']}")
-        print(f"  JD: {len(d.get('jd',''))} 字 ({time.time()-t0:.0f}s)")
-
-        # 每抓完一个详情就写入，异常退出也能保留
-        if output_path:
-            _atomic_write_json(output_path, results)
-
-        ws.send("Target.closeTarget", {"targetId": tid})
-        ws.close()
-        # 详情页之间保留较长间隔；最后一个岗位完成后不再无意义等待。
-        if idx < len(jobs) - 1:
-            gap = random.uniform(10, 25)
-            print("  准备采集下一个岗位")
-            _countdown_wait(gap, "详情采集滚动等待", should_stop=should_stop)
-
-    # 最终保存（dirname 为空时回退到当前目录，与循环内/其它写文件处保持一致）
-    _atomic_write_json(output_path, results)
-    print(f"\n详情已保存: {output_path}")
-
+            previous_callback = runtime.callback
+            runtime.callback = on_progress
+            try:
+                incr_request()
+                detail = fetch_job_detail(job, cdp_port=cdp_port, runtime=runtime,
+                                          progress_callback=on_progress, should_stop=should_stop)
+                results.append(detail)
+            except DetailLoginRequiredError:
+                raise
+            except DetailExtractionError:
+                # 普通失败继续采集，下一项会等待已保存冷却的剩余时间。
+                continue
+            finally:
+                runtime.callback = previous_callback
+                _atomic_write_json(output_path, results)
+    finally:
+        runtime.activity()
+        _atomic_write_json(output_path, results)
     if fmt == "csv":
-        csv_path = output_path.rsplit(".", 1)[0] + ".csv"
-        write_detail_csv(csv_path, results)
+        write_detail_csv(output_path.rsplit(".", 1)[0] + ".csv", results)
     return results
 
 

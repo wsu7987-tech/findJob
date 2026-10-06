@@ -81,7 +81,7 @@ def _parse_job_fields(html: str) -> dict[str, str]:
 
 
 def _current_fields(cdp, sid):
-    """??? DOM ????????????????"""
+    """从当前 DOM 同时取得详情字段和页面错误信息。"""
     html = cdp.eval_js("document.documentElement.outerHTML", sid) or ""
     fields = _parse_job_fields(html)
     value = cdp.eval_js(engine.EXTRACT_DETAIL_JS, sid)
@@ -100,10 +100,10 @@ def _capture_detail_html(cdp, sid, url, *, runtime=None, timeout=20):
     from backend.app.services.fine_job.capture_runtime import CaptureRuntime, check_stop
     runtime = runtime or CaptureRuntime(scope="formal_jd")
     check_stop(runtime.should_stop)
-    runtime.activity("loading", "????????")
+    runtime.activity("loading", "等待详情正文就绪")
     cdp.send("Page.navigate", {"url": url}, sid)
     deadline = time.monotonic() + timeout
-    last_error = "????????"
+    last_error = "详情正文尚未就绪"
     while time.monotonic() < deadline:
         check_stop(runtime.should_stop)
         try:
@@ -114,13 +114,13 @@ def _capture_detail_html(cdp, sid, url, *, runtime=None, timeout=20):
         except (engine.DetailExtractionError, ValueError, TypeError) as exc:
             last_error = str(exc)
         runtime.wait(min(0.25, max(0, deadline - time.monotonic())))
-    raise engine.DetailExtractionError(f"?????????{last_error}")
+    raise engine.DetailExtractionError(f"详情正文等待超时：{last_error}")
 
 
 def _wait_and_scroll(cdp, sid, *, runtime=None):
     from backend.app.services.fine_job.capture_runtime import CaptureRuntime
     runtime = runtime or CaptureRuntime(scope="formal_jd")
-    runtime.activity("scrolling", "??????")
+    runtime.activity("scrolling", "阅读详情正文")
     for _ in range(random.randint(3, 7)):
         runtime.wait(0)
         delta = -random.randint(80, 200) if random.random() < 0.12 else random.randint(200, 600)
@@ -166,7 +166,7 @@ def fetch_job_detail(
         tid, sid = engine.create_page_session(cdp)
         response_url, _html = _capture_detail_html(cdp, sid, engine.build_detail_url(job), runtime=runtime)
         _wait_and_scroll(cdp, sid, runtime=runtime)
-        runtime.activity("collecting", "????????")
+        runtime.activity("collecting", "提取当前页面详情")
         _html, fields = _current_fields(cdp, sid)
         fields = {key: value or job.get(key, "") for key, value in fields.items()}
         if not fields["title"] or not fields["jd"]:
