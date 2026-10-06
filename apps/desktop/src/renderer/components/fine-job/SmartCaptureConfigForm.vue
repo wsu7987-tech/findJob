@@ -15,9 +15,13 @@ const props = withDefaults(defineProps<{
   recommendationStrategies: FineJobRecommendationStrategy[];
   codexModels?: Array<{ id: string; label?: string | null }>;
   codexModelLoadError?: string;
+  showAnalysisGuidance?: boolean;
+  showContextBudget?: boolean;
 }>(), {
   codexModels: () => [],
-  codexModelLoadError: ""
+  codexModelLoadError: "",
+  showAnalysisGuidance: true,
+  showContextBudget: true
 });
 
 const emit = defineEmits<{
@@ -157,7 +161,7 @@ defineExpose({ validation });
       <span>采集列表后，自动获取岗位详情</span>
     </div>
 
-    <el-form-item label="本 Run 临时分析指导（可选）">
+    <el-form-item v-if="showAnalysisGuidance" label="本 Run 临时分析指导（可选）">
       <el-input
         :model-value="modelValue.analysis_guidance"
         type="textarea"
@@ -166,7 +170,7 @@ defineExpose({ validation });
         @update:model-value="updateField('analysis_guidance', $event)"
       />
     </el-form-item>
-    <el-form-item label="本轮 Context 软预算（字符）">
+    <el-form-item v-if="showContextBudget" label="本轮 Context 软预算（字符）">
       <el-input-number
         :model-value="modelValue.context_soft_budget_characters"
         :min="1000"

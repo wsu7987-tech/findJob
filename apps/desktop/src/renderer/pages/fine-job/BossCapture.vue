@@ -1949,6 +1949,97 @@ function formatDuration(seconds: number) {
       <el-tab-pane label="智能采集" name="smart" />
       <el-tab-pane label="自定义采集" name="custom" />
     </el-tabs>
+    <!-- 智能采集配置置于对应 Tab 首位，用户先完成目标与策略配置，再查看任务结果。 -->
+    <section
+      v-if="activeCaptureConditionTab === 'smart'"
+      v-loading="formOptionsLoading || strategiesStore.loading"
+      class="capture-condition-tabs smart-capture-first"
+    >
+      <el-alert v-if="strategiesStore.error" :title="strategiesStore.error" type="error" :closable="false" />
+      <el-button v-if="strategiesStore.error" @click="strategiesStore.load()">刷新策略选项</el-button>
+      <section class="page-panel smart-capture-panel">
+        <div class="panel-title-row">
+          <div>
+            <p class="panel-eyebrow">Smart Capture</p>
+            <h2>智能采集</h2>
+          </div>
+          <span class="secondary-text">按岗位筛选策略准备搜索范围，再交给现有采集流程执行。</span>
+        </div>
+        <SmartCaptureConfigForm
+          v-model="smartExecutionConfig"
+          :filter-strategies="strategiesStore.filters"
+          :recommendation-strategies="strategiesStore.recommendations"
+          :codex-models="smartCodexModels"
+          :codex-model-load-error="smartCodexModelLoadError"
+          :show-analysis-guidance="false"
+          :show-context-budget="false"
+        />
+        <div class="capture-config-summary">
+          <span>搜索词 {{ smartSelectedKeywords.length }} 个</span>
+          <span>城市 {{ smartSelectedCities.length }} 个</span>
+          <span>目标 {{ smartCandidateTargetCount }} 个岗位</span>
+          <span v-if="smartWorkflowRunId">当前 Run <code>{{ smartWorkflowRunId }}</code></span>
+        </div>
+        <div class="platform-actions capture-submit">
+          <el-button
+            v-if="smartCaptureStartable"
+            type="primary"
+            :loading="smartCaptureControlLoading"
+            @click="startCurrentSmartCapture"
+          >
+            启动当前采集
+          </el-button>
+          <el-button
+            v-else
+            type="primary"
+            :loading="smartCaptureControlLoading"
+            :disabled="smartCaptureControlLoading || !smartCaptureCanStart"
+            @click="startSmartCapture"
+          >
+            开始智能采集
+          </el-button>
+          <el-button v-if="smartCaptureRunning" :loading="smartCaptureControlLoading" @click="pauseCurrentSmartCapture">
+            暂停采集
+          </el-button>
+          <el-button v-if="smartCaptureResumable" :disabled="Boolean(startState.intent)" type="success" :loading="smartCaptureControlLoading" @click="resumeCurrentSmartCapture">
+            继续采集
+          </el-button>
+          <el-button v-if="smartCaptureRetryable" :disabled="Boolean(startState.intent)" type="warning" :loading="smartCaptureControlLoading" @click="retryCurrentSmartCapture">
+            重试采集
+          </el-button>
+          <el-button
+            v-if="currentSmartCapture && !smartWorkflowTerminalStatuses.includes(currentSmartCapture.status)"
+            type="danger"
+            plain
+            :loading="smartCaptureControlLoading"
+            @click="stopCurrentSmartCapture"
+          >
+            停止采集
+          </el-button>
+        </div>
+        <el-alert
+          v-if="currentSmartCapture"
+          type="info"
+          :closable="false"
+          show-icon
+          :title="`岗位采集：${currentSmartCapture.status}`"
+          :description="currentSmartCapture.message"
+        />
+        <el-alert
+          v-if="hasEndedSmartWorkflowCodexSession"
+          title="原 Codex 会话不可恢复；下一批进入 waiting_codex 后可重新交给 Codex 分析。"
+          type="info"
+          :closable="false"
+          show-icon
+        />
+        <div v-if="currentSmartCapture" class="platform-actions">
+          <el-button v-if="smartWorkflowCodexEntry" type="primary" @click="openSmartWorkflowCodex(smartWorkflowCodexEntry.action)">{{ smartWorkflowCodexEntry.label }}</el-button>
+          <el-button v-if="canResubmitSmartWorkflowCodex" @click="resubmitSmartWorkflowCodex">再次提交</el-button>
+          <el-button v-if="canRetrySmartWorkflowCodex" type="warning" @click="retrySmartWorkflowCodex">重新交接</el-button>
+          <el-tag v-if="smartWorkflowHandoffStatus" type="info">{{ smartWorkflowHandoffStatus }}</el-tag>
+        </div>
+      </section>
+    </section>
     <section v-if="startState.intent || startState.submitting || startState.error" class="page-panel">
       <p>{{ startState.submitting ? startPhaseLabel : startState.intent ? "启动结果待确认" : startState.error }}</p>
       <p v-if="startState.intent && startState.error">{{ startState.error }}</p>
@@ -2271,171 +2362,9 @@ function formatDuration(seconds: number) {
       </div>
     </section>
 
-    <details v-if="activeCaptureConditionTab === 'smart'" class="page-panel smart-workflow-operations"><summary>历史 / Context 检查工具</summary>
-      <div class="panel-title-row">
-        <div><p class="panel-eyebrow">Workflow History</p><h2>历史 / Context 检查工具</h2></div>
-      </div>
-      <div class="smart-run-restore">
-        <el-input v-model="smartRunLookupId" clearable placeholder="输入历史 Workflow Run ID 查看 Context" @keyup.enter="restoreSmartWorkflowRun" />
-        <el-select v-model="smartContextChannel" class="smart-context-channel" @change="loadSelectedContextSnapshots">
-          <el-option label="搜索 Context" value="deep_job_search" />
-          <el-option label="分析 Shared Base" value="candidate_analysis" />
-        </el-select>
-        <el-button :loading="historicalRunLoading" @click="restoreSmartWorkflowRun">查看历史 Context</el-button>
-      </div>
-      <el-alert
-        v-if="inspectedHistoricalRun"
-        type="info"
-        :closable="false"
-        show-icon
-        :title="`历史 Run：${inspectedHistoricalRun.workflow_run_id}`"
-        :description="`状态：${inspectedHistoricalRun.status}；当前 Smart Capture 与关联父任务保持不变。`"
-      />
-      <el-collapse v-if="inspectedHistoricalRun" class="smart-context-inspector">
-        <el-collapse-item name="inspected-context-summary">
-          <template #title>历史 Run Context：{{ inspectedHistoricalRun.workflow_run_id }}</template>
-          <el-button :loading="inspectedContextLoading" @click="loadInspectedContextSnapshot(true)">刷新历史 Context</el-button>
-          <el-alert v-if="inspectedContextError" :title="inspectedContextError" type="error" :closable="false" />
-          <pre v-if="inspectedContextSnapshot">{{ JSON.stringify(inspectedContextSnapshot, null, 2) }}</pre>
-          <el-empty v-else-if="!inspectedContextLoading && !inspectedContextError" description="该历史 Run 当前通道没有 Context 快照。" :image-size="64" />
-        </el-collapse-item>
-      </el-collapse>
-    </details>
-
     <div class="capture-condition-tabs" v-loading="formOptionsLoading || strategiesStore.loading">
-      <el-alert v-if="strategiesStore.error" :title="strategiesStore.error" type="error" :closable="false" />
-      <el-button v-if="strategiesStore.error" @click="strategiesStore.load()">刷新策略选项</el-button>
-      <section v-if="activeCaptureConditionTab === 'smart'">
-        <section class="page-panel smart-capture-panel">
-          <div class="panel-title-row">
-            <div>
-              <p class="panel-eyebrow">Smart Capture</p>
-              <h2>智能采集</h2>
-            </div>
-            <span class="secondary-text">按岗位筛选策略准备搜索范围，再交给现有采集流程执行。</span>
-          </div>
-          <SmartCaptureConfigForm
-            v-model="smartExecutionConfig"
-            :filter-strategies="strategiesStore.filters"
-            :recommendation-strategies="strategiesStore.recommendations"
-            :codex-models="smartCodexModels"
-            :codex-model-load-error="smartCodexModelLoadError"
-          />
-          <div class="capture-config-summary">
-            <span>搜索词 {{ smartSelectedKeywords.length }} 个</span>
-            <span>城市 {{ smartSelectedCities.length }} 个</span>
-            <span>目标 {{ smartCandidateTargetCount }} 个岗位</span>
-            <span v-if="smartWorkflowRunId">当前 Run <code>{{ smartWorkflowRunId }}</code></span>
-          </div>
-          <div class="platform-actions capture-submit">
-            <el-button
-              v-if="smartCaptureStartable"
-              type="primary"
-              :loading="smartCaptureControlLoading"
-              @click="startCurrentSmartCapture"
-            >
-              启动当前采集
-            </el-button>
-            <el-button
-              v-else
-              type="primary"
-              :loading="smartCaptureControlLoading"
-              :disabled="smartCaptureControlLoading || !smartCaptureCanStart"
-              @click="startSmartCapture"
-            >
-              开始智能采集
-            </el-button>
-            <el-button v-if="smartCaptureRunning" :loading="smartCaptureControlLoading" @click="pauseCurrentSmartCapture">
-              暂停采集
-            </el-button>
-            <el-button v-if="smartCaptureResumable" :disabled="Boolean(startState.intent)" type="success" :loading="smartCaptureControlLoading" @click="resumeCurrentSmartCapture">
-              继续采集
-            </el-button>
-            <el-button v-if="smartCaptureRetryable" :disabled="Boolean(startState.intent)" type="warning" :loading="smartCaptureControlLoading" @click="retryCurrentSmartCapture">
-              重试采集
-            </el-button>
-            <el-button
-              v-if="currentSmartCapture && !smartWorkflowTerminalStatuses.includes(currentSmartCapture.status)"
-              type="danger"
-              plain
-              :loading="smartCaptureControlLoading"
-              @click="stopCurrentSmartCapture"
-            >
-              停止采集
-            </el-button>
-          </div>
-          <el-alert
-            v-if="currentSmartCapture"
-            type="info"
-            :closable="false"
-            show-icon
-            :title="`岗位采集：${currentSmartCapture.status}`"
-            :description="currentSmartCapture.message"
-          />
-          <el-alert
-            v-if="hasEndedSmartWorkflowCodexSession"
-            title="原 Codex 会话不可恢复；下一批进入 waiting_codex 后可重新交给 Codex 分析。"
-            type="info"
-            :closable="false"
-            show-icon
-          />
-          <div v-if="currentSmartCapture" class="platform-actions">
-            <el-button v-if="smartWorkflowCodexEntry" type="primary" @click="openSmartWorkflowCodex(smartWorkflowCodexEntry.action)">{{ smartWorkflowCodexEntry.label }}</el-button>
-            <el-button v-if="canResubmitSmartWorkflowCodex" @click="resubmitSmartWorkflowCodex">再次提交</el-button>
-            <el-button v-if="canRetrySmartWorkflowCodex" type="warning" @click="retrySmartWorkflowCodex">重新交接</el-button>
-            <el-tag v-if="smartWorkflowHandoffStatus" type="info">{{ smartWorkflowHandoffStatus }}</el-tag>
-          </div>
-          <div v-if="currentSmartCapture" class="smart-guidance-actions">
-            <h2>本次智能采集分析指导</h2>
-            <el-input v-model="smartAnalysisGuidance" type="textarea" :rows="2" placeholder="补充要求会保存并作用于后续批次" />
-            <el-button @click="saveSmartAnalysisGuidance">保存分析指导</el-button>
-          </div>
-          <section v-if="activeCaptureConditionTab === 'smart' && currentSmartCapture" v-loading="smartContextLoading" class="smart-context-inspector">
-            <el-alert v-if="smartContextError" :title="smartContextError" type="error" :closable="false" />
-            <div class="panel-title-row">
-              <div><p class="panel-eyebrow">Context</p><h2>Context 快照与预算</h2></div>
-            </div>
-            <el-collapse>
-              <el-collapse-item name="smart-context">
-                <template #title>查看 Context 快照与预算</template>
-                <div class="smart-context-controls">
-                  <el-select v-model="smartContextChannel" @change="loadSelectedContextSnapshots">
-                    <el-option label="搜索 Context" value="deep_job_search" />
-                    <el-option label="分析 Shared Base" value="candidate_analysis" />
-                  </el-select>
-                  <el-button @click="loadSmartContextSnapshot(true)">查看 Context</el-button>
-                </div>
-                <template v-if="smartContextSnapshot">
-                  <el-alert
-                    :title="`任务通道：${smartContextSnapshot.channel}；后端快照 ${smartContextSnapshot.status === 'ready' ? '可用' : '被预算阻断'}`"
-                    :description="`实际纳入 ${smartContextSnapshot.context_characters} 字，估算 ${smartContextSnapshot.estimated_tokens} token；软预算 ${smartContextSnapshot.soft_budget_characters} 字。`"
-                    :type="smartContextSnapshot.status === 'ready' ? 'success' : 'warning'"
-                    :closable="false"
-                    show-icon
-                  />
-                  <el-table :data="smartContextSnapshot.sections" class="smart-context-table" max-height="300">
-                    <el-table-column prop="section_id" label="Section" min-width="180" />
-                    <el-table-column prop="section_type" label="类型" min-width="130" />
-                    <el-table-column label="纳入" width="90"><template #default="scope"><el-tag :type="scope.row.included ? 'success' : 'info'">{{ scope.row.included ? '已纳入' : '未注入' }}</el-tag></template></el-table-column>
-                    <el-table-column prop="character_count" label="字符量" width="100" />
-                    <el-table-column prop="estimated_tokens" label="估算 token" width="120" />
-                    <el-table-column prop="source" label="来源" min-width="140" />
-                    <el-table-column prop="source_version" label="版本" width="90" />
-                    <el-table-column prop="exclusion_reason" label="排除说明" min-width="240" />
-                  </el-table>
-                  <el-collapse class="smart-context-content">
-                    <el-collapse-item v-for="section in smartContextSnapshot.sections" :key="section.section_id" :name="section.section_id">
-                      <template #title>{{ section.section_id }}：{{ section.included ? "实际注入内容" : "未注入说明" }}</template>
-                      <pre>{{ section.included ? JSON.stringify(section.content, null, 2) : section.exclusion_reason }}</pre>
-                    </el-collapse-item>
-                  </el-collapse>
-                </template>
-                <el-empty v-else-if="!smartContextLoading && !smartContextError" description="当前通道尚未生成 Context 快照。" :image-size="64" />
-              </el-collapse-item>
-            </el-collapse>
-          </section>
-        </section>
-      </section>
+      <el-alert v-if="activeCaptureConditionTab === 'custom' && strategiesStore.error" :title="strategiesStore.error" type="error" :closable="false" />
+      <el-button v-if="activeCaptureConditionTab === 'custom' && strategiesStore.error" @click="strategiesStore.load()">刷新策略选项</el-button>
       <section v-if="activeCaptureConditionTab === 'custom'">
         <section class="page-panel">
           <div class="panel-title-row">
