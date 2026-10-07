@@ -46,8 +46,8 @@ const transportDebugCandidateId = ref("enter");
 const transportDebugCandidates = ref<Array<{ id: string; binding: string; keySequence: string }>>([]);
 
 const TRANSPORT_DEBUG_PROMPT = "请只回复：FINEJOB_SUBMIT_OK";
-// 保留 Transport Debug 代码供后续排查，仅在需要时通过此开关显示测试界面。
-const SHOW_TRANSPORT_DEBUG = false;
+// 显示 Transport Debug，直接验证 Codex TUI 的 Prompt 提交键。
+const SHOW_TRANSPORT_DEBUG = true;
 
 const labels: Record<string, string> = {
   send_greeting: "发送打招呼",

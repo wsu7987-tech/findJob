@@ -946,14 +946,18 @@ class BossScraperService:
         output_path: Path,
         cdp_port: int = engine.DEFAULT_CDP_PORT,
         progress_callback: Callable[[dict[str, object]], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+        runtime: object | None = None,
     ) -> dict[str, object]:
-        """使用独立详情脚本获取聊天岗位字段，保持普通批量详情链路不变。"""
+        """使用独立详情脚本获取聊天岗位字段，并沿用统一运行控制。"""
         with _CAPTURE_LOCK:
             return fetch_job_detail(
                 job,
                 output_path=output_path,
                 cdp_port=cdp_port,
                 progress_callback=progress_callback,
+                should_stop=should_stop,
+                runtime=runtime,
             )
 
     def _find_interactive_target(self, cdp_port: int) -> dict[str, object] | None:

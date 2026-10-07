@@ -23,6 +23,7 @@ from backend.app.schemas.fine_job.smart_captures import (
     SmartCaptureHandoffClaimRequest,
     SmartCaptureHandoffRequest,
     SmartCaptureHandoffStartAckRequest,
+    SmartCaptureManualDetailsRequest,
     SmartCaptureManualAnalysisBatchRequest,
 )
 from backend.app.services.fine_job import smart_captures
@@ -207,6 +208,21 @@ def create_analysis_batch(
         recommendation_strategy_id=payload.recommendation_strategy_id,
         codex_model=payload.codex_model,
         codex_reasoning_effort=payload.codex_reasoning_effort,
+    )
+
+
+@router.post("/{smart_capture_id}/manual-details")
+def queue_manual_details(
+    smart_capture_id: str,
+    payload: SmartCaptureManualDetailsRequest,
+    config: AppConfig = Depends(get_config),
+    db: Database = Depends(get_database),
+):
+    return smart_captures.queue_manual_detail_collection(
+        db,
+        config,
+        smart_capture_id,
+        payload.job_ids,
     )
 
 

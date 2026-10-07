@@ -493,9 +493,13 @@ def release_handoff(
     db: Database, smart_capture_id: str, analysis_batch_id: str, handoff_attempt_id: str,
     codex_session_ref: str, release_reason: str | None = None,
 ) -> dict[str, object]:
+    # Codex 已退出或失去当前会话时，允许人工释放已 ACK 的 started 交接，重新进入待交接队列。
+    expected_statuses = {"claimed", "prompt_written"}
+    if release_reason == "session_missing":
+        expected_statuses.add("started")
     handoff, changed = _update_handoff(
         db, smart_capture_id, analysis_batch_id, handoff_attempt_id, codex_session_ref,
-        expected={"claimed", "prompt_written"},
+        expected=expected_statuses,
         updates={"status": "released", "attempt_status": "released", "released_at": utc_now(), "recovery_reason": release_reason or "transport_failure"},
         allow_full_retry=release_reason == "full_retry",
     )
@@ -649,23 +653,81 @@ def _latest_analysis_batch_id(rows: list[Any], smart_capture_id: str) -> str:
 def _handoff_summary(db: Database, smart_capture_id: str, rows: list[Any]) -> dict[str, object]:
     batch_id = _active_batch_id(rows)
     if not batch_id:
-        return {"analysis_batch_id": "", "pending_item_count": 0, "attempt_status": "none"}
+        return {
+            "analysis_batch_id": "",
+            "pending_item_count": 0,
+            "running_item_count": 0,
+            "succeeded_item_count": 0,
+            "attempt_status": "none",
+            "codex_processing": False,
+            "analysis_batch_complete": True,
+            "needs_initial_codex_handoff": False,
+            "needs_next_batch_handoff": False,
+            "awaiting_start_ack": False,
+            "start_ack_timed_out": False,
+            "retry_available": False,
+            "start_ack_timeout_seconds": workflow_runs.START_ACK_TIMEOUT_SECONDS,
+        }
     with db.connect() as connection:
         handoff = connection.execute(
             "SELECT * FROM fj_workflow_analysis_handoffs WHERE smart_capture_id = ? AND analysis_batch_id = ?",
             (smart_capture_id, batch_id),
         ).fetchone()
+        # 当前批次没有交接记录时，查找同一 Smart Capture 上一批已完成但仍存活的会话。
+        # 这样下一批可以复用原有 Codex TUI，不会被误判为其他任务占用。
+        reusable_session = connection.execute(
+            """
+            SELECT session.id
+            FROM fj_codex_sessions session
+            JOIN fj_workflow_analysis_handoffs previous
+              ON previous.smart_capture_id = session.smart_capture_id
+             AND previous.analysis_batch_id = session.analysis_batch_id
+            WHERE session.smart_capture_id = ?
+              AND session.status = 'running'
+              AND previous.attempt_status = 'completed'
+              AND previous.analysis_batch_id <> ?
+            ORDER BY session.updated_at DESC, session.started_at DESC
+            LIMIT 1
+            """,
+            (smart_capture_id, batch_id),
+        ).fetchone()
     batch_rows = [row for row in rows if _analysis_batch_id(row["payload_json"], smart_capture_id) == batch_id]
+    pending_count = sum(str(row["status"]) == "pending" for row in batch_rows)
+    running_count = sum(str(row["status"]) == "running" for row in batch_rows)
+    succeeded_count = sum(str(row["status"]) == "succeeded" for row in batch_rows)
+    attempt_status = str(handoff["attempt_status"]) if handoff is not None else "none"
+    start_ack_timed_out = bool(
+        handoff is not None
+        and attempt_status == "prompt_written"
+        and workflow_runs._start_ack_timed_out(handoff)
+    )
+    batch_ids = list(dict.fromkeys(
+        _analysis_batch_id(row["payload_json"], smart_capture_id)
+        for row in rows
+        if _analysis_batch_id(row["payload_json"], smart_capture_id)
+    ))
+    batch_index = batch_ids.index(batch_id) if batch_id in batch_ids else 0
+    ready_for_handoff = pending_count > 0 and (handoff is None or attempt_status == "released")
     return {
         "analysis_batch_id": batch_id,
-        "pending_item_count": sum(str(row["status"]) == "pending" for row in batch_rows),
-        "running_item_count": sum(str(row["status"]) == "running" for row in batch_rows),
-        "succeeded_item_count": sum(str(row["status"]) == "succeeded" for row in batch_rows),
+        "pending_item_count": pending_count,
+        "running_item_count": running_count,
+        "succeeded_item_count": succeeded_count,
         "handoff_status": str(handoff["status"]) if handoff is not None else "none",
         "handoff_attempt_id": str(handoff["handoff_attempt_id"]) if handoff is not None else None,
-        "attempt_status": str(handoff["attempt_status"]) if handoff is not None else "none",
+        "attempt_status": attempt_status,
         "codex_session_ref": str(handoff["codex_session_ref"]) if handoff is not None else None,
         "codex_runtime_id": str(handoff["codex_runtime_id"]) if handoff is not None else None,
+        "reusable_codex_session_ref": str(reusable_session["id"]) if reusable_session is not None else None,
+        "needs_initial_codex_handoff": ready_for_handoff and batch_index == 0,
+        "needs_next_batch_handoff": ready_for_handoff and batch_index > 0,
+        # 只有当前批次仍有待处理岗位时，started 才代表 Codex 仍在处理分析。
+        "codex_processing": attempt_status == "started" and (pending_count + running_count) > 0,
+        "analysis_batch_complete": pending_count + running_count == 0,
+        "awaiting_start_ack": attempt_status == "prompt_written",
+        "start_ack_timed_out": start_ack_timed_out,
+        "retry_available": start_ack_timed_out,
+        "start_ack_timeout_seconds": workflow_runs.START_ACK_TIMEOUT_SECONDS,
     }
 
 

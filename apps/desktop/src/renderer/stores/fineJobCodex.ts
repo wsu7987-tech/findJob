@@ -131,6 +131,10 @@ export const useFineJobCodexStore = defineStore("fine-job-codex", () => {
     return state;
   };
 
+  const stop = () => {
+    getCodexBridge()?.stopCodex?.();
+  };
+
   const savePermissions = async (next: FineJobCodexPermissions) => {
     permissions.value = await api.updateFineJobCodexPermissions({
       enabled: next.enabled,
@@ -165,6 +169,7 @@ export const useFineJobCodexStore = defineStore("fine-job-codex", () => {
     start,
     startWorkflow,
     startSmartCapture,
+    stop,
     startTransportDebug,
     savePermissions,
     decide

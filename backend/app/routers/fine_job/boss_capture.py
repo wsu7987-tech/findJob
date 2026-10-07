@@ -405,6 +405,14 @@ def capture_selected_boss_details(
     payload: BossDetailCaptureRequest,
     db: Database = Depends(get_database),
 ) -> dict[str, object]:
+    current_task = boss_capture_task_manager.get_task(task_id)
+    if current_task.get("capture_source") != "smart" and current_task.get("status") in {"queued", "running"}:
+        # 采集器已有详情阶段时复用同一执行器，避免重复启动浏览器任务。
+        return boss_capture_task_manager.queue_manual_details(
+            task_id,
+            payload.job_ids,
+            manual_override=payload.manual_override,
+        )
     start_kwargs = {"force": payload.force}
     if payload.manual_override:
         start_kwargs["manual_override"] = True

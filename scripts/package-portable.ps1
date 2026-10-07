@@ -9,6 +9,29 @@ $backendWork = Join-Path $repoRoot "build\pyinstaller"
 $cityData = Join-Path $repoRoot "backend\app\services\fine_job\boss_scraper\data"
 $electronOutput = Join-Path $repoRoot "build\electron"
 $venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
+$buildMachineAppData = Join-Path $env:APPDATA "fine-job-desktop"
+$portableData = Join-Path $portableDirectory "data"
+$electronProfileEntries = @(
+    "blob_storage",
+    "Cache",
+    "Code Cache",
+    "DawnGraphiteCache",
+    "DawnWebGPUCache",
+    "GPUCache",
+    "Local Storage",
+    "Network",
+    "Session Storage",
+    "Shared Dictionary",
+    "WebStorage",
+    "DevToolsActivePort",
+    "DIPS",
+    "DIPS-shm",
+    "DIPS-wal",
+    "Local State",
+    "Preferences",
+    "SharedStorage",
+    "SharedStorage-wal"
+)
 
 function Invoke-Checked {
     param(
@@ -90,9 +113,19 @@ try {
     Copy-Item -LiteralPath $nodePtySource -Destination $appNodeModules -Recurse
 
     $resourceRoot = Join-Path $portableDirectory "resources"
-    Copy-Item -LiteralPath (Join-Path $backendOutput "FineJob-Backend") -Destination $resourceRoot -Recurse
-    Rename-Item -LiteralPath (Join-Path $resourceRoot "FineJob-Backend") -NewName "backend"
+    $portableBackend = Join-Path $resourceRoot "backend"
+    Copy-Item -LiteralPath (Join-Path $backendOutput "FineJob-Backend") -Destination $portableBackend -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $repoRoot "apps\desktop\resources\codex") -Destination $resourceRoot -Recurse
+
+    # 只迁移业务数据，排除 Electron 浏览器缓存，确保 ZIP 可以携带已有岗位和配置。
+    New-Item -ItemType Directory -Force -Path $portableData | Out-Null
+    if (Test-Path -LiteralPath $buildMachineAppData) {
+        Get-ChildItem -LiteralPath $buildMachineAppData -Force |
+            Where-Object { $_.Name -notin $electronProfileEntries } |
+            ForEach-Object {
+                Copy-Item -LiteralPath $_.FullName -Destination $portableData -Recurse -Force
+            }
+    }
 
     Compress-Archive -Path $portableDirectory -DestinationPath $archivePath -CompressionLevel Optimal
     Write-Host "Portable package created: $archivePath"

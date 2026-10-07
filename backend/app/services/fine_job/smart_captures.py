@@ -6,6 +6,7 @@ from backend.app.services.fine_job.collection_starts import prepare_smart, guard
 
 import json
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from backend.app.config import AppConfig
@@ -59,7 +60,9 @@ def _on_capture_task_updated(capture: dict[str, object]) -> None:
             "SELECT status FROM fj_smart_captures WHERE id = ?",
             (smart_capture_id,),
         ).fetchone()
-    if parent is not None and str(parent["status"]) in TERMINAL_STATUSES:
+    stage = str(capture.get("stage") or "")
+    manual_detail_callback = bool(capture.get("manual_detail_phase")) and stage.startswith("details")
+    if parent is not None and str(parent["status"]) in TERMINAL_STATUSES and not manual_detail_callback:
         # 终态后的迟到批次回调只释放启动占用，不再进入自动 Engine。
         cutover_guard.get_runtime_cutover_guard().release_live_start(
             child_ref=smart_capture_id
@@ -83,14 +86,59 @@ def _on_capture_task_updated(capture: dict[str, object]) -> None:
             return
         return
     # linked 与 independent 在 BOSS 批次结束后都由同一 Engine 写入候选池。
-    stage = str(capture.get("stage") or "")
     if (
         str(capture.get("status") or "") == "completed"
         and not stage.endswith("paused")
         and not stage.endswith("stopped")
+        and not (bool(capture.get("manual_detail_phase")) and stage.startswith("details"))
     ):
         try:
             # 先落批次进度，再由 Engine 写入更高层 Pipeline 状态，避免批次终态覆盖 JD/Analysis。
+            sync_capture_snapshot(db, capture)
+            metrics = smart_capture_engine.process_completed_batch(db, smart_capture_id, capture)
+            if boss_capture_task_manager.has_manual_detail_queue(str(capture.get("id") or "")):
+                queued_task = boss_capture_task_manager.start_manual_detail_queue(str(capture.get("id") or ""))
+                if queued_task is not None:
+                    _update_capture(
+                        db,
+                        smart_capture_id,
+                        status="running",
+                        stage="manual_details_collecting",
+                        waiting_reason="",
+                        control_cause="",
+                        message="列表采集完成，正在采集已选择的岗位详情。",
+                        allow_terminal_reopen=True,
+                    )
+                    return
+            auto_continued = smart_capture_engine.advance_completed_batch(
+                db,
+                smart_capture_id,
+                capture,
+                metrics=metrics,
+            )
+        except Exception as exc:
+            _update_capture(
+                db,
+                smart_capture_id,
+                status="interrupted",
+                stage="pipeline_interrupted",
+                waiting_reason="capture_interrupted",
+                control_cause="recovery",
+                message="Smart Capture 批次结果处理中断，可恢复后继续。",
+                error_message=str(exc),
+            )
+            return
+        if not auto_continued:
+            cutover_guard.get_runtime_cutover_guard().release_live_start(
+                child_ref=smart_capture_id
+            )
+        return
+    if (
+        str(capture.get("status") or "") == "completed"
+        and bool(capture.get("manual_detail_phase"))
+        and stage.startswith("details")
+    ):
+        try:
             sync_capture_snapshot(db, capture)
             metrics = smart_capture_engine.process_completed_batch(db, smart_capture_id, capture)
             auto_continued = smart_capture_engine.advance_completed_batch(
@@ -107,7 +155,7 @@ def _on_capture_task_updated(capture: dict[str, object]) -> None:
                 stage="pipeline_interrupted",
                 waiting_reason="capture_interrupted",
                 control_cause="recovery",
-                message="Smart Capture 批次结果处理中断，可恢复后继续。",
+                message="Smart Capture 详情结果处理中断，可恢复后继续。",
                 error_message=str(exc),
             )
             return
@@ -1066,6 +1114,10 @@ def resume_smart_capture(
         db, smart_capture_id
     )
     transition_id = transition_id or new_id()
+    if str(capture.get("status") or "") == "waiting_next_batch":
+        # 兼容修复前已停在等待态的任务，继续按钮复用分析完成后的自动推进。
+        if smart_capture_engine.resume_after_analysis_batch(db, smart_capture_id):
+            return publish_smart_capture_snapshot(db, smart_capture_id) or {}
     if has_pending_details(db, smart_capture_id):
         with db.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1197,6 +1249,39 @@ def resume_smart_capture(
         )
         refreshed = get_smart_capture(db, smart_capture_id)
     return publish_smart_capture_snapshot(db, smart_capture_id) or refreshed
+
+
+def queue_manual_detail_collection(
+    db: Database,
+    config: AppConfig,
+    smart_capture_id: str,
+    job_ids: list[str],
+) -> dict[str, object]:
+    """把岗位列表中的人工选择详情接入当前 Smart Capture 任务。"""
+    del config
+    capture = get_smart_capture(db, smart_capture_id)
+    if str(capture.get("status") or "") in {"stopped", "failed"}:
+        raise AppError(409, "SMART_CAPTURE_DETAILS_NOT_ALLOWED", "已停止或失败的智能采集不能继续采集详情。")
+    batch_id = str(capture.get("current_batch_id") or "")
+    if not batch_id:
+        raise AppError(409, "CAPTURE_NOT_READY", "当前智能采集还没有可接续的岗位采集批次。")
+    task = boss_capture_task_manager.get_task(batch_id)
+    if task.get("status") not in {"queued", "running"}:
+        ensure_ready()
+    queued = boss_capture_task_manager.queue_manual_details(batch_id, job_ids)
+    # 列表已经完成时，人工详情会重新打开当前 Smart Capture；列表仍运行时保留原有采集阶段。
+    if str(queued.get("stage") or "").startswith("details"):
+        _update_capture(
+            db,
+            smart_capture_id,
+            status="running",
+            stage="manual_details_collecting",
+            waiting_reason="",
+            control_cause="",
+            message="正在采集已选择的岗位详情。",
+            allow_terminal_reopen=True,
+        )
+    return publish_smart_capture_snapshot(db, smart_capture_id) or get_smart_capture(db, smart_capture_id)
 
 
 def stop_smart_capture(
@@ -1356,15 +1441,43 @@ def get_smart_capture(db: Database, smart_capture_id: str) -> dict[str, object]:
         job_rows = connection.execute(
             """
             SELECT j.snapshot_json, j.job_id AS history_record_id,
-                   j.was_previously_collected
+                   j.was_previously_collected,
+                   h.payload_json AS history_payload_json,
+                   h.detail_json AS history_detail_json,
+                   h.detail_status AS history_detail_status,
+                   h.detail_error AS history_detail_error,
+                   h.detail_collected_at AS history_detail_collected_at,
+                   h.delivery_evaluation_json AS history_delivery_evaluation_json
             FROM fj_boss_capture_batch_jobs j
             JOIN fj_boss_capture_batches b ON b.id = j.capture_id
+            LEFT JOIN fj_boss_jobs h ON h.id = j.job_id
             WHERE b.smart_capture_id = ?
             ORDER BY j.collected_at
             """,
             (smart_capture_id,),
         ).fetchall()
+        analysis_rows = connection.execute(
+            """
+            SELECT payload_json, status, result_json
+            FROM fj_workflow_tasks
+            WHERE smart_capture_id = ? AND task_type = 'deep_job_search_analysis'
+            ORDER BY created_at, id
+            """,
+            (smart_capture_id,),
+        ).fetchall()
     data = dict(row)
+    # Codex 分析任务使用岗位历史主键，先按该主键汇总到岗位快照，统一页面状态来源。
+    analysis_by_job_id: dict[str, dict[str, object]] = {}
+    for analysis_row in analysis_rows:
+        analysis_payload = _load_json(str(analysis_row["payload_json"] or "{}"))
+        analysis_job_id = str(analysis_payload.get("job_id") or "")
+        if not analysis_job_id:
+            continue
+        analysis_result = _load_json(str(analysis_row["result_json"] or "{}"))
+        analysis_by_job_id[analysis_job_id] = {
+            "status": str(analysis_row["status"] or ""),
+            "result": analysis_result if analysis_result else None,
+        }
     jobs_by_id: dict[str, dict[str, object]] = {}
     for job_row in job_rows:
         try:
@@ -1374,6 +1487,45 @@ def get_smart_capture(db: Database, smart_capture_id: str) -> dict[str, object]:
         # 批次关系是新旧岗位判定的权威来源，旧快照没有保存该展示字段。
         job["history_record_id"] = str(job_row["history_record_id"])
         job["is_previously_collected"] = bool(job_row["was_previously_collected"])
+        # 岗位主记录保存筛选与详情的最新状态，覆盖采集时保存的旧快照字段。
+        history_payload = _load_json(str(job_row["history_payload_json"] or "{}"))
+        for field in (
+            "filter_status",
+            "strategy_filter_status",
+            "final_filter_status",
+            "filter_reasons",
+            "filter_pass_reasons",
+            "filter_reject_reasons",
+            "filter_review_reasons",
+            "filter_failure_codes",
+            "filter_missing_fields",
+            "filter_strategy_id",
+            "cooldown_excluded",
+            "cooldown_reasons",
+            "recommended",
+            "recommendation_source",
+            "recommendation_reason",
+        ):
+            if field in history_payload:
+                job[field] = history_payload[field]
+        if job_row["history_detail_status"] is not None:
+            job["detail_status"] = job_row["history_detail_status"]
+        if job_row["history_detail_error"] is not None:
+            job["detail_error"] = job_row["history_detail_error"]
+        if job_row["history_detail_collected_at"] is not None:
+            job["detail_collected_at"] = job_row["history_detail_collected_at"]
+        history_detail = _load_json(str(job_row["history_detail_json"] or "{}"))
+        if history_detail:
+            job["detail"] = history_detail
+        history_delivery = _load_json(
+            str(job_row["history_delivery_evaluation_json"] or "{}")
+        )
+        if history_delivery:
+            job["delivery_evaluation"] = history_delivery
+        analysis = analysis_by_job_id.get(str(job_row["history_record_id"]))
+        if analysis is not None:
+            job["codex_analysis_status"] = analysis["status"]
+            job["codex_analysis_result"] = analysis["result"]
         key = str(job.get("job_id") or job.get("history_record_id") or "")
         if key:
             jobs_by_id[key] = job
@@ -1529,6 +1681,70 @@ def _start_new_batch(
     return publish_smart_capture_snapshot(db, smart_capture_id) or {}
 
 
+def start_search_combination_batch(
+    db: Database,
+    smart_capture_id: str,
+    payload: dict[str, Any],
+    *,
+    output_dir: Path,
+) -> dict[str, object]:
+    """在当前 Engine 回调持有启动权时启动 Planner 选出的下一搜索组合。"""
+    # 当前回调仍持有同一个 child 的 live start，不重复 claim，避免把同一任务锁成冲突状态。
+    assert_collection_start_allowed(db, requested_kind="smart")
+    if current_operation() is None and not boss_scraper_service.get_browser_status().running:
+        raise AppError(409, "BROWSER_NOT_RUNNING", "FineJob 专用 Chrome 未启动，请先打开并完成 BOSS 登录。")
+    keyword = str(payload.get("keyword") or "").strip()
+    city = str(payload.get("city") or "").strip()
+    if not keyword or not city:
+        raise AppError(422, "VALIDATION_FAILED", "岗位采集任务缺少搜索词或城市。")
+    capture = get_smart_capture(db, smart_capture_id)
+    if current_operation() is not None:
+        prepare_smart(db, capture)
+    owner = pipeline_owner.get_pipeline_owner(db, smart_capture_id)
+    search_task: dict[str, str] | None = None
+    started_task: dict[str, object] | None = None
+    try:
+        search_task = smart_capture_engine.prepare_search_execution(
+            db,
+            smart_capture_id,
+            payload,
+        )
+        started_task = boss_capture_task_manager.start_capture(
+            BossCaptureRequest(
+                keyword=keyword,
+                city=city,
+                pages=max(1, min(10, int(payload.get("min_depth") or 1))),
+                filters=dict(payload.get("platform_filters") or payload.get("filters") or {}),
+                include_details=False,
+                prefer_current_page=bool(payload.get("prefer_current_page", True)),
+                # Planner 已经切换组合时必须重新定位到新的搜索条件。
+                force_search_navigation=bool(payload.get("force_search_navigation", True)),
+                filter_strategy_id=str(payload.get("filter_strategy_id") or "") or None,
+                capture_source="smart",
+                workflow_run_id=owner.workflow_run_id,
+                smart_capture_id=owner.identity,
+            ),
+            output_dir=output_dir,
+            db=db,
+        )
+        bind_batch(
+            db,
+            smart_capture_id,
+            str(started_task["id"]),
+            search_task=search_task,
+            search_payload=payload,
+        )
+    except Exception:
+        if started_task is not None:
+            # 绑定失败时停止已创建执行器，启动权仍由外层回调统一处理。
+            try:
+                boss_capture_task_manager.stop_capture(str(started_task["id"]))
+            except Exception:
+                pass
+        raise
+    return publish_smart_capture_snapshot(db, smart_capture_id) or {}
+
+
 def _update_capture(
     db: Database,
     smart_capture_id: str,
@@ -1544,6 +1760,7 @@ def _update_capture(
     current_batch_id: str | None = None,
     progress: dict[str, object] | None = None,
     result_summary: dict[str, object] | None = None,
+    allow_terminal_reopen: bool = False,
 ) -> None:
     now = utc_now()
     with db.connect() as connection:
@@ -1572,7 +1789,7 @@ def _update_capture(
         next_transition_id = transition_id or new_id()
         status = _canonical_status(status, next_waiting_reason)
         # 进程迟到状态或重复回调不得把已确认的 terminal outcome 改成另一种结果。
-        if str(row["status"]) in TERMINAL_STATUSES:
+        if str(row["status"]) in TERMINAL_STATUSES and not allow_terminal_reopen:
             return
         next_batch_id = (
             row["current_batch_id"] if current_batch_id is None else current_batch_id
@@ -1780,6 +1997,7 @@ def _canonical_status(status: str, waiting_reason: str) -> str:
 
 def _build_execution_config(payload: dict[str, Any]) -> dict[str, object]:
     """把 linked/independent 共用的完整执行配置固定在 Smart Capture owner。"""
+    delivery_target_enabled = bool(payload.get("delivery_target_enabled", False))
     return {
         "search": {
             "filter_strategy_id": str(payload.get("filter_strategy_id") or ""),
@@ -1789,8 +2007,11 @@ def _build_execution_config(payload: dict[str, Any]) -> dict[str, object]:
             "prefer_current_page": bool(payload.get("prefer_current_page", True)),
         },
         "candidate_target_count": int(payload.get("candidate_target_count") or 0) or None,
+        "auto_jd_detail_collection_enabled": delivery_target_enabled or bool(
+            payload.get("auto_jd_detail_collection_enabled", True)
+        ),
         "delivery_target": {
-            "enabled": bool(payload.get("delivery_target_enabled", False)),
+            "enabled": delivery_target_enabled,
             "recommendation_strategy_id": str(payload.get("recommendation_strategy_id") or ""),
             "recommend_target": payload.get("recommend_target") or payload.get("target_count"),
             "review_target": payload.get("review_target"),

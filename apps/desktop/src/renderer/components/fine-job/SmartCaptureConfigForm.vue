@@ -61,6 +61,16 @@ const selectStrategy = (strategyId: string) => {
   });
 };
 
+const updateDeliveryTarget = (enabled: boolean) => {
+  emit("update:modelValue", {
+    ...props.modelValue,
+    delivery_target_enabled: enabled,
+    auto_jd_detail_collection_enabled: enabled
+      ? true
+      : props.modelValue.auto_jd_detail_collection_enabled
+  });
+};
+
 watch(validation, (value) => emit("validation", value), { immediate: true });
 defineExpose({ validation });
 </script>
@@ -209,12 +219,20 @@ defineExpose({ validation });
       />
     </el-form-item>
 
+    <el-form-item v-if="!modelValue.delivery_target_enabled" label="进入自动 JD 详情采集">
+      <el-switch
+        :model-value="modelValue.auto_jd_detail_collection_enabled"
+        active-text="自动采集"
+        inactive-text="手动采集"
+        @update:model-value="updateField('auto_jd_detail_collection_enabled', Boolean($event))"
+      />
+    </el-form-item>
     <el-form-item label="投递目标">
       <el-switch
         :model-value="modelValue.delivery_target_enabled"
         active-text="采集后自动交给 Codex 分析"
         inactive-text="采集完成后等待手动选择"
-        @update:model-value="updateField('delivery_target_enabled', Boolean($event))"
+        @update:model-value="updateDeliveryTarget(Boolean($event))"
       />
     </el-form-item>
     <template v-if="modelValue.delivery_target_enabled">

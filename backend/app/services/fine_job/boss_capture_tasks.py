@@ -113,6 +113,8 @@ class BossCaptureTaskManager:
             "jobs": [],
             "jobs_path": None,
             "details_path": None,
+            "manual_detail_queue_job_ids": [],
+            "manual_detail_phase": False,
             "created_at": now,
             "updated_at": now,
             "finished_at": None,
@@ -371,34 +373,157 @@ class BossCaptureTaskManager:
             for job_id in selected_ids:
                 existing[job_id]["detail_status"] = "queued"
                 existing[job_id]["detail_error"] = None
-            task.update(
-                status="queued",
-                stage="details_queued",
-                _execution_id=new_id(),
-                detail_phase_id=new_id(),
-                detail_phase_job_ids=selected_ids,
+            self._prepare_detail_phase_locked(
+                task,
+                selected_ids,
                 message=f"已选择 {len(selected_ids)} 个岗位，等待采集详情。",
-                progress_current=0,
-                progress_total=len(selected_ids),
-                details_completed=sum(
-                    1 for job in task["jobs"] if job.get("detail_status") == "completed"
-                ),
-                details_failed=sum(
-                    1 for job in task["jobs"] if job.get("detail_status") == "failed"
-                ),
-                current_job=None,
-                estimated_seconds_min=len(selected_ids) * DETAIL_SECONDS_MIN,
-                estimated_seconds_max=len(selected_ids) * DETAIL_SECONDS_MAX,
-                finished_at=None,
-                error_message=None,
-                stop_requested=False,
-                pause_requested=False,
-                updated_at=utc_now(),
+                manual_phase=False,
             )
             self._sync_capture_batch(task, status="running")
         self._notify_task_updated(task_id)
         Thread(target=self._run_selected_details, args=(task_id, selected_ids), daemon=True).start()
         return self.get_task(task_id)
+
+    def queue_manual_details(
+        self,
+        task_id: str,
+        job_ids: list[str],
+        *,
+        manual_override: bool = False,
+    ) -> dict[str, object]:
+        """把人工选择的详情岗位加入当前批次，并对活动详情任务做集合去重。"""
+        start_ids: list[str] = []
+        with self._lock:
+            task = self._require_task(task_id)
+            existing = {str(job.get("job_id") or ""): job for job in task.get("jobs") or []}
+            normalized_ids = list(dict.fromkeys(str(job_id).strip() for job_id in job_ids if str(job_id).strip()))
+            active_ids = set(str(job_id) for job_id in task.get("detail_phase_job_ids") or [])
+            queued_ids = list(dict.fromkeys(str(job_id) for job_id in task.get("manual_detail_queue_job_ids") or []))
+            queued_set = set(queued_ids)
+            selected_ids = [
+                job_id
+                for job_id in normalized_ids
+                if job_id in existing
+                and (manual_override or existing[job_id].get("detail_status") != "completed")
+                and job_id not in active_ids
+                and job_id not in queued_set
+            ]
+            if not selected_ids:
+                raise AppError(
+                    status_code=400,
+                    error_category="VALIDATION_FAILED",
+                    error_message="所选岗位均已在详情队列、正在采集或已经完成详情。",
+                )
+            db = task.get("_db")
+            if isinstance(db, Database):
+                for job_id in selected_ids:
+                    job = existing[job_id]
+                    strategy_id = str(job.get("filter_strategy_id") or "")
+                    strategy = get_filter_strategy(db, strategy_id) if strategy_id else None
+                    history_id = str(job.get("history_record_id") or "")
+                    if history_id:
+                        assert_job_action_allowed(
+                            db,
+                            history_id,
+                            strategy=strategy,
+                            action="detail",
+                            allow_manual_override=manual_override,
+                        )
+            for job_id in selected_ids:
+                existing[job_id]["detail_status"] = "queued"
+                existing[job_id]["detail_error"] = None
+
+            active = task.get("status") in {"queued", "running"}
+            stage = str(task.get("stage") or "")
+            if active:
+                task["manual_detail_queue_job_ids"] = queued_ids + selected_ids
+                task["manual_detail_phase"] = True
+                task["updated_at"] = utc_now()
+                task["message"] = f"已加入 {len(selected_ids)} 个详情岗位，当前任务完成后按队列采集。"
+                self._sync_capture_batch(task, status=task["status"])
+            else:
+                # 列表阶段已经结束且没有活动详情任务，立即启动本次人工详情队列。
+                start_ids = selected_ids
+                self._prepare_detail_phase_locked(
+                    task,
+                    start_ids,
+                    message=f"已选择 {len(start_ids)} 个岗位，等待采集详情。",
+                    manual_phase=True,
+                )
+                self._sync_capture_batch(task, status="running")
+        self._notify_task_updated(task_id)
+        if start_ids:
+            Thread(target=self._run_selected_details, args=(task_id, start_ids), daemon=True).start()
+        return self.get_task(task_id)
+
+    def has_manual_detail_queue(self, task_id: str) -> bool:
+        with self._lock:
+            task = self._require_task(task_id)
+            return bool(task.get("manual_detail_queue_job_ids"))
+
+    def start_manual_detail_queue(self, task_id: str) -> dict[str, object] | None:
+        """在列表任务结束后启动已经登记的人工详情队列。"""
+        with self._lock:
+            task = self._require_task(task_id)
+            if task.get("status") in {"queued", "running"}:
+                return None
+            job_ids = list(dict.fromkeys(str(job_id) for job_id in task.get("manual_detail_queue_job_ids") or []))
+            existing = {str(job.get("job_id") or ""): job for job in task.get("jobs") or []}
+            job_ids = [
+                job_id for job_id in job_ids
+                if job_id in existing and existing[job_id].get("detail_status") != "completed"
+            ]
+            task["manual_detail_queue_job_ids"] = []
+            if not job_ids:
+                task["manual_detail_phase"] = False
+                self._sync_capture_batch(task, status=task.get("status", "completed"))
+                return None
+            self._prepare_detail_phase_locked(
+                task,
+                job_ids,
+                message=f"列表采集完成，开始采集已选择的 {len(job_ids)} 个岗位详情。",
+                manual_phase=True,
+            )
+            self._sync_capture_batch(task, status="running")
+        self._notify_task_updated(task_id)
+        Thread(target=self._run_selected_details, args=(task_id, job_ids), daemon=True).start()
+        return self.get_task(task_id)
+
+    def _prepare_detail_phase_locked(
+        self,
+        task: dict[str, object],
+        selected_ids: list[str],
+        *,
+        message: str,
+        manual_phase: bool,
+    ) -> None:
+        """准备一组详情岗位，统一维护当前阶段和可恢复队列。"""
+        existing = {str(job.get("job_id") or ""): job for job in task.get("jobs") or []}
+        for job_id in selected_ids:
+            if job_id in existing:
+                existing[job_id]["detail_status"] = "queued"
+                existing[job_id]["detail_error"] = None
+        task.update(
+            status="queued",
+            stage="details_queued",
+            _execution_id=new_id(),
+            detail_phase_id=new_id(),
+            detail_phase_job_ids=list(selected_ids),
+            manual_detail_phase=bool(manual_phase),
+            message=message,
+            progress_current=0,
+            progress_total=len(selected_ids),
+            details_completed=sum(1 for job in task["jobs"] if job.get("detail_status") == "completed"),
+            details_failed=sum(1 for job in task["jobs"] if job.get("detail_status") == "failed"),
+            current_job=None,
+            estimated_seconds_min=len(selected_ids) * DETAIL_SECONDS_MIN,
+            estimated_seconds_max=len(selected_ids) * DETAIL_SECONDS_MAX,
+            finished_at=None,
+            error_message=None,
+            stop_requested=False,
+            pause_requested=False,
+            updated_at=utc_now(),
+        )
 
     def start_history_detail(
         self,
@@ -576,6 +701,9 @@ class BossCaptureTaskManager:
                     "final_filter_status", result.get("status")
                 )
                 job["filter_reasons"] = list(result.get("reasons") or [])
+                job["filter_pass_reasons"] = list(result.get("pass_reasons") or [])
+                job["filter_reject_reasons"] = list(result.get("reject_reasons") or [])
+                job["filter_review_reasons"] = list(result.get("review_reasons") or [])
                 job["filter_failure_codes"] = list(result.get("failure_codes") or [])
                 job["filter_missing_fields"] = list(result.get("missing_fields") or [])
                 job["filter_strategy_id"] = result.get("strategy_id")
@@ -898,24 +1026,46 @@ class BossCaptureTaskManager:
                 selected_failed = sum(
                     1 for job in selected_jobs if job.get("detail_status") == "failed"
                 )
-                task.update(
-                    status="completed",
-                    stage="details_completed",
-                    message=(
-                        f"所选详情采集完成：成功 {selected_completed}，"
-                        f"失败 {selected_failed}。"
-                    ),
-                    details_path=str(output_path),
-                    progress_current=len(job_ids),
-                    progress_total=len(job_ids),
-                    estimated_seconds_min=0,
-                    estimated_seconds_max=0,
-                    current_job=None,
-                    updated_at=utc_now(),
-                    finished_at=utc_now(),
-                )
-                self._sync_capture_batch(task, status="completed", finished=True)
+                pending_ids = list(dict.fromkeys(str(job_id) for job_id in task.get("manual_detail_queue_job_ids") or []))
+                existing = {str(job.get("job_id") or ""): job for job in task.get("jobs") or []}
+                next_ids = [
+                    job_id for job_id in pending_ids
+                    if job_id in existing and existing[job_id].get("detail_status") != "completed"
+                ]
+                if next_ids:
+                    # 当前详情批次完成后立即接续去重后的人工队列，不产生重复浏览器任务。
+                    task["manual_detail_queue_job_ids"] = []
+                    self._prepare_detail_phase_locked(
+                        task,
+                        next_ids,
+                        message=f"上一批详情完成，开始采集队列中的 {len(next_ids)} 个岗位详情。",
+                        manual_phase=True,
+                    )
+                    task["details_path"] = str(output_path)
+                    self._sync_capture_batch(task, status="running")
+                else:
+                    task["manual_detail_queue_job_ids"] = []
+                    task.update(
+                        status="completed",
+                        stage="details_completed",
+                        message=(
+                            f"所选详情采集完成：成功 {selected_completed}，"
+                            f"失败 {selected_failed}。"
+                        ),
+                        details_path=str(output_path),
+                        progress_current=len(job_ids),
+                        progress_total=len(job_ids),
+                        estimated_seconds_min=0,
+                        estimated_seconds_max=0,
+                        current_job=None,
+                        manual_detail_phase=bool(task.get("manual_detail_phase")),
+                        updated_at=utc_now(),
+                        finished_at=utc_now(),
+                    )
+                    self._sync_capture_batch(task, status="completed", finished=True)
             self._notify_task_updated(task_id)
+            if next_ids:
+                Thread(target=self._run_selected_details, args=(task_id, next_ids), daemon=True).start()
         except Exception as exc:  # noqa: BLE001 - 后台任务边界
             if self._tasks.get(task_id, {}).get("_execution_id") != execution_id:
                 return
@@ -1105,6 +1255,7 @@ class BossCaptureTaskManager:
                     continue
                 job["filter_status"] = "exclude"
                 job["filter_reasons"] = ["公司黑名单"]
+                job["filter_reject_reasons"] = ["公司黑名单"]
                 job["cooldown_excluded"] = True
                 job["cooldown_reasons"] = ["公司黑名单"]
                 blocked_ids.add(str(job.get("job_id") or ""))
@@ -1122,6 +1273,9 @@ class BossCaptureTaskManager:
             if not result:
                 continue
             job["filter_status"] = result.get("status")
+            job["filter_pass_reasons"] = list(result.get("pass_reasons") or [])
+            job["filter_reject_reasons"] = list(result.get("reject_reasons") or [])
+            job["filter_review_reasons"] = list(result.get("review_reasons") or [])
             job["filter_reasons"] = list(result.get("reasons") or [])
             job["filter_failure_codes"] = list(result.get("failure_codes") or [])
             job["filter_missing_fields"] = list(result.get("missing_fields") or [])
@@ -1200,6 +1354,9 @@ class BossCaptureTaskManager:
                     "strategy_filter_status": previous.get("strategy_filter_status"),
                     "final_filter_status": previous.get("final_filter_status"),
                     "filter_reasons": previous.get("filter_reasons", []),
+                    "filter_pass_reasons": previous.get("filter_pass_reasons", []),
+                    "filter_reject_reasons": previous.get("filter_reject_reasons", []),
+                    "filter_review_reasons": previous.get("filter_review_reasons", []),
                     "filter_failure_codes": previous.get("filter_failure_codes", []),
                     "filter_missing_fields": previous.get("filter_missing_fields", []),
                     "filter_strategy_id": previous.get("filter_strategy_id"),

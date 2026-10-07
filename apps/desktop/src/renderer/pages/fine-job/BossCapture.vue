@@ -13,6 +13,7 @@ import { useFineJobWorkflowRunStore } from "@/stores/fineJobWorkflowRun";
 import SmartCaptureConfigForm from "@/components/fine-job/SmartCaptureConfigForm.vue";
 import {
   resubmitSmartCaptureCodexSubmit,
+  recoverSmartCaptureCodexHandoff,
   retrySmartCaptureCodexHandoff,
   triggerSmartCaptureCodexHandoff
 } from "@/services/workflowCodexHandoff";
@@ -137,12 +138,15 @@ const smartFilterStrategyId = ref<string | null>(null);
 const smartSelectedKeywords = ref<string[]>([]);
 const smartSelectedCities = ref<string[]>([]);
 const smartCandidateTargetCount = ref(15);
+const smartAutoJdDetailCollectionEnabled = ref(true);
 const smartDeliveryTargetEnabled = ref(false);
 const smartRecommendationStrategyId = ref<string | null>(null);
 const smartCodexModel = ref("");
 const smartCodexReasoningEffort = ref<"minimal" | "low" | "medium" | "high" | "xhigh">("medium");
 const smartCodexModels = ref<Array<{ id: string; label?: string | null }>>([]);
 const smartCodexModelLoadError = ref("");
+const smartRecommendationDialogOpen = ref(false);
+const smartPendingRecommendationStrategyId = ref<string | null>(null);
 const formOptionsLoading = ref(false);
 const smartAnalysisGuidance = ref("");
 const smartRecommendTarget = ref(5);
@@ -189,6 +193,8 @@ let inspectedContextRequestGeneration = 0;
 const smartContextLoading = ref(false);
 const smartContextError = ref("");
 const smartAnalysisLoading = ref(false);
+const smartAnalysisManualLoading = ref(false);
+const smartCodexStatusLoading = ref(false);
 const smartAnalysisError = ref("");
 const inspectedContextLoading = ref(false);
 const inspectedContextError = ref("");
@@ -197,6 +203,9 @@ const analysisDetailError = ref("");
 let analysisDetailGeneration = 0;
 const customSubmitting = ref(false);
 const selectedJobIds = ref<string[]>([]);
+const selectedJobIdsByOwner = new Map<string, Set<string>>();
+const defaultSelectedJobKeysByOwner = new Map<string, Set<string>>();
+let selectionSyncing = false;
 const selectedJobId = ref<string | null>(null);
 const detailDrawerOpen = ref(false);
 type SortableJobColumn =
@@ -273,16 +282,18 @@ const smartCaptureResumable = computed(() =>
   Boolean(currentSmartCapture.value?.capabilities?.resume)
 );
 const smartCaptureRetryable = computed(() =>
-  Boolean(currentSmartCapture.value?.capabilities?.retry)
+  Boolean(
+    currentSmartCapture.value?.capabilities?.retry
+      && (
+        currentSmartCapture.value.status === "interrupted"
+        || ["capture_interrupted", "browser_not_running"].includes(
+          String(currentSmartCapture.value.waiting_reason || "")
+        )
+      )
+  )
 );
 const smartCaptureCanStart = computed(() =>
   !currentSmartCapture.value || smartWorkflowTerminalStatuses.includes(currentSmartCapture.value.status)
-);
-const smartManualAnalysisAvailable = computed(() =>
-  Boolean(
-    currentSmartCapture.value
-      && ["waiting_for_user", "completed"].includes(currentSmartCapture.value.status)
-  )
 );
 const smartActiveAnalysisItem = computed(() =>
   smartAnalysisItems.value.find((item) => item.status === "running") ?? null
@@ -381,6 +392,7 @@ const smartCompletionProgress = computed(() => {
 const smartDetailProgress = computed(() => {
   const capture = currentSmartCapture.value;
   const progress = capture?.progress ?? {};
+  const currentBatch = capture?.current_batch ?? {};
   const combinations = capture?.search_combinations ?? [];
   const currentCombination = combinations.find((item) => item.status === "running") ?? combinations[combinations.length - 1];
   const totals = combinations.reduce((result, item) => ({
@@ -391,7 +403,8 @@ const smartDetailProgress = computed(() => {
   return {
     keyword: currentCombination?.keyword ?? "等待开始",
     city: currentCombination?.city ?? "—",
-    depth: Number(progress.current ?? progress.progress_current ?? 0),
+    // 展示累计页数，避免暂停或切换搜索阶段后当前阶段进度归零。
+    depth: Number(currentBatch.total_pages_loaded ?? progress.pages_collected ?? 0),
     batchCount: capture?.batches.length ?? 0,
     jobsSeen: totals.jobsSeen || capture?.jobs.length || Number(progress.jobs_collected ?? 0),
     freshJobs: totals.freshJobs,
@@ -501,9 +514,41 @@ const smartWorkflowHandoffStatus = computed(() => {
   const handoff = smartAnalysisHandoff.value;
   if (!currentSmartCapture.value || !handoff || smartCodexHandoff.value !== "auto") return "";
   if (handoff.attempt_status === "prompt_written") return "等待 Codex 开始";
-  if (handoff.attempt_status === "started") return "Codex 分析中";
+  if (handoff.attempt_status === "started" && handoff.codex_processing && hasCurrentSmartWorkflowCodexSession.value) {
+    return "Codex 分析中";
+  }
+  if (handoff.attempt_status === "started" && handoff.codex_processing) return "Codex 已断开，可重新交给 Codex";
+  if (handoff.attempt_status === "started" && handoff.analysis_batch_complete) return "分析批次已完成";
   if (handoff.needs_initial_codex_handoff || handoff.needs_next_batch_handoff) return "准备 Codex";
   return "";
+});
+const smartPendingAnalysisCount = computed(() => {
+  if (smartAnalysisHandoff.value) return Number(smartAnalysisHandoff.value.pending_item_count || 0);
+  return smartAnalysisItems.value.filter((item) => item.status === "pending").length;
+});
+const smartAnalysisManualAction = computed<"advance" | "retry" | "recover" | null>(() => {
+  const capture = currentSmartCapture.value;
+  const handoff = smartAnalysisHandoff.value;
+  if (!capture || ["completed", "stopped", "failed"].includes(capture.status) || !handoff) return null;
+  if (handoff.attempt_status === "prompt_written" && handoff.retry_available) return "retry";
+  if (
+    handoff.attempt_status === "started"
+    && handoff.codex_processing
+    && !hasCurrentSmartWorkflowCodexSession.value
+  ) return "recover";
+  if (!["none", "released"].includes(handoff.attempt_status)) return null;
+  return smartPendingAnalysisCount.value > 0 ? "advance" : null;
+});
+const smartAnalysisQueueStatus = computed(() => {
+  const handoff = smartAnalysisHandoff.value;
+  if (!handoff || smartPendingAnalysisCount.value <= 0) return "";
+  if (handoff.attempt_status === "started" && handoff.codex_processing && hasCurrentSmartWorkflowCodexSession.value) return "Codex 分析中";
+  if (handoff.attempt_status === "started" && handoff.codex_processing) return "Codex 已断开，可重新交给 Codex";
+  if (handoff.attempt_status === "prompt_written") {
+    return handoff.retry_available ? "Codex 交接超时，可手动重试" : "等待 Codex 开始";
+  }
+  if (handoff.attempt_status === "claimed") return "正在提交 Codex 交接";
+  return "等待推进 Codex 分析";
 });
 const currentTaskBelongsToSmartWorkflow = computed(() => {
   const currentTaskId = captureStore.task?.id;
@@ -548,6 +593,43 @@ const workflowDisplayJobs = computed(() => {
   }
   return activeCaptureConditionTab.value === "custom" && currentTaskIsCustomCapture.value ? captureStore.task?.jobs ?? [] : [];
 });
+const selectionOwnerKey = () => displayingCurrentSmartCapture.value
+  ? `smart:${currentSmartCapture.value?.smart_capture_id || ""}`
+  : `custom:${captureStore.task?.id || ""}`;
+const defaultSelectionStatus = (job: FineJobBossCapturedJob) =>
+  String(job.final_filter_status || job.filter_status || "");
+const applyDefaultJobSelection = async () => {
+  const owner = selectionOwnerKey();
+  const selectedKeys = selectedJobIdsByOwner.get(owner) ?? new Set<string>();
+  const defaultKeys = defaultSelectedJobKeysByOwner.get(owner) ?? new Set<string>();
+  selectedJobIdsByOwner.set(owner, selectedKeys);
+  defaultSelectedJobKeysByOwner.set(owner, defaultKeys);
+  const rows = sortedJobs.value.filter((job) =>
+    ["pass", "review", "pass_for_human"].includes(defaultSelectionStatus(job))
+  );
+  const newRows = rows.filter((job) => {
+    const key = jobDisplayKey(job);
+    return Boolean(key) && !defaultKeys.has(key);
+  });
+  newRows.forEach((job) => {
+    const key = jobDisplayKey(job);
+    if (!key) return;
+    defaultKeys.add(key);
+    selectedKeys.add(key);
+  });
+  selectedJobIds.value = [...selectedKeys];
+  await nextTick();
+  if (!jobsTable.value) return;
+  selectionSyncing = true;
+  try {
+    sortedJobs.value.forEach((job) => {
+      const key = jobDisplayKey(job);
+      if (key && selectedKeys.has(key)) jobsTable.value?.toggleRowSelection(job, true);
+    });
+  } finally {
+    selectionSyncing = false;
+  }
+};
 
 const hotCityNames = ["北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "南京", "苏州"];
 const cityOptions = computed(() =>
@@ -591,6 +673,9 @@ const smartExecutionConfig = computed<SmartCaptureExecutionConfig>({
     filters: { ...selectedBossFilters.value },
     candidate_target_count: smartCandidateTargetCount.value,
     prefer_current_page: form.preferCurrentPage,
+    auto_jd_detail_collection_enabled: smartDeliveryTargetEnabled.value
+      ? true
+      : smartAutoJdDetailCollectionEnabled.value,
     delivery_target_enabled: smartDeliveryTargetEnabled.value,
     recommendation_strategy_id: smartRecommendationStrategyId.value || "",
     recommend_target: smartRecommendTarget.value,
@@ -617,6 +702,7 @@ const smartExecutionConfig = computed<SmartCaptureExecutionConfig>({
     smartSelectedCities.value = [...value.allowed_cities];
     smartCandidateTargetCount.value = value.candidate_target_count;
     form.preferCurrentPage = value.prefer_current_page;
+    smartAutoJdDetailCollectionEnabled.value = value.auto_jd_detail_collection_enabled ?? true;
     smartDeliveryTargetEnabled.value = value.delivery_target_enabled;
     smartRecommendationStrategyId.value = value.recommendation_strategy_id || null;
     smartRecommendTarget.value = value.recommend_target;
@@ -711,10 +797,19 @@ const checkStartResult = async () => {
 watch(() => startState.receipt, (receipt) => {
   if (receipt?.status === "started") void checkStartResult();
 });
-watch(() => [activeCaptureConditionTab.value, activeCaptureConditionTab.value === "smart" ? currentSmartCapture.value?.smart_capture_id : captureStore.task?.id], () => {
+watch(() => [activeCaptureConditionTab.value, activeCaptureConditionTab.value === "smart" ? currentSmartCapture.value?.smart_capture_id : captureStore.task?.id], async () => {
   selectedJobIds.value = []; selectedJobId.value = null; detailDrawerOpen.value = false;
   smartAnalysisDetailOpen.value = false; analysisDetailGeneration += 1; analysisDetailLoading.value = false;
-  jobsTable.value?.clearSelection();
+  const owner = selectionOwnerKey();
+  selectedJobIds.value = [...(selectedJobIdsByOwner.get(owner) ?? new Set<string>())];
+  selectionSyncing = true;
+  try {
+    jobsTable.value?.clearSelection();
+  } finally {
+    selectionSyncing = false;
+  }
+  await nextTick();
+  await applyDefaultJobSelection();
 });
 const preCaptureEstimate = computed(() => {
   if (!form.includeDetails) return "";
@@ -776,6 +871,8 @@ const sortedJobs = computed(() => {
     return 0;
   });
 });
+// 列表更新后等待表格完成渲染，再同步通过和待判断岗位的默认勾选。
+watch(sortedJobs, () => { void applyDefaultJobSelection(); }, { flush: "post" });
 const handleJobSortChange = ({ prop, order }: { prop: string; order: JobSortOrder | null }) => {
   if (!(prop in sortComparators)) return;
   const column = prop as SortableJobColumn;
@@ -811,6 +908,8 @@ const captureStageLabel = (stage?: string) => ({
   list_collecting: "采集岗位列表",
   list_continue_queued: "准备继续采集",
   list_continuing: "继续采集岗位列表",
+  pause_requested: "正在暂停",
+  paused: "已暂停",
   details_collecting: "采集岗位详情",
   details_stopped: "用户已停止详情采集",
   list_stopped: "用户已停止采集"
@@ -819,9 +918,11 @@ const captureOverview = computed(() => {
   const task = displayedTask.value;
   const smart = activeCaptureConditionTab.value === "smart" ? currentSmartCapture.value : null;
   const jobs = workflowDisplayJobs.value;
+  const stage = smart?.stage || task?.stage || "";
+  const isPausing = stage === "pause_requested";
   return {
     status: displayStatus.value,
-    stage: smart?.stage || captureStageLabel(task?.stage),
+    stage: captureStageLabel(stage),
     message: smart?.message || task?.message || "还没有开始岗位采集。",
     keyword: smart ? smartDetailProgress.value.keyword : task?.keyword || form.keyword || "—",
     city: smart ? smartDetailProgress.value.city : task?.city || form.city || "—",
@@ -835,7 +936,12 @@ const captureOverview = computed(() => {
     detailsCompleted: jobs.filter((job) => job.detail_status === "completed").length,
     detailsFailed: jobs.filter((job) => job.detail_status === "failed").length,
     hasMore: task?.has_more === true,
-    continuationAvailable: task?.continuation_available === true,
+    continuationAvailable: !isPausing && task?.continuation_available === true,
+    continuationText: isPausing
+      ? "正在暂停"
+      : task?.continuation_available === true && task?.has_more === true
+        ? "可以继续"
+        : "暂无更多",
     currentJob: task?.current_job
   };
 });
@@ -848,15 +954,48 @@ const selectedSmartRecommendationStrategy = computed(() =>
 const selectedJobs = computed(() =>
   workflowDisplayJobs.value.filter((job) => selectedJobIds.value.includes(jobDisplayKey(job)))
 );
+// Codex 任务使用岗位历史主键，列表勾选展示仍保留 BOSS 岗位主键。
+const jobHistoryRecordId = (job: FineJobBossCapturedJob) =>
+  String(job.history_record_id || job.id || "");
+const codexAnalysisByHistoryId = computed(() => {
+  const result = new Map<string, FineJobWorkflowAnalysisItem>();
+  smartAnalysisItems.value.forEach((item) => {
+    const historyId = String(item.job?.job_id || "");
+    if (historyId) result.set(historyId, item);
+  });
+  return result;
+});
 const selectedWorkflowJobIds = computed(() =>
   selectedJobs.value
     .filter((job) => job.detail_status === "completed")
-    .map((job) => String(job.history_record_id || job.id || job.job_id || ""))
+    .map((job) => jobHistoryRecordId(job) || String(job.job_id || ""))
+    .filter(Boolean)
+);
+const codexUnavailableJobIds = computed(() => new Set(
+  [
+    ...smartAnalysisItems.value
+      .filter((item) => ["pending", "running", "succeeded"].includes(item.status))
+      .map((item) => String(item.job?.job_id || "")),
+    ...workflowDisplayJobs.value
+      .filter((job) => ["pending", "running", "succeeded"].includes(String(job.codex_analysis_status || "")))
+      .map((job) => jobHistoryRecordId(job))
+  ]
+    .filter(Boolean)
+));
+const selectedCodexJobIds = computed(() =>
+  selectedJobs.value
+    .filter((job) => {
+      const historyId = jobHistoryRecordId(job);
+      return job.detail_status === "completed"
+        && historyId
+        && (!displayingCurrentSmartCapture.value || !codexUnavailableJobIds.value.has(historyId));
+    })
+    .map((job) => jobHistoryRecordId(job))
     .filter(Boolean)
 );
 const selectedDetailJobIds = computed(() =>
   selectedJobs.value
-    .filter((job) => job.job_id && job.detail_status !== "completed" && job.detail_status !== "collecting")
+    .filter((job) => job.job_id && job.detail_status === "not_collected")
     .map((job) => job.job_id as string)
 );
 const selectedDeliveryJobIds = computed(() =>
@@ -939,6 +1078,8 @@ onMounted(async () => {
     currentCapturePromise
   ]);
   if (!bossCapturePageActive) return;
+  await nextTick();
+  await applyDefaultJobSelection();
   const initialFilter = strategiesStore.filters.find((item) => item.enabled) ?? strategiesStore.filters[0];
   const initialRecommendation = strategiesStore.recommendations.find((item) => item.enabled) ?? strategiesStore.recommendations[0];
   filterStrategyId.value = initialFilter?.id ?? null;
@@ -1228,7 +1369,7 @@ const retryCurrentSmartCapture = async () => {
   try {
     smartCaptureControlLoading.value = true;
     await applySmartControlResult(await api.retryFineJobSmartCapture(capture.smart_capture_id));
-    if (ownsControl()) ElMessage.success("岗位采集任务已重试");
+    if (ownsControl()) ElMessage.success("岗位采集任务已恢复");
   } catch (errorValue) {
     if (!ownsControl()) return;
     ElMessage.error(errorValue instanceof Error ? errorValue.message : "重试岗位采集失败");
@@ -1391,6 +1532,21 @@ const loadSmartAnalysisItems = async (showError = false) => {
   } finally { if (requestGeneration === smartAnalysisRequestGeneration) smartAnalysisLoading.value = false; }
 };
 
+const syncSmartCodexStatus = async () => {
+  if (smartCodexStatusLoading.value) return;
+  smartCodexStatusLoading.value = true;
+  try {
+    // 先读取 Electron 中的实际 Codex 进程，再刷新当前 Smart Capture 的交接快照。
+    await codexStore.load();
+    await loadSmartAnalysisItems(true);
+    ElMessage.success("已同步 Codex 窗口状态和分析队列");
+  } catch (errorValue) {
+    ElMessage.error(errorValue instanceof Error ? errorValue.message : "同步 Codex 窗口状态失败");
+  } finally {
+    smartCodexStatusLoading.value = false;
+  }
+};
+
 const viewSmartAnalysisItem = async (item: FineJobWorkflowAnalysisItem) => {
   const capture = currentSmartCapture.value;
   if (!capture) return;
@@ -1468,29 +1624,61 @@ const retrySmartWorkflowCodex = async () => {
     : ElMessage.warning(result.message);
 };
 
+const manuallyAdvanceSmartAnalysis = async () => {
+  const capture = currentSmartCapture.value;
+  const action = smartAnalysisManualAction.value;
+  if (!capture || !action || smartAnalysisManualLoading.value) return;
+  smartAnalysisManualLoading.value = true;
+  try {
+    if (action === "retry") {
+      await retrySmartWorkflowCodex();
+    } else if (action === "recover") {
+      const snapshot = await api.getFineJobSmartCaptureAnalysisSnapshot(capture.smart_capture_id);
+      const result = await recoverSmartCaptureCodexHandoff(snapshot, codexStore);
+      result.status === "submitted"
+        ? ElMessage.success("已释放失联交接并重新推进当前 Analysis Batch")
+        : ElMessage.warning(result.message);
+    } else {
+      const snapshot = await api.getFineJobSmartCaptureAnalysisSnapshot(capture.smart_capture_id);
+      const result = await triggerSmartCaptureCodexHandoff(snapshot, codexStore, "manual");
+      result.status === "submitted"
+        ? ElMessage.success("已手动推进当前 Analysis Batch")
+        : ElMessage.warning(result.message);
+    }
+    await loadSmartAnalysisItems(true);
+  } catch (errorValue) {
+    ElMessage.error(errorValue instanceof Error ? errorValue.message : "手动推进 Codex 分析失败");
+  } finally {
+    smartAnalysisManualLoading.value = false;
+  }
+};
+
 const createManualCodexBatch = async () => {
   const capture = currentSmartCapture.value;
   if (!capture) {
     ElMessage.warning("请先启动一个关闭投递目标的智能采集任务");
     return;
   }
-  const strategyId = recommendationStrategyId.value || smartRecommendationStrategyId.value;
+  const strategyId = smartRecommendationStrategyId.value;
   if (!strategyId) {
-    ElMessage.warning("请先选择建议投递策略");
+    smartPendingRecommendationStrategyId.value = smartRecommendationStrategyId.value;
+    smartRecommendationDialogOpen.value = true;
     return;
   }
-  if (!selectedWorkflowJobIds.value.length) {
+  if (!selectedCodexJobIds.value.length) {
     ElMessage.warning("请先选择已完成详情的岗位");
     return;
   }
   try {
     const snapshot = await api.createFineJobSmartCaptureManualAnalysisBatch(capture.smart_capture_id, {
       recommendation_strategy_id: strategyId,
-      job_ids: selectedWorkflowJobIds.value,
+      job_ids: selectedCodexJobIds.value,
       analysis_batch_size: smartAnalysisBatchSize.value,
       codex_model: smartCodexModel.value || undefined,
       codex_reasoning_effort: smartCodexReasoningEffort.value
     });
+    smartAnalysisItems.value = snapshot.items;
+    smartAnalysisHandoff.value = snapshot.handoff ?? null;
     const result = await triggerSmartCaptureCodexHandoff(snapshot, codexStore, "manual");
     if (result.status === "submitted") {
       ElMessage.success("已将选中岗位交给 Codex 批量生成建议");
@@ -1500,6 +1688,17 @@ const createManualCodexBatch = async () => {
   } catch (errorValue) {
     ElMessage.error(errorValue instanceof Error ? errorValue.message : "创建 Codex 分析批次失败");
   }
+};
+
+const confirmSmartRecommendationStrategy = async () => {
+  if (!smartPendingRecommendationStrategyId.value) {
+    ElMessage.warning("请选择建议投递策略");
+    return;
+  }
+  recommendationStrategyId.value = smartPendingRecommendationStrategyId.value;
+  smartRecommendationStrategyId.value = smartPendingRecommendationStrategyId.value;
+  smartRecommendationDialogOpen.value = false;
+  await createManualCodexBatch();
 };
 
 const syncSmartCaptureTask = async (run: typeof workflowStore.currentRun) => {
@@ -1661,7 +1860,11 @@ const captureJobs = async () => {
 };
 
 const handleSelectionChange = (rows: FineJobBossCapturedJob[]) => {
-  selectedJobIds.value = rows.map((row) => jobDisplayKey(row)).filter(Boolean);
+  if (selectionSyncing) return;
+  const owner = selectionOwnerKey();
+  const keys = new Set(rows.map((row) => jobDisplayKey(row)).filter(Boolean));
+  selectedJobIdsByOwner.set(owner, keys);
+  selectedJobIds.value = [...keys];
 };
 
 const applySuggestedSelection = async (
@@ -1778,11 +1981,33 @@ const captureSelectedDetails = async () => {
     return;
   }
   try {
-    await captureStore.captureDetails(selectedDetailJobIds.value);
+    if (displayingCurrentSmartCapture.value && currentSmartCapture.value) {
+      const capture = await api.queueFineJobSmartCaptureManualDetails(
+        currentSmartCapture.value.smart_capture_id,
+        selectedDetailJobIds.value
+      );
+      await applyCurrentSmartCapture(capture);
+    } else {
+      await captureStore.captureDetails(selectedDetailJobIds.value);
+    }
     ElMessage.success(`已开始采集选中的 ${selectedDetailJobIds.value.length} 个岗位详情`);
-  } catch {
-    ElMessage.error(captureStore.error ?? "启动岗位详情采集失败");
+  } catch (errorValue) {
+    ElMessage.error(errorValue instanceof Error ? errorValue.message : captureStore.error ?? "启动岗位详情采集失败");
   }
+};
+
+const sendSelectedToGreetingReview = async () => {
+  if (!selectedWorkflowJobIds.value.length) {
+    ElMessage.warning("请先选择已完成详情的岗位");
+    return;
+  }
+  const results = await Promise.allSettled(
+    selectedWorkflowJobIds.value.map((historyJobId) => api.requestFineJobBossHistoryGreetingReview(historyJobId))
+  );
+  const succeeded = results.filter((result) => result.status === "fulfilled").length;
+  const failed = results.length - succeeded;
+  if (succeeded) ElMessage.success(`已将 ${succeeded} 个岗位加入待确认打招呼队列`);
+  if (failed) ElMessage.warning(`${failed} 个岗位未能加入待确认队列，可能已有聊天或待确认记录`);
 };
 
 const captureSingleDetail = async (job: FineJobBossCapturedJob) => {
@@ -1864,20 +2089,94 @@ const detailStatusType = (status?: string) => {
   return "info";
 };
 
-const filterStatusLabel = (status?: string) => ({ pass: "通过", reject: "排除", exclude: "冷却排除", review: "待判断" }[status || ""] || "未筛选");
-const filterStatusType = (status?: string) => status === "pass" ? "success" : status === "reject" || status === "exclude" ? "danger" : status === "review" ? "warning" : "info";
+const filterStatusLabel = (status?: string) => ({ pass: "通过", reject: "排除", exclude: "冷却排除", review: "待判断", pass_for_human: "待判断" }[status || ""] || "未筛选");
+const filterStatusType = (status?: string) => status === "pass" ? "success" : status === "reject" || status === "exclude" ? "danger" : status === "review" || status === "pass_for_human" ? "warning" : "info";
+const filterStatusForJob = (job: FineJobBossCapturedJob) =>
+  String(job.final_filter_status || job.filter_status || "");
 const deliveryDecisionLabel = (decision?: string) => ({ recommend: "建议投递", reject: "不建议", review: "待判断" }[decision || ""] || "未评估");
 const deliveryDecisionType = (decision?: string) => decision === "recommend" ? "success" : decision === "reject" ? "danger" : decision === "review" ? "warning" : "info";
+const codexResultForJob = (job: FineJobBossCapturedJob): Record<string, unknown> | null => {
+  if (job.codex_analysis_result && typeof job.codex_analysis_result === "object") {
+    return job.codex_analysis_result;
+  }
+  const item = codexAnalysisByHistoryId.value.get(jobHistoryRecordId(job));
+  if (item?.status === "succeeded" && item.analysis_result && typeof item.analysis_result === "object") {
+    return item.analysis_result;
+  }
+  return null;
+};
+const deliveryDecisionForJob = (job: FineJobBossCapturedJob) => {
+  const codexResult = codexResultForJob(job);
+  return String(codexResult?.decision || job.delivery_evaluation?.decision || "");
+};
+const deliveryDecisionLabelForJob = (job: FineJobBossCapturedJob) => {
+  if (["pending", "running"].includes(String(job.codex_analysis_status || ""))) return "生成中";
+  return deliveryDecisionLabel(deliveryDecisionForJob(job));
+};
+const deliveryDecisionTypeForJob = (job: FineJobBossCapturedJob) =>
+  deliveryDecisionType(deliveryDecisionForJob(job));
 const deliveryEvaluationReasons = (job: FineJobBossCapturedJob) =>
   (job.delivery_evaluation?.reasons ?? []).join("；") || job.recommendation_reason || "暂无评估理由";
 const deliveryEvaluationRisks = (job: FineJobBossCapturedJob) =>
   (job.delivery_evaluation?.risks ?? []).join("；");
 const deliveryEvaluationMissingFields = (job: FineJobBossCapturedJob) =>
   (job.delivery_evaluation?.missing_fields ?? []).join("、");
-const filterReasonText = (job: FineJobBossCapturedJob) => [
-  ...(job.filter_reasons ?? []),
-  ...(job.filter_missing_fields ?? []).map((item) => `缺少：${item}`)
-].join("；") || "尚未应用筛选策略";
+const filterFailureCodeLabel = (code: string) => ({
+  title: "岗位名称",
+  company: "公司",
+  company_scale: "公司规模",
+  company_industry: "公司行业",
+  company_stage: "融资阶段",
+  degree: "学历",
+  experience: "经验",
+  city: "地点",
+  job_type: "工作性质",
+  salary: "薪资",
+  skill: "技能",
+  "skill/JD": "技能/JD"
+}[code] || code);
+const filterReasonText = (job: FineJobBossCapturedJob) => {
+  // 按最终筛选状态选择对应原因，旧数据没有拆分字段时只展示排除证据。
+  const status = filterStatusForJob(job);
+  const fallbackRejectReasons = [
+    ...(job.cooldown_reasons ?? []),
+    ...(job.filter_missing_fields ?? []).map((item) => `缺少：${item}`),
+    ...(job.filter_failure_codes ?? []).map((code) => `未满足：${filterFailureCodeLabel(code)}`)
+  ];
+  const reasons = status === "pass"
+    ? (job.filter_pass_reasons?.length ? job.filter_pass_reasons : job.filter_reasons ?? [])
+    : ["reject", "exclude"].includes(status)
+      ? (job.filter_reject_reasons?.length ? job.filter_reject_reasons : fallbackRejectReasons)
+      : ["review", "pass_for_human"].includes(status)
+        ? [
+            ...(job.filter_review_reasons ?? []),
+            ...(job.filter_missing_fields ?? []).map((item) => `缺少：${item}`)
+          ]
+        : [];
+  return reasons.join("；") || (
+    ["reject", "exclude"].includes(status)
+      ? "未记录排除原因"
+      : ["review", "pass_for_human"].includes(status)
+        ? "未记录待判断原因"
+        : status === "pass"
+          ? "已通过筛选"
+          : "尚未应用筛选策略"
+  );
+};
+const deliverySuggestionText = (job: FineJobBossCapturedJob) => {
+  const codexResult = codexResultForJob(job);
+  if (codexResult) {
+    const summary = String(codexResult.summary || "");
+    const reasons = Array.isArray(codexResult.reasons)
+      ? codexResult.reasons.map((item) => String(item)).join("；")
+      : "";
+    if (summary || reasons) return [summary, reasons].filter(Boolean).join("；");
+  }
+  if (job.delivery_evaluation) {
+    return job.delivery_evaluation.summary || deliveryEvaluationReasons(job);
+  }
+  return job.recommendation_reason || "尚未生成投递建议";
+};
 
 function formatDuration(seconds: number) {
   if (seconds < 60) return `${Math.max(1, Math.ceil(seconds))} 秒`;
@@ -2001,7 +2300,7 @@ function formatDuration(seconds: number) {
             继续采集
           </el-button>
           <el-button v-if="smartCaptureRetryable" :disabled="Boolean(startState.intent)" type="warning" :loading="smartCaptureControlLoading" @click="retryCurrentSmartCapture">
-            重试采集
+            恢复采集
           </el-button>
           <el-button
             v-if="currentSmartCapture && !smartWorkflowTerminalStatuses.includes(currentSmartCapture.status)"
@@ -2068,7 +2367,7 @@ function formatDuration(seconds: number) {
         <div><span class="secondary-text">新岗位 / 重复岗位</span><strong>{{ captureOverview.freshJobs }} / {{ captureOverview.duplicateJobs }}</strong></div>
         <div><span class="secondary-text">通过 / 待确认 / 排除</span><strong>{{ captureOverview.passed }} / {{ captureOverview.review }} / {{ captureOverview.rejected }}</strong></div>
         <div><span class="secondary-text">详情完成 / 失败</span><strong>{{ captureOverview.detailsCompleted }} / {{ captureOverview.detailsFailed }}</strong></div>
-        <div><span class="secondary-text">后续采集</span><strong>{{ captureOverview.continuationAvailable && captureOverview.hasMore ? "可以继续" : "暂无更多" }}</strong></div>
+        <div><span class="secondary-text">后续采集</span><strong>{{ captureOverview.continuationText }}</strong></div>
       </div>
       <p v-if="captureOverview.currentJob" class="secondary-text">
         当前岗位：{{ captureOverview.currentJob.title }} / {{ captureOverview.currentJob.company }}
@@ -2169,8 +2468,11 @@ function formatDuration(seconds: number) {
         <el-button type="primary" plain :disabled="taskRunning" :loading="captureStore.suggesting" @click="applySuggestedSelection('ai')">
           AI 初筛详情岗位
         </el-button>
-        <el-button type="success" :disabled="taskRunning || !selectedDetailJobIds.length" @click="captureSelectedDetails">
-          采集选中的 {{ selectedDetailJobIds.length }} 个岗位详情
+        <el-button type="success" :disabled="!selectedDetailJobIds.length" @click="captureSelectedDetails">
+          批量采集详情（{{ selectedDetailJobIds.length }}）
+        </el-button>
+        <el-button type="warning" plain :disabled="!selectedWorkflowJobIds.length" @click="sendSelectedToGreetingReview">
+          转到待确认（{{ selectedWorkflowJobIds.length }}）
         </el-button>
         <el-button
           type="warning"
@@ -2182,14 +2484,20 @@ function formatDuration(seconds: number) {
         </el-button>
       </div>
       <div v-else class="detail-actions">
+        <el-button type="success" plain :disabled="!selectedDetailJobIds.length" @click="captureSelectedDetails">
+          批量采集详情（{{ selectedDetailJobIds.length }}）
+        </el-button>
+        <el-button type="warning" plain :disabled="!selectedWorkflowJobIds.length" @click="sendSelectedToGreetingReview">
+          转到待确认（{{ selectedWorkflowJobIds.length }}）
+        </el-button>
         <el-button
           type="primary"
           plain
-          :disabled="taskRunning || !smartManualAnalysisAvailable || !recommendationStrategyId || !selectedWorkflowJobIds.length"
+          :disabled="!selectedCodexJobIds.length"
           :loading="workflowStore.loading"
           @click="createManualCodexBatch"
         >
-          交给 Codex 批量生成建议（{{ selectedWorkflowJobIds.length }}）
+          交给 Codex 批量生成建议（{{ selectedCodexJobIds.length }}）<span v-if="selectedSmartRecommendationStrategy"> · {{ selectedSmartRecommendationStrategy.name }}</span>
         </el-button>
       </div>
 
@@ -2214,20 +2522,32 @@ function formatDuration(seconds: number) {
         <el-table-column prop="filter_status" label="筛选" min-width="100" sortable="custom">
           <template #default="scope">
             <el-tooltip :content="filterReasonText(scope.row)">
-              <el-tag :type="filterStatusType(scope.row.filter_status)" size="small">{{ filterStatusLabel(scope.row.filter_status) }}</el-tag>
+              <el-tag :type="filterStatusType(filterStatusForJob(scope.row))" size="small">{{ filterStatusLabel(filterStatusForJob(scope.row)) }}</el-tag>
             </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="投递建议" min-width="100">
           <template #default="scope">
-            <el-tooltip :content="scope.row.recommendation_reason || '尚未生成投递建议'">
-              <el-tag :type="deliveryDecisionType(scope.row.delivery_evaluation?.decision)" size="small">
-                {{ deliveryDecisionLabel(scope.row.delivery_evaluation?.decision) }}
+            <el-tooltip :content="deliverySuggestionText(scope.row)">
+              <el-tag :type="deliveryDecisionTypeForJob(scope.row)" size="small">
+                {{ deliveryDecisionLabelForJob(scope.row) }}
               </el-tag>
             </el-tooltip>
           </template>
         </el-table-column>
-        <el-table-column prop="title" label="岗位" min-width="180" sortable="custom" />
+        <el-table-column prop="title" label="岗位" min-width="180" sortable="custom">
+          <template #default="scope">
+            <el-link
+              v-if="scope.row.detail_status === 'completed'"
+              type="primary"
+              :underline="false"
+              @click.stop="openDetail(scope.row)"
+            >
+              {{ scope.row.title }}
+            </el-link>
+            <span v-else>{{ scope.row.title }}</span>
+          </template>
+        </el-table-column>
         <el-table-column prop="boss_name" label="公司" min-width="190">
           <template #default="scope">
             <span>{{ scope.row.boss_name }}</span>
@@ -2302,7 +2622,35 @@ function formatDuration(seconds: number) {
     <section v-if="activeCaptureConditionTab === 'smart' && currentSmartCapture" class="page-panel smart-analysis-panel">
       <div class="panel-title-row">
         <div><p class="panel-eyebrow">Analysis Queue</p><h2>待分析岗位队列</h2></div>
-        <el-button @click="loadSmartAnalysisItems(true)">刷新</el-button>
+        <div class="platform-actions">
+          <el-button
+            v-if="smartAnalysisManualAction === 'advance'"
+            type="primary"
+            :loading="smartAnalysisManualLoading"
+            @click="manuallyAdvanceSmartAnalysis"
+          >
+            推进 Codex 分析（{{ smartPendingAnalysisCount }}）
+          </el-button>
+          <el-button
+            v-else-if="smartAnalysisManualAction === 'retry'"
+            type="warning"
+            :loading="smartAnalysisManualLoading"
+            @click="manuallyAdvanceSmartAnalysis"
+          >
+            重试 Codex 交接（{{ smartPendingAnalysisCount }}）
+          </el-button>
+          <el-button
+            v-else-if="smartAnalysisManualAction === 'recover'"
+            type="warning"
+            :loading="smartAnalysisManualLoading"
+            @click="manuallyAdvanceSmartAnalysis"
+          >
+            重新交给 Codex（{{ smartPendingAnalysisCount }}）
+          </el-button>
+          <el-tag v-if="smartAnalysisQueueStatus" type="info">{{ smartAnalysisQueueStatus }}</el-tag>
+          <el-button :loading="smartCodexStatusLoading" @click="syncSmartCodexStatus">同步 Codex 状态</el-button>
+          <el-button @click="loadSmartAnalysisItems(true)">刷新</el-button>
+        </div>
       </div>
       <p class="secondary-text">本批进入 Codex 前的岗位与筛选依据均来自当前 Smart Capture 的持久化记录。</p>
       <el-alert v-if="smartAnalysisError" :title="smartAnalysisError" type="error" :closable="false" />
@@ -2528,6 +2876,21 @@ function formatDuration(seconds: number) {
         </section>
       </section>
     </div>
+
+    <el-dialog v-model="smartRecommendationDialogOpen" title="选择建议投递策略" width="480px">
+      <el-select v-model="smartPendingRecommendationStrategyId" placeholder="选择建议投递策略" style="width: 100%">
+        <el-option
+          v-for="item in strategiesStore.recommendations"
+          :key="item.id"
+          :label="item.name"
+          :value="item.id"
+        />
+      </el-select>
+      <template #footer>
+        <el-button @click="smartRecommendationDialogOpen = false">取消</el-button>
+        <el-button type="primary" @click="confirmSmartRecommendationStrategy">确定并生成建议</el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="smartAnalysisDetailOpen" title="Workflow 分析 Item 详情" width="80%">
       <p v-if="analysisDetailLoading">正在读取分析详情…</p>

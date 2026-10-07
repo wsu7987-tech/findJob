@@ -14,13 +14,15 @@ from backend.app.services.fine_job.adaptive_search_planner import (
     build_metrics_for_window,
     canonicalize_platform_filters,
     combination_identity,
+    plan_next_combination,
+    platform_filter_code,
 )
 from backend.app.services.fine_job.boss_capture_history import (
     get_capture_history_job,
     update_capture_job_filter_result,
 )
 from backend.app.services.fine_job.boss_capture_tasks import boss_capture_task_manager
-from backend.app.services.fine_job.filter_exclusions import apply_filter_exclusions
+from backend.app.services.fine_job.filter_exclusions import apply_filter_exclusions, ensure_exclusion_state
 from backend.app.services.fine_job.job_evaluation import evaluate_filter_strategy
 from backend.app.services.fine_job.strategies import get_filter_strategy
 from backend.app.utils import new_id, utc_now
@@ -43,6 +45,10 @@ def prepare_search_execution(
     city = str(payload.get("city") or (cities[0] if cities else "")).strip()
     if not keyword or not city:
         raise AppError(422, "VALIDATION_FAILED", "岗位采集任务缺少搜索词或城市。")
+    filter_strategy_id = str(payload.get("filter_strategy_id") or "").strip()
+    if filter_strategy_id:
+        # 每个搜索批次启动前刷新排除清单，保证筛选条件切换后仍使用最新冷却状态。
+        ensure_exclusion_state(db, get_filter_strategy(db, filter_strategy_id), force=True)
     filters = canonicalize_platform_filters(payload.get("platform_filters") or payload.get("filters"))
     identity = combination_identity(keyword, city, filters)
     with db.connect() as connection:
@@ -263,29 +269,37 @@ def process_completed_batch(
     capture_pages = int(capture.get("total_pages_loaded") or 0)
     capture_job_count = len(jobs)
     previous_result = _load(task["result_json"])
+    previous_pages = 0
+    previous_job_count = 0
+    window_jobs = jobs
     if previous_result.get("capture_task_id") == batch_id and task["status"] == "succeeded":
         # 续采会复用同一个 BOSS batch ID；只有页数或累计岗位数增长时才重新处理。
         previous_pages = int(previous_result.get("capture_pages") or 0)
         previous_job_count = int(previous_result.get("capture_job_count") or 0)
         if capture_pages <= previous_pages and capture_job_count <= previous_job_count:
             return dict(previous_result.get("metrics") or {})
+        # Capture 快照是累计集合，窗口结算只消费本次新增岗位，避免续采重复累计指标。
+        window_jobs = jobs[previous_job_count:]
 
-    results = _evaluate_jobs(db, smart_capture_id, task_payload, jobs)
+    results = _evaluate_jobs(db, smart_capture_id, task_payload, window_jobs)
     result_by_id = {str(item.get("job_id") or ""): item for item in results}
     try:
         # 同步进程内快照，保留页面和后续详情流程对筛选结果的既有读取行为。
-        boss_capture_task_manager.apply_filter_results(batch_id, results)
+        if window_jobs:
+            boss_capture_task_manager.apply_filter_results(batch_id, results)
     except AppError:
         # 重启后只有持久化 batch 时，历史 discovery 仍可独立完成写入。
         pass
     strategy_id = str(task_payload.get("filter_strategy_id") or "")
     if strategy_id:
-        _persist_filter_results(db, jobs, result_by_id)
-    metrics = build_metrics_for_window(jobs, results)
+        _persist_filter_results(db, window_jobs, result_by_id)
+    metrics = build_metrics_for_window(window_jobs, results)
     combination_id = str(task_payload.get("search_combination_id") or "")
     now = utc_now()
     with db.connect() as connection:
-        for job in jobs:
+        marginal_jobs_seen = len(window_jobs)
+        marginal_first_discovery = 0
+        for job in window_jobs:
             history_job_id = str(job.get("history_record_id") or "")
             source_job_id = str(job.get("job_id") or "")
             if not history_job_id or not source_job_id:
@@ -327,11 +341,16 @@ def process_completed_batch(
                     int(filter_result.get("status") in {"pass", "review"}),
                 ),
             )
+            if previous is None:
+                marginal_first_discovery += 1
+        pages_seen = capture_pages
+        if previous_result.get("capture_task_id") == batch_id:
+            pages_seen = max(0, capture_pages - previous_pages)
         _update_combination_metrics_in_connection(
             connection,
             combination_id,
             metrics,
-            pages_seen=int(capture.get("total_pages_loaded") or 0),
+            pages_seen=pages_seen,
             low_novelty_threshold=float((planner_policy or {}).get("low_novelty_threshold") or 0.25),
             low_qualified_yield_threshold=float((planner_policy or {}).get("low_qualified_yield_threshold") or 0.15),
         )
@@ -343,6 +362,8 @@ def process_completed_batch(
             connection, combination_id, "low_qualified_yield_streak", metrics.low_qualified_yield_streak
         )
         metrics_dict = metrics.as_dict()
+        metrics_dict["marginal_jobs_seen"] = marginal_jobs_seen
+        metrics_dict["marginal_first_discovery_jobs"] = marginal_first_discovery
         metrics_dict["low_novelty_streak"] = task_payload["low_novelty_streak"]
         metrics_dict["low_qualified_yield_streak"] = task_payload["low_qualified_yield_streak"]
         if combination_id:
@@ -384,16 +405,36 @@ def process_completed_batch(
     return metrics_dict
 
 
-def count_candidates(db: Database, smart_capture_id: str) -> int:
+def count_candidates(
+    db: Database,
+    smart_capture_id: str,
+    filter_strategy_id: str | None = None,
+) -> int:
+    strategy_id = str(filter_strategy_id or "").strip()
+    if strategy_id:
+        # 目标岗位数使用当前筛选策略的有效岗位/公司冷却状态。
+        ensure_exclusion_state(db, get_filter_strategy(db, strategy_id))
+    now = utc_now()
     with db.connect() as connection:
         row = connection.execute(
             """
-            SELECT COUNT(DISTINCT job_id) AS count
-            FROM fj_workflow_job_discoveries
-            WHERE smart_capture_id = ? AND is_run_first_discovery = 1
-              AND is_historical_duplicate = 0 AND is_filter_candidate = 1
+            SELECT COUNT(DISTINCT d.job_id) AS count
+            FROM fj_workflow_job_discoveries d
+            JOIN fj_boss_jobs j ON j.id = d.job_id
+            WHERE d.smart_capture_id = ?
+              AND d.is_filter_candidate = 1
+              AND (? = '' OR NOT EXISTS (
+                SELECT 1
+                FROM fj_filter_exclusion_entries exclusion
+                WHERE exclusion.strategy_id = ?
+                  AND (exclusion.excluded_until IS NULL OR exclusion.excluded_until > ?)
+                  AND (
+                    (exclusion.entity_type = 'job' AND exclusion.entity_id = j.id)
+                    OR (exclusion.entity_type = 'company' AND exclusion.entity_id = j.company_id)
+                  )
+              ))
             """,
-            (smart_capture_id,),
+            (smart_capture_id, strategy_id, strategy_id, now),
         ).fetchone()
     return int(row["count"] or 0)
 
@@ -461,17 +502,17 @@ def _select_available_candidates(
 ) -> list[Any]:
     return connection.execute(
         """
-        SELECT d.job_id, j.detail_status
+            SELECT DISTINCT d.job_id, j.detail_status
         FROM fj_workflow_job_discoveries d
         JOIN fj_boss_jobs j ON j.id = d.job_id
         WHERE d.smart_capture_id = ?
-          AND d.is_run_first_discovery = 1
-          AND d.is_historical_duplicate = 0
           AND d.is_filter_candidate = 1
+          AND j.detail_status = 'not_collected'
           AND NOT EXISTS (
             SELECT 1 FROM fj_workflow_tasks t
             WHERE t.smart_capture_id = d.smart_capture_id
               AND t.task_type IN ('deep_job_search_jd', 'deep_job_search_analysis')
+                  AND t.status IN ('pending', 'running', 'succeeded')
               AND json_extract(t.payload_json, '$.job_id') = d.job_id
           )
           AND NOT EXISTS (
@@ -741,7 +782,27 @@ def _advance_pipeline_details(
             f"SELECT 1 FROM {table} WHERE smart_capture_id = ? {task_filter} AND status IN ('pending', 'running', 'collecting') LIMIT 1",
             (smart_capture_id,),
         ).fetchone()
+        retryable_failed = connection.execute(
+            "SELECT result_json FROM fj_workflow_tasks WHERE smart_capture_id = ? AND task_type = 'deep_job_search_jd' AND status = 'failed' AND retryable = 1 LIMIT 1",
+            (smart_capture_id,),
+        ).fetchone() if unit_type == "formal_jd" else None
     if active is not None:
+        return
+    if retryable_failed is not None:
+        # 当前详情批次失败后进入可恢复状态，由继续采集统一重置失败单元并重试。
+        from backend.app.services.fine_job import smart_captures
+
+        error_message = _load(retryable_failed["result_json"]).get("error") or "JD 详情采集失败。"
+        smart_captures._update_capture(
+            db,
+            smart_capture_id,
+            status="interrupted",
+            stage="pipeline_interrupted",
+            waiting_reason="capture_interrupted",
+            control_cause="recovery",
+            message="JD 详情采集失败，请点击继续采集重试。",
+            error_message=str(error_message),
+        )
         return
     if unit_type == "formal_jd":
         _create_analysis_from_formal_jd(db, smart_capture_id)
@@ -781,7 +842,7 @@ def resume_pipeline(
     with db.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         formal = connection.execute(
-            "SELECT 1 FROM fj_workflow_tasks WHERE smart_capture_id = ? AND task_type = 'deep_job_search_jd' AND status IN ('pending', 'running') LIMIT 1",
+            "SELECT 1 FROM fj_workflow_tasks WHERE smart_capture_id = ? AND task_type = 'deep_job_search_jd' AND (status IN ('pending', 'running') OR (status = 'failed' AND retryable = 1)) LIMIT 1",
             (smart_capture_id,),
         ).fetchone()
         prefetch = connection.execute(
@@ -789,7 +850,7 @@ def resume_pipeline(
             (smart_capture_id,),
         ).fetchone()
         connection.execute(
-            "UPDATE fj_workflow_tasks SET status = 'pending', operation_ref_type = NULL, operation_ref_id = NULL, updated_at = ? WHERE smart_capture_id = ? AND task_type = 'deep_job_search_jd' AND status = 'running'",
+            "UPDATE fj_workflow_tasks SET status = 'pending', operation_ref_type = NULL, operation_ref_id = NULL, completed_at = NULL, updated_at = ? WHERE smart_capture_id = ? AND task_type = 'deep_job_search_jd' AND status IN ('running', 'failed') AND retryable = 1",
             (utc_now(), smart_capture_id),
         )
         connection.execute(
@@ -1137,15 +1198,22 @@ def _finalize_prefetch_batch(db: Database, smart_capture_id: str) -> None:
             (smart_capture_id, source_analysis_batch_id),
         ).fetchone()
     # Analysis 先于 Prefetch 完成时，由最后一个详情事件完成交接。
-    if unfinished_analysis is None and _promote_ready_prefetch(db, smart_capture_id) == "promoted":
-        _set_capture_state(
-            db,
-            smart_capture_id,
-            status="running",
-            stage="waiting_codex",
-            waiting_reason="codex",
-            message="Prefetch 已收敛并提升为下一正式 Analysis Batch。",
-        )
+    if unfinished_analysis is None:
+        promotion = _promote_ready_prefetch(db, smart_capture_id)
+        if promotion == "promoted":
+            _set_capture_state(
+                db,
+                smart_capture_id,
+                status="running",
+                stage="waiting_codex",
+                waiting_reason="codex",
+                message="Prefetch 已收敛并提升为下一正式 Analysis Batch。",
+            )
+        elif promotion == "none":
+            # Prefetch 没有可用岗位时，继续搜索以补充下一批候选。
+            snapshot = _smart_capture_snapshot(db, smart_capture_id)
+            config = _capture_config(snapshot)
+            _continue_after_analysis_batch(db, smart_capture_id, snapshot, config)
 
 
 def analysis_item_saved(
@@ -1209,6 +1277,9 @@ def analysis_item_saved(
             message="当前分析已完成，等待并行 Prefetch 收敛。",
         )
     else:
+        # 分析目标未达成且没有可用 Prefetch 时，继续既有的列表推进流程。
+        if _continue_after_analysis_batch(db, smart_capture_id, snapshot, config):
+            return
         _set_capture_state(
             db,
             smart_capture_id,
@@ -1217,6 +1288,81 @@ def analysis_item_saved(
             waiting_reason="next_batch",
             message="当前分析已完成，等待后续候选批次。",
         )
+
+
+def _continue_after_analysis_batch(
+    db: Database,
+    smart_capture_id: str,
+    snapshot: dict[str, object],
+    execution_config: dict[str, object],
+) -> bool:
+    """分析批次未达目标时，接续当前搜索或切换下一搜索组合。"""
+    analysis_config = execution_config.get("analysis")
+    analysis_config = analysis_config if isinstance(analysis_config, dict) else {}
+    if str(analysis_config.get("after_analysis_batch") or "auto_continue") != "auto_continue":
+        return False
+    if bool(analysis_config.get("stop_after_current_batch")):
+        return False
+
+    current_batch_id = str(snapshot.get("current_batch_id") or "")
+    if not current_batch_id:
+        return False
+    try:
+        # 允许服务重启后从持久化批次恢复当前列表采集任务。
+        capture_task = boss_capture_task_manager.get_task(current_batch_id, db=db)
+    except AppError:
+        return False
+    if str(capture_task.get("status") or "") in {"queued", "running"}:
+        # 当前列表采集仍在执行，等待它自己的完成回调推进，避免重复启动。
+        return False
+
+    task_info = _task_for_batch(db, smart_capture_id, current_batch_id)
+    if task_info is None:
+        return False
+    with db.connect() as connection:
+        task = connection.execute(
+            "SELECT result_json FROM fj_workflow_tasks WHERE id = ? AND smart_capture_id = ?",
+            (task_info["task_id"], smart_capture_id),
+        ).fetchone()
+    if task is None:
+        return False
+    metrics = _load(task["result_json"]).get("metrics") or {}
+    if not isinstance(metrics, dict):
+        metrics = {}
+
+    # 搜索切换时复用 Smart Capture 的统一输出目录，保证重启恢复后仍可创建新批次。
+    from backend.app.config import load_config
+
+    capture_task["_output_dir"] = load_config().output_root / "fine-job" / "boss-capture"
+    return _advance_search_progression(
+        db,
+        smart_capture_id,
+        capture_task,
+        metrics,
+        execution_config,
+    )
+
+
+def resume_after_analysis_batch(db: Database, smart_capture_id: str) -> bool:
+    """恢复已进入等待态的任务，补执行一次分析完成后的自动推进。"""
+    snapshot = _smart_capture_snapshot(db, smart_capture_id)
+    if str(snapshot.get("status") or "") in {"completed", "stopped", "failed"}:
+        return False
+    config = _capture_config(snapshot)
+    promotion = _promote_ready_prefetch(db, smart_capture_id)
+    if promotion == "promoted":
+        _set_capture_state(
+            db,
+            smart_capture_id,
+            status="running",
+            stage="waiting_codex",
+            waiting_reason="codex",
+            message="已将 ready Prefetch 提升为下一正式 Analysis Batch。",
+        )
+        return True
+    if promotion == "waiting":
+        return False
+    return _continue_after_analysis_batch(db, smart_capture_id, snapshot, config)
 
 
 def _analysis_decision_counts(db: Database, smart_capture_id: str) -> dict[str, int]:
@@ -1385,14 +1531,20 @@ def advance_completed_batch(
         return False
     config = snapshot.get("execution_config")
     config = config if isinstance(config, dict) else {}
-    delivery_target = config.get("delivery_target")
-    delivery_enabled = bool(delivery_target.get("enabled")) if isinstance(delivery_target, dict) else False
-    workflow_run_id = str(snapshot.get("workflow_run_id") or "")
-    candidate_count = count_candidates(db, smart_capture_id)
+    auto_jd_details = bool(config.get("auto_jd_detail_collection_enabled", True))
+    search_config = config.get("search")
+    search_config = search_config if isinstance(search_config, dict) else {}
+    candidate_count = count_candidates(
+        db,
+        smart_capture_id,
+        str(search_config.get("filter_strategy_id") or ""),
+    )
     target_count = int(snapshot.get("target_count") or 0)
     exhausted = not bool(capture_task.get("has_more"))
-    # OFF 模式仅以候选目标为完成条件；搜索耗尽仍保留为可恢复的系统等待。
-    if not delivery_enabled and target_count > 0 and candidate_count >= target_count:
+    # 采集目标岗位数始终是列表进入 JD 详情的门槛，投递目标只在分析阶段判断完成。
+    target_reached = target_count > 0 and candidate_count >= target_count
+    # 手动 JD 模式达到目标后结束列表采集；自动 JD 模式达到目标后直接进入详情批次。
+    if target_reached and not auto_jd_details:
         smart_captures._update_capture(
             db,
             smart_capture_id,
@@ -1409,7 +1561,7 @@ def advance_completed_batch(
             completed=True,
         )
         return False
-    if not workflow_run_id and _continue_independent_capture_batch(
+    if not target_reached and _advance_search_progression(
         db,
         smart_capture_id,
         capture_task,
@@ -1422,6 +1574,20 @@ def advance_completed_batch(
         "last_batch_id": str(capture_task.get("id") or ""),
         "search_exhausted": exhausted,
     }
+    if not auto_jd_details:
+        # 关闭自动 JD 详情时，列表采集完成后交给岗位列表的手动采集入口处理详情。
+        smart_captures._update_capture(
+            db,
+            smart_capture_id,
+            status="completed",
+            stage="completed",
+            waiting_reason="",
+            control_cause="",
+            message="岗位列表采集完成，等待手动采集 JD 详情。",
+            result_summary={**result_summary, "completion_reason": "list_completed_waiting_manual_details"},
+            completed=True,
+        )
+        return False
     output_dir = capture_task.get("_output_dir")
     created = _ensure_formal_jd_batch(db, smart_capture_id, snapshot)
     if created and isinstance(output_dir, Path):
@@ -1451,14 +1617,14 @@ def advance_completed_batch(
     return False
 
 
-def _continue_independent_capture_batch(
+def _continue_capture_batch(
     db: Database,
     smart_capture_id: str,
     capture_task: dict[str, object],
     metrics: dict[str, object],
     execution_config: dict[str, object],
 ) -> bool:
-    """独立智能采集按搜索深度自动推进，不再用用户页数作为停止条件。"""
+    """按现有搜索深度和低产出规则继续当前搜索组合。"""
     if not bool(capture_task.get("continuation_available") and capture_task.get("has_more")):
         return False
     stop_policy = execution_config.get("stop_policy")
@@ -1469,14 +1635,12 @@ def _continue_independent_capture_batch(
     if depth >= max_depth:
         return False
     qualified = int(metrics.get("qualified_fresh_jobs") or 0)
-    fresh = int(metrics.get("run_fresh_jobs") or 0)
     low_novelty_streak = int(metrics.get("low_novelty_streak") or 0)
-    duplicate_rate = float(metrics.get("duplicate_rate") or 0)
+    low_qualified_yield_streak = int(metrics.get("low_qualified_yield_streak") or 0)
     low_yield_limit = int(stop_policy.get("low_yield_streak_limit") or 3)
     should_continue = qualified > 0 or (
-        fresh == 0
-        and low_novelty_streak < low_yield_limit
-        and duplicate_rate < 0.6
+        low_novelty_streak < low_yield_limit
+        and low_qualified_yield_streak < low_yield_limit
     )
     if not should_continue:
         return False
@@ -1506,6 +1670,520 @@ def _continue_independent_capture_batch(
     return True
 
 
+def _advance_search_progression(
+    db: Database,
+    smart_capture_id: str,
+    capture_task: dict[str, object],
+    metrics: dict[str, object],
+    execution_config: dict[str, object],
+) -> bool:
+    """迁移 Workflow 的批次后续推进：续采当前组合或切换到下一组合。"""
+    if _continue_capture_batch(
+        db,
+        smart_capture_id,
+        capture_task,
+        metrics,
+        execution_config,
+    ):
+        return True
+
+    task_info = _task_for_batch(db, smart_capture_id, str(capture_task.get("id") or ""))
+    if task_info is None:
+        task_info = _pending_task_for_capture(db, smart_capture_id)
+    if task_info is None:
+        return False
+    with db.connect() as connection:
+        task = connection.execute(
+            "SELECT payload_json, result_json FROM fj_workflow_tasks WHERE id = ? AND smart_capture_id = ?",
+            (task_info["task_id"], smart_capture_id),
+        ).fetchone()
+        combination = connection.execute(
+            "SELECT * FROM fj_workflow_search_combinations WHERE id = ? AND smart_capture_id = ?",
+            (task_info["combination_id"], smart_capture_id),
+        ).fetchone() if task_info["combination_id"] else None
+    if task is None:
+        return False
+
+    payload = _load(task["payload_json"])
+    result = _load(task["result_json"])
+    window = metrics or result.get("metrics") or {}
+    window_metrics = SearchWindowMetrics(
+        jobs_seen=int(window.get("jobs_seen") or 0),
+        run_fresh_jobs=int(window.get("run_fresh_jobs") or window.get("new_jobs") or 0),
+        historical_duplicates=int(window.get("historical_duplicates") or window.get("duplicates") or 0),
+        cooldown_excluded=int(window.get("cooldown_excluded") or 0),
+        strategy_pass=int(window.get("strategy_pass") or 0),
+        strategy_review=int(window.get("strategy_review") or 0),
+        strategy_reject=int(window.get("strategy_reject") or 0),
+        qualified_fresh_jobs=int(window.get("qualified_fresh_jobs") or window.get("candidate_jobs") or 0),
+        candidate_jobs=int(window.get("candidate_jobs") or window.get("new_candidates") or 0),
+        novelty_yield=float(window.get("novelty_yield") or 0),
+        qualified_novelty_yield=float(window.get("qualified_novelty_yield") or 0),
+        duplicate_rate=float(window.get("duplicate_rate") or 0),
+        low_novelty_streak=int(window.get("low_novelty_streak") or payload.get("low_novelty_streak") or 0),
+        low_qualified_yield_streak=int(window.get("low_qualified_yield_streak") or payload.get("low_qualified_yield_streak") or 0),
+        failure_code_counts={
+            str(key): int(value)
+            for key, value in (window.get("failure_code_counts") or {}).items()
+        },
+    )
+    stop_policy = execution_config.get("stop_policy")
+    stop_policy = stop_policy if isinstance(stop_policy, dict) else {}
+    search_config = execution_config.get("search")
+    search_config = search_config if isinstance(search_config, dict) else {}
+    keyword = str(payload.get("keyword") or capture_task.get("keyword") or "").strip()
+    city = str(payload.get("city") or capture_task.get("city") or "").strip()
+    strategy_id = str(payload.get("filter_strategy_id") or search_config.get("filter_strategy_id") or "")
+    if not keyword or not city or not strategy_id:
+        return False
+
+    can_continue = bool(capture_task.get("continuation_available") and capture_task.get("has_more"))
+    depth = int(payload.get("depth") or capture_task.get("total_pages_loaded") or 0)
+    max_depth = int(stop_policy.get("max_depth") or 20)
+    current_filters = canonicalize_platform_filters(
+        payload.get("platform_filters")
+        or (_load(combination["platform_filters_json"]) if combination is not None else {})
+    )
+    parent_filters: dict[str, str] | None = None
+    if combination is not None and combination["parent_combination_id"]:
+        with db.connect() as connection:
+            parent = connection.execute(
+                "SELECT platform_filters_json FROM fj_workflow_search_combinations WHERE id = ? AND smart_capture_id = ?",
+                (str(combination["parent_combination_id"]), smart_capture_id),
+            ).fetchone()
+        if parent is not None:
+            parent_filters = canonicalize_platform_filters(_load(parent["platform_filters_json"]))
+    current_combination_empty = bool(
+        combination is not None and int(combination["jobs_seen"] or 0) == 0
+    )
+    evidence_combination_id = (
+        str(combination["parent_combination_id"])
+        if current_combination_empty and combination is not None and combination["parent_combination_id"]
+        else task_info["combination_id"]
+    )
+    positive_distribution = _positive_filter_distribution(
+        db,
+        smart_capture_id,
+        evidence_combination_id,
+    )
+    if (
+        not current_combination_empty
+        and combination is not None
+        and combination["parent_combination_id"]
+    ):
+        positive_distribution = _merge_filter_distributions(
+            positive_distribution,
+            _positive_filter_distribution(
+                db,
+                smart_capture_id,
+                str(combination["parent_combination_id"]),
+            ),
+        )
+    decision = plan_next_combination(
+        current_filters=current_filters,
+        strategy=get_filter_strategy(db, strategy_id),
+        metrics=window_metrics,
+        attempted_filters=_list_combination_filters(db, smart_capture_id, keyword, city),
+        duplicate_distribution=_historical_duplicate_distribution(db, smart_capture_id, keyword, city),
+        force_transition=not can_continue or depth >= max_depth,
+        low_yield_streak_limit=int(stop_policy.get("low_yield_streak_limit") or 3),
+        low_novelty_threshold=0.25,
+        low_qualified_yield_threshold=0.15,
+        duplicate_skew_threshold=0.6,
+        combination_safety_limit=24,
+        parent_filters=parent_filters,
+        positive_distribution=positive_distribution,
+        current_combination_empty=current_combination_empty,
+        scope_empty_streak=_scope_empty_streak(db, smart_capture_id, keyword, city),
+        scope_empty_limit=2,
+    )
+    _save_planner_decision(db, smart_capture_id, task_info["combination_id"], decision)
+    if decision.action == "SCOPE_EXHAUSTED":
+        _mark_search_combination_exhausted(
+            db,
+            task_info["combination_id"],
+            decision.switch_reason or "approved_platform_search_space_exhausted",
+        )
+        next_task = _create_next_approved_scope(
+            db,
+            smart_capture_id,
+            keyword,
+            city,
+            search_config,
+            task_info["combination_id"],
+        )
+    else:
+        transition_parent_id = (
+            str(combination["parent_combination_id"])
+            if current_combination_empty and combination is not None and combination["parent_combination_id"]
+            else task_info["combination_id"]
+        )
+        next_task = _create_search_combination_task(
+            db,
+            smart_capture_id,
+            workflow_run_id=str(_smart_capture_workflow_id(db, smart_capture_id) or "") or None,
+            keyword=keyword,
+            city=city,
+            platform_filters=decision.platform_filters,
+            parent_combination_id=transition_parent_id or None,
+            transition_action=decision.action,
+            transition_reason=decision.switch_reason,
+            selected_axis=decision.selected_axis,
+            evidence=decision.evidence or {},
+        )
+    if next_task is None:
+        return False
+    output_dir = capture_task.get("_output_dir")
+    if not isinstance(output_dir, Path):
+        return False
+    next_payload = {
+        "keyword": next_task["keyword"],
+        "city": next_task["city"],
+        "allowed_search_keywords": list(search_config.get("keywords") or []),
+        "allowed_cities": list(search_config.get("cities") or []),
+        "platform_filters": next_task["platform_filters"],
+        "filters": next_task["platform_filters"],
+        "filter_strategy_id": strategy_id,
+        "min_depth": int(stop_policy.get("min_depth") or 1),
+        "prefer_current_page": bool(search_config.get("prefer_current_page", True)),
+        "force_search_navigation": True,
+    }
+    from backend.app.services.fine_job import smart_captures
+
+    smart_captures.start_search_combination_batch(
+        db,
+        smart_capture_id,
+        next_payload,
+        output_dir=output_dir,
+    )
+    smart_captures._update_capture(
+        db,
+        smart_capture_id,
+        status="running",
+        stage="capturing",
+        waiting_reason="",
+        control_cause="",
+        message="当前搜索条件产出不足，正在切换下一组搜索条件。",
+    )
+    return True
+
+
+def _smart_capture_workflow_id(db: Database, smart_capture_id: str) -> str | None:
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT workflow_run_id FROM fj_smart_captures WHERE id = ?",
+            (smart_capture_id,),
+        ).fetchone()
+    return str(row["workflow_run_id"] or "") if row is not None else None
+
+
+def _scope_empty_streak(
+    db: Database,
+    smart_capture_id: str,
+    keyword: str,
+    city: str,
+) -> int:
+    """读取当前词城末尾连续完成的可信空组合数量。"""
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT status, jobs_seen
+            FROM fj_workflow_search_combinations
+            WHERE smart_capture_id = ? AND keyword = ? AND city = ?
+            ORDER BY sequence DESC
+            """,
+            (smart_capture_id, keyword, city),
+        ).fetchall()
+    streak = 0
+    for row in rows:
+        if str(row["status"] or "") not in {"completed", "exhausted"}:
+            break
+        if int(row["jobs_seen"] or 0) != 0:
+            break
+        streak += 1
+    return streak
+
+
+def _historical_duplicate_distribution(
+    db: Database,
+    smart_capture_id: str,
+    keyword: str,
+    city: str,
+) -> dict[str, dict[str, int]]:
+    """统计当前搜索词和城市下历史重复岗位的平台筛选分布。"""
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT j.company_scale, j.company_stage, j.company_industry,
+                   j.experience, j.degree, j.salary
+            FROM fj_workflow_job_discoveries d
+            JOIN fj_boss_jobs j ON j.id = d.job_id
+            WHERE d.smart_capture_id = ? AND d.search_keyword = ? AND d.city = ?
+              AND d.is_historical_duplicate = 1
+            """,
+            (smart_capture_id, keyword, city),
+        ).fetchall()
+    columns = {
+        "company_scale": "company_scale",
+        "company_stage": "company_stage",
+        "company_industry": "company_industry",
+        "experience": "experience",
+        "degree": "degree",
+        "salary": "salary",
+    }
+    distribution: dict[str, dict[str, int]] = {axis: {} for axis in columns}
+    for row in rows:
+        for axis, column in columns.items():
+            value = str(row[column] or "").strip()
+            code = platform_filter_code(axis, value) if value else None
+            if code:
+                distribution[axis][code] = distribution[axis].get(code, 0) + 1
+    return distribution
+
+
+def _positive_filter_distribution(
+    db: Database,
+    smart_capture_id: str,
+    combination_id: str,
+) -> dict[str, dict[str, int]]:
+    """统计父组合或当前组合实际岗位对平台筛选值的正向证据。"""
+    axes = {
+        "company_scale": "company_scale",
+        "company_stage": "company_stage",
+        "company_industry": "company_industry",
+        "experience": "experience",
+        "degree": "degree",
+        "salary": "salary",
+    }
+    distribution: dict[str, dict[str, int]] = {axis: {} for axis in axes}
+    if not combination_id:
+        return distribution
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT j.company_scale, j.company_stage, j.company_industry,
+                   j.experience, j.degree, j.salary
+            FROM fj_workflow_job_discoveries d
+            JOIN fj_boss_jobs j ON j.id = d.job_id
+            WHERE d.smart_capture_id = ?
+              AND json_extract(d.search_combination_json, '$.search_combination_id') = ?
+            """,
+            (smart_capture_id, combination_id),
+        ).fetchall()
+    for row in rows:
+        for axis, column in axes.items():
+            value = str(row[column] or "").strip()
+            code = platform_filter_code(axis, value) if value else None
+            if code:
+                distribution[axis][code] = distribution[axis].get(code, 0) + 1
+    return distribution
+
+
+def _merge_filter_distributions(
+    first: dict[str, dict[str, int]],
+    second: dict[str, dict[str, int]],
+) -> dict[str, dict[str, int]]:
+    merged = {axis: dict(values) for axis, values in first.items()}
+    for axis, values in second.items():
+        target = merged.setdefault(axis, {})
+        for value, count in values.items():
+            target[value] = target.get(value, 0) + int(count)
+    return merged
+
+
+def _list_combination_filters(
+    db: Database,
+    smart_capture_id: str,
+    keyword: str,
+    city: str,
+) -> list[dict[str, str]]:
+    with db.connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT platform_filters_json
+            FROM fj_workflow_search_combinations
+            WHERE smart_capture_id = ? AND keyword = ? AND city = ?
+            ORDER BY sequence
+            """,
+            (smart_capture_id, keyword, city),
+        ).fetchall()
+    return [canonicalize_platform_filters(_load(row["platform_filters_json"])) for row in rows]
+
+
+def _save_planner_decision(
+    db: Database,
+    smart_capture_id: str,
+    combination_id: str,
+    decision: Any,
+) -> None:
+    if not combination_id:
+        return
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_workflow_search_combinations
+            SET transition_reason = CASE WHEN ? <> '' THEN ? ELSE transition_reason END,
+                selected_axis = CASE WHEN ? <> '' THEN ? ELSE selected_axis END,
+                evidence_json = ?
+            WHERE id = ? AND smart_capture_id = ?
+            """,
+            (
+                decision.switch_reason,
+                decision.switch_reason,
+                decision.selected_axis,
+                decision.selected_axis,
+                _dump(decision.evidence or {}),
+                combination_id,
+                smart_capture_id,
+            ),
+        )
+
+
+def _mark_search_combination_exhausted(
+    db: Database,
+    combination_id: str,
+    stop_reason: str,
+) -> None:
+    if not combination_id:
+        return
+    with db.connect() as connection:
+        connection.execute(
+            """
+            UPDATE fj_workflow_search_combinations
+            SET status = 'exhausted', completed_at = COALESCE(completed_at, ?), stop_reason = ?
+            WHERE id = ? AND status IN ('pending', 'running', 'completed')
+            """,
+            (utc_now(), stop_reason, combination_id),
+        )
+
+
+def _create_search_combination_task(
+    db: Database,
+    smart_capture_id: str,
+    *,
+    workflow_run_id: str | None,
+    keyword: str,
+    city: str,
+    platform_filters: dict[str, str],
+    parent_combination_id: str | None,
+    transition_action: str,
+    transition_reason: str,
+    selected_axis: str,
+    evidence: dict[str, object],
+    is_baseline: bool = False,
+) -> dict[str, object] | None:
+    filters = canonicalize_platform_filters(platform_filters)
+    identity = combination_identity(keyword, city, filters)
+    with db.connect() as connection:
+        existing = connection.execute(
+            "SELECT id FROM fj_workflow_search_combinations WHERE smart_capture_id = ? AND identity_json = ?",
+            (smart_capture_id, identity),
+        ).fetchone()
+        if existing is not None:
+            return None
+        sequence = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM fj_workflow_search_combinations WHERE smart_capture_id = ?",
+                (smart_capture_id,),
+            ).fetchone()[0]
+        ) + 1
+        combination_id = new_id()
+        now = utc_now()
+        connection.execute(
+            """
+            INSERT INTO fj_workflow_search_combinations (
+              id, workflow_run_id, smart_capture_id, keyword, city, platform_filters_json,
+              identity_json, status, sequence, parent_combination_id,
+              transition_action, transition_reason, selected_axis, evidence_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                combination_id,
+                workflow_run_id,
+                smart_capture_id,
+                keyword,
+                city,
+                _dump(filters),
+                identity,
+                sequence,
+                parent_combination_id,
+                transition_action,
+                transition_reason,
+                selected_axis,
+                _dump(evidence),
+            ),
+        )
+        task_id = new_id()
+        connection.execute(
+            """
+            INSERT INTO fj_workflow_tasks (
+              id, workflow_run_id, smart_capture_id, task_type, payload_json, result_json,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, 'deep_job_search', ?, '{}', ?, ?)
+            """,
+            (
+                task_id,
+                workflow_run_id,
+                smart_capture_id,
+                _dump({
+                    "keyword": keyword,
+                    "city": city,
+                    "platform_filters": filters,
+                    "search_combination_id": combination_id,
+                    "is_baseline": is_baseline,
+                    "depth": 0,
+                    "low_yield_streak": 0,
+                    "low_novelty_streak": 0,
+                    "low_qualified_yield_streak": 0,
+                }),
+                now,
+                now,
+            ),
+        )
+    return {
+        "combination_id": combination_id,
+        "task_id": task_id,
+        "keyword": keyword,
+        "city": city,
+        "platform_filters": filters,
+    }
+
+
+def _create_next_approved_scope(
+    db: Database,
+    smart_capture_id: str,
+    current_keyword: str,
+    current_city: str,
+    search_config: dict[str, object],
+    parent_combination_id: str,
+) -> dict[str, object] | None:
+    keywords = [str(value) for value in search_config.get("keywords") or []]
+    cities = [str(value) for value in search_config.get("cities") or []]
+    scopes = [(keyword, city) for keyword in keywords for city in cities]
+    try:
+        current_index = scopes.index((current_keyword, current_city))
+    except ValueError:
+        current_index = -1
+    if current_index + 1 >= len(scopes):
+        return None
+    next_keyword, next_city = scopes[current_index + 1]
+    reason = "approved_city_next" if next_keyword == current_keyword else "approved_keyword_next"
+    return _create_search_combination_task(
+        db,
+        smart_capture_id,
+        workflow_run_id=_smart_capture_workflow_id(db, smart_capture_id),
+        keyword=next_keyword,
+        city=next_city,
+        platform_filters={},
+        parent_combination_id=parent_combination_id or None,
+        transition_action="SWITCH_COMBINATION",
+        transition_reason=reason,
+        selected_axis="",
+        evidence={"previous_scope": {"keyword": current_keyword, "city": current_city}},
+        is_baseline=True,
+    )
+
+
 def list_search_combinations(db: Database, smart_capture_id: str) -> list[dict[str, object]]:
     with db.connect() as connection:
         rows = connection.execute(
@@ -1522,8 +2200,9 @@ def list_candidate_pool(db: Database, smart_capture_id: str) -> list[dict[str, o
             SELECT j.*, MIN(d.discovered_at) AS candidate_discovered_at
             FROM fj_workflow_job_discoveries d
             JOIN fj_boss_jobs j ON j.id = d.job_id
-            WHERE d.smart_capture_id = ? AND d.is_run_first_discovery = 1
-              AND d.is_historical_duplicate = 0 AND d.is_filter_candidate = 1
+            WHERE d.smart_capture_id = ?
+              AND d.is_filter_candidate = 1
+              AND j.detail_status = 'not_collected'
             GROUP BY j.id
             ORDER BY candidate_discovered_at, j.id
             """,

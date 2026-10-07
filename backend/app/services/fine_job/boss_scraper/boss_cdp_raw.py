@@ -1828,9 +1828,16 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     gate_first_response(data)
             else:
                 # 翻页：滚动到底触发无限滚动加载，继续旁听页面自身请求
+                def trigger_scroll():
+                    # 复用现有 BOSS 搜索标签页，滚动前恢复该标签页和浏览器焦点。
+                    if target_id:
+                        cdp.send("Target.activateTarget", {"targetId": str(target_id)})
+                        interruptible_wait(0.2, "搜索标签页焦点切换")
+                    human_scroll(cdp, sid, to_bottom=True)
+
                 data = capture.wait_next_response(
                     timeout=20,
-                    trigger=lambda: human_scroll(cdp, sid, to_bottom=True),
+                    trigger=trigger_scroll,
                     should_stop=should_stop,
                 )
                 incr_request()

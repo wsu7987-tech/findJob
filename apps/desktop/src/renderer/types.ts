@@ -288,6 +288,9 @@ export interface FineJobBossCapturedJob {
   final_filter_status?: "pass" | "pass_for_human" | "reject" | "review" | "exclude" | null;
   processing_state?: "new" | "reprocessable" | "duplicate" | "excluded" | null;
   filter_reasons?: string[];
+  filter_pass_reasons?: string[];
+  filter_reject_reasons?: string[];
+  filter_review_reasons?: string[];
   filter_failure_codes?: string[];
   filter_missing_fields?: string[];
   filter_strategy_id?: string | null;
@@ -300,6 +303,8 @@ export interface FineJobBossCapturedJob {
   cooldown_excluded?: boolean;
   cooldown_reasons?: string[];
   delivery_evaluation?: FineJobBossDeliveryEvaluation | null;
+  codex_analysis_status?: "pending" | "running" | "succeeded" | "failed" | null;
+  codex_analysis_result?: Record<string, unknown> | null;
   list_collected_at?: string | null;
   detail_collected_at?: string | null;
   is_previously_collected?: boolean;
@@ -462,6 +467,7 @@ export interface FineJobSmartCaptureHandoff {
   handoff_attempt_id?: string | null;
   attempt_status: "none" | "claimed" | "prompt_written" | "started" | "released" | "completed";
   codex_session_ref?: string | null;
+  reusable_codex_session_ref?: string | null;
   needs_initial_codex_handoff?: boolean;
   needs_next_batch_handoff?: boolean;
   codex_processing?: boolean;

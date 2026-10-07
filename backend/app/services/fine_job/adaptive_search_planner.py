@@ -261,6 +261,11 @@ def plan_next_combination(
     low_qualified_yield_threshold: float = 0.15,
     duplicate_skew_threshold: float = 0.6,
     combination_safety_limit: int = 24,
+    parent_filters: Mapping[str, object] | None = None,
+    positive_distribution: Mapping[str, Mapping[str, int]] | None = None,
+    current_combination_empty: bool = False,
+    scope_empty_streak: int = 0,
+    scope_empty_limit: int = 2,
 ) -> PlannerDecision:
     """根据窗口质量和重复池分布，按需选择下一 Search Combination。"""
     current = canonicalize_platform_filters(current_filters)
@@ -281,6 +286,80 @@ def plan_next_combination(
 
     options = strategy_platform_options(strategy)
 
+    # 空的 baseline 直接结束当前 Scope；没有证据时不凭空叠加平台筛选。
+    if current_combination_empty and not current:
+        return PlannerDecision(
+            "SCOPE_EXHAUSTED",
+            current,
+            "baseline_empty",
+            evidence={"metrics": metrics.as_dict()},
+            should_switch_scope=True,
+        )
+    if current_combination_empty and scope_empty_streak >= scope_empty_limit:
+        return PlannerDecision(
+            "SCOPE_EXHAUSTED",
+            current,
+            "scope_empty_streak_limit",
+            evidence={
+                "metrics": metrics.as_dict(),
+                "scope_empty_streak": scope_empty_streak,
+                "scope_empty_limit": scope_empty_limit,
+            },
+            should_switch_scope=True,
+        )
+    if current_combination_empty:
+        # 空组合只允许回到父组合寻找同一维度的其他未尝试值，禁止继续增加筛选维度。
+        if parent_filters is None:
+            return PlannerDecision(
+                "SCOPE_EXHAUSTED",
+                current,
+                "empty_combination_without_parent",
+                evidence={"metrics": metrics.as_dict(), "empty_combination": current},
+                should_switch_scope=True,
+            )
+        parent = canonicalize_platform_filters(parent_filters)
+        changed_axes = [
+            axis
+            for axis in PLATFORM_FILTER_KEYS
+            if current.get(axis) != parent.get(axis)
+        ]
+        for axis in changed_axes:
+            candidates = [
+                value
+                for value in options.get(axis, [])
+                if value != current.get(axis) and value != parent.get(axis)
+            ]
+            positive_counts = (positive_distribution or {}).get(axis, {})
+            candidates = [value for value in candidates if positive_counts.get(value, 0) > 0]
+            counts = (duplicate_distribution or {}).get(axis, {})
+            candidates.sort(key=lambda value: (-positive_counts.get(value, 0), counts.get(value, 0), value))
+            for candidate in candidates:
+                decision = _make_axis_decision(
+                    parent,
+                    axis,
+                    candidate,
+                    attempted,
+                    reason="empty_combination_sibling",
+                    evidence={
+                        "metrics": metrics.as_dict(),
+                        "parent_filters": parent,
+                        "empty_combination": current,
+                    },
+                )
+                if decision is not None:
+                    return decision
+        return PlannerDecision(
+            "SCOPE_EXHAUSTED",
+            current,
+            "empty_combination_no_sibling",
+            evidence={
+                "metrics": metrics.as_dict(),
+                "parent_filters": parent,
+                "empty_combination": current,
+            },
+            should_switch_scope=True,
+        )
+
     # Fresh 产出偏低或策略拒绝占比高时，优先收窄造成拒绝最多的可映射维度。
     failure_codes = metrics.failure_code_counts or {}
     filter_quality_triggered = bool(
@@ -295,7 +374,15 @@ def plan_next_combination(
         for axis in sorted(options, key=lambda item: (-failure_codes.get(item, 0), item)):
             if failure_codes.get(axis, 0) <= 0:
                 continue
-            candidate = _select_axis_value(axis, current, options, duplicate_distribution, prefer_unexplored=False)
+            candidate = _select_axis_value(
+                axis,
+                current,
+                options,
+                duplicate_distribution,
+                prefer_unexplored=False,
+                positive_distribution=positive_distribution,
+                require_positive=positive_distribution is not None,
+            )
             decision = _make_axis_decision(
                 current,
                 axis,
@@ -337,7 +424,15 @@ def plan_next_combination(
             share = _distribution_share(distribution.get(axis, {}))
             if share < duplicate_skew_threshold and metrics.run_fresh_jobs > 0:
                 continue
-            candidate = _select_axis_value(axis, current, options, distribution, prefer_unexplored=True)
+            candidate = _select_axis_value(
+                axis,
+                current,
+                options,
+                distribution,
+                prefer_unexplored=True,
+                positive_distribution=positive_distribution,
+                require_positive=positive_distribution is not None,
+            )
             decision = _make_axis_decision(
                 current,
                 axis,
@@ -372,7 +467,15 @@ def plan_next_combination(
     # 在没有明显偏斜证据时，按可探索值逐步扩展当前 Scope；每次只创建一个组合。
     if len(attempted) < combination_safety_limit:
         for axis in options:
-            candidate = _select_axis_value(axis, current, options, duplicate_distribution, prefer_unexplored=True)
+            candidate = _select_axis_value(
+                axis,
+                current,
+                options,
+                duplicate_distribution,
+                prefer_unexplored=True,
+                positive_distribution=positive_distribution,
+                require_positive=positive_distribution is not None,
+            )
             decision = _make_axis_decision(
                 current,
                 axis,
@@ -466,16 +569,22 @@ def _select_axis_value(
     distribution: Mapping[str, Mapping[str, int]] | None,
     *,
     prefer_unexplored: bool,
+    positive_distribution: Mapping[str, Mapping[str, int]] | None = None,
+    require_positive: bool = False,
 ) -> str | None:
     platform_key = FAILURE_AXIS_MAP[axis][0]
     current_values = set(str(current.get(platform_key, "")).split(",")) if current.get(platform_key) else set()
     candidates = [value for value in options.get(axis, []) if value not in current_values]
+    if require_positive:
+        positive_counts = (positive_distribution or {}).get(axis, {})
+        candidates = [value for value in candidates if positive_counts.get(value, 0) > 0]
     if not candidates:
         return None
     counts = distribution.get(axis, {}) if distribution else {}
+    positive_counts = (positive_distribution or {}).get(axis, {})
     # 低覆盖或未探索值优先，用于改变结果池的分布。
     if prefer_unexplored:
-        return min(candidates, key=lambda value: (counts.get(value, 0), value))
+        return min(candidates, key=lambda value: (counts.get(value, 0), -positive_counts.get(value, 0), value))
     return candidates[0]
 
 

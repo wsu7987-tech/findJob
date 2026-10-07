@@ -10,6 +10,7 @@ export interface SmartCaptureExecutionConfig {
   filters: Record<string, string>;
   candidate_target_count: number;
   prefer_current_page: boolean;
+  auto_jd_detail_collection_enabled: boolean;
   delivery_target_enabled: boolean;
   recommendation_strategy_id: string;
   recommend_target: number;
@@ -51,6 +52,7 @@ export const createDefaultSmartCaptureExecutionConfig = (
   filters: {},
   candidate_target_count: 15,
   prefer_current_page: true,
+  auto_jd_detail_collection_enabled: true,
   // 岗位采集页原来默认关闭投递目标，驾驶舱原来默认开启投递目标。
   delivery_target_enabled: source === "task_cockpit",
   recommendation_strategy_id: "",
@@ -127,6 +129,9 @@ export const toSmartCaptureRequest = (config: SmartCaptureExecutionConfig) => ({
   filters: { ...config.filters },
   candidate_target_count: config.candidate_target_count,
   prefer_current_page: config.prefer_current_page,
+  auto_jd_detail_collection_enabled: config.delivery_target_enabled
+    ? true
+    : config.auto_jd_detail_collection_enabled,
   delivery_target_enabled: config.delivery_target_enabled,
   recommendation_strategy_id: config.delivery_target_enabled ? config.recommendation_strategy_id || undefined : undefined,
   recommend_target: config.delivery_target_enabled ? config.recommend_target : undefined,
@@ -154,6 +159,7 @@ export interface SmartCaptureExecutionConfigRequest {
   filters?: Record<string, string>;
   candidate_target_count?: number;
   prefer_current_page?: boolean;
+  auto_jd_detail_collection_enabled?: boolean;
   delivery_target_enabled?: boolean;
   recommendation_strategy_id?: string;
   recommend_target?: number;

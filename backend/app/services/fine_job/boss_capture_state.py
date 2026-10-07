@@ -36,7 +36,8 @@ def persist_task(task):
     snapshot = public_task(task)
     recovery = {key: deepcopy(task.get(key)) for key in (
         "_runtime_state", "_list_data", "_capture_target_id", "_paused_detail_job_ids",
-        "_detail_mode", "_capture_id", "_control_status",
+        "_detail_mode", "_capture_id", "_control_status", "manual_detail_queue_job_ids",
+        "manual_detail_phase",
     )}
     request = task.get("_request")
     if request:

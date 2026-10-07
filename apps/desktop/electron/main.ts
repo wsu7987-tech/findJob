@@ -49,7 +49,12 @@ const workspaceRoot =
 const backendOrigin =
   process.env.KNOWLEDGE_CURATOR_API_ORIGIN ?? "http://127.0.0.1:8000";
 const appDataDir =
-  process.env.KNOWLEDGE_CURATOR_APP_DATA_DIR ?? app.getPath("userData");
+  process.env.KNOWLEDGE_CURATOR_APP_DATA_DIR ??
+  (app.isPackaged
+    ? path.resolve(process.resourcesPath, "..", "data")
+    : app.getPath("userData"));
+// 让后端、快捷捕获配置和 Codex 托管工作区使用同一个业务数据目录。
+process.env.KNOWLEDGE_CURATOR_APP_DATA_DIR ??= appDataDir;
 const pythonPath =
   process.env.FINE_JOB_PYTHON_PATH ??
   path.resolve(

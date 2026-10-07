@@ -1456,6 +1456,12 @@ export const api = {
       { method: "POST", body: JSON.stringify(payload) }
     );
   },
+  async queueFineJobSmartCaptureManualDetails(smartCaptureId: string, jobIds: string[]) {
+    return request<FineJobSmartCapture>(
+      `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/manual-details`,
+      { method: "POST", body: JSON.stringify({ job_ids: jobIds }) }
+    );
+  },
   async getFineJobSmartCaptureAnalysisItemContext(smartCaptureId: string, workflowTaskId: string) {
     return request<Record<string, unknown>>(
       `/api/fine-job/smart-captures/${encodeURIComponent(smartCaptureId)}/analysis-items/${encodeURIComponent(workflowTaskId)}/context`
@@ -1548,7 +1554,7 @@ export const api = {
       analysis_batch_id: string;
       handoff_attempt_id: string;
       codex_session_ref: string;
-      release_reason?: "transport_failure" | "full_retry";
+      release_reason?: "transport_failure" | "full_retry" | "session_missing";
     }
   ) {
     return request<Record<string, unknown>>(

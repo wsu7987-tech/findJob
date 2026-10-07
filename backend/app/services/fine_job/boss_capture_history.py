@@ -423,6 +423,36 @@ def record_chat_job(
     }
 
 
+def _sync_capture_job_snapshot(
+    connection,
+    *,
+    history_record_id: str,
+    updates: dict[str, object],
+) -> None:
+    """把岗位主记录的最新状态同步到当前岗位采集批次快照。"""
+    rows = connection.execute(
+        """
+        SELECT capture_id, snapshot_json
+        FROM fj_boss_capture_batch_jobs
+        WHERE job_id = ?
+        """,
+        (history_record_id,),
+    ).fetchall()
+    for row in rows:
+        snapshot = _load_json(row["snapshot_json"])
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        snapshot.update(updates)
+        connection.execute(
+            """
+            UPDATE fj_boss_capture_batch_jobs
+            SET snapshot_json = ?
+            WHERE capture_id = ? AND job_id = ?
+            """,
+            (_json(snapshot), row["capture_id"], history_record_id),
+        )
+
+
 def update_capture_job_filter_result(
     db: Database,
     *,
@@ -435,7 +465,7 @@ def update_capture_job_filter_result(
     identity_value = history_record_id or build_job_dedupe_key(job)
     with db.connect() as connection:
         row = connection.execute(
-            f"SELECT payload_json FROM fj_boss_jobs WHERE {identity_column} = ?",
+            f"SELECT id, payload_json FROM fj_boss_jobs WHERE {identity_column} = ?",
             (identity_value,),
         ).fetchone()
         if row is None:
@@ -453,6 +483,9 @@ def update_capture_job_filter_result(
                     "final_filter_status", result.get("status")
                 ),
                 "filter_reasons": list(result.get("reasons") or []),
+                "filter_pass_reasons": list(result.get("pass_reasons") or []),
+                "filter_reject_reasons": list(result.get("reject_reasons") or []),
+                "filter_review_reasons": list(result.get("review_reasons") or []),
                 "filter_failure_codes": list(result.get("failure_codes") or []),
                 "filter_missing_fields": list(result.get("missing_fields") or []),
                 "filter_strategy_id": result.get("strategy_id"),
@@ -463,6 +496,24 @@ def update_capture_job_filter_result(
         connection.execute(
             f"UPDATE fj_boss_jobs SET payload_json = ? WHERE {identity_column} = ?",
             (_json(payload), identity_value),
+        )
+        _sync_capture_job_snapshot(
+            connection,
+            history_record_id=str(row["id"]),
+            updates={
+                "filter_status": payload["filter_status"],
+                "strategy_filter_status": payload["strategy_filter_status"],
+                "final_filter_status": payload["final_filter_status"],
+                "filter_reasons": payload["filter_reasons"],
+                "filter_pass_reasons": payload["filter_pass_reasons"],
+                "filter_reject_reasons": payload["filter_reject_reasons"],
+                "filter_review_reasons": payload["filter_review_reasons"],
+                "filter_failure_codes": payload["filter_failure_codes"],
+                "filter_missing_fields": payload["filter_missing_fields"],
+                "filter_strategy_id": payload["filter_strategy_id"],
+                "cooldown_excluded": payload["cooldown_excluded"],
+                "cooldown_reasons": payload["cooldown_reasons"],
+            },
         )
         final_status = str(
             result.get("final_filter_status") or result.get("status") or ""
@@ -560,6 +611,17 @@ def update_capture_job_detail(
                 f"UPDATE fj_boss_jobs SET {', '.join(assignments)} WHERE {identity_column} = ?",
                 values,
             )
+            _sync_capture_job_snapshot(
+                connection,
+                history_record_id=str(existing["id"]),
+                updates={
+                    **field_values,
+                    "detail": detail,
+                    "detail_status": "completed",
+                    "detail_error": None,
+                    "detail_collected_at": now,
+                },
+            )
             if field_values["title"]:
                 # 详情采集得到标题后回填关联会话，列表立即展示真实岗位名称。
                 connection.execute(
@@ -579,6 +641,11 @@ def update_capture_job_detail(
                 WHERE {identity_column} = ?
                 """,
                 (status, error, identity_value),
+            )
+            _sync_capture_job_snapshot(
+                connection,
+                history_record_id=str(existing["id"]),
+                updates={"detail_status": status, "detail_error": error},
             )
     if status == "completed":
         from backend.app.services.fine_job.filter_exclusions import record_job_event
@@ -626,6 +693,16 @@ def update_capture_job_delivery_evaluation(
             WHERE {identity_column} = ?
             """,
             (_json(evaluation), _json(payload), identity_value),
+        )
+        _sync_capture_job_snapshot(
+            connection,
+            history_record_id=str(row["id"]),
+            updates={
+                "delivery_evaluation": evaluation,
+                "recommended": payload["recommended"],
+                "recommendation_source": payload["recommendation_source"],
+                "recommendation_reason": payload["recommendation_reason"],
+            },
         )
 
 
@@ -902,6 +979,9 @@ def _serialize_history_row(row) -> dict[str, object]:
             "final_filter_status", payload.get("filter_status")
         ),
         "filter_reasons": list(payload.get("filter_reasons") or []),
+        "filter_pass_reasons": list(payload.get("filter_pass_reasons") or []),
+        "filter_reject_reasons": list(payload.get("filter_reject_reasons") or []),
+        "filter_review_reasons": list(payload.get("filter_review_reasons") or []),
         "filter_failure_codes": list(payload.get("filter_failure_codes") or []),
         "filter_missing_fields": list(payload.get("filter_missing_fields") or []),
         "filter_strategy_id": payload.get("filter_strategy_id"),

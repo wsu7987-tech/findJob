@@ -285,6 +285,10 @@ def apply_filter_exclusions(
             result["status"] = "exclude"
             result["final_filter_status"] = "exclude"
             result["reasons"] = [*list(result.get("reasons") or []), *reasons]
+            result["reject_reasons"] = [
+                *list(result.get("reject_reasons") or []),
+                *reasons,
+            ]
             result["cooldown_excluded"] = True
             result["cooldown_reasons"] = reasons
         if result is not None:

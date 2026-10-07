@@ -17,6 +17,7 @@ class SmartCaptureCreateRequest(BaseModel):
     candidate_target_count: int = Field(default=15, ge=1, le=500)
     prefer_current_page: bool = True
     filters: dict[str, str] = Field(default_factory=dict)
+    auto_jd_detail_collection_enabled: bool = True
     delivery_target_enabled: bool = False
     recommendation_strategy_id: str | None = Field(default=None, min_length=1, max_length=100)
     recommend_target: int | None = Field(default=None, ge=1, le=100)
@@ -58,6 +59,10 @@ class SmartCaptureManualAnalysisBatchRequest(BaseModel):
     codex_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
 
 
+class SmartCaptureManualDetailsRequest(BaseModel):
+    job_ids: list[str] = Field(min_length=1, max_length=100)
+
+
 class SmartCaptureCodexSessionRequest(BaseModel):
     codex_session_ref: str = Field(min_length=1, max_length=200)
     codex_runtime_id: str | None = Field(default=None, max_length=200)
@@ -73,7 +78,7 @@ class SmartCaptureHandoffRequest(BaseModel):
     analysis_batch_id: str = Field(min_length=1, max_length=100)
     handoff_attempt_id: str = Field(min_length=1, max_length=100)
     codex_session_ref: str = Field(min_length=1, max_length=200)
-    release_reason: Literal["transport_failure", "full_retry"] | None = None
+    release_reason: Literal["transport_failure", "full_retry", "session_missing"] | None = None
 
 
 class SmartCaptureHandoffStartAckRequest(BaseModel):

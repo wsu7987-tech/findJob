@@ -262,7 +262,9 @@ type SmartCaptureHandoffApi = Pick<
   | "claimFineJobSmartCaptureAnalysisHandoff"
   | "markFineJobSmartCaptureAnalysisHandoffPromptWritten"
   | "releaseFineJobSmartCaptureAnalysisHandoff"
->;
+> & {
+  pauseFineJobSmartCapture?: typeof api.pauseFineJobSmartCapture;
+};
 
 export type SmartCaptureCodexStore = {
   status: string;
@@ -279,6 +281,7 @@ export type SmartCaptureCodexStore = {
     sessionRef: string | null;
     smartCaptureSessionMode?: "live_reused" | "resumed_explicit" | "new_from_smart_capture_state";
   }>;
+  stop?: () => void;
 };
 
 type SmartCapturePromptTransport = {
@@ -319,7 +322,7 @@ const canStartSmartCaptureHandoff = (
   snapshot: FineJobSmartCaptureAnalysisSnapshot,
   trigger: HandoffTrigger
 ) => {
-  if (["completed", "stopped", "failed"].includes(snapshot.smart_capture.status)) return false;
+  if (["stopped", "failed"].includes(snapshot.smart_capture.status)) return false;
   if (!smartCaptureHasReadyBatch(snapshot)) return false;
   return trigger !== "auto" || smartCaptureExecution(snapshot).handoff !== "manual";
 };
@@ -375,12 +378,23 @@ const currentSmartCaptureSnapshot = async (
   }
 };
 
+const smartCaptureHasActiveTask = (snapshot: FineJobSmartCaptureAnalysisSnapshot) => Boolean(
+  snapshot.handoff?.attempt_status === "started"
+    || snapshot.items.some((item) => item.status === "running")
+);
+
+const waitForCodexSessionStop = (codexStore: SmartCaptureCodexStore) => new Promise<void>((resolve) => {
+  codexStore.stop?.();
+  setTimeout(resolve, 250);
+});
+
 const runSmartCaptureHandoff = async (
   snapshot: FineJobSmartCaptureAnalysisSnapshot,
   codexStore: SmartCaptureCodexStore,
   trigger: HandoffTrigger,
   client: SmartCaptureHandoffApi,
-  transport: SmartCapturePromptTransport
+  transport: SmartCapturePromptTransport,
+  allowSessionRestart = true
 ): Promise<SmartCaptureCodexHandoffResult> => {
   if (!canStartSmartCaptureHandoff(snapshot, trigger)) {
     return { status: "skipped", snapshot, message: "当前 Smart Capture 没有可交接的 Analysis Batch。" };
@@ -392,17 +406,64 @@ const runSmartCaptureHandoff = async (
   if (!model || !reasoningEffort || !transport.submitSmartCaptureCodexPrompt) {
     return { status: "skipped", snapshot, message: "当前桌面端缺少 Smart Capture Codex handoff 条件。" };
   }
-  if (codexStore.status === "running" && codexStore.sessionRef !== snapshot.handoff?.codex_session_ref) {
+  // 下一批没有自己的交接记录时，允许复用同一 Smart Capture 上一批已完成的 Codex 会话。
+  const reusableSessionRef = snapshot.handoff?.reusable_codex_session_ref || null;
+  const expectedSessionRef = snapshot.handoff?.codex_session_ref || reusableSessionRef;
+  if (codexStore.status === "running" && codexStore.sessionRef !== expectedSessionRef) {
     return { status: "busy", snapshot, message: "当前 Codex 会话属于其他 Smart Capture，等待该会话结束后再交接。" };
   }
 
-  const session = await codexStore.startSmartCapture({
-    cols: 120,
-    rows: 36,
-    model,
-    reasoningEffort,
-    sessionRef: snapshot.handoff?.codex_session_ref || undefined
-  });
+  let session: Awaited<ReturnType<SmartCaptureCodexStore["startSmartCapture"]>>;
+  try {
+    session = await codexStore.startSmartCapture({
+      cols: 120,
+      rows: 36,
+      model,
+      reasoningEffort,
+      sessionRef: expectedSessionRef || undefined
+    });
+  } catch {
+    if (smartCaptureHasActiveTask(snapshot)) {
+      return {
+        status: "busy",
+        snapshot,
+        message: "Codex 当前有任务正在执行，请等待人工推进。"
+      };
+    }
+    const currentSessionIsAnotherTask = Boolean(
+      codexStore.status === "running"
+        && codexStore.sessionRef
+        && codexStore.sessionRef !== expectedSessionRef
+    );
+    if (currentSessionIsAnotherTask) {
+      return {
+        status: "busy",
+        snapshot,
+        message: "当前 Codex 会话有任务正在执行，请等待人工推进。"
+      };
+    }
+    // 当前没有正在执行的分析任务，先结束空闲会话，再重新建立任务会话。
+    await waitForCodexSessionStop(codexStore);
+    try {
+      session = await codexStore.startSmartCapture({
+        cols: 120,
+        rows: 36,
+        model,
+        reasoningEffort
+      });
+    } catch (retryError) {
+      try {
+        await (client.pauseFineJobSmartCapture ?? api.pauseFineJobSmartCapture)(snapshot.smart_capture_id);
+      } catch {
+        // 暂停失败时保留原有待分析状态，页面手动按钮仍可再次尝试交接。
+      }
+      return {
+        status: "transport_failed",
+        snapshot: await currentSmartCaptureSnapshot(client, snapshot.smart_capture_id, snapshot),
+        message: `Codex 会话启动失败，已暂停岗位采集，等待手动推进。${retryError instanceof Error ? ` ${retryError.message}` : ""}`
+      };
+    }
+  }
   if (!session.sessionRef) {
     return { status: "busy", snapshot, message: "Codex 会话未返回可绑定的 Session Ref。" };
   }
@@ -453,9 +514,22 @@ const runSmartCaptureHandoff = async (
         handoff_attempt_id: handoffAttemptId,
         codex_session_ref: session.sessionRef
       });
+      const releasedSnapshot = normalizeSmartCaptureResponse(response, claimed);
+      if (allowSessionRestart && codexStore.stop && !smartCaptureHasActiveTask(releasedSnapshot)) {
+        // 当前批次尚未开始执行，重启一次空闲会话后重新交接；失败时由下一层暂停任务。
+        await waitForCodexSessionStop(codexStore);
+        return runSmartCaptureHandoff(
+          await currentSmartCaptureSnapshot(client, snapshot.smart_capture_id, releasedSnapshot),
+          codexStore,
+          trigger,
+          client,
+          transport,
+          false
+        );
+      }
       return {
         status: "transport_failed",
-        snapshot: normalizeSmartCaptureResponse(response, claimed),
+        snapshot: releasedSnapshot,
         message: "Codex 终端当前不可接收 Prompt，Smart Capture 交接已释放。"
       };
     } catch {
@@ -555,6 +629,43 @@ export const retrySmartCaptureCodexHandoff = (
       handoff_attempt_id: handoff.handoff_attempt_id,
       codex_session_ref: handoff.codex_session_ref,
       release_reason: "full_retry"
+    });
+    const refreshed = await currentSmartCaptureSnapshot(client, snapshot.smart_capture_id, snapshot);
+    return runSmartCaptureHandoff(refreshed, codexStore, "manual", client, transport);
+  })().finally(() => activeSmartCaptureHandoffs.delete(snapshot.smart_capture_id));
+  activeSmartCaptureHandoffs.set(snapshot.smart_capture_id, task);
+  return task;
+};
+
+export const recoverSmartCaptureCodexHandoff = (
+  snapshot: FineJobSmartCaptureAnalysisSnapshot,
+  codexStore: SmartCaptureCodexStore,
+  dependencies: { client?: SmartCaptureHandoffApi; transport?: SmartCapturePromptTransport } = {}
+) => {
+  const existing = activeSmartCaptureHandoffs.get(snapshot.smart_capture_id);
+  if (existing) return existing;
+  const client = dependencies.client ?? api;
+  const transport = dependencies.transport ?? getCodexBridge() ?? {};
+  const task = (async (): Promise<SmartCaptureCodexHandoffResult> => {
+    const handoff = snapshot.handoff;
+    if (
+      !handoff
+      || handoff.attempt_status !== "started"
+      || handoff.codex_processing !== true
+      || !handoff.analysis_batch_id
+      || !handoff.handoff_attempt_id
+      || !handoff.codex_session_ref
+    ) {
+      return { status: "skipped", snapshot, message: "当前分析批次没有可恢复的 Codex 交接。" };
+    }
+    if (codexStore.status === "running" && codexStore.sessionRef === handoff.codex_session_ref) {
+      return { status: "skipped", snapshot, message: "当前 Codex 会话仍连接着这批分析，请直接查看 Codex 窗口。" };
+    }
+    await client.releaseFineJobSmartCaptureAnalysisHandoff(snapshot.smart_capture_id, {
+      analysis_batch_id: handoff.analysis_batch_id,
+      handoff_attempt_id: handoff.handoff_attempt_id,
+      codex_session_ref: handoff.codex_session_ref,
+      release_reason: "session_missing"
     });
     const refreshed = await currentSmartCaptureSnapshot(client, snapshot.smart_capture_id, snapshot);
     return runSmartCaptureHandoff(refreshed, codexStore, "manual", client, transport);

@@ -12,9 +12,15 @@ const EXIT_SUMMARY_LIMIT = 500;
 const INITIAL_TUI_OUTPUT_TIMEOUT_MS = 2_000;
 const PROMPT_SUBMIT_FALLBACK_MS = 750;
 const PROMPT_SUBMIT_SETTLE_MS = 300;
+const MANAGED_PROMPT_SUBMIT_FALLBACK_MS = 1_500;
+const MANAGED_PROMPT_SUBMIT_SETTLE_MS = 1_200;
+const UPDATE_CONFIRMATION_SETTLE_MS = 500;
 export const FINEJOB_WORKFLOW_COMPOSER_SUBMIT_BINDING = "enter";
 export const FINEJOB_WORKFLOW_COMPOSER_SUBMIT_SEQUENCE = "\r";
 export const FINEJOB_WORKFLOW_COMPOSER_SUBMIT_SEQUENCE_DISPLAY = "\\r";
+// 分析窗口保留审批能力，并交给 Codex 自动审查需要批准的操作。
+export const FINEJOB_ANALYSIS_APPROVAL_POLICY = "on-request";
+export const FINEJOB_ANALYSIS_APPROVAL_REVIEWER = "auto_review";
 
 export interface CodexTransportDebugSubmitCandidate {
   id: string;
@@ -45,6 +51,17 @@ const stripTerminalControlSequences = (value: string) =>
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/\r/g, "\n");
+
+// Codex 首次启动可能询问是否更新；托管任务固定选择“不更新”，避免把任务提交键当成更新确认。
+const isCodexUpdateConfirmationPrompt = (value: string) => {
+  const text = stripTerminalControlSequences(value).toLowerCase();
+  return (
+    /would you like to update/.test(text)
+    || /update.*\[(y\/n|yes\/no)\]/.test(text)
+    || /是否.*更新.*codex/.test(text)
+    || /更新.*codex.*[？?]/.test(text)
+  );
+};
 
 export const buildCodexExitMessage = (exitCode: number, recentOutput: string) => {
   const summary = stripTerminalControlSequences(recentOutput)
@@ -116,8 +133,10 @@ export const buildCodexInteractiveArgs = (options: {
 }) => {
   const args = [
     ...(options.resumeSessionRef ? ["resume", options.resumeSessionRef] : []),
-    "--sandbox", "read-only", "--ask-for-approval", "on-request", "--no-alt-screen", "-C", options.tuiWorkspace
+    "--sandbox", "read-only", "--ask-for-approval", FINEJOB_ANALYSIS_APPROVAL_POLICY, "--no-alt-screen", "-C", options.tuiWorkspace
   ];
+  // 让 Codex 自动审查可自动批准的请求，对应“帮我批准”权限模式。
+  args.push("--config", `approvals_reviewer=\"${FINEJOB_ANALYSIS_APPROVAL_REVIEWER}\"`);
   if (options.model) args.push("--model", options.model);
   if (options.reasoningEffort) args.push("--config", `model_reasoning_effort=\"${options.reasoningEffort}\"`);
   if (options.workflowComposerSubmitBinding) {
@@ -229,11 +248,17 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
   let recentOutput = "";
   let firstOutputPromise: Promise<void> | null = null;
   let resolveFirstOutput: (() => void) | null = null;
+  let startupPhase = false;
+  let updatePromptHandled = false;
+  let updatePromptHandling: Promise<void> | null = null;
   let outputSequence = 0;
   const outputWaiters = new Set<() => void>();
   let transportDebugPromptOutputSequence: number | null = null;
 
-  const waitForOutputAfter = (sequence: number) => new Promise<void>((resolve) => {
+  const waitForOutputAfter = (
+    sequence: number,
+    fallbackMs = PROMPT_SUBMIT_FALLBACK_MS
+  ) => new Promise<void>((resolve) => {
     if (outputSequence > sequence) {
       resolve();
       return;
@@ -244,7 +269,7 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
       resolve();
     };
     // PTY 输出只用于安排 Enter 的发送时机，业务开始仍由 MCP ACK 确认。
-    const fallback = setTimeout(complete, PROMPT_SUBMIT_FALLBACK_MS);
+    const fallback = setTimeout(complete, fallbackMs);
     outputWaiters.add(complete);
   });
 
@@ -280,6 +305,12 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
         if (managedTask && requestedComposerMode && dedicatedComposerMode !== requestedComposerMode) {
           throw new Error("当前 Codex 会话属于其他托管任务，结束后再切换。");
         }
+        if (requestedComposerMode === "smart_capture") {
+          // 复用空闲 TUI 时重新检查首屏，避免残留的更新确认提示吞掉下一批任务输入。
+          startupPhase = isCodexUpdateConfirmationPrompt(recentOutput);
+          updatePromptHandled = !startupPhase;
+          updatePromptHandling = null;
+        }
         return {
           status,
           runtimeId,
@@ -299,6 +330,9 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
     }
     setStatus("starting");
     recentOutput = "";
+    startupPhase = true;
+    updatePromptHandled = false;
+    updatePromptHandling = null;
     try {
       const runtime = await options.createRuntime();
       const codexPath = await options.getCodexPath();
@@ -320,12 +354,14 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
         reasoningEffort: managedTask?.reasoningEffort,
         workflowComposerSubmitBinding: requestedComposerSubmit?.binding,
         managedComposerSubmitBinding: requestedComposerMode === null ? "enter" : undefined,
-        keymapOverrides: requestedComposerMode === "transport_debug"
+        keymapOverrides: requestedComposerMode
           ? undefined
           : { "editor.insert_newline": ["shift-enter"] },
         unbindKeymapActions: requestedComposerMode === "transport_debug"
           ? ["editor.insert_newline", "editor.yank"]
-          : undefined
+          : requestedComposerMode
+            ? ["editor.insert_newline"]
+            : undefined
       });
       const resolvedLaunch = resolveCodexLaunch(codexPath, []);
       const launch =
@@ -357,6 +393,15 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
         resolveFirstOutput = null;
         firstOutputPromise = null;
         outputSequence += 1;
+        if (startupPhase && !updatePromptHandled && isCodexUpdateConfirmationPrompt(recentOutput)) {
+          updatePromptHandled = true;
+          const promptOutputSequence = outputSequence;
+          // 明确发送“不更新”，随后等待 TUI 输出完成再提交岗位任务。
+          terminal?.write("n\r");
+          updatePromptHandling = waitForOutputAfter(promptOutputSequence).then(
+            () => new Promise<void>((resolve) => setTimeout(resolve, UPDATE_CONFIRMATION_SETTLE_MS))
+          );
+        }
         resolveOutputWaiters();
         options.emit("codex:output", { runtimeId, sessionRef, data });
       });
@@ -366,6 +411,8 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
         firstOutputPromise = null;
         resolveOutputWaiters();
         terminal = null;
+        startupPhase = false;
+        updatePromptHandling = null;
         dedicatedComposerSubmit = null;
         dedicatedComposerMode = null;
         transportDebugPromptOutputSequence = null;
@@ -402,6 +449,8 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
       };
     } catch (error) {
       terminal = null;
+      startupPhase = false;
+      updatePromptHandling = null;
       sessionRef = null;
       dedicatedComposerSubmit = null;
       dedicatedComposerMode = null;
@@ -504,6 +553,8 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
       terminal?.kill();
       terminal = null;
       sessionRef = null;
+      startupPhase = false;
+      updatePromptHandling = null;
       dedicatedComposerSubmit = null;
       dedicatedComposerMode = null;
       setStatus("idle");
@@ -534,12 +585,35 @@ export const createCodexSessionController = (options: CodexSessionOptions) => {
       ]);
     }
     if (terminal !== currentTerminal) return false;
-    // Prompt 与提交键分开发送，等待写入后的新输出或保守回退后再提交。
+    if (startupPhase) {
+      // 给首屏提示留出渲染时间，避免更新确认框分多段输出时被任务 Prompt 抢先写入。
+      await new Promise<void>((resolve) => setTimeout(resolve, UPDATE_CONFIRMATION_SETTLE_MS));
+      if (!updatePromptHandled && isCodexUpdateConfirmationPrompt(recentOutput)) {
+        updatePromptHandled = true;
+        const promptOutputSequence = outputSequence;
+        // 首屏延迟出现更新提示时，先处理“不更新”选项。
+        currentTerminal.write("n\r");
+        updatePromptHandling = waitForOutputAfter(promptOutputSequence).then(
+          () => new Promise<void>((resolve) => setTimeout(resolve, UPDATE_CONFIRMATION_SETTLE_MS))
+        );
+      }
+      if (updatePromptHandling) await updatePromptHandling;
+      if (terminal !== currentTerminal) return false;
+      startupPhase = false;
+    }
+    // Prompt 与提交键分开发送；托管分析会话额外等待 TUI composer 稳定，避免回车过早被消费。
     const outputBeforePrompt = outputSequence;
     currentTerminal.write(text);
-    await waitForOutputAfter(outputBeforePrompt);
-    // 即使首屏输出恰好晚到，也给 composer 一个独立的处理窗口，避免提交键和文本进入同一批输入。
-    await new Promise<void>((resolve) => setTimeout(resolve, PROMPT_SUBMIT_SETTLE_MS));
+    const managedComposer = dedicatedComposerMode === "workflow" || dedicatedComposerMode === "smart_capture";
+    await waitForOutputAfter(
+      outputBeforePrompt,
+      managedComposer ? MANAGED_PROMPT_SUBMIT_FALLBACK_MS : PROMPT_SUBMIT_FALLBACK_MS
+    );
+    // 即使首屏输出恰好晚到，也给托管 composer 一个独立的处理窗口，避免提交键和文本进入同一批输入。
+    await new Promise<void>((resolve) => setTimeout(
+      resolve,
+      managedComposer ? MANAGED_PROMPT_SUBMIT_SETTLE_MS : PROMPT_SUBMIT_SETTLE_MS
+    ));
     if (terminal !== currentTerminal) return false;
     currentTerminal.write(submitKey);
     return true;

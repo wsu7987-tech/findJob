@@ -2178,10 +2178,11 @@ def _create_jd_tasks(
             f"""
             SELECT d.job_id
             FROM fj_workflow_job_discoveries d
+            JOIN fj_boss_jobs j ON j.id = d.job_id
             WHERE d.smart_capture_id = ?
               AND d.is_run_first_discovery = 1
-              AND d.is_historical_duplicate = 0
               AND d.is_filter_candidate = 1
+              AND j.detail_status = 'not_collected'
               AND NOT EXISTS (
                 SELECT 1 FROM fj_workflow_tasks t
                 WHERE t.smart_capture_id = d.smart_capture_id
@@ -2638,8 +2639,8 @@ def _ensure_prefetch_batch(
             JOIN fj_boss_jobs j ON j.id = d.job_id
             WHERE d.smart_capture_id = ?
               AND d.is_run_first_discovery = 1
-              AND d.is_historical_duplicate = 0
               AND d.is_filter_candidate = 1
+              AND j.detail_status = 'not_collected'
               AND NOT EXISTS (
                 SELECT 1 FROM fj_workflow_tasks t
                 WHERE t.smart_capture_id = d.smart_capture_id
@@ -3675,10 +3676,12 @@ def _freeze_candidate_pool(
     with db.connect() as connection:
         rows = connection.execute(
             f"""
-            SELECT DISTINCT job_id FROM fj_workflow_job_discoveries
-            WHERE {owner_column} = ? AND is_run_first_discovery = 1
-              AND is_historical_duplicate = 0 AND is_filter_candidate = 1
-            ORDER BY discovered_at ASC, job_id ASC
+            SELECT DISTINCT d.job_id FROM fj_workflow_job_discoveries d
+            JOIN fj_boss_jobs j ON j.id = d.job_id
+            WHERE d.{owner_column} = ? AND d.is_run_first_discovery = 1
+              AND d.is_filter_candidate = 1
+              AND j.detail_status = 'not_collected'
+            ORDER BY d.discovered_at ASC, d.job_id ASC
             """,
             (owner_id,),
         ).fetchall()
@@ -3809,7 +3812,7 @@ def _refresh_counts(db: Database, workflow_run_id: str) -> None:
         contract = _load(run["completion_contract_json"], {})
         target = int(contract.get("recommend_target") or contract.get("target_count") or 0)
         completed = int(connection.execute(f"SELECT COUNT(DISTINCT json_extract(result_json, '$.job_id')) FROM fj_workflow_tasks WHERE {owner_column} = ? AND task_type = 'deep_job_search_analysis' AND status = 'succeeded' AND json_extract(result_json, '$.decision') = 'recommend'", (owner_id,)).fetchone()[0])
-        available = int(connection.execute(f"""SELECT COUNT(DISTINCT d.job_id) FROM fj_workflow_job_discoveries d WHERE d.{owner_column} = ? AND d.is_run_first_discovery = 1 AND d.is_historical_duplicate = 0 AND d.is_filter_candidate = 1 AND NOT EXISTS (SELECT 1 FROM fj_workflow_tasks t WHERE t.{owner_column} = d.{owner_column} AND t.task_type IN ('deep_job_search_jd', 'deep_job_search_analysis') AND json_extract(t.payload_json, '$.job_id') = d.job_id)""", (owner_id,)).fetchone()[0])
+        available = int(connection.execute(f"""SELECT COUNT(DISTINCT d.job_id) FROM fj_workflow_job_discoveries d JOIN fj_boss_jobs j ON j.id = d.job_id WHERE d.{owner_column} = ? AND d.is_run_first_discovery = 1 AND d.is_filter_candidate = 1 AND j.detail_status = 'not_collected' AND NOT EXISTS (SELECT 1 FROM fj_workflow_tasks t WHERE t.{owner_column} = d.{owner_column} AND t.task_type IN ('deep_job_search_jd', 'deep_job_search_analysis') AND json_extract(t.payload_json, '$.job_id') = d.job_id)""", (owner_id,)).fetchone()[0])
         telemetry = _load(run["telemetry_json"], {})
         telemetry["fresh_candidates"] = fresh
         telemetry["available_fresh_candidates"] = available
@@ -4178,9 +4181,10 @@ def _get_run_progress(db: Database, workflow_run_id: str) -> dict[str, object]:
               COUNT(*) AS jobs_seen,
               COALESCE(SUM(CASE WHEN is_run_first_discovery = 1 AND is_historical_duplicate = 0 THEN 1 ELSE 0 END), 0) AS fresh_jobs,
               COALESCE(SUM(CASE WHEN is_historical_duplicate = 1 THEN 1 ELSE 0 END), 0) AS historical_duplicates,
-              COALESCE(SUM(CASE WHEN is_run_first_discovery = 1 AND is_historical_duplicate = 0 AND is_filter_candidate = 1 THEN 1 ELSE 0 END), 0) AS candidates
-            FROM fj_workflow_job_discoveries
-            WHERE {owner_column} = ?
+              COALESCE(SUM(CASE WHEN d.is_run_first_discovery = 1 AND d.is_filter_candidate = 1 AND j.detail_status = 'not_collected' THEN 1 ELSE 0 END), 0) AS candidates
+            FROM fj_workflow_job_discoveries d
+            JOIN fj_boss_jobs j ON j.id = d.job_id
+            WHERE d.{owner_column} = ?
             """,
             (owner_id,),
         ).fetchone()

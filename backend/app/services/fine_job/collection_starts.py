@@ -108,6 +108,6 @@ def guard_owner_in_connection(connection):
 
 def has_pending_details(db, capture_id):
     with db.connect() as connection:
-        formal = connection.execute("SELECT 1 FROM fj_workflow_tasks WHERE smart_capture_id = ? AND task_type = 'deep_job_search_jd' AND status IN ('pending', 'running') LIMIT 1", (capture_id,)).fetchone()
+        formal = connection.execute("SELECT 1 FROM fj_workflow_tasks WHERE smart_capture_id = ? AND task_type = 'deep_job_search_jd' AND (status IN ('pending', 'running') OR (status = 'failed' AND retryable = 1)) LIMIT 1", (capture_id,)).fetchone()
         prefetch = connection.execute("SELECT 1 FROM fj_workflow_prefetch_items WHERE smart_capture_id = ? AND status IN ('pending', 'collecting') AND lifecycle_status NOT IN ('cancelled', 'abandoned') LIMIT 1", (capture_id,)).fetchone()
     return bool(formal or prefetch)
